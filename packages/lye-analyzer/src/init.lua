@@ -488,8 +488,9 @@ end
 ---@param parsed lye.parser.Result
 ---@param file lye.doc.File
 ---@param declaration lye.parser.Declaration
+---@param resolve fun(text: string): lye.doc.Type?
 ---@return lye.doc.Type?
-function analyzer.declaredTypeFor(parsed, file, declaration)
+function analyzer.declaredTypeFor(parsed, file, declaration, resolve)
 	local spanStart = annotationSpan(parsed, declaration)
 	if not spanStart then return nil end
 
@@ -502,7 +503,7 @@ function analyzer.declaredTypeFor(parsed, file, declaration)
 	end
 	local previous = annotations[high]
 	if not previous or previous.tag ~= "type" or previous.start < spanStart then return nil end
-	return types.parse(previous.type)
+	return types.parse(previous.type, resolve)
 end
 
 --- A fact belongs to the variable its condition resolved to, so an inner `local` of the same
@@ -623,10 +624,12 @@ end
 ---@param params lye.doc.Annotation[]?
 ---@param name string
 ---@return lye.doc.Type?
-local function paramTypeOf(params, name)
+local function paramTypeOf(params, name, resolve)
 	if not params then return nil end
 	for _, annotation in ipairs(params) do
-		if annotation.name == name and annotation.type then return types.parse(annotation.type) end
+		if annotation.name == name and annotation.type then
+			return types.parse(annotation.type, resolve)
+		end
 	end
 end
 
@@ -666,19 +669,19 @@ end
 ---@param annotations lye.doc.File
 ---@param signatures table<string, { params: lye.doc.Annotation[], returns: lye.doc.Annotation? }>
 ---@param returns table<string, lye.doc.Type>
-local function checkCalls(self, parsed, annotations, signatures, returns)
+local function checkCalls(self, parsed, annotations, signatures, returns, resolve)
 	for _, node in ipairs(parsed.nodes) do
 		if node.kind == "call" and node.callee then
 			local signature = signatures[node.callee]
 			if signature then
 				if signature.returns and signature.returns.type then
-					returns[node.callee] = types.parse(signature.returns.type)
+					returns[node.callee] = types.parse(signature.returns.type, resolve)
 				end
 				for index, argIdx in ipairs(node.args or {}) do
 					local wanted = signature.params[index]
 					local argument = parsed.nodes[argIdx]
 					if wanted and wanted.type and argument then
-						local declared = types.parse(wanted.type)
+						local declared = types.parse(wanted.type, resolve)
 						local actual = typeOfExpression(parsed, argument, self, returns)
 						local message = declared and types.mismatch(declared, actual, "argument " .. index)
 						if message then
@@ -714,13 +717,18 @@ function analyzer.analyze(source)
 	local parsed = Parser.new(source):parse()
 	local annotations = doc.parse(source)
 
+	-- What this file declares, so a class name or an alias in an annotation means what it says.
+	-- Read before anything parses a type.
+	local namespace = doc.classes.read(annotations)
+	local resolve = doc.classes.resolver(namespace)
+
 	-- Declared returns are needed while typing declarations, and a `@return` belongs to the
 	-- declaration below it, so this is resolved from the annotations alone.
 	local returns = {}
 	for _, declaration in ipairs(parsed.declarations) do
 		local _, returned = signatureOf(parsed, annotations, declaration)
 		if returned and returned.type then
-			returns[declaration.name] = types.parse(returned.type)
+			returns[declaration.name] = types.parse(returned.type, resolve)
 		end
 	end
 
@@ -776,12 +784,12 @@ function analyzer.analyze(source)
 	---@param signature { params: lye.doc.Annotation[] }?
 	---@return lye.doc.Type[] params
 	---@return boolean isVariadic
-	local function paramsFor(declaration, signature)
+	local function paramsFor(declaration, signature, resolve)
 		local params = {}
 		for _, param in ipairs(declaredParams[declaration] or {}) do
 			-- `self` is the receiver of a method, not an argument a caller passes.
 			if param.name ~= "self" then
-				local found = paramTypeOf(signature and signature.params, param.name)
+				local found = paramTypeOf(signature and signature.params, param.name, resolve)
 				params[#params + 1] = found or types.ANY_TYPE
 			end
 		end
@@ -794,12 +802,12 @@ function analyzer.analyze(source)
 	---@param signature { params: lye.doc.Annotation[], returns: lye.doc.Annotation? }
 	---@return lye.doc.Type
 	local function signatureTypeOf(declaration, signature)
-		local params, isVariadic = paramsFor(declaration, signature)
+		local params, isVariadic = paramsFor(declaration, signature, resolve)
 		for _, annotation in ipairs(signature.params) do
 			if annotation.name == "..." then isVariadic = true end
 		end
 		local returned = signature.returns and signature.returns.type
-		return types.fn(params, (returned and types.parse(returned)) or types.ANY_TYPE, isVariadic)
+		return types.fn(params, (returned and types.parse(returned, resolve)) or types.ANY_TYPE, isVariadic)
 	end
 
 	local root, byRecord = buildScopes(parsed)
@@ -811,7 +819,7 @@ function analyzer.analyze(source)
 			local declaration = bodyOwner[index]
 			if declaration then
 				inferCtx.fnTypes[index] = types.fn(
-					paramsFor(declaration, signatureOfDecl[declaration]),
+					paramsFor(declaration, signatureOfDecl[declaration], resolve),
 					-- A mutable unknown, so a call typed before the body settles stays promotable.
 					types.mutable(),
 					(parsed.nodes[index].isVariadic == true)
@@ -820,11 +828,26 @@ function analyzer.analyze(source)
 		end
 	end
 
+	-- A method declared on a class is part of it: `function Foo:bar()` gives every `Foo` a `bar`
+	-- that returns what the body returns. Done before typing so a call reads the finished class.
+	for _, declaration in ipairs(parsed.declarations) do
+		if declaration.valueIdx then
+			local className, methodName = declaration.name:match("^([%w_%.]+)%s*[%.:]([%w_]+)$")
+			-- Only the last segment names the method: `A.B.c` is a method of `A.B`.
+			if className and methodName and namespace.classes[className] then
+				local methodType = inferCtx.fnTypes[declaration.valueIdx]
+					or (declaration.valueIdx and infer.at(inferCtx, declaration.valueIdx))
+				if methodType and types.isFn(methodType) then
+					doc.classes.evolve(namespace, className, methodName, methodType)
+				end
+			end
+		end
+	end
 	-- Declaration first, typing second. Every name is in scope before any initializer is
 	-- typed, so `local v = t.foo` can resolve `t` even though it was declared earlier.
 	for _, declaration in ipairs(parsed.declarations) do
 		if declaration.qualifier ~= "label" then
-			local declared = analyzer.declaredTypeFor(parsed, annotations, declaration)
+			local declared = analyzer.declaredTypeFor(parsed, annotations, declaration, resolve)
 			if not declared then
 				-- Only annotations make a declared signature: an unannotated function is typed
 				-- from its own body, which already carries the parameters and the inferred return.
@@ -834,7 +857,13 @@ function analyzer.analyze(source)
 				else
 					local ownerDecl = paramOwner[declaration]
 					local owned = ownerDecl and signatureOfDecl[ownerDecl]
-					declared = paramTypeOf(owned and owned.params, declaration.name)
+					declared = paramTypeOf(owned and owned.params, declaration.name, resolve)
+					-- `self` is the receiver, and a method is declared `function Foo:bar`, so the
+					-- class is named right there.
+					if not declared and declaration.name == "self" and ownerDecl then
+						local className = ownerDecl.name:match("^(.-)%s*:")
+						if className then declared = resolve(className) end
+					end
 					-- A parameter with no `@param` is `any`: the arity is known, the type is not.
 					if not declared and declaration.qualifier == "param" then
 						declared = types.ANY_TYPE
@@ -981,6 +1010,39 @@ function analyzer.analyze(source)
 		end
 	end
 
+	-- A field a class keeps to itself is read only from that class, or, when it is protected,
+	-- from a class that extends it. The read is judged against the method it sits in.
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "index" and node.field and not node.isMethod then
+			local targetType = infer.at(inferCtx, node.target)
+			if targetType and targetType.variant == "class" then
+				local visibility = (targetType.visibility or {})[node.field]
+				if visibility == "private" or visibility == "protected" then
+					local enclosing
+					for _, body in ipairs(functionNodes) do
+						if body.start <= node.start and body.stop >= node.stop then
+							if not enclosing or body.start > enclosing.start then enclosing = body end
+						end
+					end
+					local declaration = enclosing and bodyOwner[enclosing.index]
+					local inside = declaration and declaration.name:match("^([%w_%.]+)%s*[%.:]")
+					local allowed = inside == targetType.name
+					if not allowed and visibility == "protected" and inside then
+						local ownType = resolve(inside)
+						allowed = ownType ~= nil and types.satisfies(ownType, targetType)
+					end
+					if not allowed then
+						self.diagnostics[#self.diagnostics + 1] = {
+							message = string.format("'%s' is %s to %s", node.field, visibility,
+								targetType.name),
+							start = node.start, stop = node.stop, severity = 1,
+						}
+					end
+				end
+			end
+		end
+	end
+
 	-- Arithmetic on a type that can never be a number cannot work at all, so it is an error
 	-- rather than a guess. A string is in that group: the engine coerces a numeric one, but the
 	-- annotation says string, and `"3" * 2` is exactly the case a reader should be told about.
@@ -1013,7 +1075,7 @@ function analyzer.analyze(source)
 		end
 	end
 
-	checkCalls(self, parsed, annotations, signatures, returns)
+	checkCalls(self, parsed, annotations, signatures, returns, resolve)
 	self.signatures = signatures
 	self.returns = returns
 

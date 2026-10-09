@@ -52,7 +52,9 @@ for _, symbol in ipairs(OPERATORS) do
 	local first = symbol:byte(1)
 	SYMBOLS_BY_FIRST[first] = SYMBOLS_BY_FIRST[first] or {}
 	local group = SYMBOLS_BY_FIRST[first]
-	group[#group + 1] = symbol
+	-- The length and second byte travel with the symbol, so a scan can rule a candidate out
+	-- without searching the source for it.
+	group[#group + 1] = { text = symbol, len = #symbol, second = symbol:byte(2) }
 end
 
 --- A token is a struct in an FFI array: `tokens.arena[index]` holds `kind`, the byte span and
@@ -322,12 +324,18 @@ end
 local function scanSymbol(self)
 	local group = SYMBOLS_BY_FIRST[self.source:byte(self.pos)]
 	if not group then return false end
+	local pos = self.pos
+	local second = self.source:byte(pos + 1) or 0
 	for _, symbol in ipairs(group) do
-		-- A plain find matches in place without copying the candidate out of the source.
-		if self.source:find(symbol, self.pos, true) == self.pos then
-			emit(self, KIND.symbol, self.pos, self.pos + #symbol - 1, nil, symbol)
-			self.pos += #symbol
-			return true
+		-- A one-byte operator is decided by the first byte, which the group lookup already
+		-- matched; a longer one is ruled out by its second byte almost every time, so the
+		-- search below only runs for a candidate that can still match.
+		if symbol.len == 1 or symbol.second == second then
+			if symbol.len == 1 or self.source:find(symbol.text, pos, true) == pos then
+				emit(self, KIND.symbol, pos, pos + symbol.len - 1, nil, symbol.text)
+				self.pos = pos + symbol.len
+				return true
+			end
 		end
 	end
 	return false

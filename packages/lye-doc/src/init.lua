@@ -81,7 +81,9 @@ local function parse(comment, start, stop)
 	if not body or body == "" then return nil end
 
 	local tag = body:match("^@([%w_]+)")
-	if not tag or not TAGS[tag] then
+	-- `TAGS` records whether a tag takes a name, so `false` means "known, and it does not" —
+	-- testing the value for truth rather than for presence made every such tag unknown.
+	if not tag or TAGS[tag] == nil then
 		return { tag = "unknown", text = "", start = start, stop = stop }
 	end
 
@@ -198,5 +200,7 @@ function doc.first(file, tag)
 		if annotation.tag == tag then return annotation end
 	end
 end
+
+doc.classes = require("lye-doc.class")
 
 return doc

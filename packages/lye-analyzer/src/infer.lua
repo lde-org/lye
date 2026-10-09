@@ -27,6 +27,8 @@ local KNOWN = {
 ---@param ctx lye.infer.Context
 ---@param idx integer?
 ---@return lye.doc.Type
+local calleeTypeOf
+
 local function of(ctx, idx)
 	if not idx then return types.mutable() end
 	local cached = ctx.cache[idx]
@@ -87,7 +89,7 @@ local function of(ctx, idx)
 		-- A call yields what its callee returns, whether that came from an annotation or from the
 		-- callee's own body. While that is still unknown the answer is a mutable unknown, so the
 		-- refinement pass can fill it in rather than this being cached as settled.
-		local calleeType = node.callee and ctx.typeOfName(node.callee, node.start)
+		local calleeType = calleeTypeOf(ctx, node)
 		if calleeType and types.isFn(calleeType) and not types.isAnyFn(calleeType) then
 			result = calleeType.returns
 		else
@@ -119,6 +121,20 @@ function infer.at(ctx, idx)
 	return of(ctx, idx)
 end
 
+--- The type a call's callee holds. A plain call names one; a method call names none, and calls
+--- the field its target carries, which is where the signature is.
+---@param ctx lye.infer.Context
+---@param node lye.parser.Node
+---@return lye.doc.Type?
+calleeTypeOf = function(ctx, node)
+	local named = node.callee and ctx.typeOfName(node.callee, node.start)
+	if named then return named end
+	if not node.target then return nil end
+	local targetType = of(ctx, node.target)
+	if node.field then return types.indexResult(targetType, node.field) end
+	return targetType
+end
+
 --- Whether typing reached a verdict for this node, which is what refinement waits on.
 ---@param ctx lye.infer.Context
 ---@param idx integer
@@ -134,12 +150,14 @@ end
 ---@param returns table<string, lye.doc.Type>
 function infer.refine(ctx, returns)
 	for _, node in ipairs(ctx.parser.nodes) do
-		if node.kind == "call" and node.callee then
+		-- Every call, not only the ones that name their callee: a method call is filled in the
+		-- same way, and leaving it out cached its result as unknown for good.
+		if node.kind == "call" then
 			local cached = ctx.cache[node.index]
 			if cached and types.isMutable(cached) then
 				-- An annotated return, or one the callee's own body has now settled.
-				local known = returns[node.callee]
-				local calleeType = ctx.typeOfName(node.callee, node.start)
+				local known = node.callee and returns[node.callee]
+				local calleeType = calleeTypeOf(ctx, node)
 				if calleeType and types.isFn(calleeType) and not types.isAnyFn(calleeType) then
 					known = calleeType.returns
 				end

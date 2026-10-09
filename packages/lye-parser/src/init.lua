@@ -80,6 +80,9 @@ local lexer = require("lye-lexer")
 ---@field tableFields table<integer, table<string, string>> field kinds per table literal
 local Parser = {}
 Parser.KIND = lexer.KIND
+
+--- The tokens that close a block. One list, not a table built per question.
+local BLOCK_END = { "end", "else", "elseif", "until" }
 Parser.__index = Parser
 
 Parser.MAX_DIAGNOSTICS = 25
@@ -362,7 +365,7 @@ end
 function Parser:isBlockEnd()
 	local token = self:peek()
 	if token.kind == lexer.KIND.eof then return true end
-	return self:checkAny({ "end", "else", "elseif", "until" })
+	return self:checkAny(BLOCK_END)
 end
 
 ---@return lye.parser.Result

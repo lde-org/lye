@@ -61,8 +61,10 @@ local function parsePrefix(self, allowTernaryColon)
 		elseif text == ":" and allowTernaryColon then
 			self:advance()
 			local method = self:parseName()
-			self:parseArguments()
-			link = { field = method, isMethod = true }
+			-- The arguments are kept and the node is a call: a method call has a result, and one
+			-- represented as a plain index node silently has none.
+			local _, args = self:parseArguments()
+			link = { field = method, isMethod = true, args = args, isCall = true }
 		elseif text == "(" or text == "{" or nextToken.kind == KIND.string then
 			local before = self.index
 			local args

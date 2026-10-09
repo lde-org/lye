@@ -25,6 +25,7 @@ local types = {}
 ---| { variant: "array", type: lye.doc.Type }
 ---| { variant: "object", fields: table<string, lye.doc.Type> }
 ---| { variant: "union", types: lye.doc.Type[] }
+---| { variant: "class", name: string, args: lye.doc.Type[], fields: table<string, lye.doc.Type>, parents: lye.doc.Type[] }
 
 types.UNKNOWN = "unknown"
 types.ANY = "any"
@@ -78,6 +79,21 @@ types.STRING = make("string")
 types.BOOLEAN = make("boolean")
 types.NIL_TYPE = make("nil")
 types.TABLE = make("table")
+--- A class this file declares. It is nominal: `Foo<number>` is not `Foo<string>`, and a class
+--- satisfies what it extends. The fields are already resolved, so reading one costs nothing.
+---@param name string
+---@param args lye.doc.Type[]?
+---@param fields table<string, lye.doc.Type>?
+---@param parents lye.doc.Type[]?
+---@param visibility table<string, string>? who may read each field
+---@return lye.doc.Type
+function types.classType(name, args, fields, parents, visibility)
+	return make("class", {
+		name = name, args = args or {}, fields = fields or {}, parents = parents or {},
+		visibility = visibility or {},
+	})
+end
+
 --- A callable. The parameters and the return type are types, so a function is as hard typed as
 --- anything else: `fn(a: number) -> string` does not accept a function that takes a string.
 ---@param params lye.doc.Type[]
@@ -171,6 +187,16 @@ function types.satisfies(type, constraint)
 	if constraint.variant == "any" or constraint.variant == "unknown" then return true end
 	if type.variant == "unknown" or type.variant == "any" then return true end
 
+	-- A union fits only when every member does, and this is asked first: `A|B` fits `A|B`
+	-- because each member fits the constraint, while the other order would ask whether one
+	-- member of the constraint accepts the whole union.
+	if type.variant == "union" then
+		for _, member in ipairs(type.types) do
+			if not types.satisfies(member, constraint) then return false end
+		end
+		return true
+	end
+
 	if constraint.variant == "union" then
 		for _, member in ipairs(constraint.types) do
 			if types.satisfies(type, member) then return true end
@@ -178,10 +204,28 @@ function types.satisfies(type, constraint)
 		return false
 	end
 
-	-- A union fits only when every member does.
-	if type.variant == "union" then
-		for _, member in ipairs(type.types) do
-			if not types.satisfies(member, constraint) then return false end
+	if constraint.variant == "class" then
+		-- A table is how a class is built, and `local Foo = {}` is how the class itself is
+		-- declared, so a table fits. Only the fields it does have are checked: an instance is
+		-- routinely built in pieces, and requiring all of them would report that as an error.
+		if type.variant == "table" then return true end
+		if type.variant == "object" then
+			for name, have in pairs(type.fields) do
+				local wanted = constraint.fields[name]
+				if wanted and not types.satisfies(have, wanted) then return false end
+			end
+			return true
+		end
+		if type.variant ~= "class" then return false end
+		if type.name ~= constraint.name then
+			for _, parent in ipairs(type.parents) do
+				if types.satisfies(parent, constraint) then return true end
+			end
+			return false
+		end
+		for index, wanted in ipairs(constraint.args) do
+			local have = type.args[index] or types.UNKNOWN_TYPE
+			if not types.satisfies(have, wanted) then return false end
 		end
 		return true
 	end
@@ -327,15 +371,23 @@ end
 ---@param want boolean
 ---@return lye.doc.Type? narrowed
 function types.narrowField(type, field, want)
+	--- A class and an object both carry named fields, which is what a discriminant is read from.
+	---@param member lye.doc.Type
+	---@return boolean
+	local function hasField(member)
+		return (member.variant == "object" or member.variant == "class")
+			and member.fields[field] ~= nil
+	end
+
 	if type.variant ~= "union" then
-		if type.variant ~= "object" then return type end
-		return (type.fields[field] ~= nil) == want and type or nil
+		if type.variant ~= "object" and type.variant ~= "class" then return type end
+		return hasField(type) == want and type or nil
 	end
 
 	local kept = {}
 	for _, member in ipairs(type.types) do
-		if member.variant == "object" then
-			if (member.fields[field] ~= nil) == want then kept[#kept + 1] = member end
+		if hasField(member) then
+			if want then kept[#kept + 1] = member end
 		elseif not want then
 			kept[#kept + 1] = member
 		end
@@ -417,6 +469,11 @@ function types.indexResult(target, field)
 	if target.variant == "object" and field then
 		return target.fields[field] or types.NIL_TYPE
 	end
+	if target.variant == "class" and field then
+		-- A field a class does not declare is unknown rather than nil: the class is built at
+		-- runtime and a method may have added it.
+		return target.fields[field] or types.mutable()
+	end
 	if target.variant == "array" then return target.type end
 	if target.variant == "string" then return types.STRING end
 	if target.variant == "union" then
@@ -474,7 +531,7 @@ end
 --- A parameter may be named or not, may be optional, and `...` stands for the rest.
 ---@param text string
 ---@return lye.doc.Type?
-local function parseFn(text)
+local function parseFn(text, resolve)
 	-- `fn(` or the `fun(` spelling; `f?un` would read as "un" or "fun", which is neither.
 	local head = text:match("^fu?n%s*%(")
 	if not head then return nil end
@@ -500,7 +557,7 @@ local function parseFn(text)
 	local returns = types.ANY_TYPE
 	local rest = text:sub(closeAt + 1):gsub("^%s*", "")
 	local returned = rest:match("^[-:]?>%s*(.*)$") or rest:match("^:%s*(.*)$")
-	if returned and returned ~= "" then returns = types.parse(returned) or types.ANY_TYPE end
+	if returned and returned ~= "" then returns = types.parse(returned, resolve) or types.ANY_TYPE end
 
 	local params, isVariadic = {}, false
 	for _, part in ipairs(splitParams(text:sub(openAt + 1, closeAt - 1))) do
@@ -515,7 +572,7 @@ local function parseFn(text)
 			local hasMarker = typeText:sub(-1) == "?"
 			if hasMarker then typeText = typeText:sub(1, -2) end
 			local optional = marker == "?" or hasMarker
-			local paramType = types.parse(typeText) or types.UNKNOWN_TYPE
+			local paramType = types.parse(typeText, resolve) or types.UNKNOWN_TYPE
 			if optional then paramType = types.combine(paramType, types.NIL_TYPE) end
 			params[#params + 1] = paramType
 		end
@@ -523,16 +580,19 @@ local function parseFn(text)
 	return types.fn(params, returns, isVariadic)
 end
 
-function types.parse(text)
+---@param text string?
+---@param resolve fun(text: string): lye.doc.Type? a class or alias, where the annotations declare one
+---@return lye.doc.Type?
+function types.parse(text, resolve)
 	local trimmed = (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	if trimmed == "" then return nil end
 
 	if trimmed:sub(-1) == "?" then
-		local inner = types.parse(trimmed:sub(1, -2))
+		local inner = types.parse(trimmed:sub(1, -2), resolve)
 		return inner and types.combine(inner, types.NIL_TYPE) or nil
 	end
 	if trimmed:sub(-2) == "[]" then
-		local inner = types.parse(trimmed:sub(1, -3))
+		local inner = types.parse(trimmed:sub(1, -3), resolve)
 		return inner and types.array(inner) or nil
 	end
 
@@ -540,7 +600,7 @@ function types.parse(text)
 	if #members > 1 then
 		local parsed = {}
 		for _, member in ipairs(members) do
-			local one = types.parse(member)
+			local one = types.parse(member, resolve)
 			if one then parsed[#parsed + 1] = one end
 		end
 		return #parsed > 0 and types.union(parsed) or nil
@@ -550,7 +610,7 @@ function types.parse(text)
 		local fields = {}
 		for field in trimmed:sub(2, -2):gmatch("[^,;]+") do
 			local key, value = field:match("^%s*([%w_]+)%s*:?%s*(.*)$")
-			if key then fields[key] = types.parse(value) or types.UNKNOWN_TYPE end
+			if key then fields[key] = types.parse(value, resolve) or types.UNKNOWN_TYPE end
 		end
 		return types.object(fields)
 	end
@@ -559,14 +619,24 @@ function types.parse(text)
 	if trimmed == "table" then return types.TABLE end
 	if trimmed == "function" then return types.FUNCTION end
 
-	local parsedFn = parseFn(trimmed)
+	local parsedFn = parseFn(trimmed, resolve)
 	if parsedFn then return parsedFn end
+	if resolve then
+		local declared = resolve(trimmed)
+		if declared then return declared end
+	end
 	return types.extern(trimmed)
 end
 
 ---@param type lye.doc.Type
 ---@return string
 function types.display(type)
+	if type.variant == "class" then
+		if #type.args == 0 then return type.name end
+		local parts = {}
+		for _, arg in ipairs(type.args) do parts[#parts + 1] = types.display(arg) end
+		return type.name .. "<" .. table.concat(parts, ", ") .. ">"
+	end
 	if type.variant == "fn" then
 		if types.isAnyFn(type) then return "function" end
 		local parts = {}

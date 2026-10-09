@@ -604,6 +604,192 @@ test.it("claims nothing about arithmetic on an any", function()
 	test.equal(types.display(analyzer.typeAt(result, y, #source)), "fn(any) -> unknown")
 end)
 
+test.it("types a field through the class its name is annotated with", function()
+	local source = table.concat({
+		"---@class Point\n",
+		"---@field x number\n",
+		"---@field y number\n",
+		"local Point = {}\n",
+		"---@param p Point\n",
+		"local function at(p)\n",
+		"\tlocal sx = p.x\n",
+		"\treturn sx\n",
+		"end\n",
+	}, "")
+	test.equal(typeOf(source, "sx"), "number")
+end)
+
+test.it("keeps a generic class nominal in its arguments", function()
+	local source = table.concat({
+		"---@class Box<T>\n",
+		"---@field item T\n",
+		"local Box = {}\n",
+		"---@param b Box<number>\n",
+		"local function unbox(b) end\n",
+		"---@type Box<string>\n",
+		"local wrong = {}\n",
+		"unbox(wrong)\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 1, "Box<string> is not Box<number>")
+	test.truthy(result.diagnostics[1].message:match("Box<number>"), result.diagnostics[1].message)
+	test.truthy(result.diagnostics[1].message:match("Box<string>"), result.diagnostics[1].message)
+end)
+
+test.it("reads a bare generic class as unknown in its arguments", function()
+	local source = table.concat({
+		"---@class Box<T>\n",
+		"---@field item T\n",
+		"local Box = {}\n",
+		"---@type Box\n",
+		"local loose = {}\n",
+		"local value = loose.item\n",
+	}, "")
+	test.equal(#analyzer.analyze(source).diagnostics, 0, "an unspecified argument is unknown, not a mismatch")
+end)
+
+test.it("accepts a table for a class", function()
+	-- `local Foo = {}` is how the class itself is declared, and how an instance is built.
+	local source = table.concat({
+		"---@class Point\n",
+		"---@field x number\n",
+		"---@type Point\n",
+		"local built = { x = 1 }\n",
+	}, "")
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
+test.it("lets a child class stand in for its parent", function()
+	local source = table.concat({
+		"---@class Animal\n",
+		"---@field name string\n",
+		"local Animal = {}\n",
+		"---@class Dog: Animal\n",
+		"---@field barks boolean\n",
+		"local Dog = {}\n",
+		"---@param a Animal\n",
+		"local function pet(a) end\n",
+		"---@type Dog\n",
+		"local dog = {}\n",
+		"pet(dog)\n",
+	}, "")
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
+test.it("narrows a union of classes by the field it tests", function()
+	local source = table.concat({
+		"---@class Cat\n",
+		"---@field meows boolean\n",
+		"local Cat = {}\n",
+		"---@class Dog\n",
+		"---@field barks boolean\n",
+		"local Dog = {}\n",
+		"---@param a Cat|Dog\n",
+		"local function speak(a)\n",
+		"\tif a.meows then\n",
+		"\t\tlocal c = a\n",
+		"\telse\n",
+		"\t\tlocal d = a\n",
+		"\tend\n",
+		"end\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	local at = assert(source:find("local c", 1, true))
+	local byName = {}
+	for _, variable in ipairs(result.variables) do byName[variable.name] = variable end
+	test.equal(types.display(analyzer.typeAt(result, byName.c, at)), "Cat")
+	test.equal(types.display(analyzer.typeAt(result, byName.d, at)), "Dog")
+end)
+
+test.it("resolves an alias where a type is written", function()
+	local source = table.concat({
+		"---@alias Id number|string\n",
+		"---@param id Id\n",
+		"local function keyed(id) end\n",
+		"keyed(1)\n",
+		"keyed(\"a\")\n",
+		"keyed(true)\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 1, "a boolean is not an Id")
+	test.truthy(result.diagnostics[1].message:match("number|string"), result.diagnostics[1].message)
+end)
+
+test.it("evolves a class with the methods declared on it", function()
+	local source = table.concat({
+		"---@class Dog\n",
+		"---@field name string\n",
+		"local Dog = {}\n",
+		"function Dog:bark()\n",
+		"\treturn \"woof\"\n",
+		"end\n",
+		"---@type Dog\n",
+		"local d = {}\n",
+		"local field = d.bark\n",
+		"local called = d:bark()\n",
+	}, "")
+	test.equal(typeOf(source, "field"), "fn() -> string", "the method is a field of the class")
+	test.equal(typeOf(source, "called"), "string", "and calling it yields what it returns")
+end)
+
+test.it("types self as the class its method was declared on", function()
+	local source = table.concat({
+		"---@class Dog\n",
+		"---@field name string\n",
+		"local Dog = {}\n",
+		"function Dog:rename(to)\n",
+		"\tlocal before = self.name\n",
+		"\treturn before\n",
+		"end\n",
+	}, "")
+	test.equal(typeOf(source, "before"), "string")
+end)
+
+test.it("reports a field read outside the class that keeps it", function()
+	local source = table.concat({
+		"---@class Account\n",
+		"---@field name string\n",
+		"---@field private balance number\n",
+		"---@field protected limit number\n",
+		"local Account = {}\n",
+		"---@type Account\n",
+		"local a = {}\n",
+		"local open = a.name\n",
+		"local secret = a.balance\n",
+		"local guarded = a.limit\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 2, "a public field is fine; the other two are not")
+	test.truthy(result.diagnostics[1].message:match("private"), result.diagnostics[1].message)
+	test.truthy(result.diagnostics[2].message:match("protected"), result.diagnostics[2].message)
+end)
+
+test.it("allows a class to read its own fields", function()
+	local source = table.concat({
+		"---@class Account\n",
+		"---@field private balance number\n",
+		"local Account = {}\n",
+		"function Account:peek()\n",
+		"\treturn self.balance\n",
+		"end\n",
+	}, "")
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
+test.it("allows a subclass to read a protected field", function()
+	local source = table.concat({
+		"---@class Account\n",
+		"---@field protected limit number\n",
+		"local Account = {}\n",
+		"---@class Savings: Account\n",
+		"local Savings = {}\n",
+		"function Savings:check()\n",
+		"\treturn self.limit\n",
+		"end\n",
+	}, "")
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
 test.it("checks an argument against its parameter type", function()
 	local bad = analyzer.analyze("---@param a string\nlocal function f(a) end\nf(5)\n")
 	test.equal(#bad.diagnostics, 1)
