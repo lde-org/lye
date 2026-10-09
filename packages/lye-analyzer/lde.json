@@ -1,0 +1,17 @@
+{
+	"$schema": "https://raw.githubusercontent.com/lde-org/lde/master/schemas/lde.schema.json",
+	"name": "lye-analyzer",
+	"version": "0.1.0",
+	"description": "Name resolution and type inference for LuaJIT",
+	"dependencies": {
+		"lye-parser": {
+			"path": "../lye-parser"
+		},
+		"lye-lexer": {
+			"path": "../lye-lexer"
+		},
+		"lye-doc": {
+			"path": "../lye-doc"
+		}
+	}
+}

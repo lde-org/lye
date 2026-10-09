@@ -1,0 +1,11 @@
+{
+	"$schema": "https://raw.githubusercontent.com/lde-org/lde/master/schemas/lde.schema.json",
+	"name": "lye-rpc",
+	"version": "0.1.0",
+	"description": "JSON-RPC 2.0 framing and connection handling over a byte stream",
+	"dependencies": {
+		"lye-json": {
+			"path": "../lye-json"
+		}
+	}
+}

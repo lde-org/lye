@@ -1,0 +1,7 @@
+{
+	"$schema": "https://raw.githubusercontent.com/lde-org/lde/master/schemas/lde.schema.json",
+	"name": "lye-json",
+	"version": "0.1.0",
+	"description": "Minimal JSON encode/decode for LuaJIT, tuned for LSP message payloads",
+	"dependencies": {}
+}

@@ -1,0 +1,12 @@
+{
+	"dependencies": {
+		"lye-json": {
+			"path": "../lye-json"
+		},
+		"lye-rpc": {
+			"path": "../lye-rpc"
+		}
+	},
+	"manifestHash": "530b61f46bc4bb2f",
+	"version": "1"
+}

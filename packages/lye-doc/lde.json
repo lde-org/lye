@@ -1,0 +1,11 @@
+{
+	"$schema": "https://raw.githubusercontent.com/lde-org/lde/master/schemas/lde.schema.json",
+	"name": "lye-doc",
+	"version": "0.1.0",
+	"description": "LuaLS annotation parsing",
+	"dependencies": {
+		"lye-lexer": {
+			"path": "../lye-lexer"
+		}
+	}
+}

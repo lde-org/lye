@@ -1,0 +1,15 @@
+{
+	"dependencies": {
+		"lye-doc": {
+			"path": "../lye-doc"
+		},
+		"lye-lexer": {
+			"path": "../lye-lexer"
+		},
+		"lye-parser": {
+			"path": "../lye-parser"
+		}
+	},
+	"manifestHash": "bfdd96b7fac6ac35",
+	"version": "1"
+}

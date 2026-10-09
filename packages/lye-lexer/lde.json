@@ -1,0 +1,7 @@
+{
+	"$schema": "https://raw.githubusercontent.com/lde-org/lde/master/schemas/lde.schema.json",
+	"name": "lye-lexer",
+	"version": "0.1.0",
+	"description": "Allocation-light LuaJIT-aware Lua tokenizer with byte spans and trivia",
+	"dependencies": {}
+}

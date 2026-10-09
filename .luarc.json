@@ -1,0 +1,46 @@
+{
+	"$schema": "https://raw.githubusercontent.com/sumneko/vscode-lua/master/setting/schema.json",
+	"diagnostics": {
+		"groupSeverity": {
+			"unused": "Warning",
+			"type-check": "Error",
+			"unbalanced": "Error",
+			"luadoc": "Error",
+			"duplicate": "Error",
+			"global": "Error"
+		},
+		"disable": [
+			"duplicate-doc-field",
+			"duplicate-index",
+			"duplicate-set-field",
+			"duplicate-doc-alias"
+		],
+		"unusedLocalExclude": [
+			"_*"
+		]
+	},
+	"runtime": {
+		"version": "LuaJIT",
+		"enableLuaJITExtensions": true,
+		"path": [
+			"./target/?.lua",
+			"./target/?/init.lua",
+			"./packages/*/src/?.lua",
+			"./packages/*/src/?/init.lua"
+		],
+		"special": {
+			"lazyRequire": "require"
+		}
+	},
+	"workspace": {
+		"library": [
+			"packages/*/target"
+		],
+		"ignoreDir": [
+			".git",
+			"target",
+			".scratch",
+			".lls"
+		]
+	}
+}

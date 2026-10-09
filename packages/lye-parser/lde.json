@@ -1,0 +1,11 @@
+{
+	"$schema": "https://raw.githubusercontent.com/lde-org/lde/master/schemas/lde.schema.json",
+	"name": "lye-parser",
+	"version": "0.1.0",
+	"description": "Span-tracking Lua parser producing a lean AST for LuaJIT",
+	"dependencies": {
+		"lye-lexer": {
+			"path": "../lye-lexer"
+		}
+	}
+}

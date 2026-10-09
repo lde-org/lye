@@ -1,0 +1,9 @@
+{
+	"dependencies": {
+		"lye-json": {
+			"path": "../lye-json"
+		}
+	},
+	"manifestHash": "159808abb9573bba",
+	"version": "1"
+}

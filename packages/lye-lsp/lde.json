@@ -1,0 +1,30 @@
+{
+	"$schema": "https://raw.githubusercontent.com/lde-org/lde/master/schemas/lde.schema.json",
+	"name": "lye-lsp",
+	"version": "0.1.0",
+	"description": "A language server for LuaJIT",
+	"bin": "main.lua",
+	"dependencies": {
+		"lye-framework": {
+			"path": "../lye-framework"
+		},
+		"lye-json": {
+			"path": "../lye-json"
+		},
+		"lye-lexer": {
+			"path": "../lye-lexer"
+		},
+		"lye-parser": {
+			"path": "../lye-parser"
+		},
+		"lye-rpc": {
+			"path": "../lye-rpc"
+		},
+		"lye-analyzer": {
+			"path": "../lye-analyzer"
+		},
+		"lye-doc": {
+			"path": "../lye-doc"
+		}
+	}
+}

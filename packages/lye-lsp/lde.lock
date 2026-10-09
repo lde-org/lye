@@ -1,0 +1,27 @@
+{
+	"dependencies": {
+		"lye-analyzer": {
+			"path": "../lye-analyzer"
+		},
+		"lye-doc": {
+			"path": "../lye-doc"
+		},
+		"lye-framework": {
+			"path": "../lye-framework"
+		},
+		"lye-json": {
+			"path": "../lye-json"
+		},
+		"lye-lexer": {
+			"path": "../lye-lexer"
+		},
+		"lye-parser": {
+			"path": "../lye-parser"
+		},
+		"lye-rpc": {
+			"path": "../lye-rpc"
+		}
+	},
+	"manifestHash": "cfe384f645c8ee84",
+	"version": "1"
+}

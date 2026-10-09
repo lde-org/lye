@@ -1,0 +1,9 @@
+{
+	"dependencies": {
+		"lye-lexer": {
+			"path": "../lye-lexer"
+		}
+	},
+	"manifestHash": "0a6a40d2e9b76b68",
+	"version": "1"
+}
