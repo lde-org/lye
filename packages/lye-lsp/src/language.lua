@@ -14,14 +14,28 @@ local types = require("lye-doc.type")
 local SYMBOL_KIND = { ["function"] = 12, variable = 13 }
 
 local TOKEN_LEGEND = {
-	tokenTypes = { "keyword", "string", "number", "comment", "operator", "variable", "function", "parameter" },
-	tokenModifiers = {},
+	tokenTypes = {
+		"keyword", "string", "number", "comment", "operator", "variable", "function", "parameter",
+		"type",
+	},
+	tokenModifiers = { "documentation" },
 }
 
 local TOKEN_TYPE = {}
 for index, name in ipairs(TOKEN_LEGEND.tokenTypes) do
 	TOKEN_TYPE[name] = index - 1
 end
+
+--- Modifiers are a bitmask, one bit per legend entry, in legend order.
+local TOKEN_MODIFIER = {}
+for index, name in ipairs(TOKEN_LEGEND.tokenModifiers) do
+	TOKEN_MODIFIER[name] = 2 ^ (index - 1)
+end
+
+--- A `---@tag` inside a comment, with the tag's own span. Whitespace is matched without
+--- newlines, so a tag never counts as spanning two lines.
+local DOC_TAG = "%-%-%-[ \t]*@"
+local DOC_TAG_NAME = "[%a_][%w_]*"
 
 ---@class lye.Server
 ---@field server lye.framework.Server
@@ -278,47 +292,152 @@ function Lye:onSemanticTokens(params)
 		end
 	end
 
+	-- Read before the emitters below: a closure that reads a local declared after it sees a
+	-- global instead, which is nil and silent until it is indexed.
+	local names = self.names[uri]
+	local annotations = names and names.doc and names.doc.annotations or {}
+
 	local data, count = json.array(), 0
 	local lastLine, lastStart = 0, 0
 	local isFirst = true
+
+	--- Tokens are relative to the one before, and a token never spans a line.
+	---@param spanStart integer
+	---@param spanStop integer
+	---@param target string
+	---@param modifiers integer?
+	local function emitSpan(spanStart, spanStop, target, modifiers)
+		if spanStop < spanStart then return end
+		local line, start = position.toPosition(text, index, spanStart, encoding)
+		local stopCharacter = select(2, position.toPosition(text, index, spanStop + 1, encoding))
+		local deltaLine = isFirst and line or (line - lastLine)
+		local deltaStart = isFirst and start or (deltaLine == 0 and (start - lastStart) or start)
+
+		count += 1
+		data[count] = deltaLine
+		count += 1
+		data[count] = deltaStart
+		count += 1
+		data[count] = math.max(stopCharacter - start, 1)
+		count += 1
+		data[count] = TOKEN_TYPE[target]
+		count += 1
+		data[count] = modifiers or 0
+
+		lastLine, lastStart, isFirst = line, start, false
+	end
+
+	--- A doc comment is emitted as the comment it is, with the tags, parameter names and types
+	--- inside it marked out. The spans are cut at newlines because a token may not cross one.
+	---@param token lye.lexer.ffi.token
+	---@param written string
+	local function emitComment(token, written)
+		local carved, count_ = {}, 0
+		---@param from integer
+		---@param to integer
+		---@param target string
+		local function carve(from, to, target)
+			if to < from or from < token.start or to > token.stop then return end
+			count_ += 1
+			carved[count_] = { start = from, stop = to, target = target }
+		end
+
+		local at, stop = written:find(DOC_TAG .. DOC_TAG_NAME)
+		while at do
+			local tagStart = token.start + at - 1
+			carve(tagStart, token.start + stop - 1, "keyword")
+			at, stop = written:find(DOC_TAG .. DOC_TAG_NAME, stop + 1)
+		end
+
+		-- The name of a parameter reads as a parameter, and the identifiers in a type read as a
+		-- type. A string literal inside a type stays a string; the punctuation around them is
+		-- grammar and stays part of the comment.
+		for _, annotation in ipairs(annotations) do
+			if annotation.start >= token.start and annotation.stop <= token.stop then
+				if annotation.nameStart then
+					local target = annotation.tag == "param" and "parameter" or "variable"
+					carve(annotation.nameStart, annotation.nameStop, target)
+				end
+				if annotation.typeStart then
+					local typeText = text:sub(annotation.typeStart, annotation.typeStop)
+					local cursor = 1
+					while cursor <= #typeText do
+						local quoteAt = typeText:find("['\"]", cursor)
+						local nameAt = typeText:find("[%a_]", cursor)
+						if quoteAt and (not nameAt or quoteAt < nameAt) then
+							local quote = typeText:sub(quoteAt, quoteAt)
+							local closeAt = typeText:find(quote, quoteAt + 1, true) or #typeText
+							carve(annotation.typeStart + quoteAt - 1, annotation.typeStart + closeAt - 1, "string")
+							cursor = closeAt + 1
+						elseif nameAt then
+							local _, nameStop = typeText:find("^[%a_][%w_%.]*", nameAt)
+							carve(annotation.typeStart + nameAt - 1, annotation.typeStart + nameStop - 1, "type")
+							cursor = nameStop + 1
+						else
+							break
+						end
+					end
+				end
+			end
+		end
+
+		if count_ == 0 then
+			emitSpan(token.start, token.stop, "comment")
+			return
+		end
+		table.sort(carved, function(left, right) return left.start < right.start end)
+
+		---@param from integer
+		---@param to integer
+		---@param target string
+		---@param modifiers integer?
+		local function emitLines(from, to, target, modifiers)
+			-- Split at newlines: a span that crosses one cannot be encoded.
+			local cursor = from
+			while cursor <= to do
+				local newline = text:find("\n", cursor, true)
+				local lineStop = (newline and newline - 1 < to) and newline - 1 or to
+				emitSpan(cursor, lineStop, target, modifiers)
+				cursor = lineStop + 2
+			end
+		end
+
+		local cursor, seen = token.start, token.start - 1
+		for _, span in ipairs(carved) do
+			if span.start > seen then
+				if span.start > cursor then
+					emitLines(cursor, span.start - 1, "comment", TOKEN_MODIFIER.documentation)
+				end
+				emitLines(span.start, span.stop, span.target)
+				cursor = span.stop + 1
+				seen = span.stop
+			end
+		end
+		if cursor <= token.stop then
+			emitLines(cursor, token.stop, "comment", TOKEN_MODIFIER.documentation)
+		end
+	end
 
 	local tokens = result.tokens
 	for at = 1, tokens.count do
 		local token = tokens.arena[at]
 		local written = tokens.texts[at]
-		local target
-		if token.kind == KIND.keyword then
-			target = "keyword"
-		elseif token.kind == KIND.string then
-			target = "string"
-		elseif token.kind == KIND.number then
-			target = "number"
-		elseif token.kind == KIND.comment then
-			target = "comment"
-		elseif token.kind == KIND.symbol and written ~= "::" and written ~= "label" then
-			target = "operator"
-		elseif token.kind == KIND.name then
-			target = kinds[token.start] or "variable"
-		end
-
-		if target then
-			local line, start = position.toPosition(text, index, token.start, encoding)
-			local stopCharacter = select(2, position.toPosition(text, index, token.stop + 1, encoding))
-			local deltaLine = isFirst and line or (line - lastLine)
-			local deltaStart = isFirst and start or (deltaLine == 0 and (start - lastStart) or start)
-
-			count += 1
-			data[count] = deltaLine
-			count += 1
-			data[count] = deltaStart
-			count += 1
-			data[count] = math.max(stopCharacter - start, 1)
-			count += 1
-			data[count] = TOKEN_TYPE[target]
-			count += 1
-			data[count] = 0
-
-			lastLine, lastStart, isFirst = line, start, false
+		if token.kind == KIND.comment then
+			emitComment(token, written)
+		else
+			local target
+			if token.kind == KIND.keyword then
+				target = "keyword"
+			elseif token.kind == KIND.string then
+				target = "string"
+			elseif token.kind == KIND.number then
+				target = "number"
+			elseif token.kind == KIND.symbol and written ~= "::" and written ~= "label" then
+				target = "operator"
+			elseif token.kind == KIND.name then
+				target = kinds[token.start] or "variable"
+			end
+			if target then emitSpan(token.start, token.stop, target) end
 		end
 	end
 

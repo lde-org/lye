@@ -1,0 +1,73 @@
+{
+	"name": "lye",
+	"displayName": "lye — LuaJIT language server",
+	"description": "Types, narrowing, diagnostics and completion for LuaJIT, from the lye language server.",
+	"version": "0.1.0",
+	"publisher": "lde-org",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/lde-org/lye.git",
+		"directory": "editors/vscode"
+	},
+	"engines": {
+		"vscode": "^1.82.0"
+	},
+	"categories": [
+		"Programming Languages",
+		"Linters"
+	],
+	"main": "./dist/extension.js",
+	"activationEvents": [
+		"onLanguage:lua"
+	],
+	"contributes": {
+		"languages": [
+			{
+				"id": "lua",
+				"aliases": [
+					"Lua",
+					"lua"
+				],
+				"extensions": [
+					".lua"
+				],
+				"configuration": "./language-configuration.json"
+			}
+		],
+		"configuration": {
+			"title": "lye",
+			"properties": {
+				"lye.serverPath": {
+					"type": "string",
+					"default": "lye",
+					"markdownDescription": "Path to the `lye` executable. The default looks it up on `PATH`."
+				},
+				"lye.trace.server": {
+					"type": "string",
+					"enum": [
+						"off",
+						"messages",
+						"verbose"
+					],
+					"default": "off",
+					"description": "Trace the messages between VS Code and lye, in the lye output channel."
+				}
+			}
+		}
+	},
+	"scripts": {
+		"compile": "tsc -p .",
+		"watch": "tsc -p . --watch",
+		"test": "node tests/smoke.mjs",
+		"package": "vsce package"
+	},
+	"dependencies": {
+		"vscode-languageclient": "^9.0.1"
+	},
+	"devDependencies": {
+		"@types/node": "^20.11.0",
+		"@types/vscode": "^1.82.0",
+		"@vscode/vsce": "^3.2.0",
+		"typescript": "^5.4.0"
+	}
+}

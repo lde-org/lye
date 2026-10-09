@@ -133,8 +133,10 @@ function statements.parseFunctionStatement(self)
 	if name and token then
 		self:declare(name, name:find("[%.:]") and "field" or "global", token, true)
 	end
-	if self.lastDeclaration then self.declarations[self.lastDeclaration].anchorIdx = startIdx end
-	self:parseFunctionBody(start, isMethod)
+	local declarationIdx = self.lastDeclaration
+	if declarationIdx then self.declarations[declarationIdx].anchorIdx = startIdx end
+	local bodyIdx = self:parseFunctionBody(start, isMethod)
+	if declarationIdx then self:setInitializer(declarationIdx, "function", bodyIdx) end
 end
 
 function statements.parseLocal(self, start)
@@ -143,8 +145,12 @@ function statements.parseLocal(self, start)
 	if self:accept("function") then
 		local name, token = self:parseName()
 		if name then self:declare(name, "local", token, true) end
-		if self.lastDeclaration then self.declarations[self.lastDeclaration].anchorIdx = startIdx end
-		self:parseFunctionBody(start, false)
+		local declarationIdx = self.lastDeclaration
+		if declarationIdx then self.declarations[declarationIdx].anchorIdx = startIdx end
+		-- The declaration has to be remembered before the body is parsed: parsing it declares the
+		-- parameters, and `lastDeclaration` moves to the last of them.
+		local bodyIdx = self:parseFunctionBody(start, false)
+		if declarationIdx then self:setInitializer(declarationIdx, "function", bodyIdx) end
 		return
 	end
 
@@ -212,13 +218,17 @@ end
 function statements.parseReturn(self)
 	local start = self:peek().start
 	self:expect("return")
+	-- The returned expressions are linked to the statement, so a reader can ask what a function
+	-- returns without searching the arena for what follows it.
+	local valueIdxs = {}
 	if not self:isBlockEnd() and not self:check(";") then
 		repeat
-			self:parseExpression()
+			valueIdxs[#valueIdxs + 1] = self:parseExpression()
 		until not self:accept(",")
 	end
 	self:accept(";")
-	self:emit("return", start, self.arena[self.index - 1].stop)
+	local returnIdx = self:emit("return", start, self.arena[self.index - 1].stop)
+	self:adopt(returnIdx, valueIdxs)
 end
 
 --- An assignment or a call statement. The engine parses the prefix once and then decides

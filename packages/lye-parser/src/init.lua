@@ -269,10 +269,16 @@ end
 ---@param parentIdx integer
 ---@param childIdxs integer[]
 function Parser:adopt(parentIdx, childIdxs)
+	local children = self.nodes[parentIdx].children
 	for _, childIdx in ipairs(childIdxs) do
 		local child = self.nodes[childIdx]
-		if child and childIdx ~= parentIdx then child.parent = parentIdx end
+		if child and childIdx ~= parentIdx then
+			child.parent = parentIdx
+			children = children or {}
+			children[#children + 1] = childIdx
+		end
 	end
+	self.nodes[parentIdx].children = children
 end
 
 --- Open a node that expressions emitted before it closes become children of.
@@ -375,11 +381,9 @@ function Parser:parse()
 		if not node.parent and node.kind ~= "chunk" then topLevel[#topLevel + 1] = node.index end
 	end
 	local chunkIdx = self:emit("chunk", 1, eof.stop, nil)
-	-- The chunk is emitted last, so its statements are listed here rather than appended to it
-	-- while it was building, which is how every other block gets them. They are adopted by loop
-	-- rather than unpacked: `unpack` gives up past a few thousand values, and a generated file
-	-- can have that many statements.
-	self.nodes[chunkIdx].children = topLevel
+	-- The chunk is emitted last, so its statements are adopted afterwards rather than appended
+	-- as they were parsed. Adopting walks them rather than unpacking them: `unpack` gives up past
+	-- a few thousand values, and a generated file can have that many statements.
 	self:adopt(chunkIdx, topLevel)
 	self.rootIdx = chunkIdx
 

@@ -155,12 +155,20 @@ end
 
 ---@return integer
 local function parseFunctionBody(self, start, isMethod)
+	-- The body's scope opens at the parameter list, not at the statement: a `local function f`
+	-- declares its name outside the scope that holds its parameters and body, so the name stays
+	-- visible after the declaration. Opening it at the statement put the name inside it.
+	local paramsStart = self:peek().start
 	self:expect("(")
-	self:pushScope(start)
+	self:pushScope(paramsStart)
 	if isMethod then self:declare("self", "param", self.arena[self.index]) end
 
+	local isVariadic = false
 	while not self:check(")") and not self:isEof(self:peek()) do
-		if self:accept("...") then break end
+		if self:accept("...") then
+			isVariadic = true
+			break
+		end
 		local name, token = self:parseName()
 		if name then self:declare(name, "param", token) end
 		if not self:accept(",") then break end
@@ -170,7 +178,8 @@ local function parseFunctionBody(self, start, isMethod)
 	self:parseBlock()
 	self:popScope(self:peek().start - 1)
 	self:expect("end")
-	local index = self:emit("function", start, self.arena[self.index - 1].stop, { isFunction = true })
+	local index = self:emit("function", start, self.arena[self.index - 1].stop,
+		{ isFunction = true, isVariadic = isVariadic })
 	-- Set last, since parsing the body overwrites it.
 	self.lastKind = "function"
 	return index
@@ -200,10 +209,15 @@ local function parsePrimary(self, allowTernaryColon)
 		end
 		self:expect("|")
 		self:expect("->")
-		self:parseExpression()
+		-- The expression is the body, and what an arrow returns.
+		local bodyIdx = self:parseExpression()
 		self:popScope(self.arena[self.index - 1].stop)
-		return self:emit("function", start, self.arena[self.index - 1].stop, { isFunction = true })
+		local index = self:emit("function", start, self.arena[self.index - 1].stop,
+			{ isFunction = true, body = bodyIdx })
+		self.lastKind = "function"
+		return index
 	end
+
 
 	if text == "{" then return parseTable(self) end
 

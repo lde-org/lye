@@ -89,6 +89,35 @@ test.it("fails a file whose annotation contradicts its value", function()
 	test.equal(tonumber(ok), 0)
 end)
 
+test.it("rejects an unknown option instead of checking a file named after it", function()
+	-- A stray flag used to be treated as a path, so an editor that passes its own conventions
+	-- got a usage error dressed as a failed file check.
+	local out = run(string.format("lde run %q -- --bogus >/dev/null 2>&1; echo $?", MAIN))
+	test.equal(tonumber(out), 2)
+	local message = run(string.format("lde run %q -- --bogus 2>&1 >/dev/null", MAIN))
+	test.truthy(message:match("unknown option '%-%-bogus'"), "got: " .. message)
+	test.truthy(message:match("usage: lye"), "the usage line belongs in the message")
+end)
+
+test.it("serves the protocol when an editor passes its own flags", function()
+	-- `vscode-languageclient` appends exactly these, so this is the command line an editor runs.
+	local frame = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
+	local out = run(string.format(
+		"printf 'Content-Length: %d\\r\\n\\r\\n%s' | lde run %q -- --stdio --clientProcessId=1234 2>/dev/null",
+		#frame, frame, MAIN
+	))
+	test.truthy(out:match("Content%-Length:%s*%d+"), "the server should answer, got: " .. out)
+	test.truthy(out:match('"capabilities"'), "and the answer should carry capabilities")
+end)
+
+test.it("exits quietly when the editor closes the pipe", function()
+	-- A client that has gone away closes the pipe rather than sending `exit`. Reporting a
+	-- failure here would read as a crash, and a client that restarts on a failed exit would
+	-- bring the server back up as it shuts down.
+	local out = run(string.format("lde run %q -- --stdio </dev/null >/dev/null 2>&1; echo $?", MAIN))
+	test.equal(tonumber(out), 0)
+end)
+
 test.it("prints its version and exits 0", function()
 	local out = run(string.format("lde run %q -- --version 2>/dev/null; echo $?", MAIN))
 	test.truthy(out:match("^lye %d+%.%d+%.%d+"), "got: " .. out)

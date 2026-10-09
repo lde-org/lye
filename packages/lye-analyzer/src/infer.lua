@@ -56,7 +56,13 @@ local function of(ctx, idx)
 			result = types.object(fields)
 		end
 	elseif kind == "function" then
-		result = types.FUNCTION
+		-- One callable per function node: its return type is filled in from its own body, so it
+		-- cannot be the shared one every literal starts as.
+		result = ctx.fnTypes[idx]
+		if not result then
+			result = types.fn({}, types.ANY_TYPE, true)
+			ctx.fnTypes[idx] = result
+		end
 	elseif kind == "name" then
 		result = node.name and ctx.typeOfName(node.name, node.start) or types.mutable()
 	elseif kind == "prefix" then
@@ -78,7 +84,15 @@ local function of(ctx, idx)
 	elseif kind == "index" then
 		result = types.indexResult(of(ctx, node.target), node.field)
 	elseif kind == "call" then
-		result = ctx.returns[node.callee or ""] or types.mutable()
+		-- A call yields what its callee returns, whether that came from an annotation or from the
+		-- callee's own body. While that is still unknown the answer is a mutable unknown, so the
+		-- refinement pass can fill it in rather than this being cached as settled.
+		local calleeType = node.callee and ctx.typeOfName(node.callee, node.start)
+		if calleeType and types.isFn(calleeType) and not types.isAnyFn(calleeType) then
+			result = calleeType.returns
+		else
+			result = ctx.returns[node.callee or ""] or types.mutable()
+		end
 	else
 		result = types.mutable()
 	end
@@ -92,7 +106,9 @@ end
 ---@param returns table<string, lye.doc.Type>?
 ---@return lye.infer.Context
 function infer.context(parser, typeOfName, returns)
-	return { parser = parser, typeOfName = typeOfName, returns = returns or {}, cache = {} }
+	return {
+		parser = parser, typeOfName = typeOfName, returns = returns or {}, cache = {}, fnTypes = {},
+	}
 end
 
 --- The type of the expression at an arena index.
@@ -118,10 +134,16 @@ end
 ---@param returns table<string, lye.doc.Type>
 function infer.refine(ctx, returns)
 	for _, node in ipairs(ctx.parser.nodes) do
-		if node.kind == "call" and node.callee and returns[node.callee] then
+		if node.kind == "call" and node.callee then
 			local cached = ctx.cache[node.index]
 			if cached and types.isMutable(cached) then
-				types.promote(cached, returns[node.callee])
+				-- An annotated return, or one the callee's own body has now settled.
+				local known = returns[node.callee]
+				local calleeType = ctx.typeOfName(node.callee, node.start)
+				if calleeType and types.isFn(calleeType) and not types.isAnyFn(calleeType) then
+					known = calleeType.returns
+				end
+				if known then types.promote(cached, known) end
 			end
 		end
 	end

@@ -110,6 +110,44 @@ test.it("narrows to nothing when a rule rules every member out", function()
 	test.equal(doctype.narrowNil(doctype.parse("string"), true), nil)
 end)
 
+test.it("reads a function signature", function()
+	test.equal(doctype.display(doctype.parse("fn(a: number, b: string) -> boolean")),
+		"fn(number, string) -> boolean")
+	test.equal(doctype.display(doctype.parse("fn() -> nil")), "fn() -> nil")
+	test.equal(doctype.display(doctype.parse("fn(a?: number) -> nil")), "fn(nil|number) -> nil")
+	test.equal(doctype.display(doctype.parse("fn(a: number, ...) -> nil")), "fn(number, ...) -> nil")
+	test.equal(doctype.display(doctype.parse("fun(a: number): string")), "fn(number) -> string",
+		"the spelling LuaLS uses reads the same")
+end)
+
+test.it("treats a bare function as any signature", function()
+	local signature = doctype.parse("fn(a: number) -> string")
+	test.equal(doctype.display(doctype.parse("function")), "function")
+	test.equal(doctype.satisfies(doctype.FUNCTION, signature), true,
+		"a function literal says nothing about its parameters, so it fits")
+	test.equal(doctype.satisfies(doctype.NUMBER, signature), false, "a number is not callable")
+end)
+
+test.it("compares two signatures by parameters and return", function()
+	local wants = doctype.parse("fn(a: number) -> string")
+	test.equal(doctype.satisfies(doctype.parse("fn(a: number) -> string"), wants), true)
+	test.equal(doctype.satisfies(doctype.parse("fn(a: string) -> string"), wants), false,
+		"a parameter is contravariant: it has to accept what the constraint passes")
+	test.equal(doctype.satisfies(doctype.parse("fn(a: number) -> number"), wants), false,
+		"a return is covariant")
+	test.equal(doctype.satisfies(doctype.parse("fn() -> string"), wants), false, "arity counts")
+	test.equal(doctype.satisfies(doctype.parse("fn(a: number, ...) -> string"), wants), true,
+		"a variadic accepts the constraint's arguments")
+end)
+
+test.it("claims a number only when both operands are numbers", function()
+	local number, any = doctype.parse("number"), doctype.parse("any")
+	test.equal(doctype.display(doctype.binaryResult("*", number, number)), "number")
+	test.equal(doctype.display(doctype.binaryResult("*", any, number)), "unknown",
+		"an `any` could be a table with a metamethod, so the result is not a number")
+	test.equal(doctype.display(doctype.binaryResult("*", doctype.parse("string"), number)), "unknown")
+end)
+
 test.it("never reports against a wildcard or an unresolved type", function()
 	test.equal(doctype.satisfies(doctype.parse("number"), doctype.parse("any")), true)
 	test.equal(doctype.satisfies(doctype.parse("number"), doctype.parse("unknown")), true)

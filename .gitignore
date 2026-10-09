@@ -2,3 +2,8 @@ target
 *.exe
 .scratch
 docs
+node_modules
+dist
+*.vsix
+/packages/*/lye-*
+package-lock.json

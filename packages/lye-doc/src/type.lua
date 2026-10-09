@@ -18,7 +18,7 @@ local types = {}
 ---| { variant: "boolean" }
 ---| { variant: "nil" }
 ---| { variant: "table" }
----| { variant: "function" }
+---| { variant: "fn", params: lye.doc.Type[], returns: lye.doc.Type, isVariadic: boolean? }
 ---| { variant: "any" }
 ---| { variant: "unknown" }
 ---| { variant: "extern", name: string }
@@ -78,9 +78,38 @@ types.STRING = make("string")
 types.BOOLEAN = make("boolean")
 types.NIL_TYPE = make("nil")
 types.TABLE = make("table")
-types.FUNCTION = make("function")
+--- A callable. The parameters and the return type are types, so a function is as hard typed as
+--- anything else: `fn(a: number) -> string` does not accept a function that takes a string.
+---@param params lye.doc.Type[]
+---@param returns lye.doc.Type
+---@param isVariadic boolean? accepts any number of arguments
+---@return lye.doc.Type
+function types.fn(params, returns, isVariadic)
+	return make("fn", { params = params, returns = returns, isVariadic = isVariadic })
+end
+
+---@param type lye.doc.Type
+---@return boolean
+function types.isFn(type)
+	return type.variant == "fn"
+end
+
+--- The permissive callable, the one a `function` literal has until something says otherwise.
+---@param type lye.doc.Type
+---@return boolean
+function types.isAnyFn(type)
+	return type.variant == "fn"
+		and #type.params == 0
+		and type.isVariadic == true
+		and type.returns.variant == "any"
+end
 types.UNKNOWN_TYPE = make("unknown")
 types.ANY_TYPE = make("any")
+
+--- What a bare `function` means: `fn(...any) -> ...any`, so annotations written before
+--- signatures keep working and a function literal satisfies any signature it is given. It is
+--- built here because it is made of them.
+types.FUNCTION = types.fn({}, types.ANY_TYPE, true)
 
 ---@param name string
 ---@return lye.doc.Type
@@ -155,6 +184,20 @@ function types.satisfies(type, constraint)
 			if not types.satisfies(member, constraint) then return false end
 		end
 		return true
+	end
+
+	if constraint.variant == "fn" then
+		if type.variant ~= "fn" then return false end
+		-- A callable that takes anything accepts any callable, which is what a bare `function`
+		-- means and what keeps unannotated literals out of trouble.
+		if types.isAnyFn(constraint) then return true end
+		if #type.params ~= #constraint.params and not type.isVariadic then return false end
+		for index, wanted in ipairs(constraint.params) do
+			local have = type.params[index] or types.UNKNOWN_TYPE
+			-- Contravariant: the value has to accept what the constraint will pass it.
+			if not types.satisfies(wanted, have) then return false end
+		end
+		return types.satisfies(type.returns, constraint.returns)
 	end
 
 	if constraint.variant == "array" then
@@ -307,6 +350,21 @@ end
 ---@param left lye.doc.Type
 ---@param right lye.doc.Type
 ---@return lye.doc.Type
+--- Whether every value of this type is a number, which is what makes arithmetic a number. An
+--- `any` is not: it could be a table whose metamethod returns anything at all.
+---@param type lye.doc.Type
+---@return boolean
+local function isNumeric(type)
+	if type.variant == "number" then return true end
+	if type.variant == "union" then
+		for _, member in ipairs(type.types) do
+			if not isNumeric(member) then return false end
+		end
+		return true
+	end
+	return false
+end
+
 function types.binaryResult(op, left, right)
 	if left.variant == "unknown" or right.variant == "unknown" then return types.mutable() end
 
@@ -327,11 +385,10 @@ function types.binaryResult(op, left, right)
 	local isArithmetic = op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
 		or op == "^" or op == "&" or op == "|" or op == "~" or op == "<<" or op == ">>" or op == "~>>"
 	if isArithmetic then
-		if left.variant == "number" and right.variant == "number" then return types.NUMBER end
-		-- A union operand must be numeric everywhere for the result to be a number.
-		if types.satisfies(left, types.NUMBER) and types.satisfies(right, types.NUMBER) then
-			return types.NUMBER
-		end
+		if isNumeric(left) and isNumeric(right) then return types.NUMBER end
+		-- Anything else could be a table with a metamethod, so the result is not claimed. `any`
+		-- is in that group: it satisfies `number`, and a value that satisfies a constraint is not
+		-- a guarantee that the constraint is what it is.
 		return types.mutable()
 	end
 	return types.mutable()
@@ -393,6 +450,79 @@ end
 
 ---@param text string
 ---@return lye.doc.Type?
+--- Split a parameter list on the commas that are not inside a nested shape.
+---@param text string
+---@return string[]
+local function splitParams(text)
+	local parts, depth, from = {}, 0, 1
+	for index = 1, #text do
+		local char = text:sub(index, index)
+		if char == "(" or char == "{" or char == "<" then
+			depth += 1
+		elseif char == ")" or char == "}" or char == ">" then
+			depth -= 1
+		elseif char == "," and depth == 0 then
+			parts[#parts + 1] = text:sub(from, index - 1)
+			from = index + 1
+		end
+	end
+	parts[#parts + 1] = text:sub(from)
+	return parts
+end
+
+--- `fn(a: number, b: string) -> boolean`, and the `fun(a): boolean` spelling LuaLS uses.
+--- A parameter may be named or not, may be optional, and `...` stands for the rest.
+---@param text string
+---@return lye.doc.Type?
+local function parseFn(text)
+	-- `fn(` or the `fun(` spelling; `f?un` would read as "un" or "fun", which is neither.
+	local head = text:match("^fu?n%s*%(")
+	if not head then return nil end
+
+	-- The parameter list ends at its own closing parenthesis: a parameter's type can be a
+	-- signature itself, so parens nest.
+	local openAt = text:find("(", 1, true)
+	local depth, closeAt = 0, nil
+	for index = openAt, #text do
+		local char = text:sub(index, index)
+		if char == "(" then
+			depth += 1
+		elseif char == ")" then
+			depth -= 1
+			if depth == 0 then
+				closeAt = index
+				break
+			end
+		end
+	end
+	if not closeAt then return nil end
+
+	local returns = types.ANY_TYPE
+	local rest = text:sub(closeAt + 1):gsub("^%s*", "")
+	local returned = rest:match("^[-:]?>%s*(.*)$") or rest:match("^:%s*(.*)$")
+	if returned and returned ~= "" then returns = types.parse(returned) or types.ANY_TYPE end
+
+	local params, isVariadic = {}, false
+	for _, part in ipairs(splitParams(text:sub(openAt + 1, closeAt - 1))) do
+		local one = part:gsub("^%s+", ""):gsub("%s+$", "")
+		if one == "..." or one:match("^%.%.%.[%s:]*") then
+			isVariadic = true
+		elseif one ~= "" then
+			-- `name: type` names the parameter; a bare type is the type itself. Either the
+			-- name or the type may carry the `?` that makes it optional.
+			local name, marker, named = one:match("^([%w_]+)(%??)%s*:%s*(.*)$")
+			local typeText = named or one
+			local hasMarker = typeText:sub(-1) == "?"
+			if hasMarker then typeText = typeText:sub(1, -2) end
+			local optional = marker == "?" or hasMarker
+			local paramType = types.parse(typeText) or types.UNKNOWN_TYPE
+			if optional then paramType = types.combine(paramType, types.NIL_TYPE) end
+			params[#params + 1] = paramType
+		end
+	end
+	return types.fn(params, returns, isVariadic)
+end
+
 function types.parse(text)
 	local trimmed = (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	if trimmed == "" then return nil end
@@ -427,13 +557,23 @@ function types.parse(text)
 
 	if SIMPLE[trimmed] then return types.base(trimmed) end
 	if trimmed == "table" then return types.TABLE end
-	if trimmed == "function" or trimmed:match("^fun%s*%(") then return types.FUNCTION end
+	if trimmed == "function" then return types.FUNCTION end
+
+	local parsedFn = parseFn(trimmed)
+	if parsedFn then return parsedFn end
 	return types.extern(trimmed)
 end
 
 ---@param type lye.doc.Type
 ---@return string
 function types.display(type)
+	if type.variant == "fn" then
+		if types.isAnyFn(type) then return "function" end
+		local parts = {}
+		for _, param in ipairs(type.params) do parts[#parts + 1] = types.display(param) end
+		if type.isVariadic then parts[#parts + 1] = "..." end
+		return "fn(" .. table.concat(parts, ", ") .. ") -> " .. types.display(type.returns)
+	end
 	if type.variant == "array" then return types.display(type.type) .. "[]" end
 	if type.variant == "object" then
 		local parts = {}

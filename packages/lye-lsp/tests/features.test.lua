@@ -195,6 +195,72 @@ test.it("encodes semantic tokens relative to the previous token", function()
 	test.equal(seen["1:15"], "parameter", "name is a parameter")
 end)
 
+test.it("marks a doc annotation as documentation and its tag as a keyword", function()
+	-- Annotations are the one comment an editor should not paint as an ordinary one.
+	local source = "---@param x number\nlocal function f(x) end\n"
+	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
+	local data = results["2"].data
+
+	local legend = {
+		"keyword", "string", "number", "comment", "operator", "variable", "function", "parameter",
+		"type",
+	}
+	local line, start, seen = 0, 0, {}
+	for at = 1, #data, 5 do
+		local deltaLine, deltaStart = data[at], data[at + 1]
+		line += deltaLine
+		start = deltaLine == 0 and (start + deltaStart) or deltaStart
+		seen[string.format("%d:%d", line, start)] = {
+			type = legend[data[at + 3] + 1],
+			modifiers = data[at + 4],
+			length = data[at + 2],
+		}
+	end
+
+	test.equal(seen["0:0"].type, "keyword", "the tag itself")
+	test.equal(seen["0:0"].length, 9, "covering `---@param`")
+	test.equal(seen["0:10"].type, "parameter", "the parameter's name")
+	test.equal(seen["0:12"].type, "type", "the type reads as a type")
+	test.equal(seen["0:9"].type, "comment", "the space between them is still a comment")
+	test.equal(seen["0:9"].modifiers, 1, "with the documentation modifier bit set")
+	test.equal(seen["1:0"].type, "keyword", "and an ordinary keyword keeps no modifier")
+	test.equal(seen["1:0"].modifiers, 0)
+end)
+
+test.it("colours a type without colouring its grammar", function()
+	-- A string literal in a type is a string, and the `|` joining two of them is grammar.
+	local source = '---@type "a"|"b"\nlocal x = "a"\n'
+	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
+	local data = results["2"].data
+
+	local legend = {
+		"keyword", "string", "number", "comment", "operator", "variable", "function", "parameter",
+		"type",
+	}
+	local line, start, seen = 0, 0, {}
+	for at = 1, #data, 5 do
+		local deltaLine, deltaStart = data[at], data[at + 1]
+		line += deltaLine
+		start = deltaLine == 0 and (start + deltaStart) or deltaStart
+		seen[string.format("%d:%d", line, start)] = legend[data[at + 3] + 1]
+	end
+
+	test.equal(seen["0:0"], "keyword", "the tag")
+	test.equal(seen["0:9"], "string", "the first literal")
+	test.equal(seen["0:12"], "comment", "the `|` is grammar and stays a comment")
+	test.equal(seen["0:13"], "string", "the second literal")
+end)
+
+test.it("leaves a comment with no annotation alone", function()
+	local source = "-- just a note\nlocal x = 1\n"
+	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
+	local data = results["2"].data
+	test.equal(data[1], 0, "it starts on the first line")
+	test.equal(data[3], 14, "spanning the comment")
+	test.equal(data[4], 3, "as a comment")
+	test.equal(data[5], 0, "with no modifier")
+end)
+
 test.it("answers nothing for an identifier with no declaration", function()
 	local results = run({ request(2, "textDocument/definition", { line = 1, character = 9 }) })
 	-- `greet` is declared at that position, so this resolves to itself; use a stray name.

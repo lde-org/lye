@@ -27,6 +27,10 @@ local doc = {}
 ---@field comment string?
 ---@field start integer byte offset of the comment
 ---@field stop integer
+---@field nameStart integer? byte offset of the name, so an editor can mark it as one
+---@field nameStop integer?
+---@field typeStart integer? byte offset of the type, for the same reason
+---@field typeStop integer?
 
 ---@class lye.doc.File
 ---@field annotations lye.doc.Annotation[]
@@ -59,6 +63,19 @@ end
 ---@param start integer
 ---@param stop integer
 ---@return lye.doc.Annotation?
+--- The span a piece of an annotation occupies in the line it was written on. The pieces are
+--- located by their own text, read forwards from where the previous one ended.
+---@param comment string
+---@param text string
+---@param from integer
+---@return integer? start
+---@return integer? stop
+local function spanOf(comment, text, from)
+	local at = comment:find(text, from, true)
+	if not at then return nil end
+	return at, at + #text - 1
+end
+
 local function parse(comment, start, stop)
 	local body = comment:match("^%-%-%-?%s*(.*)$")
 	if not body or body == "" then return nil end
@@ -84,22 +101,42 @@ local function parse(comment, start, stop)
 		local name, marker, remaining = rest:match("^([%w_%.]+)(%??)(.*)$")
 		annotation.name = name
 		annotation.type = trim(remaining or "")
+		annotation.typeText = annotation.type
 		-- The marker belongs to the type, not the name: an optional parameter can be nil.
 		if marker == "?" then annotation.type = (annotation.type or "") .. "?" end
 	elseif tag == "field" or tag == "alias" or tag == "generic" or tag == "class" then
 		local name, remaining = rest:match("^([%w_%.]+)(.*)$")
 		annotation.name = name
 		annotation.type = trim((remaining or ""):gsub("^=", ""))
+		annotation.typeText = annotation.type
 	elseif tag == "return" or tag == "type" or tag == "cast" or tag == "overload" then
 		annotation.type = rest
+		annotation.typeText = rest
 	elseif tag == "meta" or tag == "diagnostic" then
 		-- `---@meta name value`, used for identifiers and severity names.
 		local name, value = rest:match("^([%w_]+)%s+(.*)$")
 		annotation.name = name
 		annotation.type = trim(value or "")
+		annotation.typeText = annotation.type
 	end
 
 	if annotation.type == "" then annotation.type = nil end
+
+	-- Offsets for the parts an editor colours separately: the name of a parameter reads as a
+	-- parameter, and the type as a type. Searching starts after the tag, since a name as short as
+	-- `a` also appears inside `param`.
+	local searchFrom = (select(2, comment:find("^%-%-%-?%s*")) or 0) + #tag + 2
+	if annotation.name then
+		local at, to = spanOf(comment, annotation.name, searchFrom)
+		if at then
+			annotation.nameStart, annotation.nameStop = start + at - 1, start + to - 1
+			searchFrom = to + 1
+		end
+	end
+	if annotation.typeText and annotation.typeText ~= "" then
+		local at, to = spanOf(comment, annotation.typeText, searchFrom)
+		if at then annotation.typeStart, annotation.typeStop = start + at - 1, start + to - 1 end
+	end
 	return annotation
 end
 

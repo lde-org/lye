@@ -68,6 +68,7 @@ local analyzer = {}
 
 ---@class lye.analyzer.Result
 ---@field parser lye.parser.Result
+---@field doc lye.doc.File the annotations the analysis read
 ---@field root lye.analyzer.Scope
 ---@field variables lye.analyzer.Variable[]
 ---@field byStart table<integer, lye.analyzer.Variable>
@@ -77,6 +78,27 @@ local analyzer = {}
 
 ---@param result lye.parser.Result
 ---@return lye.analyzer.Scope
+local ARITHMETIC = {
+	["+"] = true, ["-"] = true, ["*"] = true, ["/"] = true, ["%"] = true, ["^"] = true,
+	["&"] = true, ["|"] = true, ["~"] = true, ["<<"] = true, [">>"] = true, ["~>>"] = true,
+}
+
+--- A type arithmetic cannot work on at all. `any` and an unresolved name are not: whatever they
+--- hold may have a metamethod, so nothing is claimed about them.
+---@param type lye.doc.Type
+---@return boolean
+local function isNeverNumeric(type)
+	if type.variant == "union" then
+		if #type.types == 0 then return false end
+		for _, member in ipairs(type.types) do
+			if not isNeverNumeric(member) then return false end
+		end
+		return true
+	end
+	return type.variant ~= "number" and type.variant ~= "any" and type.variant ~= "unknown"
+		and type.variant ~= "extern"
+end
+
 local function buildScopes(result)
 	local root = { start = 1, stop = math.huge, depth = 0, variables = {}, children = {}, facts = {} }
 	local byRecord = {}
@@ -437,6 +459,27 @@ end
 ---@param file lye.doc.File
 ---@param declaration lye.parser.Declaration
 ---@return lye.doc.Type?
+--- The byte span a declaration's own annotations live in: the comment lines immediately above
+--- it, and nothing further back. Every line of a doc block is its own comment token, so the block
+--- is the run of comment tokens ending where the declaration begins.
+---@param parsed lye.parser.Result
+---@param declaration lye.parser.Declaration
+---@return integer? start
+---@return integer? stop
+local function annotationSpan(parsed, declaration)
+	local anchorIdx = declaration.anchorIdx
+	if not anchorIdx then return nil end
+
+	local tokens = parsed.tokens.arena
+	local first, index = nil, anchorIdx - 1
+	while index >= 1 and tokens[index].kind == KIND.comment do
+		first = index
+		index -= 1
+	end
+	if not first then return nil end
+	return tokens[first].start, tokens[anchorIdx - 1].stop
+end
+
 --- The `@type` that describes a declaration, or nil when it has none.
 ---
 --- An annotation describes a declaration when it is the comment immediately before the
@@ -447,9 +490,8 @@ end
 ---@param declaration lye.parser.Declaration
 ---@return lye.doc.Type?
 function analyzer.declaredTypeFor(parsed, file, declaration)
-	local anchorIdx = declaration.anchorIdx
-	local comment = anchorIdx and parsed.tokens.arena[anchorIdx - 1]
-	if not comment or comment.kind ~= KIND.comment then return nil end
+	local spanStart = annotationSpan(parsed, declaration)
+	if not spanStart then return nil end
 
 	-- Annotations are in source order, so the candidate is the last one before the declaration.
 	local annotations = file.annotations
@@ -459,8 +501,7 @@ function analyzer.declaredTypeFor(parsed, file, declaration)
 		if annotations[mid].start < declaration.start then low = mid + 1 else high = mid - 1 end
 	end
 	local previous = annotations[high]
-	if not previous or previous.tag ~= "type" then return nil end
-	if previous.start < comment.start or previous.stop > comment.stop then return nil end
+	if not previous or previous.tag ~= "type" or previous.start < spanStart then return nil end
 	return types.parse(previous.type)
 end
 
@@ -542,28 +583,51 @@ local function objectLiteralAfter(parsed, declaration)
 	return types.object(fields)
 end
 
---- The `@param` and `@return` annotations of a declaration, in order.
+--- The `@param` and `@return` annotations of a declaration, in order. They are the ones in the
+--- block above it, so a `@param` written for one function is never read as another's.
+---@param parsed lye.parser.Result
 ---@param file lye.doc.File
 ---@param declaration lye.parser.Declaration
 ---@return lye.doc.Annotation[] params
 ---@return lye.doc.Annotation? returns
-local function signatureOf(file, declaration)
+local function signatureOf(parsed, file, declaration)
 	local params, returned = {}, nil
-	for _, annotation in ipairs(file.annotations) do
-		if annotation.start < declaration.start then
-			-- A new group replaces the previous one; a declaration owns one signature.
-			if annotation.tag == "param" then
-				params[#params + 1] = annotation
-			elseif annotation.tag == "return" then
-				returned = annotation
-			elseif annotation.tag == "type" or annotation.tag == "class" then
-				params, returned = {}, nil
-			end
-		else
+	local spanStart = annotationSpan(parsed, declaration)
+	if not spanStart then return params, returned end
+
+	-- Annotations are in source order, so the ones in the block end where the declaration starts.
+	local annotations = file.annotations
+	local low, high = 1, #annotations
+	while low <= high do
+		local mid = math.floor((low + high) / 2)
+		if annotations[mid].start < declaration.start then low = mid + 1 else high = mid - 1 end
+	end
+
+	for index = high, 1, -1 do
+		local annotation = annotations[index]
+		if annotation.start < spanStart then break end
+		if annotation.tag == "param" then
+			table.insert(params, 1, annotation)
+		elseif annotation.tag == "return" then
+			-- Walking back, the first one met is the last written, which is the one that wins.
+			if not returned then returned = annotation end
+		elseif annotation.tag == "type" or annotation.tag == "class" then
 			break
 		end
 	end
 	return params, returned
+end
+
+--- The type a `@param` gives a parameter, matched by the name the annotation carries. An
+--- annotation that names nothing cannot be matched to one parameter over another.
+---@param params lye.doc.Annotation[]?
+---@param name string
+---@return lye.doc.Type?
+local function paramTypeOf(params, name)
+	if not params then return nil end
+	for _, annotation in ipairs(params) do
+		if annotation.name == name and annotation.type then return types.parse(annotation.type) end
+	end
 end
 
 --- The type an argument expression has, from its own kind and any name it mentions.
@@ -654,7 +718,7 @@ function analyzer.analyze(source)
 	-- declaration below it, so this is resolved from the annotations alone.
 	local returns = {}
 	for _, declaration in ipairs(parsed.declarations) do
-		local _, returned = signatureOf(annotations, declaration)
+		local _, returned = signatureOf(parsed, annotations, declaration)
 		if returned and returned.type then
 			returns[declaration.name] = types.parse(returned.type)
 		end
@@ -662,7 +726,7 @@ function analyzer.analyze(source)
 
 	-- `self` is declared before the closure that reads it, so the closure captures this
 	-- table rather than an outer name.
-	local self = { parser = parsed, variables = {}, byStart = {}, diagnostics = {} }
+	local self = { parser = parsed, variables = {}, byStart = {}, diagnostics = {}, doc = annotations }
 
 	local inferCtx
 	---@param name string
@@ -675,22 +739,108 @@ function analyzer.analyze(source)
 	end
 
 	local signatures = {}
+	-- A parameter belongs to the nearest function declared above it, which is what lets its
+	-- `@param` type reach it. Declarations arrive in source order.
+	local paramOwner, signatureOfDecl, annotatedBodies, bodyOwner = {}, {}, {}, {}
+	-- The parameters a function declares, in order. A signature built from them has the arity the
+	-- function has, so a call with the wrong number of arguments can be seen.
+	local declaredParams = {}
+	local owner
 	for _, declaration in ipairs(parsed.declarations) do
-		local params, returned = signatureOf(annotations, declaration)
+		local params, returned = signatureOf(parsed, annotations, declaration)
 		if #params > 0 or returned then
 			signatures[declaration.name] = { params = params, returns = returned }
 		end
+		local body = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
+		if declaration.isFunction or (body and body.kind == "function") then
+			owner = declaration
+			if #params > 0 or returned then
+				signatureOfDecl[owner] = { params = params, returns = returned }
+				annotatedBodies[declaration.valueIdx] = true
+			end
+			-- The body names the declaration it belongs to, so an inferred return can reach the
+			-- signature a `@param` built.
+			if body then bodyOwner[declaration.valueIdx] = declaration end
+			declaredParams[owner] = declaredParams[owner] or {}
+			owner = owner
+		elseif declaration.qualifier == "param" then
+			paramOwner[declaration] = owner
+			local list = owner and declaredParams[owner]
+			if list then list[#list + 1] = declaration end
+		end
+	end
+
+	--- The parameters of a function, in order, typed by the `@param` that names them. One with no
+	--- annotation is `any`: the arity is known even when the type is not.
+	---@param declaration lye.parser.Declaration
+	---@param signature { params: lye.doc.Annotation[] }?
+	---@return lye.doc.Type[] params
+	---@return boolean isVariadic
+	local function paramsFor(declaration, signature)
+		local params = {}
+		for _, param in ipairs(declaredParams[declaration] or {}) do
+			-- `self` is the receiver of a method, not an argument a caller passes.
+			if param.name ~= "self" then
+				local found = paramTypeOf(signature and signature.params, param.name)
+				params[#params + 1] = found or types.ANY_TYPE
+			end
+		end
+		local body = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
+		return params, (body and body.isVariadic) == true
+	end
+
+	--- The type a function's own annotations give it. A declaration with no annotation keeps the
+	--- permissive callable, so only what was written down is enforced.
+	---@param signature { params: lye.doc.Annotation[], returns: lye.doc.Annotation? }
+	---@return lye.doc.Type
+	local function signatureTypeOf(declaration, signature)
+		local params, isVariadic = paramsFor(declaration, signature)
+		for _, annotation in ipairs(signature.params) do
+			if annotation.name == "..." then isVariadic = true end
+		end
+		local returned = signature.returns and signature.returns.type
+		return types.fn(params, (returned and types.parse(returned)) or types.ANY_TYPE, isVariadic)
 	end
 
 	local root, byRecord = buildScopes(parsed)
 	self.root = root
 	collectNarrowing(parsed, byRecord)
 	inferCtx = infer.context(parsed, typeOfName, returns)
+	for index, node in ipairs(parsed.nodes) do
+		if node.kind == "function" then
+			local declaration = bodyOwner[index]
+			if declaration then
+				inferCtx.fnTypes[index] = types.fn(
+					paramsFor(declaration, signatureOfDecl[declaration]),
+					-- A mutable unknown, so a call typed before the body settles stays promotable.
+					types.mutable(),
+					(parsed.nodes[index].isVariadic == true)
+				)
+			end
+		end
+	end
 
 	-- Declaration first, typing second. Every name is in scope before any initializer is
 	-- typed, so `local v = t.foo` can resolve `t` even though it was declared earlier.
 	for _, declaration in ipairs(parsed.declarations) do
 		if declaration.qualifier ~= "label" then
+			local declared = analyzer.declaredTypeFor(parsed, annotations, declaration)
+			if not declared then
+				-- Only annotations make a declared signature: an unannotated function is typed
+				-- from its own body, which already carries the parameters and the inferred return.
+				local mine = signatureOfDecl[declaration]
+				if mine then
+					declared = signatureTypeOf(declaration, mine)
+				else
+					local ownerDecl = paramOwner[declaration]
+					local owned = ownerDecl and signatureOfDecl[ownerDecl]
+					declared = paramTypeOf(owned and owned.params, declaration.name)
+					-- A parameter with no `@param` is `any`: the arity is known, the type is not.
+					if not declared and declaration.qualifier == "param" then
+						declared = types.ANY_TYPE
+					end
+				end
+			end
 			local variable = {
 				declaration = declaration,
 				name = declaration.name,
@@ -698,7 +848,7 @@ function analyzer.analyze(source)
 				start = declaration.start,
 				stop = declaration.stop,
 				scope = scopeAt(self, declaration.start),
-				declared = analyzer.declaredTypeFor(parsed, annotations, declaration),
+				declared = declared,
 				initializer = types.mutable(),
 				assignments = {},
 				references = {},
@@ -709,20 +859,94 @@ function analyzer.analyze(source)
 		end
 	end
 
-	-- Collected now that names are in scope, so an assignment's value can be typed.
+	-- Collected now that names are in scope, so an assignment's value can be typed. The target
+	-- belongs to the name as it resolves where the assignment is written: a map from name to
+	-- declaration hands every `x = ...` to whichever `x` was declared last, which silently moved
+	-- a local's assignments onto a later parameter of the same name.
 	local assignments = collectAssignments(parsed)
-	local byName = {}
-	for _, variable in ipairs(self.variables) do byName[variable.name] = variable end
+	for _, assignment in ipairs(assignments) do
+		local variable = lookupIn(scopeAt(self, assignment.at), assignment.name, assignment.at)
+		if variable then
+			local list = variable.assignments
+			-- The type starts as a mutable unknown because typing one assignment can read the
+			-- variable it writes: `current = current.parent` asks for `current` at its own
+			-- offset, while its own type is still being worked out. A nil here reaches
+			-- `combine` and poisons the type.
+			list[#list + 1] = {
+				at = assignment.at, valueIdx = assignment.valueIdx, type = types.mutable(),
+			}
+		end
+	end
+	-- Which function a `return` belongs to: the innermost function whose span holds it. Functions
+	-- nest properly, so this is decided rather than guessed, and the walk back covers a literal
+	-- that closed before the statement.
+	local functionNodes, returnsOf = {}, {}
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "function" then functionNodes[#functionNodes + 1] = node end
+	end
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "return" then
+			local owner
+			for _, body in ipairs(functionNodes) do
+				if body.start <= node.start and body.stop >= node.stop then
+					if not owner or body.start > owner.start then owner = body end
+				end
+			end
+			if owner then
+				local list = returnsOf[owner.index]
+				if not list then
+					list = {}
+					returnsOf[owner.index] = list
+				end
+				list[#list + 1] = node
+			end
+		end
+	end
+
 	--- Type every variable from the arena. Run until it settles: a call can be met before
 	--- its callee's `@return` is known, which leaves a mutable unknown for `refine` to
 	--- promote in place, so one pass is not enough on its own.
 	local function typeAll()
-		for _, assignment in ipairs(assignments) do infer.at(inferCtx, assignment.valueIdx) end
+		-- Assignments are typed before initializers, and both re-run to the fixpoint, so
+		-- `local y = x` sees what `x` was assigned above it rather than what it started as.
 		for _, variable in ipairs(self.variables) do
+			for _, assignment in ipairs(variable.assignments) do
+				assignment.type = infer.at(inferCtx, assignment.valueIdx)
+			end
 			local declaration = variable.declaration
 			variable.initializer = declaration.valueIdx
 				and infer.at(inferCtx, declaration.valueIdx)
 				or kindToType(declaration.initializer)
+		end
+		-- What a function returns is read off its body: the union of every value it returns, or
+		-- nil when it returns nothing at all, which is what a caller gets. Annotations are left
+		-- alone here, so a `@return` and an inferred return can be compared later.
+		for index, fnType in pairs(inferCtx.fnTypes) do
+			local statements = returnsOf[index]
+			local inferred
+			local body = parsed.nodes[index].body
+			if body then inferred = infer.at(inferCtx, body) end
+			for _, statement in ipairs(statements or {}) do
+				for _, valueIdx in ipairs(statement.children or {}) do
+					local valueType = infer.at(inferCtx, valueIdx)
+					inferred = inferred and types.combine(inferred, valueType) or valueType
+				end
+			end
+			if inferred then
+				fnType.returns = inferred
+				-- A declaration that named its parameters but not its return takes the inferred
+				-- one. `@return`, where it is written, still wins.
+				local declaration = bodyOwner[index]
+				local signature = declaration and signatureOfDecl[declaration]
+				local variable = declaration and self.byStart[declaration.start]
+				if signature and not signature.returns and variable and variable.declared then
+					if types.isFn(variable.declared) then variable.declared.returns = inferred end
+				end
+			elseif not annotatedBodies[index] then
+				-- No returns at all, or a bare `return`, means the caller gets nil. A declaration
+				-- that says what it returns is left alone: a stub has not contradicted it yet.
+				fnType.returns = types.NIL_TYPE
+			end
 		end
 		infer.refine(inferCtx, returns)
 	end
@@ -730,28 +954,48 @@ function analyzer.analyze(source)
 	typeAll()
 	typeAll()
 
-	for _, assignment in ipairs(assignments) do
-		local variable = byName[assignment.name]
-		if variable then
-			variable.assignments[#variable.assignments + 1] = {
-				at = assignment.at,
-				type = infer.at(inferCtx, assignment.valueIdx),
-			}
-		end
-	end
 	-- A fixed type does not evolve, so every assignment is checked against it. An annotation
-	-- that contradicts the code is a bug in the code, hence severity 1.
+	-- that contradicts the code is a bug in the code, hence severity 1. Each one is reported on
+	-- its own span: the initializer where the variable is declared, and otherwise the value that
+	-- was assigned, which is where the wrong type actually is.
 	for _, variable in ipairs(self.variables) do
 		if variable.declared then
+			local declaration = variable.declaration
 			local message = types.mismatch(variable.declared, variable.initializer, variable.name)
-			for _, assignment in ipairs(variable.assignments) do
-				message = message or types.mismatch(variable.declared, assignment.type, variable.name)
-			end
 			if message then
-				local declaration = variable.declaration
 				self.diagnostics[#self.diagnostics + 1] = {
 					message = message, start = declaration.start, stop = declaration.stop, severity = 1,
 				}
+			end
+			for _, assignment in ipairs(variable.assignments) do
+				local assigned = types.mismatch(variable.declared, assignment.type, variable.name)
+				if assigned then
+					local value = parsed.nodes[assignment.valueIdx]
+					self.diagnostics[#self.diagnostics + 1] = {
+						message = assigned, severity = 1,
+						start = value and value.start or assignment.at,
+						stop = value and value.stop or assignment.at,
+					}
+				end
+			end
+		end
+	end
+
+	-- Arithmetic on a type that can never be a number cannot work at all, so it is an error
+	-- rather than a guess. A string is in that group: the engine coerces a numeric one, but the
+	-- annotation says string, and `"3" * 2` is exactly the case a reader should be told about.
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "binary" and ARITHMETIC[node.op] then
+			for _, operandIdx in ipairs({ node.left, node.right }) do
+				local operand = parsed.nodes[operandIdx]
+				local operandType = operand and infer.at(inferCtx, operandIdx)
+				if operandType and isNeverNumeric(operandType) then
+					self.diagnostics[#self.diagnostics + 1] = {
+						message = string.format("'%s' needs numbers, but this is a %s",
+							node.op, types.display(operandType)),
+						start = operand.start, stop = operand.stop, severity = 1,
+					}
+				end
 			end
 		end
 	end
