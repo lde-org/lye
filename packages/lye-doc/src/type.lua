@@ -1147,7 +1147,7 @@ function types.literalKind(text)
 	return nil
 end
 
-function types.parse(text, resolve)
+local function parseText(text, resolve)
 	local trimmed = (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	if trimmed == "" then return nil end
 
@@ -1261,6 +1261,27 @@ function types.parse(text, resolve)
 		if declared then return declared end
 	end
 	return types.extern(trimmed)
+end
+
+--- Types already read, keyed by the resolver that read them. A file asks for the same texts over
+--- and over — every declaration's parameters, every call site's arguments, every field — and reading
+--- `number` or `string|nil` again each time is allocation for an answer that cannot have changed.
+--- The resolver is part of the key because a text means what the namespace it is read in says.
+---@type table<function, table<string, lye.doc.Type|false>>
+local parsedBy = setmetatable({}, { __mode = "k" })
+
+---@param text string?
+---@param resolve fun(text: string): lye.doc.Type?
+---@return lye.doc.Type?
+function types.parse(text, resolve)
+	local cache = resolve and parsedBy[resolve]
+	if not cache then return parseText(text, resolve) end
+	local held = cache[text]
+	if held == nil then
+		held = parseText(text, resolve) or false
+		cache[text] = held
+	end
+	return held or nil
 end
 
 ---@param type lye.doc.Type

@@ -25,6 +25,34 @@
  */
 
 import { spawn } from "node:child_process";
+import { readdirSync } from "node:fs";
+
+/**
+ * Resident memory of a process and everything it forked, in MiB. A language server is not always
+ * one process, and a number that ignores its workers flatters whichever one uses them.
+ * @param {number} pid
+ * @returns {number}
+ */
+function residentOf(pid) {
+	let total = 0;
+	const stack = [pid];
+	while (stack.length) {
+		const current = stack.pop();
+		try {
+			const match = /VmRSS:\s+(\d+) kB/.exec(readFileSync(`/proc/${current}/status`, "utf8"));
+			if (match) total += Number(match[1]) / 1024;
+		} catch {}
+		try {
+			for (const entry of readdirSync("/proc")) {
+				if (!/^\d+$/.test(entry)) continue;
+				const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+				const parent = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+				if (parent === current) stack.push(Number(entry));
+			}
+		} catch {}
+	}
+	return total;
+}
 import { readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -499,6 +527,10 @@ async function measure(spec) {
 		p95: samples.length ? +samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.95))].toFixed(2) : null,
 	};
 
+	// What the server costs to keep around, measured while it is warm and holding the fixture and
+	// everything it has indexed from it.
+	report.memory = { rssMiB: +residentOf(client.child.pid).toFixed(1) };
+
 	await client.request("shutdown", {}, 5000);
 	client.notify("exit", {});
 	setTimeout(() => client.kill(), 200);
@@ -543,6 +575,12 @@ for (const action of [...ACTIONS.map((one) => one.name), "keystroke → diagnost
 	});
 	console.log(`${action.padEnd(24)}${cells.join("")}`);
 }
+
+console.log("");
+console.log("");
+console.log("memory".padEnd(24) + reports.map((report) => report.name.padStart(28)).join(""));
+console.log("resident (RSS, MiB)".padEnd(24) + reports.map((report) => (
+	report.memory ? `${report.memory.rssMiB} MiB`.padStart(28) : "—".padStart(28))).join(""));
 
 console.log("");
 console.log("capability".padEnd(34) + reports.map((report) => report.name.padStart(10)).join(""));

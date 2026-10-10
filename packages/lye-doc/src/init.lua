@@ -148,11 +148,16 @@ end
 
 ---@param source string
 ---@return lye.doc.File
-function doc.parse(source)
+---@param source string
+---@param tokens lye.lexer.Tokens? the tokens of this source, when the caller already has them
+---@return lye.doc.File
+function doc.parse(source, tokens)
 	assert(type(source) == "string", "doc.parse expects a string")
 
 	local annotations = {}
-	local tokens = lexer.tokenize(source)
+	-- The parser lexes the same text on its way to a tree, and a caller that has done so already
+	-- hands the tokens over rather than paying for a second pass over every byte.
+	tokens = tokens or lexer.tokenize(source)
 	for at = 1, tokens.count do
 		local token = tokens.arena[at]
 		if token.kind == lexer.KIND.comment then

@@ -473,6 +473,51 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve)
 	---@param condition lye.analyzer.Condition
 	---@param record lye.parser.Scope
 	---@param from integer? where the fact starts, which is the scope's own start by default
+	-- Everything that could change a field between a condition and a read: a call, because the callee
+	-- may hold the same table and a `__newindex` may run, and a write through the same name. Gathered
+	-- once and sorted, so a fact finds the first one after it by bisection rather than by walking the
+	-- arena — which is what made a file with many conditions cost the square of its size.
+	---@type { start: integer, name: string }[]
+	local interfering = {}
+	for _, node in ipairs(parsed.nodes) do
+		local name
+		if node.kind == "call" then
+			name = "*"
+		elseif node.kind == "assignment" and node.target then
+			local target = parsed.nodes[node.target]
+			local base = target
+			if target and target.field then base = parsed.nodes[target.target] end
+			name = base and (base.callee or base.name) or nil
+		end
+		if name then interfering[#interfering + 1] = { start = node.start, name = name } end
+	end
+	table.sort(interfering, function(left, right) return left.start < right.start end)
+
+	--- The first offset at or after `from` where something could disturb the name, or nil.
+	---@param from integer
+	---@param until_ integer
+	---@param name string
+	---@return integer? offset
+	local function firstDisturbance(from, until_, name)
+		local low, high, best = 1, #interfering, nil
+		while low <= high do
+			local mid = math.floor((low + high) / 2)
+			if interfering[mid].start > from then
+				best = mid
+				high = mid - 1
+			else
+				low = mid + 1
+			end
+		end
+		while best and best <= #interfering do
+			local node = interfering[best]
+			if node.start > until_ then return nil end
+			if node.name == "*" or node.name == name then return node.start end
+			best = best + 1
+		end
+		return nil
+	end
+
 	local function add(condition, record, from)
 		local guarded = byRecord[record].facts
 		local list = guarded[condition.name]
@@ -486,29 +531,8 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve)
 		-- any call, because the callee may hold the same table, or a write to that field or to
 		-- the whole object. Cutting the span here is the whole of the invalidation.
 		if condition.field then
-			for _, node in ipairs(parsed.nodes) do
-				if node.start > start and node.start <= stop then
-					local target
-					if node.kind == "assignment" and node.target then
-						target = parsed.nodes[node.target]
-					end
-					-- Anything that could change the object invalidates the fact: a call, because the
-					-- callee may hold the same table and a `__newindex` may run, and any write
-					-- through the name — the field itself, another field, or the whole object.
-					-- Being certain costs an occasional narrowing; being wrong reports a type the
-					-- value does not have at runtime.
-					-- `config.name = v` writes the field and `config = v` the object; the parser
-					-- records a written field as an index the assignment points at, so the name is
-					-- the index's own base.
-					local base = target
-					if target and target.field then base = parsed.nodes[target.target] end
-					local writes = base ~= nil and ((base.callee or base.name) == condition.name)
-					if node.kind == "call" or writes then
-						stop = node.start - 1
-						break
-					end
-				end
-			end
+			local disturbance = firstDisturbance(start, stop, condition.name)
+			if disturbance then stop = disturbance - 1 end
 		end
 		list[#list + 1] = {
 			name = condition.name, field = condition.field, kind = condition.kind,
@@ -705,23 +729,24 @@ end
 ---@param declaration lye.parser.Declaration
 ---@return string?
 local function documentationOf(parsed, declaration)
-	local spanStart = annotationSpan(parsed, declaration)
-	if not spanStart then return nil end
+	local anchorIdx = declaration.anchorIdx
+	if not anchorIdx then return nil end
 
+	-- The comment block is the run of comment tokens immediately above the statement, so it is
+	-- walked rather than searched: looking through every token in the file for the ones that fall
+	-- before the declaration made this cost the file size for each declaration in it.
 	local tokens, texts = parsed.tokens.arena, parsed.tokens.texts
 	local lines = {}
-	for index = 1, parsed.tokens.count do
-		local token = tokens[index]
-		if token.kind == KIND.comment and token.start >= spanStart
-			and token.stop < declaration.start then
-			local written = texts[index]
-			-- Only a triple-dash line is documentation. A `--` comment is a note to whoever reads
-			-- the code, and a divider of dashes is a divider: putting either in a description is
-			-- how an unrelated remark turns up in a hover.
-			if written:match("^%-%-%-[^%-@]") or written:match("^%-%-%-$") then
-				lines[#lines + 1] = (written:gsub("^%-%-%-%s?", ""))
-			end
+	local index = anchorIdx - 1
+	while index >= 1 and tokens[index].kind == KIND.comment do
+		local written = texts[index]
+		-- Only a triple-dash line is documentation. A `--` comment is a note to whoever reads
+		-- the code, and a divider of dashes is a divider: putting either in a description is
+		-- how an unrelated remark turns up in a hover.
+		if written:match("^%-%-%-[^%-@]") or written:match("^%-%-%-$") then
+			table.insert(lines, 1, (written:gsub("^%-%-%-%s?", "")))
 		end
+		index -= 1
 	end
 	while #lines > 0 and lines[#lines]:match("^%s*$") do
 		table.remove(lines)
@@ -1066,6 +1091,33 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 		return withGenerics(signature.generics, signature.constraints, resolve)
 	end
 
+	-- The types a signature was written with, parsed once. A call site reads the same parameters and
+	-- the same return type as every other call site of the same function, and parsing them again for
+	-- each one was most of the cost of this pass — for the definitions, where a signature is shared
+	-- by every call in every document, it is parsed once per process.
+	---@type table<lye.analyzer.Signature, { params: (lye.doc.Type?)[], returns: lye.doc.Type? }>
+	local parsedSignatures = {}
+	---@param signature lye.analyzer.Signature
+	---@return (lye.doc.Type?)[]
+	---@return lye.doc.Type?
+	local function typesOf(signature)
+		local held = parsedSignatures[signature]
+		if held then return held.params, held.returns end
+
+		local local_ = resolveFor(signature)
+		local params = {}
+		for index, annotation in ipairs(signature.params) do
+			params[index] = annotation.type and types.parse(annotation.type, local_)
+		end
+		local written = signature.returns and signature.returns.type
+		local returned = written and types.parse(written, local_) or nil
+		-- A generic signature reads differently at each call, so only the fixed ones are kept.
+		if next(signature.generics) == nil then
+			parsedSignatures[signature] = { params = params, returns = returned }
+		end
+		return params, returned
+	end
+
 	--- The type an argument has as it was written. A string literal is the one string it spells,
 	--- which is what `select("#", ...)` and the option flags in the definitions ask for; a name of
 	--- type `string` is not that string, so this says nothing about one passed in its place.
@@ -1158,14 +1210,8 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 			local callable = target and types.metamethod(target, "__call")
 			local receiver = (node.isMethod or callable) and target or nil
 			if signature then
-				if byName and signature.returns and signature.returns.type then
-					returns[node.callee] = types.parse(signature.returns.type, resolveFor(signature))
-				end
-				local local_ = resolveFor(signature)
-				local params = {}
-				for index, annotation in ipairs(signature.params) do
-					params[index] = annotation.type and types.parse(annotation.type, local_)
-				end
+				local params, returned = typesOf(signature)
+				if byName and returned then returns[node.callee] = returned end
 				checkArgs(node, label, params, signature.overloads, receiver)
 			elseif calleeType and types.isFn(calleeType) and not types.isAnyFn(calleeType) then
 				-- A callable nothing annotated, such as a method this document declares: its own
@@ -1217,7 +1263,7 @@ function analyzer.prelude(sources)
 	local backing = {}
 	for _, source in pairs(sources) do
 		local parsed = Parser.new(source):parse()
-		local file = doc.parse(source)
+		local file = doc.parse(source, parsed.tokens)
 		local namespace = doc.classes.read(file)
 
 		-- `---@class mathlib` over `math = {}` names the table the class describes, and the
@@ -1276,6 +1322,12 @@ function analyzer.prelude(sources)
 				prepared.globalNames[declaration.name] = true
 			end
 			if #params > 0 or returned or #predicates > 0 or #overloads > 0 then
+				-- A global the definitions declare, remembered by name: the analyzer reads the
+				-- signatures through the document's own table, so a pass that asks "is this name
+				-- known" cannot iterate it to find them.
+				if not declaration.name:find("[%.:]") then
+					prepared.globalNames[declaration.name] = true
+				end
 				prepared.signatures[declaration.name] = {
 					params = params, returns = returned, generics = generics,
 					constraints = constraints, predicates = predicates, overloads = overloads,
@@ -1415,20 +1467,22 @@ function analyzer.analyze(source, prepared, elsewhere)
 	assert(type(source) == "string", "analyzer.analyze expects a string")
 
 	local parsed = Parser.new(source):parse()
-	local annotations = doc.parse(source)
-
+	local annotations = doc.parse(source, parsed.tokens)
+	
 	-- What this file declares, so a class name or an alias in an annotation means what it says.
 	-- Read before anything parses a type. The definitions are folded in first, so the standard
 	-- library's classes are known here and this file's own win where they disagree.
 	local namespace = doc.classes.read(annotations)
 	if prepared then
-		for name, class in pairs(prepared.classes) do
-			namespace.classes[name] = namespace.classes[name] or class
-		end
-		for name, alias in pairs(prepared.aliases) do
-			namespace.aliases[name] = namespace.aliases[name] or alias
-		end
+		-- The definitions are reached through the namespace rather than copied into it. Every
+		-- analysis builds a namespace of its own, and copying several hundred classes and aliases
+		-- into it on each keystroke is work that is thrown away with the namespace: a name the
+		-- document does not declare reads from the prepared tables instead, which are already built.
+		setmetatable(namespace.classes, { __index = prepared.classes })
+		setmetatable(namespace.aliases, { __index = prepared.aliases })
 		-- The methods the definitions added to their classes, which the resolver reads from here.
+		-- This one is copied: a method declared on a definition's class has to merge with what the
+		-- definitions already put there without writing into the prepared entry.
 		for className, fields in pairs(prepared.evolved or {}) do
 			namespace.evolved = namespace.evolved or {}
 			namespace.evolved[className] = namespace.evolved[className] or {}
@@ -1439,11 +1493,13 @@ function analyzer.analyze(source, prepared, elsewhere)
 	end
 	local resolve = doc.classes.resolver(namespace)
 
-	-- Declared returns are needed while typing declarations, and a `@return` belongs to the
+		-- Declared returns are needed while typing declarations, and a `@return` belongs to the
 	-- declaration below it, so this is resolved from the annotations alone.
 	local returns = {}
 	if prepared then
-		for name, declared in pairs(prepared.returns) do returns[name] = declared end
+		-- Reached rather than copied, like the namespace: a returned type the document does not
+		-- name itself is read from what the definitions already built.
+		setmetatable(returns, { __index = prepared.returns })
 	end
 	for _, declaration in ipairs(parsed.declarations) do
 		local _, returned, generics, constraints = signatureOf(parsed, annotations, declaration)
@@ -1459,7 +1515,7 @@ function analyzer.analyze(source, prepared, elsewhere)
 	-- table rather than an outer name.
 	local self = { parser = parsed, variables = {}, byStart = {}, diagnostics = {}, doc = annotations }
 
-	-- A name an annotation writes has to mean something. `---@return s` where nothing declares `s`
+		-- A name an annotation writes has to mean something. `---@return s` where nothing declares `s`
 	-- is a typo, and reading it as a type nothing knows about lets it pass as one. The definitions,
 	-- this file's own classes and aliases, the generics it declares and the names other files
 	-- declare are what a name may be.
@@ -1632,7 +1688,7 @@ function analyzer.analyze(source, prepared, elsewhere)
 	-- The definitions' signatures are the floor: this file's own declarations land on top.
 	local signatures = {}
 	if prepared then
-		for name, signature in pairs(prepared.signatures) do signatures[name] = signature end
+		setmetatable(signatures, { __index = prepared.signatures })
 	end
 	-- What a call is checked and bound against: the name it uses where it names one, and
 	-- otherwise the annotations that built the type the callee holds, which is how a function
@@ -1772,7 +1828,7 @@ function analyzer.analyze(source, prepared, elsewhere)
 	local root, byRecord = buildScopes(parsed)
 	self.root = root
 	collectNarrowing(parsed, byRecord, signatures, resolve)
-	inferCtx = infer.context(parsed, typeOfName, returns, function(base, baseName, field, offset)
+		inferCtx = infer.context(parsed, typeOfName, returns, function(base, baseName, field, offset)
 		return analyzer.fieldTypeAt(self, base, baseName, field, offset)
 	end)
 	for index, node in ipairs(parsed.nodes) do
@@ -2240,7 +2296,7 @@ function analyzer.analyze(source, prepared, elsewhere)
 
 	typeAll()
 	typeAll()
-
+	
 	-- A fixed type does not evolve, so every assignment is checked against it. An annotation
 	-- that contradicts the code is a bug in the code, hence severity 1. Each one is reported on
 	-- its own span: the initializer where the variable is declared, and otherwise the value that
@@ -2486,9 +2542,12 @@ function analyzer.analyze(source, prepared, elsewhere)
 	-- A reference is a node that names something: a bare name, a call target, an index base.
 	-- The arena has one for each, so this never has to decide whether a name token is a use.
 	local globals = {}
+	-- The document's own signatures are iterated here; the definitions' names are the list the
+	-- prelude kept, because the table itself is reached through this one rather than copied.
 	for name in pairs(signatures) do
 		if not name:find("[%.:]") then globals[name] = true end
 	end
+	for name in pairs(prepared and prepared.globalNames or {}) do globals[name] = true end
 	for _, variable in ipairs(self.variables) do
 		if variable.qualifier == "global" or variable.qualifier == "field" then
 			globals[variable.name] = true
@@ -2534,7 +2593,7 @@ function analyzer.analyze(source, prepared, elsewhere)
 	end
 
 	checkCalls(self, parsed, signatureOfCall, returns, resolve, inferCtx, source)
-	self.signatures = signatures
+		self.signatures = signatures
 	self.returns = returns
 
 	-- Typing runs twice: once to settle what each value is, and again for the ones that could only
