@@ -9,14 +9,16 @@ it needs no Lua, no lde, and no dependencies on the machine that runs it.
 
 > Status: **all features work** — diagnostics, a nested outline, hover with an inferred
 > type, go-to-definition, semantic tokens, and completion (the fields of a table after a `.`
-> or a `[`, the names in scope elsewhere — the definitions' globals included — and the
-> workspace's modules inside `require("`) — with 270 tests. The same binary also checks files headlessly for CI. See `docs/PLAN.md` §7
-> for the `---@type` annotations, evolving types, narrowing and call checking. The AST and the
-> token stream are flat arenas; see `docs/PLAN.md` §7 for the measurements behind both.
+> or a `[`, the names in scope elsewhere — the definitions' globals included — the workspace's
+> modules inside `require("`, and the modules the engine ships, `require("ffi")` and
+> `require("string.buffer")` among them) — with 274 tests. The same binary also checks files
+> headlessly for CI. See `docs/PLAN.md` §7 for the `---@type` annotations, evolving types,
+> narrowing and call checking. The AST and the token stream are flat arenas; see `docs/PLAN.md`
+> §7 for the measurements behind both.
 >
 > Measured against the alternatives on the same machine and the same harness: a keystroke
-> reaches diagnostics in **5.65 ms** against LuaLS's 201 ms and EmmyLua's 503 ms, and the
-> server holds **12.3 MiB** against 20.8 and 58.6.
+> reaches diagnostics in **6.3 ms** against LuaLS's 201 ms and EmmyLua's 503 ms, and the
+> server holds **11.9 MiB** against 20.8 and 60.5.
 
 ## Why it exists
 
@@ -42,12 +44,12 @@ Seven packages plus the server. Each is independently useful; nothing depends on
 | `lye-framework` | Language-agnostic server: lifecycle, dispatch, document store, position mapping, LSP constants. | done — 352 lines, 29 tests |
 | `lye-lexer` | LuaJIT-aware tokenizer; tokens are FFI structs in one arena, comments kept for annotation passes, half-written literals reported instead of raised. | done — 299 lines, 15 tests |
 | `lye-parser` | Span-tracking parser, error recovery, parse-time scope stack. | done — 810 lines, 14 tests |
-| `lye-doc` | LuaLS annotation parsing, the type system, and type comparison. | done — 1238 lines, 43 tests |
-| `lye-analyzer` | Name resolution, recursive arena typing to a fixpoint, evolving types, narrowing, call checking. | done — 1969 lines, 104 tests |
-| `lye-lsp` | The server itself: wires the above together and implements the features. | done — 1754 lines, 33 tests |
+| `lye-doc` | LuaLS annotation parsing, the type system, and type comparison. | done — 1243 lines, 43 tests |
+| `lye-analyzer` | Name resolution, recursive arena typing to a fixpoint, evolving types, narrowing, call checking. | done — 2009 lines, 105 tests |
+| `lye-lsp` | The server itself: wires the above together and implements the features. | done — 1773 lines, 36 tests |
 | `lye-defs` | The LuaJIT and Lua 5.1 definitions, from eighteen files gathered at build time. | done — generated, 18 meta files |
 
-**6859 lines and 270 tests**, or **7186** counting the generated definitions. A client can
+**6905 lines and 274 tests**, or **7232** counting the generated definitions. A client can
 attach, sync a document, edit it incrementally, and shut the server down with the correct exit
 code. The lexer and parser handle LuaJIT including its 3.0 syntax, and syntax errors are
 published as diagnostics that clear when the document is fixed. See `docs/PLAN.md` §3 for the

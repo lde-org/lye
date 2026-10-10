@@ -1952,6 +1952,67 @@ function analyzer.analyze(source, prepared, elsewhere, modules)
 		return held
 	end
 
+	-- A field written onto a value is part of that value's shape, whether or not the writer called it
+	-- a class. `local M = {}` given its functions below is how a Lua module is written — the whole
+	-- of `string.buffer` in the definitions is written that way, and so is most Lua written by hand.
+	-- Without this the table a `require` hands back has no fields at all, so `M.add` reads as nil
+	-- and `M.` completes nothing.
+	--
+	-- It runs after every name is in scope, because the value a field is written on is looked up by
+	-- name, and before the typing rounds, because the type it is given here is the one those rounds
+	-- read: the literal's own table, not a copy.
+	---@param written string the name as written, `M.field`, `M:field` or `A.B.field`
+	---@param offset integer
+	---@param fieldType lye.doc.Type?
+	local function addTableField(written, offset, fieldType)
+		if not fieldType then return end
+		local base, field = written:match("^(.-)[%.:]([%w_]+)$")
+		if not base or base == "" then return end
+		local first, rest = base:match("^([%w_]+)%.?(.*)$")
+		local variable = first and lookupIn(scopeAt(self, offset), first, offset)
+		-- An annotation governs the value: `---@type App local x = {}` is an App, and a method
+		-- written on `x` belongs to App — which the class pass above has already given it — not to
+		-- the empty literal behind it.
+		if variable and variable.declared then return end
+		local declaration = variable and variable.declaration
+		local held
+		if declaration and declaration.valueIdx then
+			held = infer.at(inferCtx, declaration.valueIdx)
+		else
+			held = receiverTypeOf(base, offset)
+		end
+		for segment in rest:gmatch("[%w_]+") do
+			held = held and types.indexResult(held, segment)
+		end
+		if held and held.variant == "object" and held.fields then
+			-- Two writes to one field are two possible values, the same way a variable's own
+			-- assignments are.
+			local previous = held.fields[field]
+			held.fields[field] = previous and types.combine(previous, fieldType) or fieldType
+		end
+	end
+
+	for _, declaration in ipairs(parsed.declarations) do
+		if declaration.valueIdx then
+			local className, methodName = declaration.name:match("^([%w_%.]+)%s*[%.:]([%w_]+)$")
+			if className and methodName and not namespace.classes[className] then
+				local methodType = inferCtx.fnTypes[declaration.valueIdx]
+					or infer.at(inferCtx, declaration.valueIdx)
+				addTableField(declaration.name, declaration.start, methodType)
+			end
+		end
+	end
+	-- The same field written by an assignment rather than declared: `M.add = function() end` and
+	-- `M.count = 0` are the other half of the idiom.
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "assignment" and node.value then
+			local written = writtenNameOf(parsed, node.target)
+			if written and written:find("[%.:]") then
+				addTableField(written, node.start, infer.at(inferCtx, node.value))
+			end
+		end
+	end
+
 	--- Whether a field is one this document's own method declaration put on a class. A method
 	--- written on a class is part of that class, so reading the field back as a promise the body
 	--- has to keep would make every method its own annotation.

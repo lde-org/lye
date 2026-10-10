@@ -80,6 +80,56 @@ local function request(id, method, position)
 	return { jsonrpc = "2.0", id = id, method = method, params = params }
 end
 
+test.it("reads a module the engine ships from the definitions", function()
+	-- `require("ffi")` names no file in any workspace: the module is a definition, and its text is
+	-- written where a client can open it. `jit` is both that and a global.
+	local source = 'local ffi = require("ffi")\nffi.cdef("int x;")\nffi.\n'
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/completion",
+		params = {
+			textDocument = { uri = "file:///f.lua" },
+			position = { line = 2, character = 4 },
+		},
+	} }, source)
+
+	local labels = {}
+	for _, item in ipairs(results["2"].items or {}) do labels[item.label] = item end
+	test.truthy(labels["cdef"], "a field of the ffi library")
+	test.truthy(labels["new"], "and another")
+	test.truthy(labels["cdef"].detail:match("def: string"), "with the signature it was declared with")
+	test.equal(labels["arch"] ~= nil, true, "and the rest of it")
+end)
+
+test.it("offers the definitions' globals beside the names in scope", function()
+	-- Typing `p` has to reach `print`: the definitions declare functions, and their signatures are
+	-- reached through a metatable that `pairs` cannot see through.
+	local source = "local mine = 1\nlocal read = "
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/completion",
+		params = {
+			textDocument = { uri = "file:///f.lua" },
+			position = { line = 1, character = 14 },
+		},
+	} }, source)
+
+	local labels = {}
+	for _, item in ipairs(results["2"].items or {}) do labels[item.label] = item end
+	test.truthy(labels["print"], "a function of the standard library")
+	test.truthy(labels["pairs"], "and another")
+	test.truthy(labels["mine"], "beside the local in scope")
+	test.truthy(labels["print"].detail:match("any"), "with what it takes: " .. tostring(labels["print"].detail))
+end)
+
+test.it("types a call of a definition, not the literal it was handed", function()
+	-- `math.abs` was `@generic Number: number` in the definitions, which lye bound per call from the
+	-- argument's literal type: `math.abs(-3)` came out as `-3`, contradicting the engine.
+	local source = "local n = math.abs(-3)\n"
+	local results = run({ request(2, "textDocument/hover", { line = 0, character = 6 }) }, source)
+	local value = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(value:match("number"), "n is a number: " .. value)
+	test.equal(value:match("%-3") ~= nil, false, "and not the literal it was called with")
+end)
+
 test.it("lists the declarations in a document", function()
 	local results = run({ request(2, "textDocument/documentSymbol") })
 	local symbols = results["2"]

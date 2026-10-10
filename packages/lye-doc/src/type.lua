@@ -376,7 +376,7 @@ function types.satisfies(type, constraint)
 
 	if constraint.variant == "array" then
 		-- `local names = {}` declares a list before it holds anything, so a table fits.
-		if type.variant == "table" then return true end
+		if types.isUnknownShape(type) then return true end
 		if type.variant ~= "array" then return false end
 		return types.satisfies(type.type, constraint.type)
 	end
@@ -423,6 +423,16 @@ function types.satisfies(type, constraint)
 
 	-- A container or a name the checker does not model: decline rather than guess.
 	return type.variant == constraint.variant
+end
+
+--- A table nothing is known about: `local t = {}` before anything gives it a field. That is what
+--- `types.TABLE` is — a fresh literal is its own object so its shape can grow — and it fits wherever
+--- a bare table fits, because there is no shape yet to disagree with.
+---@param type lye.doc.Type
+---@return boolean
+function types.isUnknownShape(type)
+	if type.variant == "table" then return true end
+	return type.variant == "object" and type.indexed == nil and next(type.fields) == nil
 end
 
 --- Whether the value is definitely truthy, definitely falsy, or either.
@@ -1300,6 +1310,9 @@ function types.display(type)
 		if type.indexed then
 			parts[#parts + 1] = "[" .. type.indexed.key .. "]: " .. types.display(type.indexed.type)
 		end
+		-- A table whose shape is not known *yet* is a table, not an empty one: `local t = {}` reads
+		-- as `table` until something gives it a field, which is what a reader expects to see.
+		if #parts == 0 and not type.metatable then return "table" end
 		table.sort(parts)
 		return "{ " .. table.concat(parts, ", ") .. " }"
 	end

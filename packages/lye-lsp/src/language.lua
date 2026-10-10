@@ -74,28 +74,42 @@ end
 ---@return { name: string, path: string }[]
 function Lye:moduleNames(prefix)
 	local root = self.server.rootPath
-	if not root then return {} end
-	local found = {}
-	local pipe = io.popen(string.format(
-		"find %q -name '*.lua' -not -path '*/target/*' -not -path '*/.git/*' 2>/dev/null", root))
-	if not pipe then return {} end
-	for path in pipe:lines() do
-		local relative = path:sub(#root + 2)
-		if relative ~= "" then
-			local name = (relative:gsub("%.lua$", ""):gsub("/init$", ""):gsub("[/\\]", "."))
-			-- The layout lde builds from: `packages/lye-doc/src/type.lua` is `lye-doc.type`.
-			local pkg, rest = name:match("^packages%.([%w_%-]+)%.src%.(.+)$")
-			if pkg then
-				name = pkg .. "." .. rest
-			elseif name:match("^src%.") then
-				name = name:sub(5)
+	local found, seen = {}, {}
+	if root then
+		local pipe = io.popen(string.format(
+			"find %q -name '*.lua' -not -path '*/target/*' -not -path '*/.git/*' 2>/dev/null", root))
+		if pipe then
+			for path in pipe:lines() do
+				local relative = path:sub(#root + 2)
+				if relative ~= "" then
+					local name = (relative:gsub("%.lua$", ""):gsub("/init$", ""):gsub("[/\\]", "."))
+					-- The layout lde builds from: `packages/lye-doc/src/type.lua` is `lye-doc.type`.
+					local pkg, rest = name:match("^packages%.([%w_%-]+)%.src%.(.+)$")
+					if pkg then
+						name = pkg .. "." .. rest
+					elseif name:match("^src%.") then
+						name = name:sub(5)
+					end
+					if name:sub(1, #prefix) == prefix and not seen[name] then
+						seen[name] = true
+						found[#found + 1] = { name = name, path = path }
+					end
+				end
 			end
-			if name:sub(1, #prefix) == prefix then
-				found[#found + 1] = { name = name, path = path }
-			end
+			pipe:close()
 		end
 	end
-	pipe:close()
+
+	-- The modules the engine ships are named the same way and are not files here, so they are
+	-- listed from the definitions. A workspace module of the same name was added first and wins,
+	-- which is the order `require` itself resolves in.
+	for name in pairs(self:definitionIndex().modules) do
+		if name:sub(1, #prefix) == prefix and not seen[name] then
+			seen[name] = true
+			found[#found + 1] = { name = name, detail = "LuaJIT" }
+		end
+	end
+
 	table.sort(found, function(left, right) return left.name < right.name end)
 	return found
 end
@@ -109,26 +123,35 @@ end
 ---@return string?
 function Lye:moduleFile(name)
 	local root = self.server.rootPath
-	if not root then return nil end
-	local tail = (name:gsub("%.", "/"))
-	local candidates = {
-		root .. "/" .. tail .. ".lua",
-		root .. "/" .. tail .. "/init.lua",
-		root .. "/src/" .. tail .. ".lua",
-	}
-	local head, rest = name:match("^([%w_]+)%.(.+)$")
-	if head then
-		local under = (rest:gsub("%.", "/"))
-		candidates[#candidates + 1] = root .. "/packages/" .. head .. "/src/" .. under .. ".lua"
-		candidates[#candidates + 1] = root .. "/packages/" .. head .. "/src/" .. under .. "/init.lua"
-	end
-	for _, path in ipairs(candidates) do
-		local handle = io.open(path, "rb")
-		if handle then
-			handle:close()
-			return path
+	if root then
+		local tail = (name:gsub("%.", "/"))
+		local candidates = {
+			root .. "/" .. tail .. ".lua",
+			root .. "/" .. tail .. "/init.lua",
+			root .. "/src/" .. tail .. ".lua",
+		}
+		local head, rest = name:match("^([%w_]+)%.(.+)$")
+		if head then
+			local under = (rest:gsub("%.", "/"))
+			candidates[#candidates + 1] = root .. "/packages/" .. head .. "/src/" .. under .. ".lua"
+			candidates[#candidates + 1] = root .. "/packages/" .. head .. "/src/" .. under .. "/init.lua"
+		end
+		for _, path in ipairs(candidates) do
+			local handle = io.open(path, "rb")
+			if handle then
+				handle:close()
+				return path
+			end
 		end
 	end
+
+	-- A module the engine ships is not a file in this workspace: `require("ffi")`, `require("jit")`
+	-- and `require("string.buffer")` name the definitions, whose text is written to the cache for a
+	-- client to open. The workspace was searched first, so a project's own module of that name
+	-- shadows the builtin — which is what `require` itself does — and a document outside any
+	-- workspace still resolves these, since they belong to no workspace.
+	local builtin = self:definitionIndex().modules[name]
+	if builtin then return builtin.path end
 end
 
 --- What `require("name")` is: the type the module file returns, analysed once and kept until its
@@ -1197,7 +1220,9 @@ function Lye:onCompletion(params)
 			items[#items + 1] = {
 				label = found.name,
 				kind = 9,
-				detail = found.path:sub(#(self.server.rootPath or "") + 2),
+				-- A builtin module has no path in this workspace to show, and its own name is what it
+				-- is called: the definitions are where it comes from.
+				detail = found.detail or found.path:sub(#(self.server.rootPath or "") + 2),
 				textEdit = {
 					range = self:toRange(source, document.lineIndex, inside.from, inside.to),
 					newText = found.name,

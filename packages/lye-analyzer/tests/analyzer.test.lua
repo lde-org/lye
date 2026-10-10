@@ -40,6 +40,27 @@ end
 ---@param source string
 ---@param offset integer
 ---@return string[]
+test.it("gives a table the fields its own writes add", function()
+	-- `local M = {}` given its functions below is how a Lua module is written, and the table a
+	-- `require` hands back is only useful if those writes are part of its shape.
+	test.equal(typeOf("local t = {}\nfunction t.f(x) return x end\nlocal held = t.f\n", "held"),
+		"fn(any) -> any", "a function declared on the table")
+	test.equal(typeOf("local t = {}\nt.f = function(x) return x end\nlocal held = t.f\n", "held"),
+		"function", "and one assigned to it")
+	test.equal(typeOf("local t = {}\nt.count = 2\nlocal held = t.count\n", "held"), "2",
+		"a value written to it")
+	test.equal(typeOf("local t = {}\nt.f = 2\nt.f = \"s\"\nlocal held = t.f\n", "held"),
+		"2|string", "two writes are two possible values, as they are for a name")
+	test.equal(typeOf("local A = { B = {} }\nfunction A.B.f() end\nlocal held = A.B.f\n", "held"),
+		"fn()", "and the name it is written on may be dotted")
+
+	-- An annotation governs the value: the literal behind `---@type App` is not where the fields
+	-- of an App live, and evolving it would give the same table two different shapes.
+	test.equal(typeOf("---@class App\n---@field call fun(self: App): number\n"
+		.. "---@type App\nlocal x = {}\nfunction x:call() return 1 end\nlocal held = x.call\n", "held"),
+		"fn(App) -> number", "a declared type is the shape, not the literal")
+end)
+
 test.it("evolves a name that is assigned after its declaration", function()
 	local source = 'local x = 5\nx = "string"\nlocal y = x\n'
 	local result = analyzer.analyze(source)

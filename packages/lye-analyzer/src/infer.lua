@@ -80,7 +80,10 @@ local function of(ctx, idx)
 
 		local kinds = ctx.parser.tableFields[node.index]
 		if not kinds then
-			result = elementType and types.array(elementType) or types.TABLE
+			-- `{}` has no shape *yet*, and the shape it grows belongs to this literal alone: a
+			-- module is written `local M = {}` and given its fields below, so the type cannot be
+			-- the shared `table` every other literal would then be given fields on.
+			result = elementType and types.array(elementType) or types.object({})
 		else
 			local values = ctx.parser.tableFieldValues[node.index]
 			local fields = {}

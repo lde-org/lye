@@ -33,7 +33,7 @@ end
 ---@return table index
 function definitions.prepare(sources)
 	local dir = cacheDir()
-	local index = { types = {}, names = {}, fields = {}, text = {}, lines = {} }
+	local index = { types = {}, names = {}, fields = {}, text = {}, lines = {}, modules = {} }
 
 	for name, text in pairs(sources) do
 		local path = dir .. "/" .. name .. ".lua"
@@ -67,7 +67,19 @@ function definitions.prepare(sources)
 		end
 
 		-- The declarations themselves, `function math.floor()` among them.
-		for _, declaration in ipairs(Parser.new(text):parse().declarations) do
+		local parsed = Parser.new(text):parse()
+		-- A definition file that returns a value is a module `require` may name. Over the whole
+		-- corpus that is the same question as "does the engine ship this module": the sixteen that
+		-- return one are the sixteen names `require` accepts — `ffi`, `jit`, `jit.util`,
+		-- `string.buffer`, `table.new` and the rest — and `basic` and `builtin`, which only
+		-- declare globals, are the two it refuses.
+		for _, child in ipairs(parsed.nodes[parsed.root].children or {}) do
+			if parsed.nodes[child].kind == "return" then
+				index.modules[name] = { uri = uri, path = path }
+				break
+			end
+		end
+		for _, declaration in ipairs(parsed.declarations) do
 			if not index.names[declaration.name] then
 				index.names[declaration.name] = {
 					uri = uri, start = declaration.start, stop = declaration.stop,
