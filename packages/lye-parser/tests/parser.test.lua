@@ -279,4 +279,21 @@ test.it("handles an empty file", function()
 	test.equal(#result.declarations, 0)
 end)
 
+test.it("keeps an argument's index when it is written as a long string", function()
+	-- Every other child in the tree is an arena index, and a reader takes an argument out of the
+	-- arena by one: `print[[hello]]` used to put the node table there instead, which read as no
+	-- argument at all and left the call untyped.
+	for _, source in ipairs({ 'print[[hello]]\n', 'ffi.cdef[[int x;]]\n', 'print{1}\n' }) do
+		local result = Parser.new(source):parse()
+		for _, node in ipairs(result.nodes) do
+			if node.kind == "call" then
+				local first = node.args and node.args[1]
+				test.equal(type(first), "number", source)
+				local argument = result.nodes[first]
+				test.truthy(argument, "the index names a node: " .. source)
+			end
+		end
+	end
+end)
+
 return true

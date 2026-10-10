@@ -55,9 +55,11 @@ local function parsePrefix(self, allowTernaryColon)
 			link = { field = self:parseName(), isField = true }
 		elseif text == "[" then
 			self:advance()
-			self:parseExpression()
+			-- The key is kept: `t[k]` is an index like any other, and what it reads with is what
+			-- says whether the value has anything there.
+			local key = self:parseExpression()
 			self:expect("]")
-			link = { isDynamic = true }
+			link = { isDynamic = true, key = key }
 		elseif text == ":" and allowTernaryColon then
 			self:advance()
 			local method = self:parseName()
@@ -86,7 +88,7 @@ local function parsePrefix(self, allowTernaryColon)
 end
 
 ---@return integer
----@return lye.parser.Node[] arguments
+---@return integer[] arguments arena indices, like every other child in the tree
 local function parseArguments(self)
 	local token = self:peek()
 	if self:text(token) == "(" then
@@ -105,16 +107,18 @@ local function parseArguments(self)
 		self:expect(")")
 		return start, args
 	end
+	-- The argument is the index of the node, like every other one: a reader takes an argument out
+	-- of the arena by that index, and a node table put here instead reads as no argument at all.
 	if self:text(token) == "{" then
 		local argStart = self:parseTable()
-		return argStart, { self.nodes[#self.nodes] }
+		return argStart, { self.nodes[#self.nodes].index }
 	end
 
-	-- A string literal used directly as an argument.
+	-- A string literal used directly as an argument: `print[[hello]]`.
 	local start = token.start
 	self:advance()
 	self:emit("string", start, token.stop, { value = stringValue(self:text(token)) })
-	return start, { self.nodes[#self.nodes] }
+	return start, { self.nodes[#self.nodes].index }
 end
 
 ---@return integer

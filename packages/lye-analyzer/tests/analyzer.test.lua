@@ -61,6 +61,148 @@ test.it("gives a table the fields its own writes add", function()
 		"fn(App) -> number", "a declared type is the shape, not the literal")
 end)
 
+test.it("reads the types an ffi.cdef declares", function()
+	-- The header is text in the file, so its types are the file's types: an annotation may name
+	-- them, `ffi.new` answers with one, and a member the header never wrote is reported against it.
+	-- This is what makes a cdef worth declaring rather than a comment.
+	local source = table.concat({
+		'local ffi = require("ffi")\n',
+		'ffi.cdef[[\n',
+		'\ttypedef struct { double x, y; } Vec;\n',
+		'\ttypedef struct Node { struct Node *next; int value; } Node;\n',
+		'\tenum Color { RED, GREEN = 5 };\n',
+		']]\n',
+		'local made = ffi.new("Vec")\n',
+		'local listed = ffi.new("Vec *")\n',
+		'local colored = ffi.new("Color")\n',
+		'made.x = 1\n',
+		'made.y = 2\n',
+		'made.nope = 3\n',
+	}, "")
+	test.equal(typeOf(source, "made"), "Vec", "a struct the cdef declared")
+	test.equal(typeOf(source, "listed"), "Vec", "and a pointer to one is still that struct")
+	test.equal(typeOf(source, "colored"), "Color", "an enum's value is a cdata with a name")
+
+	local messages = {}
+	for _, entry in ipairs(analyzer.analyze(source).diagnostics) do
+		messages[#messages + 1] = entry.message
+	end
+	test.truthy(table.concat(messages, "; "):match("`nope` is not a field of Vec"),
+		"a member the header never declared: " .. table.concat(messages, "; "))
+end)
+
+test.it("types a callback from the C signature it was cast to", function()
+	-- A Lua function handed to `ffi.cast` is called by C, so the values it is given are the ones
+	-- the header declares rather than Lua's: `ptr` is a pointer (not a string) and `size` a
+	-- `size_t`. The result crosses back, so what the C says it returns is what the body must give.
+	local header = table.concat({
+		'local ffi = require("ffi")\n',
+		"ffi.cdef[[\n",
+		"\ttypedef unsigned long size_t;\n",
+		"\ttypedef struct { int x; } Vec;\n",
+		"\ttypedef size_t (*write_cb)(char *ptr, size_t size, size_t nmemb, void *userdata);\n",
+		"\ttypedef void (*visit_cb)(Vec *item, int count);\n",
+		"]]\n",
+	}, "")
+
+	local source = header .. table.concat({
+		'local cb = ffi.cast("write_cb", function(ptr, size, nmemb, _)\n',
+		"\tlocal len = size * nmemb\n",
+		"\treturn len\n",
+		"end)\n",
+		'local visit = ffi.cast("visit_cb", function(item, count)\n',
+		"\treturn item.x + count\n",
+		"end)\n",
+	}, "")
+	test.equal(typeOf(source, "ptr"), "ffi.ptr<ffi.char>",
+		"a char pointer arrives as a pointer to a char")
+	test.equal(typeOf(source, "size"), "ffi.size_t", "a size_t is the cdata type the engine hands over")
+	test.equal(typeOf(source, "nmemb"), "ffi.size_t")
+	test.equal(typeOf(source, "_"), "ffi.ptr<ffi.cdata>", "and a void pointer points at anything")
+	test.equal(typeOf(source, "item"), "Vec", "a struct pointer is the struct the header named")
+	test.equal(typeOf(source, "count"), "number")
+
+	-- Not `require`: this suite runs without the definitions, which is a separate matter from what
+	-- the callback bodies return.
+	local reported = {}
+	for _, entry in ipairs(analyzer.analyze(source).diagnostics) do
+		if entry.message:match("the result") then reported[#reported + 1] = entry.message end
+	end
+	test.equal(#reported, 0, "and the bodies give what the C asks for: " .. table.concat(reported, "; "))
+
+	-- A body that gives the wrong thing is reported against the signature it was cast to.
+	local wrong = header .. 'local cb = ffi.cast("write_cb", function(ptr, size)\n\treturn "nope"\nend)\n'
+	local messages = {}
+	for _, entry in ipairs(analyzer.analyze(wrong).diagnostics) do
+		if entry.message:match("the result") then messages[#messages + 1] = entry.message end
+	end
+	test.equal(messages[1], "the result is declared as ffi.size_t but is assigned string",
+		table.concat(messages, "; "))
+end)
+
+test.it("reports a cdef it could not read where it is written", function()
+	-- The message is worth nothing without a place: the offsets the C parser reports are its own, so
+	-- they are mapped back into the document and the diagnostic lands on the text inside the
+	-- brackets. A header is rarely wrong in only one place, so what could be read is still used.
+	local source = table.concat({
+		'local ffi = require("ffi")\n',
+		'ffi.cdef[[\n',
+		'\tstruct Broken { int x }\n',
+		'\ttypedef struct { int y; } Good;\n',
+		']]\n',
+		'local made = ffi.new("Good")\n',
+	}, "")
+	local reported = {}
+	for _, entry in ipairs(analyzer.analyze(source).diagnostics) do
+		if entry.message:match("^cdef:") then
+			reported[#reported + 1] = {
+				message = entry.message, text = source:sub(entry.start, entry.stop),
+				severity = entry.severity,
+			}
+		end
+	end
+	test.equal(#reported, 1, "one problem, not a crash: " .. #reported)
+	test.equal(reported[1].message, "cdef: expected `;`, found `}`")
+	test.equal(reported[1].text, "}", "the diagnostic is on the text inside the brackets")
+	test.equal(reported[1].severity, 1, "reported as the error it is")
+	test.equal(typeOf(source, "made"), "Good", "and the declaration after it is still read")
+end)
+
+test.it("reads a cdef type named as a string, and leaves the rest alone", function()
+	local source = table.concat({
+		'local ffi = require("ffi")\n',
+		'ffi.cdef[[ typedef struct { int value; } Node; ]]\n',
+		'local known = ffi.new("Node")\n',
+		'local pointer = ffi.new("Node *")\n',
+		'local missing = ffi.new("Nowhere")\n',
+		'local builtin = ffi.new("int[4]")\n',
+	}, "")
+	test.equal(typeOf(source, "known"), "Node")
+	test.equal(typeOf(source, "pointer"), "Node")
+	test.equal(typeOf(source, "missing"), "unknown", "a name the header never declared")
+	-- `ffi.new("int[4]")` is not a class the cdef made, but it is not nothing either: the mapping
+	-- names it, and that is what lets the array be indexed and the length be known.
+	test.equal(typeOf(source, "builtin"), "ffi.array<ffi.int, 4>")
+end)
+
+test.it("compares a string argument by the value it spells", function()
+	-- A long string is the same argument as a quoted one: reading the source instead made
+	-- `f([[read]])` a type named after its own brackets, which matched no parameter at all.
+	local source = table.concat({
+		'---@param mode "read"|"write"\n',
+		"local function open_(mode) end\n",
+		'open_("read")\n',
+		"open_([[write]])\n",
+		'open_("nope")\n',
+	}, "")
+	local messages = {}
+	for _, entry in ipairs(analyzer.analyze(source).diagnostics) do
+		if not entry.message:match("^unused") then messages[#messages + 1] = entry.message end
+	end
+	test.equal(#messages, 1, table.concat(messages, "; "))
+	test.equal(messages[1], 'open_ expects "read"|"write", got "nope"')
+end)
+
 test.it("evolves a name that is assigned after its declaration", function()
 	local source = 'local x = 5\nx = "string"\nlocal y = x\n'
 	local result = analyzer.analyze(source)
@@ -361,7 +503,7 @@ test.it("narrows away nil inside a truthiness branch", function()
 	local source = "---@type string?\nlocal y = \"s\"\nif y then\n\tprint(y)\nend\n"
 	local inside = assert(source:find("print(y)", 1, true))
 	test.equal(typeAtOffset(source, "y", inside), "string", "nil is not possible in the branch")
-	test.equal(typeAtOffset(source, "y", #source), "nil|string", "and possible again after it")
+	test.equal(typeAtOffset(source, "y", #source), "string?", "and possible again after it")
 end)
 
 test.it("narrows to nil in the else branch", function()
@@ -455,7 +597,7 @@ end)
 test.it("keeps a repeat body un-narrowed for a truthiness test", function()
 	-- The body runs before the test, so only a comparison says anything on the first pass.
 	local source = "---@type string?\nlocal y = \"s\"\nrepeat\n\tprint(y)\nuntil y\n"
-	test.equal(typeAtOffset(source, "y", offsetOf(source, "print")), "nil|string")
+	test.equal(typeAtOffset(source, "y", offsetOf(source, "print")), "string?")
 end)
 
 test.it("narrows an elseif branch by the conditions before it", function()
@@ -553,7 +695,7 @@ end)
 
 test.it("asserts nothing where a disjunction holds", function()
 	local source = "---@type string?\nlocal x = \"s\"\nif x == nil or x == nil then\n\tprint(x)\nend\n"
-	test.equal(typeAtOffset(source, "x", offsetOf(source, "print")), "nil|string",
+	test.equal(typeAtOffset(source, "x", offsetOf(source, "print")), "string?",
 		"either side could have held, so neither is certain")
 end)
 
@@ -586,7 +728,7 @@ test.it("never lets an inner declaration inherit an outer narrowing", function()
 	local result = analyzer.analyze(source)
 	local at = offsetOf(source, "print(x)")
 	local inner = assert(analyzer.lookupAt(result, "x", at), "the inner one resolves here")
-	test.equal(types.display(analyzer.typeAt(result, inner, at)), "nil|string",
+	test.equal(types.display(analyzer.typeAt(result, inner, at)), "string?",
 		"a different variable, so the outer branch says nothing about it")
 	test.equal(typeAtOffset(source, "x", at), "string", "and the outer one is still narrowed")
 end)

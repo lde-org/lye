@@ -43,6 +43,88 @@ local DEVIATIONS = {
 			to = "---@generic T...\n---@param list { [integer]: T }\n---@return T...\n---@nodiscard\nfunction unpack(list) end",
 		},
 	},
+	ffi = {
+		{
+			-- A Lua string is what `ffi.string` casts from: the engine takes one directly, which is
+			-- how `ffi.string("abc")` answers with itself.
+			from = "---@param ptr  any",
+			to = "---@param ptr  ffi.cdata*|string",
+		},
+		{
+			-- `ffi.copy(dst, src, len)`: the destination is written to, so it is a cdata; the
+			-- source may be a Lua string, which needs no length of its own.
+			from = "---@param dst any\n---@param src any\n---@param len integer",
+			to = "---@param dst ffi.cdata*\n---@param src ffi.cdata*|string\n---@param len integer",
+		},
+		{
+			from = "---@overload fun(dst: any, str: string)",
+			to = "---@overload fun(dst: ffi.cdata*, str: string)",
+		},
+		{
+			-- `ffi.fill` writes bytes into memory, so there is nothing else it could fill.
+			from = "---@param dst any\n---@param len integer",
+			to = "---@param dst ffi.cdata*\n---@param len integer",
+		},
+		{
+			-- The C scalars are named types: a reader annotating a header wants `ffi.size_t`, and
+			-- the metamethods are what makes arithmetic on one legal to a type checker.
+			from = "---@class ffi.VLS*:   userdata",
+			to = "---@class ffi.VLS*:   userdata\n" .. [[
+
+---A C number: cdata the engine gives arithmetic and the comparisons to. A value of one of the
+---scalar types below is one of these, and a reader of `size * nmemb` is owed the metamethods that
+---make that arithmetic legal rather than being told the operands are not numbers.
+---@class ffi.cnum*: ffi.cdata
+---@field __add fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __sub fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __mul fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __div fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __mod fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __pow fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __unm fun(self: ffi.cnum*): ffi.cnum*
+---@field __eq fun(self: ffi.cnum*, other: any): boolean
+---@field __lt fun(self: ffi.cnum*, other: any): boolean
+---@field __le fun(self: ffi.cnum*, other: any): boolean
+---@field __concat fun(self: ffi.cnum*, other: any): string
+---@field __tostring fun(self: ffi.cnum*): string
+
+---The C scalars by name, so a header's types can be written down. A 64-bit one is handed over as a
+---cdata and a narrower one as a Lua number — that is what the engine does, and it is why a `size_t`
+---is an `ffi.size_t` while an `int` is a `number`.
+---@class ffi.char: ffi.cnum*
+---@class ffi.short: ffi.cnum*
+---@class ffi.int: ffi.cnum*
+---@class ffi.long: ffi.cnum*
+---@class ffi.longlong: ffi.cnum*
+---@class ffi.unsigned: ffi.cnum*
+---@class ffi.ulong: ffi.cnum*
+---@class ffi.ulonglong: ffi.cnum*
+---@class ffi.int8_t: ffi.cnum*
+---@class ffi.int16_t: ffi.cnum*
+---@class ffi.int32_t: ffi.cnum*
+---@class ffi.int64_t: ffi.cnum*
+---@class ffi.uint8_t: ffi.cnum*
+---@class ffi.uint16_t: ffi.cnum*
+---@class ffi.uint32_t: ffi.cnum*
+---@class ffi.uint64_t: ffi.cnum*
+---@class ffi.size_t: ffi.cnum*
+---@class ffi.ssize_t: ffi.cnum*
+---@class ffi.ptrdiff_t: ffi.cnum*
+---@class ffi.intptr_t: ffi.cnum*
+---@class ffi.uintptr_t: ffi.cnum*
+---@class ffi.float: ffi.cnum*
+---@class ffi.double: ffi.cnum*
+---@class ffi.wchar_t: ffi.cnum*
+---@class ffi.bool: ffi.cdata
+]],
+		},
+		{
+			-- The one function whose argument and result are the same piece of data: `ffi.gc`
+			-- hands back the cdata it was given, so a caller keeps the type it had.
+			from = "---@param cdata     ffi.cdata*\n---@param finalizer? function\n---@return ffi.cdata* cdata",
+			to = "---@generic T: ffi.cdata*\n---@param cdata T\n---@param finalizer? fun(obj: T)\n---@return T cdata",
+		},
+	},
 }
 
 --- What the type system needs to describe Lua itself rather than the library Lua ships with.

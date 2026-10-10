@@ -13,6 +13,24 @@ local function annotation(source, tag)
 	return doc.first(doc.parse(source), tag)
 end
 
+test.it("reads an annotation with a space before the tag", function()
+	-- `--- @class` is how a writer who thinks of the annotation as prose writes it, and LuaLS reads
+	-- it: insisting on the tight form would silently ignore half of someone's file.
+	local found = annotation("--- @type string\nlocal x = 5", "type")
+	test.truthy(found, "the tag is read")
+	test.equal(found.type, "string")
+
+	local file = doc.parse("--- @class Point\n--- @field x number\n--- @field y number\n")
+	test.equal(#file.annotations, 3, "every line of the run")
+	test.equal(file.annotations[1].tag, "class")
+	test.equal(file.annotations[1].name, "Point")
+	test.equal(file.annotations[2].tag, "field")
+
+	-- Prose that mentions one is prose: the dashes have to start the annotation, not appear in it.
+	local prose = doc.parse("--- this is @me talking\nlocal x = 1\n")
+	test.equal(#prose.annotations, 0)
+end)
+
 test.it("reads a type annotation", function()
 	local found = annotation("---@type string\nlocal x = 5", "type")
 	test.truthy(found)
@@ -114,7 +132,7 @@ test.it("reads a function signature", function()
 	test.equal(doctype.display(doctype.parse("fn(a: number, b: string) -> boolean")),
 		"fn(number, string) -> boolean")
 	test.equal(doctype.display(doctype.parse("fn() -> nil")), "fn() -> nil")
-	test.equal(doctype.display(doctype.parse("fn(a?: number) -> nil")), "fn(nil|number) -> nil")
+	test.equal(doctype.display(doctype.parse("fn(a?: number) -> nil")), "fn(number?) -> nil")
 	test.equal(doctype.display(doctype.parse("fn(a: number, ...) -> nil")), "fn(number, ...) -> nil")
 	test.equal(doctype.display(doctype.parse("fun(a: number): string")), "fn(number) -> string",
 		"the spelling LuaLS uses reads the same")
@@ -174,9 +192,9 @@ test.it("keeps an optional name unknown rather than making it nil", function()
 	-- included: collapsing it to nil would report every argument passed to it.
 	local unknown = function() return doctype.UNKNOWN_TYPE end
 	test.equal(doctype.display(doctype.parse("T?", unknown)), "unknown")
-	test.equal(doctype.display(doctype.parse("number?", unknown)), "nil|number")
-	test.equal(doctype.display(doctype.parse("T[]?", unknown)), "nil|unknown[]")
-	test.equal(doctype.display(doctype.parse("nil|string[]")), "nil|string[]",
+	test.equal(doctype.display(doctype.parse("number?", unknown)), "number?")
+	test.equal(doctype.display(doctype.parse("T[]?", unknown)), "unknown[]?")
+	test.equal(doctype.display(doctype.parse("nil|string[]")), "string[]?",
 		"a suffix belongs to its own member rather than to the union")
 end)
 

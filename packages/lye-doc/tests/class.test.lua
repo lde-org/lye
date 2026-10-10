@@ -195,8 +195,14 @@ test.it("keeps the name of a parameter that carries a limit", function()
 end)
 
 test.it("reads a class whose name carries the internal marker", function()
+	-- The marker says how a name is used, not what it is called, so the class is the one named
+	-- `file`: a definition writing `ffi.cdata*` and a reader writing `ffi.cdata` have to mean the
+	-- same class, or a value of one is not a value of the other.
 	local namespace = read("---@class file*\nlocal file = {}\n")
-	test.equal(namespace.classes["file*"] ~= nil, true, "`file*` is a class the definitions declare")
+	test.equal(namespace.classes["file"] ~= nil, true, "`file*` is a class the definitions declare")
+	test.equal(namespace.classes["file*"], nil, "and it is not a second class of its own")
+	test.equal(classes.resolve(namespace, "file*") ~= nil, true, "either spelling resolves")
+	test.equal(classes.resolve(namespace, "file") ~= nil, true)
 end)
 
 test.it("reads a const parameter and what limits it", function()

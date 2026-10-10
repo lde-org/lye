@@ -10,6 +10,7 @@ local json = require("lye-json")
 local definitionsIndex = require("lye-lsp.definitions")
 local Parser = require("lye-parser")
 local analyzer = require("lye-analyzer")
+local cdef = require("lye-cdef")
 local KIND = require("lye-lexer").KIND
 local types = require("lye-doc.type")
 
@@ -121,8 +122,22 @@ end
 ---@param self lye.Server
 ---@param name string
 ---@return string?
-function Lye:moduleFile(name)
+function Lye:moduleFile(name, from)
 	local root = self.server.rootPath
+
+	-- A `lye.json` beside a package or a workspace adds search paths of its own, in the shape
+	-- `package.path` uses: a pattern per line with `?` where the module name goes, relative to the
+	-- file that wrote it. It is asked first because it is written down: a project that says where
+	-- its modules are is answered before anything is guessed.
+	for _, pattern in ipairs(self:requirePaths(from)) do
+		local path = pattern:gsub("%?", (name:gsub("%%.", "/")))
+		local handle = io.open(path, "rb")
+		if handle then
+			handle:close()
+			return path
+		end
+	end
+
 	if root then
 		local tail = (name:gsub("%.", "/"))
 		local candidates = {
@@ -136,6 +151,19 @@ function Lye:moduleFile(name)
 			candidates[#candidates + 1] = root .. "/packages/" .. head .. "/src/" .. under .. ".lua"
 			candidates[#candidates + 1] = root .. "/packages/" .. head .. "/src/" .. under .. "/init.lua"
 		end
+
+		-- What lde itself resolves against. `lde run -C <package>` puts exactly two patterns on
+		-- `package.path` — `<package>/target/?.lua` and `<package>/target/?/init.lua` — and
+		-- `target/` holds a link per dependency, so one rule answers `require("lye-doc.type")` (a
+		-- sibling package) and `require("lye-lsp.language")` (the package's own module) alike. The
+		-- names above are tried first, so a module living in `src/` is found where it is written
+		-- rather than through the link `target/` makes to it.
+		local owner = self:packageRoot(from)
+		if owner then
+			candidates[#candidates + 1] = owner .. "/target/" .. tail .. ".lua"
+			candidates[#candidates + 1] = owner .. "/target/" .. tail .. "/init.lua"
+		end
+
 		for _, path in ipairs(candidates) do
 			local handle = io.open(path, "rb")
 			if handle then
@@ -154,14 +182,73 @@ function Lye:moduleFile(name)
 	if builtin then return builtin.path end
 end
 
+--- The directory of the lde package a document belongs to: the nearest one above it that declares
+--- itself with an `lde.json`. That file is what makes the layout knowable — the package is the unit
+--- lde resolves within, and everything it can `require` is linked into that package's `target/`.
+---@param self lye.Server
+---@param uri string?
+---@return string?
+function Lye:packageRoot(uri)
+	local root = self.server.rootPath
+	if not uri or not root then return nil end
+	local path = uri:gsub("^file://", "")
+	local at = path:match("^(.*)/[^/]+$")
+	while at and #at >= #root do
+		if self.packageRoots and self.packageRoots[at] then return self.packageRoots[at] or nil end
+		local handle = io.open(at .. "/lde.json", "rb")
+		if handle then
+			handle:close()
+			self.packageRoots = self.packageRoots or {}
+			self.packageRoots[at] = at
+			return at
+		end
+		self.packageRoots = self.packageRoots or {}
+		self.packageRoots[at] = false
+		at = at:match("^(.*)/[^/]+$")
+	end
+end
+
+--- The search paths a document's project declares, each with `?` where the module name goes. Two
+--- files are read, the package's and the workspace's, because a monorepo may have its own idea of
+--- where a shared library lives and a package may have another.
+---@param self lye.Server
+---@param uri string?
+---@return string[]
+function Lye:requirePaths(uri)
+	local out = {}
+	local seen = {}
+	local function read(dir)
+		if not dir or seen[dir] then return end
+		seen[dir] = true
+		local handle = io.open(dir .. "/lye.json", "rb")
+		if not handle then return end
+		local written = handle:read("*a")
+		handle:close()
+		local ok, config = pcall(require("lye-json").decode, written)
+		if not ok or type(config) ~= "table" then return end
+		for _, pattern in ipairs(config.requirePaths or {}) do
+			if type(pattern) == "string" and pattern ~= "" then
+				-- A pattern is written the way `package.path` writes one; an absolute one is left
+				-- alone and a relative one is read from the file that declared it.
+				out[#out + 1] = pattern:sub(1, 1) == "/" and pattern or (dir .. "/" .. pattern)
+			end
+		end
+	end
+	read(self:packageRoot(uri))
+	read(self.server.rootPath)
+	return out
+end
+
 --- What `require("name")` is: the type the module file returns, analysed once and kept until its
 --- text changes. A module that requires the file being analysed would come back around, so a name
 --- already in progress answers nothing rather than recursing.
 ---@param self lye.Server
 ---@param name string
+---@param from string? the document the require is written in, which is what says which package it
+--- resolves within
 ---@return lye.doc.Type?
-function Lye:moduleType(name)
-	local path = self:moduleFile(name)
+function Lye:moduleType(name, from)
+	local path = self:moduleFile(name, from)
 	if not path then return nil end
 	self.modules = self.modules or {}
 	self.requiring = self.requiring or {}
@@ -183,8 +270,10 @@ function Lye:moduleType(name)
 	if cached and cached.text == written then return cached.type end
 
 	self.requiring[path] = true
+	-- The module's own `require`s resolve within *its* package: a dependency's file is a document
+	-- of that package, and what it can reach is what lde linked into that package's `target/`.
 	local names = analyzer.analyze(written, PRELUDE, self:declaredTypes(), function(inner)
-		return self:moduleType(inner)
+		return self:moduleType(inner, "file://" .. path)
 	end)
 	self.requiring[path] = nil
 	self.modules[path] = { text = written, type = names.module }
@@ -215,7 +304,7 @@ function Lye:analyze(uri)
 	-- comments this needs. Parsing the same text a second time is a third of the cost of a
 	-- keystroke on a large file, for the same tree.
 	local names = analyzer.analyze(document.text, PRELUDE, self:declaredTypes(), function(name)
-		return self:moduleType(name)
+		return self:moduleType(name, uri)
 	end)
 	local result = names.parser
 	self.analysis[uri] = result
@@ -468,7 +557,7 @@ local function signatureFor(names, node, offset)
 	if not node.field then return nil end
 
 	-- A field: the type it holds is the identity the definitions recorded it under.
-	local held = typeOfExpression(names, node.index, offset)
+	local held = typeOfExpression(names, node.key or node.index, offset)
 	if not held then
 		local base = typeOfExpression(names, node.target, offset)
 		if base then held = types.indexResult(base, node.field) end
@@ -833,6 +922,19 @@ function Lye:onDefinition(params)
 	return { uri = target.uri, range = self:rangeIn(target) }
 end
 
+--- The tokens of a `ffi.cdef` block, parsed once and kept: a header is small, and they are asked
+--- for on every edit.
+---@param self lye.Server
+---@param text string
+---@return { start: integer, stop: integer, kind: string }[]
+function Lye:cdefSpans(text)
+	local cached = self.cdefCache
+	if cached and cached.text == text then return cached.spans end
+	local spans = cdef.spans(cdef.parse(text))
+	self.cdefCache = { text = text, spans = spans }
+	return spans
+end
+
 ---@param self lye.Server
 ---@return table
 function Lye:onSemanticTokens(params)
@@ -883,31 +985,71 @@ function Lye:onSemanticTokens(params)
 	local lastLine, lastStart = 0, 0
 	local isFirst = true
 
-	--- Tokens are relative to the one before, and a token never spans a line.
+	--- Tokens are relative to the one before, and a token never spans a line. A comment or a string
+	--- that does is emitted as one token per line it covers: emitting it whole is a protocol
+	--- violation, and a client that clips it colours the first line and leaves the rest — which is
+	--- what a multiline comment and an `ffi.cdef` block both looked like.
 	---@param spanStart integer
 	---@param spanStop integer
 	---@param target string
 	---@param modifiers integer?
 	local function emitSpan(spanStart, spanStop, target, modifiers)
 		if spanStop < spanStart then return end
-		local line, start = position.toPosition(text, index, spanStart, encoding)
-		local stopCharacter = select(2, position.toPosition(text, index, spanStop + 1, encoding))
-		local deltaLine = isFirst and line or (line - lastLine)
-		local deltaStart = isFirst and start or (deltaLine == 0 and (start - lastStart) or start)
+		local from = spanStart
+		while from <= spanStop do
+			local newline = text:find("\n", from, true)
+			local to = (newline and newline - 1 <= spanStop) and (newline - 1) or spanStop
+			if to >= from then
+				local line, start = position.toPosition(text, index, from, encoding)
+				local stopCharacter = select(2, position.toPosition(text, index, to, encoding))
+				local deltaLine = isFirst and line or (line - lastLine)
+				local deltaStart = isFirst and start or (deltaLine == 0 and (start - lastStart) or start)
 
-		count += 1
-		data[count] = deltaLine
-		count += 1
-		data[count] = deltaStart
-		count += 1
-		data[count] = math.max(stopCharacter - start, 1)
-		count += 1
-		data[count] = TOKEN_TYPE[target]
-		count += 1
-		data[count] = modifiers or 0
+				count += 1
+				data[count] = deltaLine
+				count += 1
+				data[count] = deltaStart
+				count += 1
+				data[count] = math.max(stopCharacter - start + 1, 1)
+				count += 1
+				data[count] = TOKEN_TYPE[target]
+				count += 1
+				data[count] = modifiers or 0
 
-		lastLine, lastStart, isFirst = line, start, false
+				lastLine, lastStart, isFirst = line, start, false
+			end
+			if not newline or newline > spanStop then break end
+			from = newline + 1
+		end
 	end
+
+	-- The text of an `ffi.cdef` call is C, and it is coloured from *our* parse of it rather than by
+	-- asking the editor to inject a C grammar: an injection needs that grammar installed, it would
+	-- not know LuaJIT's dialect even then, and a header is more useful coloured by what the names in
+	-- it are — the struct a program uses reads as a class, its members as fields.
+	local cdefSpans = {}
+	for _, node in ipairs(result.nodes) do
+		if node.kind == "call" and node.args and node.args[1] then
+			local target = node.target and result.nodes[node.target]
+			local field = node.field or (target and target.field)
+			if field == "cdef" then
+				local argument = result.nodes[node.args[1]]
+				if argument and argument.kind == "string" and type(argument.value) == "string" then
+					cdefSpans[argument.start] = {
+						spans = self:cdefSpans(argument.value),
+						from = cdef.textStart(text, argument.start, argument.stop),
+					}
+				end
+			end
+		end
+	end
+
+	-- What the parser calls a token, in the vocabulary this server advertises.
+	local CDEF_KIND = {
+		keyword = "keyword", type = "type", class = "class", member = "property",
+		constant = "property", ["function"] = "function", number = "number", variable = "variable",
+		comment = "comment",
+	}
 
 	--- A doc comment is emitted as the comment it is, with the tags, parameter names and types
 	--- inside it marked out. The spans are cut at newlines because a token may not cross one.
@@ -1045,7 +1187,26 @@ function Lye:onSemanticTokens(params)
 			elseif token.kind == KIND.name then
 				target = kinds[token.start] or "variable"
 			end
-			if target then emitSpan(token.start, token.stop, target) end
+			local declared = cdefSpans[token.start]
+			if declared then
+				-- The brackets are what says this is a string at all, so they keep that colour
+				-- even though nothing between them is coloured as one.
+				-- The delimiter is what the content started after, and a long string is closed the
+				-- way it was opened: `[[` and `]]`, `[==[` and `]==]`. The three go out in the order
+				-- they appear, because a token's position is written as the distance from the one
+				-- before it: out of order, every token after it lands in the wrong place.
+				local width = declared.from - token.start
+				emitSpan(token.start, declared.from - 1, "string")
+				for _, span in ipairs(declared.spans) do
+					local kind = CDEF_KIND[span.kind]
+					if kind then
+						emitSpan(declared.from + span.start - 1, declared.from + span.stop - 1, kind)
+					end
+				end
+				emitSpan(token.stop - width + 1, token.stop, "string")
+			elseif target then
+				emitSpan(token.start, token.stop, target)
+			end
 		end
 	end
 
@@ -1235,7 +1396,8 @@ function Lye:onCompletion(params)
 	-- Inside a `---@` comment the writer is naming a type rather than a value.
 	local lineStart = source:sub(1, offset - 1):match(".*()\n") or 1
 	local before = source:sub(lineStart, offset - 1)
-	if before:match("^%s*%-%-%-@") then return self:completeTypes(uri) end
+	-- The pattern the doc reader uses, so `--- @param` offers types exactly where `---@param` does.
+	if before:match("^%s*" .. doc.TAG_PATTERN) then return self:completeTypes(uri) end
 
 	local target, prefix, isMethod, keyFrom, quote = accessAt(names, source, offset)
 	if target then
@@ -1565,6 +1727,27 @@ end
 --- cannot see for themselves.
 ---@param self lye.Server
 ---@return table
+--- How long an inlay hint may be. A table of twenty fields and a string of two hundred characters
+--- are both correct answers to "what is this", and neither is readable beside a name.
+local HINT_LIMIT = 32
+
+--- The type an inlay hint shows, cut to fit. The hover still has all of it, so a hint only has to
+--- say enough to be worth reading: what is kept is the beginning, cut back to a separator where
+--- there is one rather than through the middle of a word.
+---@param type lye.doc.Type
+---@return string
+local function hintText(type)
+	local shown = types.display(type)
+	if #shown <= HINT_LIMIT then return shown end
+	local cut = shown:sub(1, HINT_LIMIT)
+	-- A string value keeps its shape: `"a very long messa…"` still reads as a string.
+	if shown:sub(1, 1) == '"' then return cut .. '…"' end
+	local edge = cut:match("^.*[,;{}]")
+	if edge and #edge >= HINT_LIMIT / 2 then return edge .. " …" end
+	local word = cut:match("^.*%s")
+	return (word or cut) .. "…"
+end
+
 function Lye:onInlayHint(params)
 	local uri = params.textDocument?.uri
 	local document = uri and self.server.documents:get(uri)
@@ -1584,7 +1767,7 @@ function Lye:onInlayHint(params)
 		local isFunction = value ~= nil and value.kind == "function"
 		if not variable.declared and not isFunction and declaration.start >= from and declaration.stop <= to then
 			local held = analyzer.typeAt(names, variable, declaration.stop)
-			local shown = types.display(held)
+			local shown = hintText(held)
 			if shown ~= "unknown" and shown ~= "any" then
 				out[#out + 1] = {
 					position = select(2, position.toPosition(text, index, declaration.stop + 1, encoding)) and {

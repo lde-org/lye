@@ -1,0 +1,6 @@
+{
+	"$schema": "https://raw.githubusercontent.com/lde-org/lde/master/schemas/lde.schema.json",
+	"name": "lye-cdef",
+	"version": "0.1.0",
+	"description": "C declaration parser for LuaJIT ffi.cdef"
+}

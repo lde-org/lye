@@ -217,6 +217,16 @@ local function substitute(text, params, args)
 	return out
 end
 
+--- A class or alias name without the marker an annotation may carry: `ffi.cdata*` is the class
+--- `ffi.cdata`, and `file*` the class `file`. The marker says how a name is used rather than what it
+--- is called, so a name written with it in one place and without it in another has to be one type —
+--- which is how `ffi.gc` came to reject the very cdata it had been handed.
+---@param name string
+---@return string
+local function bareName(name)
+	return (name:gsub("%s*%*$", ""))
+end
+
 --- The class a name refers to, with whatever arguments were written.
 ---@param namespace lye.doc.Namespace
 ---@param text string
@@ -224,7 +234,7 @@ end
 ---@return string[] args as written, empty when none were
 function classes.resolve(namespace, text)
 	local name, argsText = splitGeneric(text)
-	local found = namespace.classes[name]
+	local found = namespace.classes[bareName(name)]
 	if not found then return nil end
 	local args = argsText and classes.splitList(argsText) or {}
 	return found, args
@@ -297,8 +307,14 @@ function classes.resolver(namespace)
 				-- A field a value may leave out is nil as well as what it says, which is what the
 				-- `?` means: reading it gives the type or nil.
 				if field.optional then held = types.union({ held, types.NIL_TYPE }) end
-				classType.fields[name] = held
-				classType.visibility[name] = field.visibility
+				local key = name:match("^%[([^%]]+)%]$")
+				if key then
+					-- An index signature, kept where a read with a computed key can find it.
+					classType.indexed = { key = key, type = held }
+				else
+					classType.fields[name] = held
+					classType.visibility[name] = field.visibility
+				end
 			end
 			for name, field in pairs(evolved[found.name] or {}) do classType.fields[name] = field end
 			if found.parent then
@@ -313,7 +329,7 @@ function classes.resolver(namespace)
 		-- declares, however far below the alias.
 		local aliasName, argsText = splitGeneric(text)
 		aliasName = (aliasName:gsub("%s+$", ""))
-		local alias = namespace.aliases[aliasName]
+		local alias = namespace.aliases[bareName(aliasName)]
 		if alias and not active[aliasName] then
 			active[aliasName] = true
 			local body = alias.body
@@ -360,12 +376,23 @@ function classes.read(file)
 				name = name, params = params, parent = parent, fields = {}, consts = consts,
 				constraints = constraints,
 			}
-			namespace.classes[name] = current
+			namespace.classes[bareName(name)] = current
 			visibility = "public"
 		elseif annotation.tag == "field" then
 			if current then
-				local field = readField(annotation, visibility)
-				if field then current.fields[#current.fields + 1] = field end
+				-- `---@field [integer] T` is an index signature rather than a field: what a value
+				-- indexed with that kind of key gives. The name slot holds a bracket, which the
+				-- field reader has no name for, so it is read from the body and kept under the
+				-- bracketed name for the resolver to recognise.
+				local key, held = (annotation.text or ""):match("^%s*%[([^%]]+)%]%s*(.+)$")
+				if key then
+					current.fields[#current.fields + 1] = {
+						name = "[" .. (key:gsub("%s+$", "")) .. "]", type = held, visibility = visibility,
+					}
+				else
+					local field = readField(annotation, visibility)
+					if field then current.fields[#current.fields + 1] = field end
+				end
 			end
 		elseif annotation.tag == "private" or annotation.tag == "protected" or annotation.tag == "public" then
 			visibility = annotation.tag
@@ -375,8 +402,12 @@ function classes.read(file)
 			-- resolved here: it may name a class the file declares further down, and a parameter
 			-- only means something once an argument is given.
 			if annotation.name then
-				local params, body, consts, constraints = readAlias(annotation.type or "any")
-				namespace.aliases[annotation.name] = {
+				-- The marker after a name is not part of the body: `---@alias ffi.ct* ffi.ctype*|...`
+				-- splits the name off at the star and leaves the star in front of the text that
+				-- follows, which read as a first member of `*`.
+				local written = (annotation.type or "any"):gsub("^%s*%*%s*", "")
+				local params, body, consts, constraints = readAlias(written)
+				namespace.aliases[bareName(annotation.name)] = {
 					params = params, body = body, consts = consts, constraints = constraints,
 				}
 			end

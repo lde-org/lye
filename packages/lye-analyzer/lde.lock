@@ -1,5 +1,8 @@
 {
 	"dependencies": {
+		"lye-cdef": {
+			"path": "../lye-cdef"
+		},
 		"lye-doc": {
 			"path": "../lye-doc"
 		},
@@ -10,6 +13,6 @@
 			"path": "../lye-parser"
 		}
 	},
-	"manifestHash": "bfdd96b7fac6ac35",
+	"manifestHash": "a8ad796bea069aff",
 	"version": "1"
 }

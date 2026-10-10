@@ -59,6 +59,11 @@ local function splitBody(body)
 	return body, nil
 end
 
+--- Where a tag begins on a line: `---@param`, and `--- @param` too. The space is what a writer
+--- puts there when they think of the annotation as prose, and LuaLS reads it, so a reader that
+--- insisted on the tight form would silently ignore half of someone's file.
+doc.TAG_PATTERN = "%-%-%-[ \t]*@"
+
 ---@param comment string
 ---@param start integer
 ---@param stop integer
@@ -90,7 +95,7 @@ local function parse(comment, start, stop)
 	local rest, commentText = splitBody(trim(body:sub(#tag + 2)))
 	-- A tag cannot be part of a type, so a second annotation sharing the line is where this one
 	-- ends even if the line was not split before it got here.
-	local nextTag = rest:find("---@", 1, true)
+	local nextTag = rest:find(doc.TAG_PATTERN)
 	if nextTag then rest = trim(rest:sub(1, nextTag - 1)) end
 	local annotation = {
 		tag = tag,
@@ -174,12 +179,12 @@ function doc.parse(source, tokens)
 				-- A line of prose may quote an annotation — `-- write \`---@param a Vec\`` — and that
 				-- is a sentence, not a tag. Only a tag the comment starts with, or one following
 				-- another tag on the same line, is read as one.
-				local at = line:find("---@", 1, true)
+				local at = line:find(doc.TAG_PATTERN)
 				if at and not line:sub(1, at - 1):match("^%s*$") and not line:sub(1, at - 1):match("^%s*%-%-%-?%s*$") then
 					at = nil
 				end
 				while at do
-					local nextAt = line:find("---@", at + 4, true)
+					local nextAt = line:find(doc.TAG_PATTERN, at + 4)
 					local piece = line:sub(at, nextAt and nextAt - 1 or #line)
 					local found = parse(piece, index + at - 1, index + at - 1 + #piece - 1)
 					if found then annotations[#annotations + 1] = found end

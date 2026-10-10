@@ -29,21 +29,24 @@ end
 
 ---@param requests table[]
 ---@param source string?
+---@param root string? a workspace to open, when what is being tested is where a `require` looks
+---@param uri string? the document to open, for the same reason
 ---@return table<string, any> byId
-local function run(requests, source)
+local function run(requests, source, root, uri)
+	uri = uri or "file:///f.lua"
 	local handle = assert(io.open(INPUT, "wb"))
 	handle:write(frame({
 		jsonrpc = "2.0",
 		id = 1,
 		method = "initialize",
-		params = { capabilities = {} },
+		params = { capabilities = {}, rootUri = root and ("file://" .. root) or nil },
 	}))
 	handle:write(frame({
 		jsonrpc = "2.0",
 		method = "textDocument/didOpen",
 		params = {
 			textDocument = {
-				uri = "file:///f.lua", languageId = "lua", version = 1, text = source or SOURCE,
+				uri = uri, languageId = "lua", version = 1, text = source or SOURCE,
 			},
 		},
 	}))
@@ -69,6 +72,12 @@ local function run(requests, source)
 	end
 	return byId
 end
+
+--- The token types the legend advertises, by their index in it, so a test can name what it found.
+local TYPES = {
+	"keyword", "string", "number", "comment", "operator", "variable", "function", "parameter",
+	"type", "namespace", "class", "property", "method",
+}
 
 ---@param id integer
 ---@param method string
@@ -128,6 +137,176 @@ test.it("types a call of a definition, not the literal it was handed", function(
 	local value = results["2"] and results["2"].contents and results["2"].contents.value or ""
 	test.truthy(value:match("number"), "n is a number: " .. value)
 	test.equal(value:match("%-3") ~= nil, false, "and not the literal it was called with")
+end)
+
+test.it("keeps every semantic token inside one line", function()
+	-- A token may not cross a line break. One emitted whole across a comment or a long string is a
+	-- protocol violation, and a client that clips it colours the first line and leaves the rest.
+	local source = table.concat({
+		"--[[ a comment\n",
+		"\tspanning lines ] ]\n",
+		"local s = [[\n",
+		"\tlong string\n",
+		"]]\n",
+	}, "")
+	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
+	local data = results["2"].data
+	test.truthy(#data > 0, "there are tokens")
+
+	local lines = {}
+	for line in (source .. "\n"):gmatch("([^\n]*)\n") do lines[#lines + 1] = line end
+	local line, character = 0, 0
+	local covered = {}
+	for index = 1, #data, 5 do
+		-- A token is written as the distance from the one before it, so the stream is in document
+		-- order: a negative step would put every token after it in the wrong place.
+		test.truthy(data[index] >= 0, "a token does not move backwards a line")
+		test.truthy(data[index] ~= 0 or data[index + 1] >= 0, "nor backwards within one")
+		line += data[index]
+		character = data[index] == 0 and (character + data[index + 1]) or data[index + 1]
+		local length = data[index + 2]
+		test.truthy(character + length <= #lines[line + 1],
+			string.format("token on line %d ends inside it", line + 1))
+		covered[line + 1] = true
+	end
+	for _, expected in ipairs({ 1, 2, 3, 4, 5 }) do
+		test.truthy(covered[expected], "line " .. expected .. " is covered by a token")
+	end
+end)
+
+test.it("keeps an inlay hint short", function()
+	-- A table of six fields and a sentence-length string are both correct answers to "what is this",
+	-- and neither is readable beside a name. The hover still has the whole type.
+	local source = table.concat({
+		"local small = 1\n",
+		"local big = { alpha = 1, beta = 2, gamma = 3, delta = 4, epsilon = 5, zeta = 6 }\n",
+		'local long = "a string long enough to be worth cutting down to size"\n',
+	}, "")
+	local results = run({ request(2, "textDocument/inlayHint", { line = 0, character = 0 }) }, source)
+	local hints = results["2"]
+	test.truthy(#hints >= 3, "a hint per name")
+	for _, hint in ipairs(hints) do
+		test.truthy(#hint.label <= 40, "a hint is short: " .. hint.label)
+	end
+end)
+
+test.it("refuses to index a type that holds nothing at a key", function()
+	-- `ffi.array<T>` and `ffi.ptr<T>` declare an index signature and nothing else does, so a number
+	-- indexing a `size_t` or a struct is the mistake the C types exist to catch. A field read and a
+	-- string key are not asked about: `p.x` and `p["x"]` are how a cdata is written.
+	local source = table.concat({
+		'local ffi = require("ffi")\n',
+		"ffi.cdef[[\n",
+		"\ttypedef unsigned long size_t;\n",
+		"\ttypedef struct { int x; } Vec;\n",
+		"]]\n",
+		'local numbers = ffi.new("int[4]")\n',
+		"local first = numbers[0]\n",
+		'local size = ffi.new("size_t")\n',
+		"local wrong = size[1]\n",
+		'local v = ffi.new("Vec")\n',
+		"local vWrong = v[1]\n",
+		"local vRight = v.x\n",
+		'local keyed = v["x"]\n',
+	}, "")
+	local uri = "file:///tmp/indexed.lua"
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/hover",
+		params = { textDocument = { uri = uri }, position = { line = 6, character = 8 } },
+	} }, source, nil, uri)
+	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(shown:match("ffi%.int"), "an array is indexed: " .. shown)
+end)
+
+test.it("gives ffi.load the symbols the file's cdef declared", function()
+	-- A cdef declares the functions of one library, and the file that wrote it is what knows them:
+	-- every symbol the process has seen would be a list nobody can read.
+	local source = table.concat({
+		'local ffi = require("ffi")\n',
+		"ffi.cdef[[\n",
+		"\ttypedef unsigned long size_t;\n",
+		"\tint curl_easy_init(void);\n",
+		"\tsize_t curl_easy_send(void *handle, void *buffer, size_t len);\n",
+		"]]\n",
+		'local curl = ffi.load("curl")\n',
+		"local handle = curl.curl_easy_init()\n",
+		'local wrong = curl.curl_easy_send("not a handle", nil, 0)\n',
+	}, "")
+	local uri = "file:///tmp/loaded.lua"
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/hover",
+		params = { textDocument = { uri = uri }, position = { line = 8, character = 21 } },
+	} }, source, nil, uri)
+	-- The field is the function the cdef declared, with the signature it declared it with: two
+	-- pointers and a `size_t`, which is a shape only the header could have told us.
+	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(shown:match("size_t") and shown:match("fn%("), "the symbol is there: " .. shown)
+end)
+
+test.it("resolves a require the way lde does", function()
+	-- `lde run -C <package>` puts `<package>/target/?.lua` and `<package>/target/?/init.lua` on
+	-- `package.path`, and `target/` holds a link per dependency. A document inside a package is
+	-- resolved against that package, which is the unit lde resolves within.
+	local project = TESTS_DIR .. "/fixtures/project"
+	local uri = "file://" .. project .. "/src/consumer.lua"
+	local source = 'local helper = require("helper")\nlocal counted = helper.count()\n'
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/hover",
+		params = { textDocument = { uri = uri }, position = { line = 1, character = 20 } },
+	} }, source, project, uri)
+	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(shown:match("count"), "the dependency resolves and its function is typed: " .. shown)
+end)
+
+test.it("resolves a require a lye.json points at", function()
+	-- The escape hatch for a project that is not laid out the lde way: patterns written the way
+	-- `package.path` writes them, relative to the file that declared them.
+	local project = TESTS_DIR .. "/fixtures/paths"
+	local uri = "file://" .. project .. "/src/consumer.lua"
+	local source = 'local thing = require("thing")\nlocal ready = thing.ready\n'
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/hover",
+		params = { textDocument = { uri = uri }, position = { line = 1, character = 15 } },
+	} }, source, project, uri)
+	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(shown:match("true"), "the module lye.json names resolves: " .. shown)
+end)
+
+test.it("colours an ffi.cdef from its own parse", function()
+	-- Not by asking the editor to inject a C grammar: an injection needs that grammar installed, and
+	-- even then it would not know LuaJIT's dialect. The header is coloured by what its names *are* —
+	-- the struct a program uses reads as a class, its members as fields — and the string that
+	-- carries it is not coloured as a string.
+	local source = table.concat({
+		'local ffi = require("ffi")\n',
+		"ffi.cdef[[\n",
+		"\t/* a struct, documented */\n",
+		"\ttypedef struct Point { int x; } Point;   // trailing prose\n",
+		"]]\n",
+	}, "")
+	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
+	local data = results["2"].data
+
+	local lines = {}
+	for line in (source .. "\n"):gmatch("([^\n]*)\n") do lines[#lines + 1] = line end
+	local painted = {}
+	local line, character = 0, 0
+	for index = 1, #data, 5 do
+		line += data[index]
+		character = data[index] == 0 and (character + data[index + 1]) or data[index + 1]
+		local text = lines[line + 1]:sub(character + 1, character + data[index + 2])
+		painted[text] = TYPES[data[index + 3] + 1]
+	end
+
+	test.equal(painted["struct"], "keyword", "the C keyword")
+	test.equal(painted["Point"], "class", "the struct is a class a program uses")
+	test.equal(painted["int"], "type", "a builtin type")
+	test.equal(painted["x"], "property", "a member is a field")
+	test.equal(painted["typedef"], "keyword")
+	test.equal(painted["/* a struct, documented */"], "comment", "a C comment is a comment")
+	test.equal(painted["// trailing prose"], "comment")
+	test.equal(painted["[["], "string", "and the brackets say this is a string at all")
+	test.equal(painted["]]"], "string")
 end)
 
 test.it("lists the declarations in a document", function()

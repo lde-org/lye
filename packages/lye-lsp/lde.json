@@ -28,6 +28,9 @@
 		},
 		"lye-defs": {
 			"path": "../lye-defs"
+		},
+		"lye-cdef": {
+			"path": "../lye-cdef"
 		}
 	}
 }

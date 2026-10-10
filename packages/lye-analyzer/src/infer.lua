@@ -18,6 +18,8 @@ local infer = {}
 ---@field typeOfName fun(name: string, offset: integer): lye.doc.Type
 ---@field returns table<string, lye.doc.Type>
 ---@field cache table<integer, lye.doc.Type>
+---@field modules fun(name: string): lye.doc.Type? what `require("name")` is, when the caller can say
+---@field ctypes fun(node: lye.parser.Node): lye.doc.Type? what a call naming a C type is worth
 
 local KNOWN = {
 	number = true, string = true, literal = true, table = true, ["function"] = true,
@@ -133,6 +135,16 @@ local function of(ctx, idx)
 	elseif kind == "call" then
 		-- `require("a.b")` is the module that file returns: asking the caller for it is what turns a
 		-- path into a type, and the caller is whoever can read the file.
+		-- A C type named by a string is known before the program runs: `ffi.new("Vec")` is a Vec
+		-- whose members came from the `ffi.cdef` in the same file, so the constructor is typed
+		-- rather than a bare cdata.
+		if ctx.ctypes then
+			local held = ctx.ctypes(node)
+			if held then
+				ctx.cache[idx] = held
+				return held
+			end
+		end
 		if node.callee == "require" and ctx.modules then
 			local argument = node.args and node.args[1] and ctx.parser.nodes[node.args[1]]
 			if argument and argument.kind == "string" and type(argument.value) == "string" then
@@ -187,12 +199,13 @@ end
 ---@param typeOfName fun(name: string, offset: integer): lye.doc.Type
 ---@param returns table<string, lye.doc.Type>?
 ---@return lye.infer.Context
-function infer.context(parser, typeOfName, returns, typeOfField, modules)
+function infer.context(parser, typeOfName, returns, typeOfField, modules, ctypes)
 	return {
 		parser = parser, typeOfName = typeOfName, returns = returns or {}, typeOfField = typeOfField, cache = {}, fnTypes = {},
 		callTypes = {},
 		building = {},
 		modules = modules,
+		ctypes = ctypes,
 	}
 end
 

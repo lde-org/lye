@@ -260,6 +260,26 @@ function types.satisfies(type, constraint)
 	if constraint.variant == "any" or constraint.variant == "unknown" then return true end
 	if type.variant == "unknown" or type.variant == "any" then return true end
 
+	-- A C number is a cdata the engine converts wherever a number is wanted, and between C numbers:
+	-- `size * nmemb` is arithmetic and `putcdata(buf, len)` takes the `size_t` it is given. The
+	-- difference that remains is in what a value *is* — `tostring` of one reads `5LL`, a 64-bit one
+	-- does not fit in a double — and a check that refused these would report code the engine runs.
+	-- The class keeps the name it was written with, marker and all: `ffi.cnum*`.
+	local function isCNumber(candidate)
+		local function named(one)
+			return one and one.name and (one.name:gsub("%*$", "")) == "ffi.cnum" or false
+		end
+		if named(candidate) then return true end
+		for _, parent in ipairs(candidate and candidate.parents or {}) do
+			if named(parent) then return true end
+		end
+		return false
+	end
+	if isCNumber(type) and (constraint.variant == "number" or constraint.variant == "integer"
+		or isCNumber(constraint)) then
+		return true
+	end
+
 	-- A quoted name is a string value rather than a name to look up, which is how the definitions
 	-- write `select("#", ...)` and their option flags. It is one of the strings, so it fits
 	-- `string`, and only that same string fits it.
@@ -321,6 +341,19 @@ function types.satisfies(type, constraint)
 				if wanted and not types.satisfies(have, wanted) then return false end
 			end
 			return true
+		end
+		-- A class named after a builtin type *is* that type: `builtin.lua` declares
+		-- `---@class string`, so what fits `string` fits it — a quoted value among them, which is
+		-- what makes `ffi.new("Vec")` fit the `ffi.cdecl*` that extends it.
+		if SIMPLE[constraint.name] then
+			return types.satisfies(type, types.base(constraint.name))
+		end
+		-- A value that fits what the class extends fits the class: the definitions write
+		-- `---@class ffi.cdecl*: string`, and a string is exactly what a parameter of it takes.
+		-- This is asked before the value is required to be a class of its own, because a plain
+		-- string is one of these.
+		for _, parent in ipairs(constraint.parents or {}) do
+			if types.satisfies(type, parent) then return true end
 		end
 		if type.variant ~= "class" then return false end
 		-- A class whose every field is optional describes a shape rather than a name: there is
@@ -733,9 +766,12 @@ end
 ---@return lye.doc.Type?
 function types.metamethod(type, name)
 	local metatable = type and type.metatable
-	if not metatable then return nil end
-	local carried = metatable.fields and metatable.fields[name]
-	return carried
+	local carried = metatable and metatable.fields and metatable.fields[name]
+	if carried then return carried end
+	-- A type may also declare the metamethod it answers with as a field of its own, which is how
+	-- the definitions describe a C number: it is cdata the engine gives `__add` and the rest to,
+	-- and a check for "this operand has to be a number" has to see that rather than report it.
+	return type and type.fields and type.fields[name] or nil
 end
 
 --- The type a field read gives, following the metatable when the type does not carry the field.
@@ -799,6 +835,11 @@ function types.indexResult(target, field)
 	end
 	-- A key that is not a name, as `list[i]` writes one, is what an index signature describes.
 	if target.variant == "object" and target.indexed and not field then
+		return target.indexed.type
+	end
+	-- A class may declare what indexing it gives: `ffi.array<T>` and `ffi.ptr<T>` both do, which is
+	-- what makes `a[1]` the element rather than nothing at all.
+	if target.variant == "class" and not field and target.indexed then
 		return target.indexed.type
 	end
 	if target.variant == "class" and field then
@@ -1321,6 +1362,18 @@ function types.display(type)
 		local parts = {}
 		for _, member in ipairs(type.types) do parts[#parts + 1] = types.display(member) end
 		table.sort(parts)
+		-- `nil` and one other member is the `T?` the annotations already write, and reading it back
+		-- as one is what a writer expects to see. Three members stay written out: `string|number?`
+		-- reads as though the optional part were the number, and `(string|number)?` is worse.
+		if #parts == 2 then
+			local other, hasNil = nil, false
+			for _, part in ipairs(parts) do
+				if part == "nil" then hasNil = true else other = part end
+			end
+			-- Not for a signature: `fn() -> number?` would read as a function returning a number,
+			-- which is a different type from one that may be absent.
+			if hasNil and other and other:sub(1, 2) ~= "fn" then return other .. "?" end
+		end
 		return table.concat(parts, "|")
 	end
 	if type.variant == "extern" then return type.name end

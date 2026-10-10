@@ -16,6 +16,66 @@ local cb
 ---@class ffi.VLA*:   userdata
 ---@class ffi.VLS*:   userdata
 
+---A C number: cdata the engine gives arithmetic and the comparisons to. A value of one of the
+---scalar types below is one of these, and a reader of `size * nmemb` is owed the metamethods that
+---make that arithmetic legal rather than being told the operands are not numbers.
+---@class ffi.cnum*: ffi.cdata
+---@field __add fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __sub fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __mul fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __div fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __mod fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __pow fun(self: ffi.cnum*, other: any): ffi.cnum*
+---@field __unm fun(self: ffi.cnum*): ffi.cnum*
+---@field __eq fun(self: ffi.cnum*, other: any): boolean
+---@field __lt fun(self: ffi.cnum*, other: any): boolean
+---@field __le fun(self: ffi.cnum*, other: any): boolean
+---@field __concat fun(self: ffi.cnum*, other: any): string
+---@field __tostring fun(self: ffi.cnum*): string
+
+---The C scalars by name, so a header's types can be written down. A 64-bit one is handed over as a
+---cdata and a narrower one as a Lua number — that is what the engine does, and it is why a `size_t`
+---is an `ffi.size_t` while an `int` is a `number`.
+---@class ffi.char: ffi.cnum*
+---@class ffi.short: ffi.cnum*
+---@class ffi.int: ffi.cnum*
+---@class ffi.long: ffi.cnum*
+---@class ffi.longlong: ffi.cnum*
+---@class ffi.unsigned: ffi.cnum*
+---@class ffi.ulong: ffi.cnum*
+---@class ffi.ulonglong: ffi.cnum*
+---@class ffi.int8_t: ffi.cnum*
+---@class ffi.int16_t: ffi.cnum*
+---@class ffi.int32_t: ffi.cnum*
+---@class ffi.int64_t: ffi.cnum*
+---@class ffi.uint8_t: ffi.cnum*
+---@class ffi.uint16_t: ffi.cnum*
+---@class ffi.uint32_t: ffi.cnum*
+---@class ffi.uint64_t: ffi.cnum*
+---@class ffi.size_t: ffi.cnum*
+---@class ffi.ssize_t: ffi.cnum*
+---@class ffi.ptrdiff_t: ffi.cnum*
+---@class ffi.intptr_t: ffi.cnum*
+---@class ffi.uintptr_t: ffi.cnum*
+---@class ffi.float: ffi.cnum*
+---@class ffi.double: ffi.cnum*
+---@class ffi.wchar_t: ffi.cnum*
+---@class ffi.bool: ffi.cdata
+
+---An array of C values: what `ffi.new("int[4]")` gives and what a `T name[N]` member is. It is
+---indexed with a number, which is the one thing an array does that no other cdata does, and the
+---length the header wrote is carried as the second argument.
+---@class ffi.array<T, const N: integer>: ffi.cdata
+---@field [integer] T
+
+---A pointer to a C value: what `ffi.new("int *")` gives, what a callback receives where the header
+---wrote a pointer, and what going through a pointer reads. Like an array it is indexed with a
+---number, and it is not the value it points at.
+---@class ffi.ptr<T: ffi.cdata*>: ffi.cdata
+---@field [integer] T
+
+
+
 ---@class ffilib
 ---@field C    ffi.namespace*
 ---@field os   string
@@ -57,9 +117,10 @@ function ffi.cast(ct, init) end
 ---@return ffi.ctype* ctype
 function ffi.metatype(ct, metatable) end
 
----@param cdata     ffi.cdata*
----@param finalizer? function
----@return ffi.cdata* cdata
+---@generic T: ffi.cdata*
+---@param cdata T
+---@param finalizer? fun(obj: T)
+---@return T cdata
 function ffi.gc(cdata, finalizer) end
 
 ---@param ct     ffi.ct*
@@ -92,18 +153,18 @@ function ffi.istype(ct, obj) end
 ---@nodiscard
 function ffi.errno(newerr) end
 
----@param ptr  any
+---@param ptr  ffi.cdata*|string
 ---@param len? integer
 ---@return string str
 function ffi.string(ptr, len) end
 
----@overload fun(dst: any, str: string)
----@param dst any
----@param src any
+---@overload fun(dst: ffi.cdata*, str: string)
+---@param dst ffi.cdata*
+---@param src ffi.cdata*|string
 ---@param len integer
 function ffi.copy(dst, src, len) end
 
----@param dst any
+---@param dst ffi.cdata*
 ---@param len integer
 ---@param c?  any
 function ffi.fill(dst, len, c) end

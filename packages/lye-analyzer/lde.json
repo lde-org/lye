@@ -12,6 +12,9 @@
 		},
 		"lye-doc": {
 			"path": "../lye-doc"
+		},
+		"lye-cdef": {
+			"path": "../lye-cdef"
 		}
 	}
 }

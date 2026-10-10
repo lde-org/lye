@@ -16,6 +16,7 @@ local Parser = require("lye-parser")
 local lexer = require("lye-lexer")
 local KIND = lexer.KIND
 local doc = require("lye-doc")
+local cdef = require("lye-cdef")
 local types = require("lye-doc.type")
 local infer = require("lye-analyzer.infer")
 
@@ -1136,7 +1137,11 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	local function argumentAt(argIdx)
 		local argument = parsed.nodes[argIdx]
 		if argument and argument.kind == "string" then
-			return types.extern(source:sub(argument.start, argument.stop))
+			-- The value the literal spells, not the text it was written with: `f([[read]])` and
+			-- `f("read")` are the same argument, and only the value compares against a parameter
+			-- written `"read"|"write"`. Reading the source instead made a long string a type named
+			-- after its own brackets, which matched nothing.
+			return types.stringValue(argument.value or source:sub(argument.start, argument.stop))
 		end
 		return infer.at(inferCtx, argIdx)
 	end
@@ -1503,7 +1508,204 @@ function analyzer.analyze(source, prepared, elsewhere, modules)
 			end
 		end
 	end
+	--- The name a call is written with: `print`, `math.floor`, `ffi.cdef`. A call through a field
+	--- carries the field on the node it targets rather than on the call itself, so both halves are
+	--- read here rather than at every site that asks.
+	---@param node lye.parser.Node
+	---@return string?
+	local function calledName(node)
+		if node.kind ~= "call" then return nil end
+		local target = node.target and parsed.nodes[node.target]
+		local field = node.field or (target and target.field)
+		if not field then return nil end
+		local owner = writtenNameOf(parsed, target and (target.target or node.target))
+		return owner and (owner .. "." .. field) or field
+	end
+
+	--- Where the text inside a `ffi.cdef` string begins in the document: past the quote, or past the
+	--- brackets and whatever `=` signs a long one was written with. The parser reports offsets into
+	--- the text it was handed, and a reader has to be told where in their file that is. A quoted
+	--- string with escapes in it would drift — a cdef is written as a long string in practice.
+	---@param written string the document
+	---@param argument lye.parser.Node the string the cdef was written as
+	---@param offset integer 1-based, into the text the parser read
+	---@return integer
+	local function cdefTextStart(written, argument, offset)
+		local source = written:sub(argument.start, argument.stop)
+		local level = source:match("^%[(=*)%[")
+		local opened = level and (2 + #level) or 1
+		return argument.start + opened + offset - 1
+	end
+
+	-- The C a `ffi.cdef` call declares. Its types belong to this file the way its own `---@class`
+	-- entries do, so `---@type Vec` below the cdef resolves and `v.nope` is checked against the
+	-- members the header actually wrote — which is the point of declaring the header at all. The
+	-- declarations are written back out as annotation text and read by the same reader every other
+	-- class goes through, so there is one way to build a class rather than two.
+	local cdefs, cdefProblems
+	-- Only a file that writes the word can be declaring C, and the scan is per node: reading the
+	-- text first is what keeps a file that declares nothing from paying for the search.
+	if source:find("cdef", 1, true) then
+	for _, node in ipairs(parsed.nodes) do
+		if calledName(node) == "ffi.cdef" then
+			local argument = node.args and node.args[1] and parsed.nodes[node.args[1]]
+			if argument and argument.kind == "string" and type(argument.value) == "string" then
+				local declared = cdef.parse(argument.value)
+				local written = doc.parse(cdef.annotations(declared))
+				local from = doc.classes.read(written)
+				for name, class in pairs(from.classes) do namespace.classes[name] = class end
+				for name, alias in pairs(from.aliases) do namespace.aliases[name] = alias end
+				cdefs = cdefs or {}
+				cdefs[#cdefs + 1] = declared
+
+				-- A declaration that could not be read is reported where it is written, which is
+				-- inside the string: the offsets the parser gives are its own, so the text between
+				-- the brackets has to be found before they mean anything to a reader. What a header
+				-- said that *was* readable is still used — a cdef is rarely wrong in only one place.
+				for _, problem in ipairs(declared.problems) do
+					local at = cdefTextStart(source, argument, problem.start)
+					cdefProblems = cdefProblems or {}
+					cdefProblems[#cdefProblems + 1] = {
+						message = "cdef: " .. problem.message,
+						severity = 1,
+						start = at,
+						stop = at + math.max(problem.stop - problem.start, 0),
+					}
+				end
+			end
+		end
+	end
+	end
+
 	local resolve = doc.classes.resolver(namespace)
+
+	--- What a call that names a C type is worth. `ffi.new("Vec")` and `ffi.cast("Vec", v)` hand
+	--- back a Vec, and `ffi.typeof("Vec")` hands back the ctype — which is the class itself, since
+	--- what a reader does with a ctype is construct from it. Only the names the cdef introduced
+	--- resolve: `ffi.new("int")` is a number, which the definitions already say.
+	---@param node lye.parser.Node
+	---@return lye.doc.Type?
+	--- The C type a written name stands for, and the block that declared it: `ffi.cast("Node *")`
+	--- is the C type wherever a reader needs the type rather than the class a value of it is.
+	---@param written string
+	---@return lye.cdef.Type?
+	---@return lye.cdef.Namespace?
+	local function cTypeNamed(written)
+		for _, declared in ipairs(cdefs or {}) do
+			local found = cdef.typeOf(declared, written)
+			if found then return found, declared end
+		end
+	end
+
+	--- What a Lua function handed to `ffi.cast` has to be. The value really is a C function pointer
+	--- at runtime, so the callback's parameters are the C ones and its result is converted back
+	--- into the C type — which is what makes `buf:putcdata(ptr, len)` inside one the right thing to
+	--- do and `size * nmemb` a number.
+	---@param written string the type the cast names
+	---@return lye.cdef.Type?
+	---@return lye.cdef.Namespace?
+	local function cTypeOfCallback(written)
+		local found, declared = cTypeNamed(written)
+		if not found then return nil end
+		if found.kind == "function" then return found, declared end
+		if found.kind == "pointer" and found.target and found.target.kind == "function" then
+			return found.target, declared
+		end
+		-- A typedef of a callback: `curl_write_callback` is one.
+		local resolved = cdef.resolve(declared, found.name or written)
+		if resolved and resolved.kind == "pointer" and resolved.target
+			and resolved.target.kind == "function" then
+			return resolved.target, declared
+		end
+		if resolved and resolved.kind == "function" then return resolved, declared end
+	end
+
+	--- The C signature of each function literal written as a callback, by the node that is the
+	--- function. Read before the names are declared, because a parameter's type is one of them.
+	---@type table<integer, { type: lye.cdef.Type, namespace: lye.cdef.Namespace }>
+	local callbacks = {}
+	---@type table<integer, lye.doc.Type>
+	local callbackReturns = {}
+	--- Which C parameter each of a callback's parameters is, by the declaration the parser made for
+	--- it. An anonymous function has no declaration of its own to hang them on, so the parameter
+	--- itself is what is known: this is the third parameter of *that* signature.
+	---@type table<lye.parser.Declaration, { index: integer, type: lye.cdef.Type, namespace: lye.cdef.Namespace }>
+	local callbackParams = {}
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "call" and node.args and node.args[2] then
+			local called = calledName(node)
+			if called == "ffi.cast" or called == "ffi.new" then
+				local written = parsed.nodes[node.args[1]]
+				local body = parsed.nodes[node.args[2]]
+				if written and written.kind == "string" and type(written.value) == "string"
+					and body and body.kind == "function" then
+					local signature, declared = cTypeOfCallback(written.value)
+					if signature then
+						callbacks[node.args[2]] = { type = signature, namespace = declared }
+						for index, param in ipairs(body.params or {}) do
+							callbackParams[param] = { index = index, type = signature, namespace = declared }
+						end
+						-- The engine converts what the callback returns into the C result type, so
+						-- the C says what the body has to give — a promise like a `@return`.
+						local returned = signature.returns
+						if returned then
+							callbackReturns[node.args[2]] = types.parse(
+								cdef.notation(declared, returned), resolve)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	--- The signatures a `ffi.cdef` in this file declared, as the fields a `ffi.load` gives back.
+	--- A cdef declares the functions of one library, and the file that wrote it is the one that
+	--- knows them: taking every symbol the process has ever seen would be a list nobody can read.
+	---@return lye.doc.Type?
+	local function loadedSymbols()
+		local fields = {}
+		for _, declared in ipairs(cdefs or {}) do
+			for _, name in ipairs(declared.order) do
+				local type = declared.types[name]
+				if type and type.kind == "function" then
+					local parts = {}
+					for _, param in ipairs(type.params or {}) do
+						parts[#parts + 1] = cdef.notation(declared, param, "parameter")
+					end
+					if type.variadic then parts[#parts + 1] = "..." end
+					local returned = type.returns and cdef.notation(declared, type.returns)
+					local written = "fun(" .. table.concat(parts, ", ") .. ")"
+					if returned and returned ~= "nil" then written = written .. ": " .. returned end
+					local held = types.parse(written, resolve)
+					if held then fields[name] = held end
+				end
+			end
+		end
+		if not next(fields) then return nil end
+		return types.object(fields)
+	end
+
+	local function cTypeOf(node)
+		if not cdefs then return nil end
+		local called = calledName(node)
+		if called == "ffi.load" then return loadedSymbols() end
+		if called ~= "ffi.new" and called ~= "ffi.cast" and called ~= "ffi.typeof" then return nil end
+		local argument = node.args and node.args[1] and parsed.nodes[node.args[1]]
+		if not argument or argument.kind ~= "string" or type(argument.value) ~= "string" then return nil end
+		local found, declared = cTypeNamed(argument.value)
+		if not found then return nil end
+		-- A struct, a union, an enum or a typedef of one is a class the file declares, and looking
+		-- the name up lets the document's own class win over the generated one. Everything else is
+		-- mapped: an array is `ffi.array<T, N>`, a pointer `ffi.ptr<T>`, a scalar its name — which
+		-- is what makes `ffi.new("int[4]")` something a program can index.
+		local className = cdef.className(found)
+		local named = className and resolve(className)
+		if named and (found.kind == "struct" or found.kind == "union" or found.kind == "enum"
+			or (found.kind == "typedef" and cdef.resolve(declared, found.name or "") ~= nil)) then
+			return named
+		end
+		return types.parse(cdef.notation(declared, found), resolve)
+	end
 
 		-- Declared returns are needed while typing declarations, and a `@return` belongs to the
 	-- declaration below it, so this is resolved from the annotations alone.
@@ -1526,6 +1728,12 @@ function analyzer.analyze(source, prepared, elsewhere, modules)
 	-- `self` is declared before the closure that reads it, so the closure captures this
 	-- table rather than an outer name.
 	local self = { parser = parsed, variables = {}, byStart = {}, diagnostics = {}, doc = annotations }
+	-- A `ffi.cdef` that could not be read belongs in the same list as every other finding, and the
+	-- list is this table's: the problems were collected with their offsets already mapped into the
+	-- document, so they are added here rather than where they were found.
+	for _, problem in ipairs(cdefProblems or {}) do
+		self.diagnostics[#self.diagnostics + 1] = problem
+	end
 
 		-- A name an annotation writes has to mean something. `---@return s` where nothing declares `s`
 	-- is a typo, and reading it as a type nothing knows about lets it pass as one. The definitions,
@@ -1842,7 +2050,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules)
 	collectNarrowing(parsed, byRecord, signatures, resolve)
 	inferCtx = infer.context(parsed, typeOfName, returns, function(base, baseName, field, offset)
 		return analyzer.fieldTypeAt(self, base, baseName, field, offset)
-	end, modules)
+	end, modules, cTypeOf)
 	for index, node in ipairs(parsed.nodes) do
 		if node.kind == "function" then
 			local declaration = bodyOwner[index]
@@ -1901,6 +2109,17 @@ function analyzer.analyze(source, prepared, elsewhere, modules)
 					if not declared and declaration.name == "self" and ownerDecl then
 						local className = ownerDecl.name:match("^(.-)%s*:")
 						if className then declared = resolve(className) end
+					end
+					-- A function literal handed to `ffi.cast` is called by C, so its parameters are
+					-- the ones the header declares: `ptr` is a pointer rather than a Lua string,
+					-- which is what makes handing it to `ffi.string` or a buffer right.
+					local asCallback = callbackParams[declaration]
+					if not declared and asCallback then
+						local wanted = asCallback.type.params and asCallback.type.params[asCallback.index]
+						if wanted then
+							declared = types.parse(
+								cdef.notation(asCallback.namespace, wanted, "parameter"), resolve)
+						end
 					end
 					-- A parameter with no `@param` is `any`: the arity is known, the type is not.
 					if not declared and declaration.qualifier == "param" then
@@ -2178,6 +2397,26 @@ function analyzer.analyze(source, prepared, elsewhere, modules)
 		end
 	end
 
+	--- What a function's body gives back: the union of the first value of each of its `return`s, or
+	--- nothing at all when it never returns a value. The typing rounds work this out for the
+	--- functions they walk, and a callback written straight into an argument is not one of those —
+	--- its result still crosses back into C, so the same question is asked of it here.
+	---@param index integer
+	---@return lye.doc.Type?
+	local function inferredReturnOf(index)
+		local inferred
+		local body = parsed.nodes[index].body
+		if body then inferred = infer.at(inferCtx, body) end
+		for _, statement in ipairs(returnsOf[index] or {}) do
+			local valueIdx = statement.children and statement.children[1]
+			if valueIdx then
+				local valueType = infer.at(inferCtx, valueIdx)
+				inferred = inferred and types.combine(inferred, valueType) or valueType
+			end
+		end
+		return inferred
+	end
+
 	--- Type every variable from the arena. Run until it settles: a call can be met before
 	--- its callee's `@return` is known, which leaves a mutable unknown for `refine` to
 	--- promote in place, so one pass is not enough on its own.
@@ -2230,20 +2469,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules)
 		-- nil when it returns nothing at all, which is what a caller gets. Annotations are left
 		-- alone here, so a `@return` and an inferred return can be compared later.
 		for index, fnType in pairs(inferCtx.fnTypes) do
-			local statements = returnsOf[index]
-			local inferred
-			local body = parsed.nodes[index].body
-			if body then inferred = infer.at(inferCtx, body) end
-			for _, statement in ipairs(statements or {}) do
-				-- The *first* value, because that is what a caller reading one value gets: a
-				-- `return name, count` gives the caller a name, and a union with the count claims
-				-- it may be a number. A statement that returns nothing contributes nothing.
-				local valueIdx = statement.children and statement.children[1]
-				if valueIdx then
-					local valueType = infer.at(inferCtx, valueIdx)
-					inferred = inferred and types.combine(inferred, valueType) or valueType
-				end
-			end
+			local inferred = inferredReturnOf(index)
 			if inferred then
 				fnType.returns = inferred
 				-- A declaration that named its parameters but not its return takes the inferred
@@ -2283,7 +2509,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules)
 				and promised.variant ~= "any"
 			if written and not inferred then
 				self.diagnostics[#self.diagnostics + 1] = {
-					message = string.format("the field says this returns %s, but nothing is returned",
+					message = string.format("the type says this returns %s, but nothing is returned",
 						types.display(promised)),
 					severity = 1,
 					start = parsed.nodes[index].start, stop = parsed.nodes[index].stop,
@@ -2627,6 +2853,25 @@ function analyzer.analyze(source, prepared, elsewhere, modules)
 		end
 	end
 
+	-- An index with a computed key asks a value what it holds there. A class that declares an index
+	-- signature answers — `ffi.array<T>` and `ffi.ptr<T>` both do — and one that does not holds
+	-- nothing at that key: `size[1]` on a `size_t` is the mistake the C types exist to catch. A
+	-- string key is not asked about, because a cdata takes one: `p["x"]` is how `p.x` is written.
+	-- Plain tables are left alone: Lua indexes those freely and a reader knows what they mean.
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "index" and node.isDynamic == true and node.target and node.key then
+			local base = infer.at(inferCtx, node.target)
+			local key = infer.at(inferCtx, node.key)
+			if base and base.variant == "class" and not base.indexed and key and key.variant == "number" then
+				local at = parsed.nodes[node.key]
+				self.diagnostics[#self.diagnostics + 1] = {
+					message = string.format("%s cannot be indexed by a number", types.display(base)),
+					severity = 1, start = at.start, stop = at.stop,
+				}
+			end
+		end
+	end
+
 	-- A reference is a node that names something: a bare name, a call target, an index base.
 	-- The arena has one for each, so this never has to decide whether a name token is a use.
 	local globals = {}
@@ -2678,6 +2923,37 @@ function analyzer.analyze(source, prepared, elsewhere, modules)
 				message = string.format("unused local `%s`", variable.name),
 				start = declaration.start, stop = declaration.stop, severity = 2,
 			}
+		end
+	end
+
+	-- A callback's result crosses back into C: the engine converts it to the C result type, so a
+	-- body that gives something else — or gives nothing where the header promises a value — is
+	-- reported against the signature it was cast to. It is checked here rather than with the other
+	-- promises because those are keyed by the functions the typing rounds walk, and a function
+	-- written straight into an argument is not one of them.
+	for index, promised in pairs(callbackReturns) do
+		local inferred = inferredReturnOf(index)
+		local gives = inferred and inferred ~= types.VOID
+		if not gives and promised.variant ~= "nil" and promised.variant ~= "void" then
+			if not annotatedBodies[index] then
+				self.diagnostics[#self.diagnostics + 1] = {
+					message = string.format(
+						"the C signature says this returns %s, but nothing is returned",
+						types.display(promised)),
+					severity = 1,
+					start = parsed.nodes[index].start, stop = parsed.nodes[index].stop,
+				}
+			end
+		elseif gives and promised.variant ~= "nil" and promised.variant ~= "void" then
+			-- A callback the C says returns nothing may still return a value: the engine discards
+			-- it, so there is nothing to be wrong about.
+			local message = types.mismatch(promised, inferred, "the result")
+			if message then
+				self.diagnostics[#self.diagnostics + 1] = {
+					message = message, severity = 1,
+					start = parsed.nodes[index].start, stop = parsed.nodes[index].stop,
+				}
+			end
 		end
 	end
 
