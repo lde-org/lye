@@ -128,6 +128,18 @@ local function of(ctx, idx)
 		result = ctx.typeOfField and ctx.typeOfField(base, baseName, node.field, node.start)
 			or types.indexResult(base, node.field)
 	elseif kind == "call" then
+		-- `require("a.b")` is the module that file returns: asking the caller for it is what turns a
+		-- path into a type, and the caller is whoever can read the file.
+		if node.callee == "require" and ctx.modules then
+			local argument = node.args and node.args[1] and ctx.parser.nodes[node.args[1]]
+			if argument and argument.kind == "string" and type(argument.value) == "string" then
+				local held = ctx.modules(argument.value)
+				if held then
+					ctx.cache[idx] = held
+					return held
+				end
+			end
+		end
 		-- A call yields what its callee returns, whether that came from an annotation or from the
 		-- callee's own body. While that is still unknown the answer is a mutable unknown, so the
 		-- refinement pass can fill it in rather than this being cached as settled.
@@ -172,11 +184,12 @@ end
 ---@param typeOfName fun(name: string, offset: integer): lye.doc.Type
 ---@param returns table<string, lye.doc.Type>?
 ---@return lye.infer.Context
-function infer.context(parser, typeOfName, returns, typeOfField)
+function infer.context(parser, typeOfName, returns, typeOfField, modules)
 	return {
 		parser = parser, typeOfName = typeOfName, returns = returns or {}, typeOfField = typeOfField, cache = {}, fnTypes = {},
 		callTypes = {},
 		building = {},
+		modules = modules,
 	}
 end
 

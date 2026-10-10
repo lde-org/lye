@@ -67,10 +67,18 @@ end
 ---@field stop integer 1-based byte offset of the last byte
 ---@field extra number a number's value, or a string's escape count
 
+--- A literal the scan could not finish. It is reported rather than raised: the tokens around
+--- it are still what an editor needs, and the parser turns this into a diagnostic.
+---@class lye.lexer.Problem
+---@field message string the message, with the line it starts on
+---@field start integer
+---@field stop integer
+
 ---@class lye.lexer.Tokens
 ---@field arena lye.lexer.ffi.token* the struct array; index 0 is unused
 ---@field texts string[] one entry per token, indexed like the arena
 ---@field count integer how many tokens there are, the eof token included
+---@field problems lye.lexer.Problem[] what a scan could not finish, empty for a whole source
 
 ---@class lye.lexer.Lexer
 ---@field source string
@@ -90,7 +98,7 @@ function Lexer.new(source)
 	local capacity = math.floor(#source / 4) + 16
 	return setmetatable({
 		source = source, pos = 1, arena = ffi.new("lye_token[?]", capacity + 1),
-		texts = newTable(capacity, 0), capacity = capacity, count = 0,
+		texts = newTable(capacity, 0), capacity = capacity, count = 0, problems = {},
 	}, Lexer)
 end
 
@@ -110,13 +118,22 @@ end
 
 lexer.Lexer = Lexer
 
+--- A source that is being typed holds half-written literals, and refusing to tokenize it is
+--- how a completion stops working the moment a quote is opened. A scanner that cannot finish
+--- reads to the end of the input instead and records what it could not finish, which the
+--- parser reports as the syntax error it is.
 ---@param self lye.lexer.Lexer
-local function fail(self, at, msg)
+---@param at integer
+---@param stop integer
+---@param msg string
+local function fail(self, at, stop, msg)
 	local line = 1
 	for i = 1, at - 1 do
 		if self.source:byte(i) == 10 then line += 1 end
 	end
-	assert(false, string.format("lex error at line %d: %s", line, msg))
+	self.problems[#self.problems + 1] = {
+		message = string.format("%s at line %d", msg, line), start = at, stop = stop,
+	}
 end
 
 --- A token's text is its own source slice, except for keywords and operators, whose text is
@@ -144,15 +161,29 @@ end
 local function scanString(self, quote)
 	local source, len = self.source, #self.source
 	local start = self.pos
-	local escapes, i = 0, start + 1
+	local escapes, i, newline = 0, start + 1, nil
 	while true do
-		if i > len then fail(self, start, "unfinished string") end
+		if i > len then
+			-- Nothing closes it, so the string is still being typed. The token ends with its own
+			-- line and the writer keeps the rest of the file as code, which is what an editor
+			-- needs while a quote is open. A string that really does span lines has its close
+			-- somewhere and never reaches this.
+			local resume = newline or (len + 1)
+			local stop = resume - 1
+			fail(self, start, stop, "unfinished string")
+			self.pos = resume
+			emit(self, KIND.string, start, stop, escapes)
+			return
+		end
 		local byteAt = source:byte(i)
 		if byteAt == quote then
 			self.pos = i + 1
 			emit(self, KIND.string, start, i, escapes)
 			return
 		end
+		-- Remembered rather than acted on: a newline inside a short string is legal Lua, and
+		-- only a string nothing closes is cut at one.
+		if byteAt == 10 and not newline then newline = i end
 		if byteAt == 92 then
 			escapes += 1
 			i += 2
@@ -170,7 +201,10 @@ local function scanLongBracket(self, start)
 	if not level then return nil end
 	local close = "]" .. level .. "]"
 	local found = self.source:find(close, start + 2 + #level, true)
-	if not found then fail(self, start, "unfinished long bracket") end
+	if not found then
+		fail(self, start, #self.source, "unfinished long bracket")
+		return level, #self.source
+	end
 	return level, found + #close - 1
 end
 
@@ -277,11 +311,11 @@ local function scanNumber(self)
 				if isDigit(source:byte(i)) then hasExponent = true end
 				i += 1
 			end
-			if not hasExponent then fail(self, start, "malformed number") end
+			if not hasExponent then fail(self, start, i - 1, "malformed number") end
 		end
 	end
 
-	assert(hasDigits, string.format("lex error at byte %d: malformed number", start))
+	if not hasDigits then fail(self, start, i - 1, "malformed number") end
 	local stop = i - 1
 
 	local suffix = source:match("^[uUlLiI]+", i)
@@ -312,7 +346,10 @@ local function scanLabel(self, start)
 	-- Whitespace is allowed on either side of the name, so the close is found from the
 	-- end of the name rather than from a fixed offset.
 	local closeAt = self.source:find("::", start + 2 + #name, true)
-	assert(closeAt, string.format("lex error at byte %d: unfinished label", start))
+	if not closeAt then
+		fail(self, start, #self.source, "unfinished label")
+		return false
+	end
 
 	self.pos = closeAt + 2
 	emit(self, KIND.label, start, closeAt + 1, nil)
@@ -385,7 +422,7 @@ function Lexer:tokenize()
 	end
 
 	emit(self, KIND.eof, len + 1, len, nil, "")
-	return { arena = self.arena, texts = self.texts, count = self.count }
+	return { arena = self.arena, texts = self.texts, count = self.count, problems = self.problems }
 end
 
 ---@return lye.lexer.Tokens

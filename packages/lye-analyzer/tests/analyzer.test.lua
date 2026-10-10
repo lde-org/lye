@@ -6,15 +6,16 @@ local test = require("lde-test")
 local lye = require("lye-analyzer")
 local types = require("lye-doc.type")
 
--- These tests are about types and about what an editor reports as a problem. An unused local is
--- what it shows as a hint, and every snippet here is full of them, so the module is wrapped to
--- keep the diagnostics that are warnings and errors. The hints are tested on their own below.
+-- These tests are about types and about what an editor reports as a problem. Every snippet here is
+-- full of locals nothing reads, so the module is wrapped to keep the diagnostics that are about
+-- types and about names that do not resolve; the unused-local rule is dropped by name, and tested
+-- on its own below.
 local analyzer = {
 	analyze = function(source, prepared)
 		local result = lye.analyze(source, prepared)
 		local kept = {}
 		for _, entry in ipairs(result.diagnostics) do
-			if entry.severity == nil or entry.severity <= 2 then kept[#kept + 1] = entry end
+			if not entry.message:match("^unused local") then kept[#kept + 1] = entry end
 		end
 		result.diagnostics = kept
 		return result
@@ -180,7 +181,13 @@ test.it("infers what a function returns from its body", function()
 	test.equal(typeOf("local function f() return 1 end", "f"), "fn() -> 1")
 	test.equal(typeOf("local function f(a) if a then return 1 end return \"s\" end", "f"),
 		"fn(any) -> 1|string", "every return is unioned")
-	test.equal(typeOf("local function f() return 1, \"s\" end", "f"), "fn() -> 1|string")
+	-- A statement handing back several values gives a caller reading one the first of them, so
+	-- the count is not part of what `f()` is: unioning it would claim `f()` may be a string, and
+	-- `local n: number = f()` would be reported against a body that is right.
+	test.equal(typeOf("local function f() return 1, \"s\" end", "f"), "fn() -> 1",
+		"a caller reading one value gets the first")
+	test.equal(typeOf("local function f(a) if a then return 1, \"s\" end return \"t\", 2 end", "f"),
+		"fn(any) -> 1|string", "and the first of each statement is still unioned")
 		test.equal(typeOf("local function f() return end", "f"), "fn()",
 		"a bare return hands back nothing at all")
 		test.equal(typeOf("local function f() end", "f"), "fn()",
@@ -1529,6 +1536,25 @@ test.it("narrows a tagged union by its discriminant", function()
 		if not entry.message:match("^unused") then broken = broken + 1 end
 	end
 	test.equal(broken, 1, "the member that carries no `message` cannot be read for one")
+end)
+
+test.it("keeps both declarations when a name is declared twice in one scope", function()
+	-- A name declared again in the same block shadows itself. Keeping only the last one made the
+	-- reads above it resolve to nothing at all, which reported a plain `local x` as an undefined
+	-- global the moment a second `local x` appeared further down the file.
+	local source = table.concat({
+		"local x = 1\n",
+		"local first = x\n",
+		"local x = \"s\"\n",
+		"local second = x\n",
+	}, "")
+	test.equal(typeOf(source, "first"), "1", "the read above the second declaration is the first x")
+	test.equal(typeOf(source, "second"), "string", "and the read below it is the second")
+	local result = analyzer.analyze(source)
+	for _, entry in ipairs(result.diagnostics) do
+		test.truthy(not entry.message:match("undefined global"), entry.message)
+		test.truthy(not entry.message:match("unused local `x`"), entry.message)
+	end
 end)
 
 return true

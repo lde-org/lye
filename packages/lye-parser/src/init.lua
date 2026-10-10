@@ -139,7 +139,9 @@ function Parser.new(source)
 		texts = tokens.texts,
 		tokenCount = tokens.count,
 		index = 1,
-		diagnostics = {},
+		-- A literal the scanner could not finish is a syntax error like any other, and the
+		-- tokens the scan recovered from are what the tree is built on.
+		diagnostics = tokens.problems,
 		nodes = {},
 		declarations = {},
 		depth = 0,

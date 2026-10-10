@@ -1,10 +1,17 @@
 --[[
 	Gather the definitions into one module.
 
-	`meta/` holds a file per library, written to be read and edited by hand. The analyzer wants the
-	text of each to parse, so this combines them into `defs.lua`, which `src/init.lua` requires —
+	`src/meta/` holds a file per library, written to be read and edited by hand. The analyzer wants
+	the text of each to parse, so this combines them into `defs.lua`, which `src/init.lua` requires —
 	rather than a generated copy of every definition sitting in the repository, which is a copy that
 	drifts from the files it was made from.
+
+	The definitions live under `src/` rather than beside it because of how lde decides to run this
+	script at all: a build runs when the size, mtime or hash of a file under `src/`, `lde.json` or
+	`build.lua` changes. Data kept outside `src/` is invisible to that check, so editing a
+	definition used to leave the previous `defs.lua` in place and the edit silently without
+	effect. Nothing pays for the move: an unreferenced file under `src/` is not bundled — a
+	100 KB file added there does not change the compiled binary by a byte.
 
 	Two places are written, and both are needed: the package's own output, so requiring it here
 	works, and `src/`, because a package that depends on this one is given the source.
@@ -44,7 +51,7 @@ end
 local parts = {}
 for _, name in ipairs(FILES) do
 	-- Paths are relative to the output directory, which is `target/<package>`.
-	local text = build:read("../../meta/" .. name .. ".lua")
+	local text = build:read("meta/" .. name .. ".lua")
 	parts[#parts + 1] = string.format("defs[%q] = %s", name, embed(text))
 end
 

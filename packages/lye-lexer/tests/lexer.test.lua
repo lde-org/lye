@@ -5,6 +5,12 @@
 	for this dialect. Every case is chosen so the whole snippet is accepted or rejected by
 	the engine exactly when it lexes, which keeps the two failure kinds from being
 	conflated.
+
+	The lexer itself accepts everything: a source is handed to it while it is still being
+	typed, and a scan that threw on a half-written literal would leave an editor with no
+	tree, no diagnostics and no completion for the whole file. What a scan cannot finish it
+	reads to the end of the input and records, and the parser reports those records as the
+	syntax errors they are.
 ]]
 
 local test = require("lde-test")
@@ -24,6 +30,15 @@ end
 local function lexes(source)
 	local isOk = pcall(lexer.tokenize, source)
 	return isOk
+end
+
+--- What the scan could not finish, in order. A source the engine accepts yields none.
+---@param source string
+---@return string[]
+local function problemsOf(source)
+	local problems, messages = lexer.tokenize(source).problems, {}
+	for _, problem in ipairs(problems or {}) do messages[#messages + 1] = problem.message end
+	return messages
 end
 
 ---@param tokens lye.lexer.Tokens
@@ -146,9 +161,20 @@ test.it("records no value for a cdata literal", function()
 	test.equal(textAt(tokens, 3), "0b1ULL")
 end)
 
-test.it("rejects a malformed number", function()
+test.it("reads a malformed number as far as it goes", function()
+	-- Typing `0x` is a number in progress, so the digits that are there are kept and the
+	-- reader is told the rest is missing.
 	for _, bad in ipairs({ "0x", "0b", "1e", "1e+" }) do
-		test.equal(pcall(lexer.tokenize, bad), false, bad)
+		test.equal(problemsOf(bad)[1]:match("malformed number") ~= nil, true, bad)
+		local tokens = lexer.tokenize(bad)
+		test.equal(variantAt(tokens, 1), "number", bad)
+		test.equal(textAt(tokens, 1), bad, bad)
+		-- The malformed tail is part of the token, so the spans still cover the source.
+		assertSpansAreExact(bad)
+	end
+
+	for _, good in ipairs({ "0x1", "0b1", "1e1", "1e+1" }) do
+		test.equal(#problemsOf(good), 0, good)
 	end
 end)
 
@@ -184,7 +210,10 @@ test.it("lexes a label as a single token", function()
 	-- Whitespace is allowed around the name.
 	test.equal(textAt(lexer.tokenize(":: a ::"), 1), ":: a ::")
 	test.equal(textAt(lexer.tokenize("::a:: ::b::"), 2), "::b::")
-	test.equal(lexes("::unfinished"), false)
+	-- A label whose close is not written yet falls back to the two symbols it is made of,
+	-- so the rest of the file still lexes.
+	test.equal(problemsOf("::unfinished")[1]:match("unfinished label") ~= nil, true)
+	test.equal(variantString(":: unfinished"), "symbol name eof")
 end)
 
 test.it("prefers the longest operator", function()
@@ -238,15 +267,23 @@ test.it("agrees with the engine on valid input", function()
 	end
 end)
 
-test.it("rejects unterminated strings and comments", function()
+test.it("reports an unterminated string or comment without giving up", function()
 	for _, source in ipairs(LEXICALLY_INVALID) do
-		test.equal(lexes(source), false, "should reject " .. string.format("%q", source))
+		test.equal(lexes(source), true, "should still lex " .. string.format("%q", source))
+		test.equal(#problemsOf(source), 1, "should report " .. string.format("%q", source))
+		-- Whatever could not be closed runs to the end of the input.
+		local tokens = lexer.tokenize(source)
+		local last = at(tokens, tokens.count - 1)
+		test.equal(last.stop, #source, "should reach the end " .. string.format("%q", source))
+		test.equal(engineAccepts(source), false, "engine should reject the same source")
 	end
 end)
 
-test.it("reports a line number when it rejects", function()
-	local _, err = pcall(lexer.tokenize, "local a = 1\nlocal b = 2\nlocal c = \"oops")
-	test.truthy(tostring(err):match("lex error at line 3"), "got: " .. tostring(err))
+test.it("reports where the unfinished literal started", function()
+	local tokens = lexer.tokenize("local a = 1\nlocal b = 2\nlocal c = \"oops")
+	test.equal(tokens.problems[1].message, "unfinished string at line 3")
+	test.equal(tokens.problems[1].start, 35, "at the quote")
+	test.equal(tokens.problems[1].stop, 39, "to the end of the input")
 end)
 
 test.it("lexes an empty and a whitespace-only file", function()

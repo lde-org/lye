@@ -138,8 +138,9 @@ end
 
 ---@param frames table[]
 ---@return table[]
---- The diagnostics an editor shows as a problem, in the order they were published. What it shows
---- as a hint — an unused local — is dropped here: these tests are about errors.
+--- The diagnostics an editor shows as a problem, in the order they were published. An unused
+--- local, whose warning every snippet here would otherwise carry, is dropped by name: these tests
+--- are about the diagnostics of the code itself.
 ---@param frames table[]
 ---@return table[]
 local function publishedDiagnostics(frames)
@@ -148,7 +149,7 @@ local function publishedDiagnostics(frames)
 		if message.method == "textDocument/publishDiagnostics" then
 			local kept = {}
 			for _, entry in ipairs(message.params.diagnostics or {}) do
-				if entry.severity == nil or entry.severity <= 2 then kept[#kept + 1] = entry end
+				if not (entry.message or ""):match("^unused local") then kept[#kept + 1] = entry end
 			end
 			message.params.diagnostics = kept
 			published[#published + 1] = message.params

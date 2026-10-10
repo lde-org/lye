@@ -88,6 +88,37 @@ local function deviate(name, text)
 	return text
 end
 
+--- LuaLS writes the numeric functions that only hand their argument back as
+--- `@generic Number: number`, which is how it keeps `integer` distinct from `number`: the answer
+--- is whatever was passed in. LuaJIT has no such distinction — `math.type` does not exist and
+--- every number is a double — so the generic says nothing about the value a caller gets, and lye
+--- binds a generic per call from the argument's *literal* type, which made `math.abs(-3)` the
+--- literal `-3` and `math.max(1, 2)` the literal `1`. A program comparing either to the truth
+--- would be told it is wrong.
+---
+--- The rule is structural rather than an exact rewrite: what has to go is the generic and the
+--- name it introduces, not the whitespace a future template happens to put around the parameters.
+---@param name string
+---@param text string
+---@return string
+local function withoutNumberGeneric(name, text)
+	if name ~= "math" then return text end
+	local out, dropped = {}, 0
+	for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+		if line == "---@generic Number: number" then
+			dropped += 1
+		else
+			-- Only in an annotation: the prose above a function is documentation, and the word
+			-- there is not a type.
+			out[#out + 1] = line:sub(1, 4) == "---@"
+				and line:gsub("%f[%w]Number%f[%W]", "number")
+				or line
+		end
+	end
+	assert(dropped > 0, "math: no `Number` generic left to drop — has the template changed?")
+	return table.concat(out, "\n")
+end
+
 local HERE = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
 local PACKAGE = assert(HERE:match("^(.*)/tools$"))
 
@@ -390,7 +421,8 @@ local function derive(name, source, docs)
 	for _, entry in ipairs(gone) do
 		io.stderr:write(string.format("%s: %s is not in this engine\n", name, entry))
 	end
-	return deviate(name, table.concat(kept2, "\n"):gsub("\n+$", "") .. "\n")
+	local text = table.concat(kept2, "\n"):gsub("\n+$", "") .. "\n"
+	return withoutNumberGeneric(name, deviate(name, text))
 		.. (LYE_ONLY[name] or "")
 end
 
@@ -416,7 +448,7 @@ local function main(argv)
 	pipe:close()
 	assert(#listing > 0, "no templates in " .. templateDir)
 
-	local derived, embedded, dropped = {}, {}, {}
+	local derived, dropped = {}, {}
 	for _, entry in ipairs(listing) do
 		local name = entry:match("^(.-)%.lua$")
 		if name then
@@ -426,7 +458,6 @@ local function main(argv)
 			local text = derive(name, source, docs)
 			if text then
 				derived[name] = text
-				embedded[#embedded + 1] = string.format('defs["%s"] = %s\n', name, embed(text))
 			else
 				dropped[#dropped + 1] = name
 			end
@@ -436,7 +467,7 @@ local function main(argv)
 
 	local changes = 0
 	for name, text in pairs(derived) do
-		local target = PACKAGE .. "/meta/" .. name .. ".lua"
+		local target = PACKAGE .. "/src/meta/" .. name .. ".lua"
 		local handle = io.open(target, "rb")
 		local existing = handle and handle:read("*a")
 		if handle then handle:close() end
@@ -450,29 +481,16 @@ local function main(argv)
 		end
 	end
 
-	local header = table.concat({
-		"--[[",
-		"\tLuaJIT standard library definitions, as source text the analyzer reads.",
-		"",
-		"\tEmbedded rather than read from disk: `lde compile` produces a standalone binary, so a path to",
-		"\ta package would not exist on the machine running the server. Generated from `meta/` by",
-		"\t`tools/derive.lua`; edit the definitions there, not here.",
-		"]]",
-		"",
-		"local defs = {}",
-		"",
-	}, "\n")
 	local names = {}
 	for name in pairs(derived) do names[#names + 1] = name end
 	table.sort(names)
-	local parts = {}
-	for _, name in ipairs(names) do
-		parts[#parts + 1] = string.format('defs["%s"] = %s\n', name, embed(derived[name]))
-	end
-		-- The entry point is a loader now, not a generated copy of every definition: `build.lua` gathers
-	-- `meta/` into the package's output, so the module is built rather than stored.
-	local embeddedText = [[--[[
-	The LuaJIT definitions the analyzer parses, from the files in `meta/`.
+
+	-- The entry point is a loader, not a copy of every definition: `build.lua` gathers `src/meta/`
+	-- into the package's output, so the module is built rather than stored.
+	-- A level-1 long bracket would end at the `]]` of the comment inside it, so this one is
+	-- written at level two.
+	local embeddedText = [==[--[[
+	The LuaJIT definitions the analyzer parses, from the files in `src/meta/`.
 
 	`build.lua` combines them into `defs.lua` in the output directory, which is this package's
 	target: the module is written per library so that each can be read and edited on its own, and
@@ -480,7 +498,7 @@ local function main(argv)
 ]]
 
 return require("lye-defs.defs")
-]]
+]==]
 
 	local target = PACKAGE .. "/src/init.lua"
 	local handle = io.open(target, "rb")

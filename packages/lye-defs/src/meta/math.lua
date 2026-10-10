@@ -9,9 +9,8 @@
 math = {}
 
 ---Returns the absolute value of `x`.
----@generic Number: number
----@param x Number
----@return Number
+---@param x number
+---@return number
 ---@nodiscard
 function math.abs(x) end
 
@@ -106,18 +105,16 @@ function math.log(x, base) end
 
 
 ---Returns the argument with the maximum value, according to the Lua operator `<`.
----@generic Number: number
----@param x Number
----@param ... Number
----@return Number
+---@param x number
+---@param ... number
+---@return number
 ---@nodiscard
 function math.max(x, ...) end
 
 ---Returns the argument with the minimum value, according to the Lua operator `<`.
----@generic Number: number
----@param x Number
----@param ... Number
----@return Number
+---@param x number
+---@param ... number
+---@return number
 ---@nodiscard
 function math.min(x, ...) end
 

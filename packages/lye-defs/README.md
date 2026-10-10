@@ -47,7 +47,7 @@ analyzer enforces that shape on every `setmetatable` call — a `__add` that is 
 name Lua does not have, or an operand of the wrong kind is an error — since a class used as a
 metatable could not satisfy a class constraint under nominal typing.
 
-`meta/` is the editable copy. `src/init.lua` embeds the same text, because `lde compile` produces a
+`src/meta/` is the editable copy. `src/init.lua` embeds the same text, because `lde compile` produces a
 standalone binary and a path into a package would not exist on the machine running the server.
 
 The analyzer reads them as a **prelude**: `analyzer.prelude(require("lye-defs"))` parses them once

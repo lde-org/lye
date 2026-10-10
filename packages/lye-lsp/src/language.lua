@@ -67,6 +67,107 @@ function Lye.new(server)
 end
 
 ---@param self lye.Server
+--- The modules a `require("...")` could name, in the layout the workspace uses. The listing comes
+--- from `find`, because a language server has no way to read a directory in Lua.
+---@param self lye.Server
+---@param prefix string what has been typed inside the quotes so far
+---@return { name: string, path: string }[]
+function Lye:moduleNames(prefix)
+	local root = self.server.rootPath
+	if not root then return {} end
+	local found = {}
+	local pipe = io.popen(string.format(
+		"find %q -name '*.lua' -not -path '*/target/*' -not -path '*/.git/*' 2>/dev/null", root))
+	if not pipe then return {} end
+	for path in pipe:lines() do
+		local relative = path:sub(#root + 2)
+		if relative ~= "" then
+			local name = (relative:gsub("%.lua$", ""):gsub("/init$", ""):gsub("[/\\]", "."))
+			-- The layout lde builds from: `packages/lye-doc/src/type.lua` is `lye-doc.type`.
+			local pkg, rest = name:match("^packages%.([%w_%-]+)%.src%.(.+)$")
+			if pkg then
+				name = pkg .. "." .. rest
+			elseif name:match("^src%.") then
+				name = name:sub(5)
+			end
+			if name:sub(1, #prefix) == prefix then
+				found[#found + 1] = { name = name, path = path }
+			end
+		end
+	end
+	pipe:close()
+	table.sort(found, function(left, right) return left.name < right.name end)
+	return found
+end
+
+
+--- The modules a `require("...")` could name, in the layout the workspace uses. The layouts
+--- tried in turn: beside the root, under `src/`, and inside the package directory lde builds a
+--- module from — `require("lye-doc.type")` is `packages/lye-doc/src/type.lua` there.
+---@param self lye.Server
+---@param name string
+---@return string?
+function Lye:moduleFile(name)
+	local root = self.server.rootPath
+	if not root then return nil end
+	local tail = (name:gsub("%.", "/"))
+	local candidates = {
+		root .. "/" .. tail .. ".lua",
+		root .. "/" .. tail .. "/init.lua",
+		root .. "/src/" .. tail .. ".lua",
+	}
+	local head, rest = name:match("^([%w_]+)%.(.+)$")
+	if head then
+		local under = (rest:gsub("%.", "/"))
+		candidates[#candidates + 1] = root .. "/packages/" .. head .. "/src/" .. under .. ".lua"
+		candidates[#candidates + 1] = root .. "/packages/" .. head .. "/src/" .. under .. "/init.lua"
+	end
+	for _, path in ipairs(candidates) do
+		local handle = io.open(path, "rb")
+		if handle then
+			handle:close()
+			return path
+		end
+	end
+end
+
+--- What `require("name")` is: the type the module file returns, analysed once and kept until its
+--- text changes. A module that requires the file being analysed would come back around, so a name
+--- already in progress answers nothing rather than recursing.
+---@param self lye.Server
+---@param name string
+---@return lye.doc.Type?
+function Lye:moduleType(name)
+	local path = self:moduleFile(name)
+	if not path then return nil end
+	self.modules = self.modules or {}
+	self.requiring = self.requiring or {}
+	if self.requiring[path] then return nil end
+
+	local uri = "file://" .. path
+	local document = self.server.documents:get(uri)
+	local written
+	if document then
+		written = document.text
+	else
+		local handle = io.open(path, "rb")
+		if not handle then return nil end
+		written = handle:read("*a")
+		handle:close()
+	end
+
+	local cached = self.modules[path]
+	if cached and cached.text == written then return cached.type end
+
+	self.requiring[path] = true
+	local names = analyzer.analyze(written, PRELUDE, self:declaredTypes(), function(inner)
+		return self:moduleType(inner)
+	end)
+	self.requiring[path] = nil
+	self.modules[path] = { text = written, type = names.module }
+	return names.module
+end
+
 --- The type names the documents this server knows declare. An annotation may name a class another
 --- file declares, which is not this file's namespace but is still not a typo.
 ---@return table<string, boolean>
@@ -90,7 +191,9 @@ function Lye:analyze(uri)
 	-- The analyzer parses the document itself, so its result carries the tree, the scopes and the
 	-- comments this needs. Parsing the same text a second time is a third of the cost of a
 	-- keystroke on a large file, for the same tree.
-	local names = analyzer.analyze(document.text, PRELUDE, self:declaredTypes())
+	local names = analyzer.analyze(document.text, PRELUDE, self:declaredTypes(), function(name)
+		return self:moduleType(name)
+	end)
 	local result = names.parser
 	self.analysis[uri] = result
 	self.names[uri] = names
@@ -136,9 +239,9 @@ function Lye:publishDiagnostics(uri, result)
 	for _, entry in ipairs(result.diagnostics) do
 		diagnostics[#diagnostics + 1] = {
 			range = self:toRange(text, index, entry.start, entry.stop),
-			-- The severity the analysis gave it: a syntax error has none and is the loudest, an
-			-- unused local is a hint. Publishing everything as an error is how a hint becomes a
-			-- red squiggle.
+			-- The severity the analysis gave it: a syntax error has none and is the loudest, and
+			-- an unused local is a warning. Publishing everything as an error is how a warning
+			-- becomes a red squiggle.
 			severity = entry.severity or 1,
 			source = "lye",
 			message = entry.message,
@@ -287,6 +390,21 @@ local function typeOfExpression(result, idx, offset)
 		local base = typeOfExpression(result, node.target, offset)
 		if base and node.field then return types.indexResult(base, node.field) end
 	end
+	if node.kind == "call" then
+		-- A generic result belongs to the call rather than to the function, so the analyzer's
+		-- binding is read first and the callee's own return type is the fallback.
+		local bound = result.callTypes and result.callTypes[idx]
+		if bound then return bound end
+		local fnType
+		if node.field and node.target then
+			local base = typeOfExpression(result, node.target, offset)
+			fnType = base and types.indexResult(base, node.field)
+		else
+			local variable = node.callee and analyzer.lookupAt(result, node.callee, offset)
+			fnType = variable and analyzer.typeAt(result, variable, offset)
+		end
+		if fnType and types.isFn(fnType) then return fnType.returns end
+	end
 end
 
 --- A signature as its annotations wrote it: `print(...: any)`, `math.floor(x: number) -> number`.
@@ -426,6 +544,26 @@ local function nodeAt(result, offset)
 		end
 	end
 	return found
+end
+
+--- The string inside a `require(...)` that an offset sits in, and what has been typed in it.
+---@param self lye.Server
+---@param uri string
+---@param source string
+---@param offset integer
+---@return { from: integer, to: integer, typed: string }?
+function Lye:requireStringAt(uri, source, offset)
+	local names = self.names[uri] or (self:analyze(uri) and self.names[uri])
+	local node = names and nodeAt(names, offset)
+	if not node or node.kind ~= "call" or node.callee ~= "require" then return nil end
+	local argument = node.args and node.args[1] and names.parser.nodes[node.args[1]]
+	if not argument or argument.kind ~= "string" then return nil end
+	if offset < argument.start or offset > argument.stop + 1 then return nil end
+	-- The quotes are not part of the name, and the cursor may sit just past the last character.
+	local contentFrom = argument.start + 1
+	local contentTo = argument.stop - 1
+	local typed = source:sub(contentFrom, math.min(offset, contentTo))
+	return { from = contentFrom, to = contentTo, typed = typed }
 end
 
 ---@param self lye.Server
@@ -611,6 +749,17 @@ function Lye:targetAt(uri, text, names, offset)
 	if written then
 		local found = self:targetOfType(written, uri)
 		if found then return found end
+	end
+
+	-- `require("a.b")` names a file: the string is a path, and the jump goes to the module.
+	local required = nodeAt(names, offset)
+	if required and required.kind == "call" and required.callee == "require"
+		and required.args and required.args[1] then
+		local argument = names.parser.nodes[required.args[1]]
+		if argument and argument.kind == "string" and offset >= argument.start and offset <= argument.stop then
+			local path = type(argument.value) == "string" and self:moduleFile(argument.value)
+			if path then return { uri = "file://" .. path, start = 1, stop = 1 } end
+		end
 	end
 
 	local declaration = declarationFor(names, offset)
@@ -919,15 +1068,18 @@ end
 ---@return integer? target arena index of the value
 ---@return string prefix what has been typed of the field name
 ---@return boolean isMethod
+---@return integer? keyFrom where the key text starts, when it has to be rewritten
+---@return string? quote the quote a rewritten key is written with
 local function accessAt(result, source, offset)
 	local found
 	for _, node in ipairs(result.parser.nodes) do
-		-- `t[k]` names no field to offer, and an `index` or a method call is what has one. The node
-		-- spans its arguments too — and an unterminated call spans the rest of the file — so where
-		-- the cursor is relative to the *field* is what decides, not where it is in the node.
+		-- `t["` names no field in the tree, and an `index` or a method call is what has one. The
+		-- node spans its arguments too — and an unterminated call spans the rest of the file —
+		-- so where the cursor is relative to the *field* is what decides, not where it is in
+		-- the node.
 		local isAccess = node.kind == "index" and node.isDynamic ~= true
 			or (node.kind == "call" and node.isMethod == true)
-		if isAccess and node.target then
+		if node.target and isAccess then
 			local target = result.parser.nodes[node.target]
 			-- The field starts after the `.` or `:` that follows the value it is read on.
 			local targetStop = target and valueStop(result, target)
@@ -944,9 +1096,41 @@ local function accessAt(result, source, offset)
 					}
 				end
 			end
+		elseif node.target and node.kind == "index" and node.isDynamic == true then
+			-- `t["…` being typed: the parser has no field name for it, so what has been written
+			-- of the key is the text between the bracket and the cursor. Only a quoted key is a
+			-- field name — `t[i]` reads one the writer named elsewhere.
+			local target = result.parser.nodes[node.target]
+			local targetStop = target and valueStop(result, target)
+			local keyStart = targetStop and (targetStop + 2)
+			if keyStart and keyStart <= offset and (not found or keyStart > found.start) then
+				local typed = source:sub(keyStart, offset - 1)
+				local opening = typed:sub(1, 1)
+				local quote, name
+				if opening == '"' or opening == "'" then
+					local rest = typed:sub(2)
+					if rest:sub(-1) == opening and not rest:sub(1, -2):find(opening, 1, true) then
+						-- The key is written and closed: the list is what the table holds, and
+						-- choosing from it replaces the key rather than being inserted into it.
+						quote, name = opening, ""
+					elseif not rest:find(opening, 1, true) then
+						quote, name = opening, rest
+					end
+				elseif typed == "" then
+					-- Just the bracket: the field is about to be named, and a name only fits here
+					-- as a string.
+					quote, name = '"', ""
+				end
+				if name and not name:find("\n", 1, true) then
+					found = {
+						target = node.target, prefix = name, isMethod = false, start = keyStart,
+						keyFrom = opening == "" and offset or keyStart, quote = quote,
+					}
+				end
+			end
 		end
 	end
-	if found then return found.target, found.prefix, found.isMethod end
+	if found then return found.target, found.prefix, found.isMethod, found.keyFrom, found.quote end
 end
 
 --- The primitives an annotation may name, which no file declares.
@@ -992,24 +1176,48 @@ end
 function Lye:onCompletion(params)
 	local uri = params.textDocument?.uri
 	local document = uri and self.server.documents:get(uri)
-	if not uri or not document or not self.names[uri] then return { isIncomplete = false, items = json.array() } end
+	if not uri or not document then return { isIncomplete = false, items = json.array() } end
+	-- Analysed on demand, the way hover does it: a document that was just opened has not been
+	-- through the analyzer yet, and answering nothing for it is how completion stops working in a
+	-- file nobody has typed in.
+	local names = self.names[uri] or (self:analyze(uri) and self.names[uri])
+	if not names then return { isIncomplete = false, items = json.array() } end
 
 	local source = document.text
 	local offset = position.toOffset(
 		source, document.lineIndex, params.position.line, params.position.character, self.server.encoding
 	)
 
+	-- Inside `require("...")` what is wanted is a module name, and the files of the workspace are
+	-- the list of them. The item replaces the text inside the quotes.
+	local inside = self:requireStringAt(uri, source, offset)
+	if inside then
+		local items = json.array()
+		for _, found in ipairs(self:moduleNames(inside.typed)) do
+			items[#items + 1] = {
+				label = found.name,
+				kind = 9,
+				detail = found.path:sub(#(self.server.rootPath or "") + 2),
+				textEdit = {
+					range = self:toRange(source, document.lineIndex, inside.from, inside.to),
+					newText = found.name,
+				},
+			}
+		end
+		return { isIncomplete = false, items = items }
+	end
+
 	-- Inside a `---@` comment the writer is naming a type rather than a value.
 	local lineStart = source:sub(1, offset - 1):match(".*()\n") or 1
 	local before = source:sub(lineStart, offset - 1)
 	if before:match("^%s*%-%-%-@") then return self:completeTypes(uri) end
 
-	local target, prefix, isMethod = accessAt(self.names[uri], source, offset)
+	local target, prefix, isMethod, keyFrom, quote = accessAt(names, source, offset)
 	if target then
 		local items = json.array()
-		local base = typeOfExpression(self.names[uri], target, offset)
+		local base = typeOfExpression(names, target, offset)
 		if base then
-			local signatures = self.names[uri].signatures or {}
+			local signatures = names.signatures or {}
 			for name, field in pairs(fieldsOf(base)) do
 				if prefix == "" or name:sub(1, #prefix) == prefix then
 					local kind = COMPLETION_KIND.field
@@ -1030,11 +1238,27 @@ function Lye:onCompletion(params)
 							item.documentation = documentationItem(signature)
 						end
 					end
+					if quote then
+						-- Inside a bracket the field is a *string* key, so the item replaces the
+						-- text written of it — a bare label would leave `t[alpha]`.
+						item.textEdit = {
+							range = self:toRange(source, document.lineIndex, keyFrom, offset - 1),
+							newText = quote .. name .. quote,
+						}
+					end
 					items[#items + 1] = item
 				end
 			end
 		end
 		return { isIncomplete = false, items = items }
+	end
+
+	-- A name means nothing inside a string, and offering one there is how a completion writes
+	-- `string.format` into the middle of a message. The module names above are the one thing a
+	-- string may hold, and they were offered before this.
+	local token = tokenAt(names.parser, offset)
+	if token and token.kind == KIND.string then
+		return { isIncomplete = false, items = json.array() }
 	end
 
 	local items, seen = json.array(), {}
@@ -1058,15 +1282,29 @@ function Lye:onCompletion(params)
 	-- The definitions declare functions rather than variables, so `print`, `setmetatable` and the
 	-- rest of the standard library are offered from their signatures. A name the document declares
 	-- itself was already offered above, and a dotted name is reached through its table.
-	for name, signature in pairs(self.names[uri].signatures or {}) do
-		if not seen[name] and not name:find("[%.:]") then
-			seen[name] = true
-			items[#items + 1] = {
-				label = name, kind = COMPLETION_KIND["function"], detail = signatureText(signature),
-				documentation = documentationItem(signature),
-			}
-		end
+	--
+	-- The definitions' names are reached through a `__index` metatable, and `pairs` does not see
+	-- through one: iterating the table is how every prelude *function* — `print`, `pairs`,
+	-- `pcall`, `type` and the rest — came to be missing from completion while the prelude *tables*
+	-- beside them were offered, since those are injected as variables. So the list of names the
+	-- definitions declare is walked, and the signature is looked up per name.
+	local declaredSignatures = self.names[uri].signatures or {}
+	---@param name string
+	local function offerGlobal(name)
+		if seen[name] or name:find("[%.:]") then return end
+		local signature = declaredSignatures[name]
+		seen[name] = true
+		items[#items + 1] = {
+			label = name,
+			-- A name the definitions declare without a signature is a value, not a function:
+			-- `arg` and `_VERSION` are written as plain assignments.
+			kind = signature and COMPLETION_KIND["function"] or COMPLETION_KIND.variable,
+			detail = signatureText(signature),
+			documentation = documentationItem(signature),
+		}
 	end
+	for name in pairs(declaredSignatures) do offerGlobal(name) end
+	for name in pairs(PRELUDE.globalNames or {}) do offerGlobal(name) end
 
 	for _, keyword in ipairs(Parser.KEYWORD_LIST) do
 		if not seen[keyword] then
@@ -1891,7 +2129,9 @@ function Lye:register()
 	})
 	-- `.` and `:` are what a field or a method call starts with; a name is completed as it is typed,
 	-- which is what the client's own quick suggestions ask for.
-	server:capability("completionProvider", { triggerCharacters = { ".", ":" } })
+	-- `[` is a trigger, not just `.` and `:`: `t[` is where a field with a name that is not an
+	-- identifier is reached, and the client must ask there for the list to appear.
+	server:capability("completionProvider", { triggerCharacters = { ".", ":", "[", '"', "'" } })
 	server:capability("signatureHelpProvider", { triggerCharacters = { "(", "," } })
 
 	server:on(method.didOpen, function(_, params)

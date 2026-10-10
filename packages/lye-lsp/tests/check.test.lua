@@ -47,7 +47,7 @@ test.it("fails on a file it cannot read", function()
 end)
 
 test.it("fails the whole batch when one file is bad", function()
-	writeInput("local x = 1\n")
+	writeInput("local x = 1\nreturn x\n")
 	test.equal(check.files({ INPUT }), true)
 
 	writeInput("local = 1\n")
@@ -69,13 +69,20 @@ end
 
 test.it("exits 1 for a file with an error and 0 for a clean one", function()
 	test.equal(exitCode("local = 2\n", "--check"), 1)
-	test.equal(exitCode("local x = 2\n", "--check"), 0)
+	test.equal(exitCode("local x = 2\nreturn x\n", "--check"), 0)
 end)
 
 test.it("treats a bare path as a check", function()
 	-- Running the server over a file argument would make no sense.
 	test.equal(exitCode("local = 2\n", ""), 1)
-	test.equal(exitCode("local x = 2\n", ""), 0)
+	test.equal(exitCode("local x = 2\nreturn x\n", ""), 0)
+end)
+
+test.it("fails on a warning, since that is the level the check reports at", function()
+	-- An unread local is a warning: a build step fails on it, and a name written with a leading
+	-- underscore is how a writer says the name is deliberate.
+	test.equal(exitCode("local x = 2\n", "--check"), 1)
+	test.equal(exitCode("local _x = 2\n", "--check"), 0)
 end)
 
 test.it("fails a file whose annotation contradicts its value", function()
@@ -84,7 +91,7 @@ test.it("fails a file whose annotation contradicts its value", function()
 	local out = run(string.format("lde run %q -- %q >/dev/null 2>&1; echo $?", MAIN, INPUT))
 	test.equal(tonumber(out), 1)
 
-	writeInput("---@type number\nlocal x = 5\n")
+	writeInput("---@type number\nlocal x = 5\nreturn x\n")
 	local ok = run(string.format("lde run %q -- %q >/dev/null 2>&1; echo $?", MAIN, INPUT))
 	test.equal(tonumber(ok), 0)
 end)

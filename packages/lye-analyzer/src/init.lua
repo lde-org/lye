@@ -106,6 +106,7 @@ local analyzer = {}
 ---@field diagnostics lye.analyzer.Diagnostic[]
 ---@field signatures table<string, lye.analyzer.Signature>
 ---@field returns table<string, lye.doc.Type>
+---@field callTypes table<integer, lye.doc.Type> what each call was bound to, by node index
 
 ---@param result lye.parser.Result
 ---@return lye.analyzer.Scope
@@ -198,8 +199,17 @@ end
 local function lookupIn(scope, name, offset)
 	local current = scope
 	while current do
-		local found = current.variables[name]
-		if found and found.start <= offset then return found end
+		-- A name declared twice in one scope shadows itself: `local x = 1` further down the same
+		-- block is a different variable, and a read above it belongs to the one before. The
+		-- variables are in declaration order, so the last one that starts at or before the read is
+		-- the one the name means there.
+		local declared = current.variables[name]
+		if declared then
+			for index = #declared, 1, -1 do
+				local found = declared[index]
+				if found.start <= offset then return found end
+			end
+		end
 		current = current.parent
 	end
 end
@@ -1462,8 +1472,10 @@ end
 ---@param source string
 ---@param prepared lye.analyzer.Prelude? what the definitions declare
 ---@param elsewhere table<string, boolean>? type names other files declare, which are not typos
+---@param modules fun(name: string): lye.doc.Type? ? what `require("name")` is, when the caller can
+--- find the file: the analyzer reads the document it is given, and a module lives elsewhere
 ---@return lye.analyzer.Result
-function analyzer.analyze(source, prepared, elsewhere)
+function analyzer.analyze(source, prepared, elsewhere, modules)
 	assert(type(source) == "string", "analyzer.analyze expects a string")
 
 	local parsed = Parser.new(source):parse()
@@ -1828,9 +1840,9 @@ function analyzer.analyze(source, prepared, elsewhere)
 	local root, byRecord = buildScopes(parsed)
 	self.root = root
 	collectNarrowing(parsed, byRecord, signatures, resolve)
-		inferCtx = infer.context(parsed, typeOfName, returns, function(base, baseName, field, offset)
+	inferCtx = infer.context(parsed, typeOfName, returns, function(base, baseName, field, offset)
 		return analyzer.fieldTypeAt(self, base, baseName, field, offset)
-	end)
+	end, modules)
 	for index, node in ipairs(parsed.nodes) do
 		if node.kind == "function" then
 			local declaration = bodyOwner[index]
@@ -1911,7 +1923,13 @@ function analyzer.analyze(source, prepared, elsewhere)
 			self.variables[#self.variables + 1] = variable
 			self.byStart[declaration.start] = variable
 			byDeclaration[declaration] = variable
-			variable.scope.variables[declaration.name] = variable
+			-- Every declaration is kept, not just the last: the scope is a list per name.
+			local declared = variable.scope.variables[declaration.name]
+			if not declared then
+				declared = {}
+				variable.scope.variables[declaration.name] = declared
+			end
+			declared[#declared + 1] = variable
 		end
 	end
 
@@ -2156,7 +2174,11 @@ function analyzer.analyze(source, prepared, elsewhere)
 			local body = parsed.nodes[index].body
 			if body then inferred = infer.at(inferCtx, body) end
 			for _, statement in ipairs(statements or {}) do
-				for _, valueIdx in ipairs(statement.children or {}) do
+				-- The *first* value, because that is what a caller reading one value gets: a
+				-- `return name, count` gives the caller a name, and a union with the count claims
+				-- it may be a number. A statement that returns nothing contributes nothing.
+				local valueIdx = statement.children and statement.children[1]
+				if valueIdx then
 					local valueType = infer.at(inferCtx, valueIdx)
 					inferred = inferred and types.combine(inferred, valueType) or valueType
 				end
@@ -2281,15 +2303,20 @@ function analyzer.analyze(source, prepared, elsewhere)
 	-- `math` would resolve to nothing.
 	if prepared then
 		for globalName, className in pairs(prepared.globals) do
-			if not self.root.variables[globalName] then
-				local classType = resolve(className)
-				if classType then
-					self.root.variables[globalName] = {
-						name = globalName, qualifier = "global", start = -1, stop = -1,
-						scope = self.root, declared = classType, initializer = classType,
-						assignments = {}, references = {},
-					}
-				end
+			-- `-1` so the read rule finds it before any declaration: a name the definitions put in
+			-- the environment is in scope from the top of the file.
+			local declared = self.root.variables[globalName]
+			if not declared then
+				declared = {}
+				self.root.variables[globalName] = declared
+			end
+			local classType = resolve(className)
+			if classType and #declared == 0 then
+				declared[1] = {
+					name = globalName, qualifier = "global", start = -1, stop = -1,
+					scope = self.root, declared = classType, initializer = classType,
+					assignments = {}, references = {},
+				}
 			end
 		end
 	end
@@ -2578,8 +2605,9 @@ function analyzer.analyze(source, prepared, elsewhere)
 		end
 	end
 
-	-- A local nothing reads is dead weight, which is what an editor tells a reader about. A name
-	-- that starts with `_` is how a writer says they meant it.
+	-- A local nothing reads is dead weight, which is what an editor tells a reader about: a
+	-- warning, not a hint, because an unread name is usually a mistake rather than a style note.
+	-- A name that starts with `_` is how a writer says they meant it, and it silences the rule.
 	for _, variable in ipairs(self.variables) do
 		local unused = variable.qualifier == "local" and #variable.references == 0
 			and not variable.name:match("^_")
@@ -2587,13 +2615,32 @@ function analyzer.analyze(source, prepared, elsewhere)
 			local declaration = variable.declaration
 			self.diagnostics[#self.diagnostics + 1] = {
 				message = string.format("unused local `%s`", variable.name),
-				start = declaration.start, stop = declaration.stop, severity = 4,
+				start = declaration.start, stop = declaration.stop, severity = 2,
 			}
 		end
 	end
 
+	-- What this file gives a caller: `return { ... }` at the top level is what a module is, and the
+	-- type of it is what `require("this.file")` means somewhere else. Read after typing, so the
+	-- names it is built from are settled.
+
+	-- What this file gives a caller. `return { ... }` at the top level is what a module is, and the
+	-- type of it is what `require("this.file")` means somewhere else. Typed after the rounds, like
+	-- every other read, so the names it is built from are settled.
+	for _, node in ipairs(parsed.nodes) do
+		-- Top level means the scope it is written in is the file's own: `parent` says which node was
+		-- being built, which a statement inside a function body also answers with the root.
+		if node.kind == "return" and scopeAt(self, node.start) == self.root and not self.module then
+			local first = node.children and node.children[1]
+			if first then self.module = infer.at(inferCtx, first) end
+		end
+	end
+
 	checkCalls(self, parsed, signatureOfCall, returns, resolve, inferCtx, source)
-		self.signatures = signatures
+	-- What each call was bound to, by node: a generic result is settled per call, and a reader
+	-- asking what `f()` is — a completion after `f().` — has no other way to that answer.
+	self.callTypes = inferCtx.callTypes
+	self.signatures = signatures
 	self.returns = returns
 
 	-- Typing runs twice: once to settle what each value is, and again for the ones that could only
@@ -2620,11 +2667,18 @@ function analyzer.visibleAt(self, offset)
 	local out, seen, n = {}, {}, 0
 	local scope = scopeAt(self, offset)
 	while scope do
-		for name, variable in pairs(scope.variables) do
-			if not seen[name] and variable.start <= offset then
-				seen[name] = true
-				n += 1
-				out[n] = variable
+		for name, declared in pairs(scope.variables) do
+			if not seen[name] then
+				-- The nearest declaration of the name that has been reached: the same rule a read
+				-- follows, so what is offered here is what the name means.
+				for index = #declared, 1, -1 do
+					if declared[index].start <= offset then
+						seen[name] = true
+						n += 1
+						out[n] = declared[index]
+						break
+					end
+				end
 			end
 		end
 		scope = scope.parent

@@ -101,6 +101,24 @@ test.it("echoes several messages in order and never answers a notification", fun
 	test.truthy(got[3]:find('"id":2', 1, true))
 end)
 
+test.it("reads a message larger than its read buffer", function()
+	-- A document over 64 KB is one frame over 64 KB: the buffer fills before the body is
+	-- complete, and a reader that treats a full buffer as the end of the stream ends the
+	-- process here. An editor hits this the first time it opens a large enough file.
+	local padding = string.rep("x", 200000)
+	local output = runChild(
+		frame(string.format('{"jsonrpc":"2.0","id":1,"method":"m","params":"%s"}', padding))
+		.. frame('{"jsonrpc":"2.0","id":2,"method":"after"}')
+	)
+	local got = bodies(output)
+	test.equal(#got, 2, "one answer per request")
+	test.truthy(got[1]:find('"id":1', 1, true), "the large request is read and answered")
+	test.truthy(got[1]:find('"m"', 1, true), "with the method it carried")
+	-- The answer to the *second* frame is what proves the large body was consumed exactly:
+	-- reading it short would answer with a method cut out of the padding, or not at all.
+	test.truthy(got[2]:find('"id":2', 1, true), "and the frame after it parses in the right place")
+end)
+
 test.it("counts Content-Length in bytes, not characters", function()
 	-- é is 2 bytes and € is 3. A character-count implementation desyncs right here.
 	local output = runChild(frame('{"jsonrpc":"2.0","id":1,"method":"m","params":"caf\195\169\226\130\172"}'))

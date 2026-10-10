@@ -30,21 +30,38 @@ local BUFFER_SIZE = 65536
 
 ---@class lye.rpc.Chunk
 ---@field buf ffi.cdata*
----@field n integer
+---@field n integer how many bytes are held
+---@field capacity integer how many bytes fit before the buffer has to grow
 local Chunk = {}
 Chunk.__index = Chunk
 
 ---@return lye.rpc.Chunk
 function Chunk.new()
-	return setmetatable({ buf = ffi.new("char[?]", BUFFER_SIZE), n = 0 }, Chunk)
+	return setmetatable({
+		buf = ffi.new("char[?]", BUFFER_SIZE), n = 0, capacity = BUFFER_SIZE,
+	}, Chunk)
 end
 
 stdio.Chunk = Chunk
 
+--- A message is not bounded by the buffer: an editor sends a whole document in one frame, so a
+--- file larger than the buffer arrives as a frame larger than it. Doubling the buffer is what
+--- lets the read keep making progress; stopping to report EOF instead is how a 70 KB file used
+--- to end the process.
+---@param chunk lye.rpc.Chunk
+local function grow(chunk)
+	local capacity = chunk.capacity * 2
+	local buf = ffi.new("char[?]", capacity)
+	ffi.copy(buf, chunk.buf, chunk.n)
+	chunk.buf, chunk.capacity = buf, capacity
+end
+
+--- Only a read that returns nothing at all is the end of the stream, so a short read is
+--- handled where it happens rather than being mistaken for one.
 ---@return integer
 function stdio.read(chunk)
-	if chunk.n == BUFFER_SIZE then return stdio.EOF end
-	local got = tonumber(C.read(0, chunk.buf + chunk.n, BUFFER_SIZE - chunk.n))
+	if chunk.n == chunk.capacity then grow(chunk) end
+	local got = tonumber(C.read(0, chunk.buf + chunk.n, chunk.capacity - chunk.n))
 	if got <= 0 then return stdio.EOF end
 	chunk.n += got
 	return got
