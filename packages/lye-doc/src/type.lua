@@ -280,6 +280,13 @@ function types.satisfies(type, constraint)
 		return true
 	end
 
+	-- And the other way: a Lua number written into a C number is converted by the engine, which is
+	-- what assigning `32` to a `size_t` field does. The difference the types make is in what a
+	-- value *is* when it is read back, which is what the display says.
+	if isCNumber(constraint) and (type.variant == "number" or type.variant == "integer") then
+		return true
+	end
+
 	-- A quoted name is a string value rather than a name to look up, which is how the definitions
 	-- write `select("#", ...)` and their option flags. It is one of the strings, so it fits
 	-- `string`, and only that same string fits it.
