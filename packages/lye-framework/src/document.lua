@@ -2,6 +2,10 @@
 
 local position = require("lye-framework.position")
 
+---@class lye.framework.Position
+---@field line integer zero-based, as the protocol counts lines
+---@field character integer zero-based, in the encoding the client negotiated
+
 ---@class lye.framework.Range
 ---@field start lye.framework.Position
 ---@field ["end"] lye.framework.Position

@@ -28,7 +28,30 @@ server.METHOD = {
 	definition = "textDocument/definition",
 	documentSymbol = "textDocument/documentSymbol",
 	semanticTokens = "textDocument/semanticTokens/full",
+	semanticTokensRange = "textDocument/semanticTokens/range",
 	completion = "textDocument/completion",
+	signatureHelp = "textDocument/signatureHelp",
+	references = "textDocument/references",
+	prepareRename = "textDocument/prepareRename",
+	rename = "textDocument/rename",
+	documentHighlight = "textDocument/documentHighlight",
+	typeDefinition = "textDocument/typeDefinition",
+	foldingRange = "textDocument/foldingRange",
+	selectionRange = "textDocument/selectionRange",
+	inlayHint = "textDocument/inlayHint",
+	callHierarchyPrepare = "textDocument/prepareCallHierarchy",
+	callHierarchyIncoming = "callHierarchy/incomingCalls",
+	callHierarchyOutgoing = "callHierarchy/outgoingCalls",
+	workspaceSymbol = "workspace/symbol",
+	implementation = "textDocument/implementation",
+	codeAction = "textDocument/codeAction",
+	codeLens = "textDocument/codeLens",
+	documentColor = "textDocument/documentColor",
+	formatting = "textDocument/formatting",
+	formattingRange = "textDocument/rangeFormatting",
+	typeFormatting = "textDocument/onTypeFormatting",
+	workspaceDidChangeWatchedFiles = "workspace/didChangeWatchedFiles",
+	workspaceDidChangeConfiguration = "workspace/didChangeConfiguration",
 }
 
 server.ERROR = rpc.ERROR
@@ -61,7 +84,9 @@ end
 ---@field encoding string
 ---@field isInitialized boolean
 ---@field isShutdown boolean
+---@field rootPath string? the folder the client opened, as a path
 ---@field handlers table<string, fun(self: lye.framework.Server, params: table?, id: any)>
+---@field answered table<any, boolean> the requests a handler answered itself
 ---@field options { name: string?, version: string? }
 local Server = {}
 Server.__index = Server
@@ -69,7 +94,7 @@ Server.__index = Server
 ---@return lye.framework.Server
 function Server.new(connection, options)
 	local caps = { textDocumentSync = { openClose = true, change = 2 } }
-	return setmetatable({ connection = connection, documents = DocumentStore.new(), capabilities = caps, encoding = position.UTF16, isInitialized = false, isShutdown = false, handlers = {}, options = options or {} }, Server)
+	return setmetatable({ connection = connection, documents = DocumentStore.new(), capabilities = caps, encoding = position.UTF16, isInitialized = false, isShutdown = false, handlers = {}, answered = {}, options = options or {} }, Server)
 end
 
 ---@param self lye.framework.Server
@@ -100,6 +125,7 @@ end
 
 ---@param self lye.framework.Server
 function Server:respond(id, result)
+	self.answered[id] = true
 	self.connection:respond(id, result)
 end
 
@@ -123,10 +149,24 @@ function Server:log(message, kind)
 end
 
 ---@param self lye.framework.Server
+--- The folder the client opened: `workspaceFolders` when it sends them, and `rootUri` otherwise.
+--- Both are URIs, and a workspace symbol search needs a path to walk.
+---@param self lye.framework.Server
+---@param params table
+local function rememberRoot(self, params)
+	local uri = params.rootUri
+	local folders = params.workspaceFolders
+	if type(folders) == "table" and folders[1] then uri = folders[1].uri end
+	if type(uri) == "string" then self.rootPath = (uri:gsub("^file://", "")) end
+end
+
+---@param self lye.framework.Server
+---@param params table
 function Server:onInitialize(params)
 	self.encoding = negotiateEncoding(params)
 	-- Omitting this silently selects the utf-16 default, making every position wrong.
 	self.capabilities.positionEncoding = self.encoding
+	rememberRoot(self, params)
 
 	local result = { capabilities = self.capabilities }
 	if self.options.name then
@@ -195,9 +235,22 @@ function Server:handle(message)
 	end
 
 	if isRequest(message) then
-		-- A handler that answers for itself later returns nothing.
-		local result = handler(self, message.params, message.id)
-		if result ~= nil then self:respond(message.id, result) end
+		-- A handler that answers for itself later returns nothing, and the id it answered with is
+		-- recorded. Every other request is answered, `null` included: a client waits forever for
+		-- a response that never comes, which is what a hover over something with no type did.
+		local isOk, result = pcall(handler, self, message.params, message.id)
+		if not isOk then
+			-- A handler that raises is a bug in this server, not in the document. Say so in the
+			-- output channel before answering, or the only trace is an error on the wire.
+			self:log(string.format("%s: %s", method, tostring(result)))
+			result = nil
+		end
+		if result ~= nil or not self.answered[message.id] then
+			self:respond(message.id, result)
+		end
+		-- The record is only needed while this request is in flight: leaving it behind would grow
+		-- a table entry for every hover and completion of a session.
+		self.answered[message.id] = nil
 	else
 		-- A raised notification error is discarded by the transport, since there is no id
 		-- to answer with. Log it, or a broken handler fails in complete silence.

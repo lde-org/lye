@@ -169,4 +169,46 @@ test.it("describes a mismatch in the message", function()
 	test.equal(doctype.mismatch(doctype.parse("string"), doctype.parse("string"), "x"), nil)
 end)
 
+test.it("keeps an optional name unknown rather than making it nil", function()
+	-- `---@param v? T` on a name nothing is known about says the value may be anything, nil
+	-- included: collapsing it to nil would report every argument passed to it.
+	local unknown = function() return doctype.UNKNOWN_TYPE end
+	test.equal(doctype.display(doctype.parse("T?", unknown)), "unknown")
+	test.equal(doctype.display(doctype.parse("number?", unknown)), "nil|number")
+	test.equal(doctype.display(doctype.parse("T[]?", unknown)), "nil|unknown[]")
+	test.equal(doctype.display(doctype.parse("nil|string[]")), "nil|string[]",
+		"a suffix belongs to its own member rather than to the union")
+end)
+
+test.it("takes any container for a table", function()
+	-- The standard library writes `table` where it does not care what is inside.
+	test.equal(doctype.satisfies(doctype.parse("string[]"), doctype.TABLE), true)
+	test.equal(doctype.satisfies(doctype.parse("{ a: number }"), doctype.TABLE), true)
+	test.equal(doctype.satisfies(doctype.parse("string"), doctype.TABLE), false)
+	test.equal(doctype.satisfies(doctype.parse("nil|string[]"), doctype.TABLE), false,
+		"every member of a union has to fit")
+end)
+
+test.it("reads never as the type that has no value", function()
+	local never = doctype.parse("never")
+	test.equal(doctype.display(never), "never")
+	test.equal(doctype.satisfies(never, doctype.parse("number")), true,
+		"a call that never returns has no value to be wrong")
+	test.equal(doctype.satisfies(doctype.parse("number"), never), false,
+		"and nothing is a value that cannot exist")
+	test.equal(doctype.display(doctype.union({ never, doctype.parse("number") })), "number",
+		"a member that cannot exist adds nothing to what a value may be")
+	test.equal(doctype.display(doctype.parse("never|string")), "string")
+end)
+
+test.it("narrows to a class or an alias by the parsed type", function()
+	-- A predicate names a type its writer chose: `x is Point` has to narrow to the class, which a
+	-- name parsed without a resolver cannot reach.
+	local point = doctype.classType("Point", nil, { x = doctype.NUMBER })
+	test.equal(doctype.display(doctype.narrowToType(doctype.union({ point, doctype.NIL_TYPE }), point)),
+		"Point")
+	test.equal(doctype.display(doctype.excludeType(doctype.union({ point, doctype.NIL_TYPE }), point)),
+		"nil")
+end)
+
 return true

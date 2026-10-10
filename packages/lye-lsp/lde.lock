@@ -3,6 +3,9 @@
 		"lye-analyzer": {
 			"path": "../lye-analyzer"
 		},
+		"lye-defs": {
+			"path": "../lye-defs"
+		},
 		"lye-doc": {
 			"path": "../lye-doc"
 		},
@@ -22,6 +25,6 @@
 			"path": "../lye-rpc"
 		}
 	},
-	"manifestHash": "cfe384f645c8ee84",
+	"manifestHash": "91f761545e222264",
 	"version": "1"
 }

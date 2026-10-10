@@ -3,7 +3,7 @@
 
 local lexer = require("lye-lexer")
 
----@alias lye.parser.Qualifier "local"|"global"|"field"|"param"|"label"
+---@alias lye.parser.Qualifier "local"|"global"|"field"|"param"|"loop"|"label"
 
 ---@alias lye.parser.NodeKind
 
@@ -27,6 +27,7 @@ local lexer = require("lye-lexer")
 ---@field field string? the field an index reads
 ---@field callee string? the name a call invokes
 ---@field args integer[]? the argument node indices of a call
+---@field params lye.parser.Declaration[]? the parameters a function node declares, `self` first
 
 ---@class lye.parser.Declaration
 ---@field name string
@@ -52,7 +53,7 @@ local lexer = require("lye-lexer")
 ---@field root integer index of the chunk node, which contains everything
 ---@field scopes lye.parser.Scope[]
 ---@field tableFields table<integer, table<string, string>> field kinds, keyed by table node
----@field tokens lye.lexer.Token[]
+---@field tokens lye.lexer.Tokens
 ---@field nodes lye.parser.Node[]
 ---@field declarations lye.parser.Declaration[]
 ---@field diagnostics lye.parser.Diagnostic[]
@@ -78,6 +79,7 @@ local lexer = require("lye-lexer")
 ---@field scopeStarts lye.parser.Frame[]
 ---@field scopes_ lye.parser.Scope[]
 ---@field tableFields table<integer, table<string, string>> field kinds per table literal
+---@field tableIndexes table<integer, integer[]> positional element indices per table literal
 local Parser = {}
 Parser.KIND = lexer.KIND
 
@@ -145,6 +147,8 @@ function Parser.new(source)
 		scopeStarts = {},
 		scopes_ = {},
 		tableFields = {},
+		tableFieldValues = {},
+		tableIndexes = {},
 		count_ = 0,
 		building = {},
 		lastKind = nil,
@@ -175,7 +179,7 @@ function Parser:isEof(token)
 	return not token or token.kind == lexer.KIND.eof
 end
 
----@return lye.lexer.Token
+---@return lye.lexer.ffi.token
 function Parser:peekAt(ahead)
 	return self.arena[self.index + ahead - 1] or self.arena[self.tokenCount]
 end
@@ -284,6 +288,17 @@ function Parser:adopt(parentIdx, childIdxs)
 	self.nodes[parentIdx].children = children
 end
 
+--- A comment can sit anywhere a token can, including inside a table's field list, as LuaLS's
+--- definitions write `---@type Proto[]` between two fields. Expressions and fields step over one;
+--- annotations are read from their own offsets, so nothing depends on the parser stopping at them.
+function Parser:skipComments()
+	while true do
+		local token = self:peek()
+		if not token or token.kind ~= lexer.KIND.comment then return end
+		self:advance()
+	end
+end
+
 --- Open a node that expressions emitted before it closes become children of.
 ---@param index integer
 function Parser:enter(index)
@@ -300,7 +315,7 @@ end
 --- An identifier. `goto` counts, because LuaJIT keeps it a soft keyword: it only starts a
 --- statement when a name follows, so anywhere a name is expected it is a name.
 ---@return string?
----@return lye.lexer.Token?
+---@return lye.lexer.ffi.token?
 function Parser:parseName()
 	local token = self:peek()
 	if token.kind == lexer.KIND.name or self.texts[token.index] == "goto" then
@@ -320,8 +335,9 @@ end
 
 ---@param name string
 ---@param qualifier lye.parser.Qualifier
----@param token lye.lexer.Token
+---@param token lye.lexer.ffi.token
 ---@param isFunction boolean?
+---@return lye.parser.Declaration
 function Parser:declare(name, qualifier, token, isFunction)
 	local declaration = {
 		name = name,
@@ -339,6 +355,7 @@ function Parser:declare(name, qualifier, token, isFunction)
 	self.lastLiteral = nil
 	local scope = self.scopes[#self.scopes]
 	scope[#scope + 1] = name
+	return declaration
 end
 
 function Parser:pushScope(start, conditionIdx)
@@ -394,6 +411,8 @@ function Parser:parse()
 		root = chunkIdx,
 		scopes = self.scopes_,
 		tableFields = self.tableFields,
+		tableFieldValues = self.tableFieldValues,
+		tableIndexes = self.tableIndexes,
 		tokens = self.tokens,
 		nodes = self.nodes,
 		declarations = self.declarations,

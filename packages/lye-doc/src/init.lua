@@ -88,6 +88,10 @@ local function parse(comment, start, stop)
 	end
 
 	local rest, commentText = splitBody(trim(body:sub(#tag + 2)))
+	-- A tag cannot be part of a type, so a second annotation sharing the line is where this one
+	-- ends even if the line was not split before it got here.
+	local nextTag = rest:find("---@", 1, true)
+	if nextTag then rest = trim(rest:sub(1, nextTag - 1)) end
 	local annotation = {
 		tag = tag,
 		text = rest,
@@ -159,8 +163,23 @@ function doc.parse(source)
 			while true do
 				local newline = rest:find("\n", 1, true)
 				local line = newline and rest:sub(1, newline - 1) or rest
-				local found = parse(line, index, index + #line - 1)
-				if found then annotations[#annotations + 1] = found end
+				-- A line can hold more than one annotation: `---@param a Vec ---@param b Vec` is
+				-- what a formatter leaves when it folds a block onto one line, and reading the line
+				-- as one annotation puts the second tag inside the first one's type.
+				-- A line of prose may quote an annotation — `-- write \`---@param a Vec\`` — and that
+				-- is a sentence, not a tag. Only a tag the comment starts with, or one following
+				-- another tag on the same line, is read as one.
+				local at = line:find("---@", 1, true)
+				if at and not line:sub(1, at - 1):match("^%s*$") and not line:sub(1, at - 1):match("^%s*%-%-%-?%s*$") then
+					at = nil
+				end
+				while at do
+					local nextAt = line:find("---@", at + 4, true)
+					local piece = line:sub(at, nextAt and nextAt - 1 or #line)
+					local found = parse(piece, index + at - 1, index + at - 1 + #piece - 1)
+					if found then annotations[#annotations + 1] = found end
+					at = nextAt
+				end
 				if not newline then break end
 				index += newline
 				rest = rest:sub(newline + 1)

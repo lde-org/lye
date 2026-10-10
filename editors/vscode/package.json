@@ -59,6 +59,8 @@
 		"compile": "tsc -p .",
 		"watch": "tsc -p . --watch",
 		"test": "node tests/smoke.mjs",
+		"benchmark": "node tests/benchmark.mjs",
+		"compare": "node tests/compare.mjs",
 		"package": "vsce package"
 	},
 	"dependencies": {

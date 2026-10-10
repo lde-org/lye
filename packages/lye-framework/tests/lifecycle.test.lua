@@ -162,10 +162,13 @@ test.it("errors on an unknown dollar request but ignores a dollar notification",
 end)
 
 test.it("answers a handler that returns no value", function()
-	-- A request must always get exactly one response. A handler returning nothing at
-	-- all must still be answered rather than left hanging.
+	-- A request must always get exactly one response. A handler returning nothing at all used to
+	-- leave the client waiting forever — a hover over something with no type simply never came
+	-- back — so the framework answers for it, with null.
 	local responses = run({ { jsonrpc = "2.0", id = 6, method = "test/noResult" } })
-	test.equal(#responses, 1, "the server hangs the client when a request goes unanswered")
+	test.equal(#responses, 2, "the initialize result and one answer for the request")
+	test.equal(responses[2].id, 6)
+	test.equal(responses[2].result, json.null, "an absent result is null, not silence")
 end)
 
 

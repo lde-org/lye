@@ -71,10 +71,14 @@ function statements.parseFor(self)
 	self:expect("for")
 	self:pushScope(self:peek().start)
 
+	-- The control variables belong to the loop rather than to the body, so they carry their own
+	-- kind: a numeric `for` counts, and a generic one takes what its expressions yield.
 	local name, token = self:parseName()
-	if name then self:declare(name, "local", token) end
+	if name then self:declare(name, "loop", token) end
 
+	local values, isNumeric = {}, false
 	if self:accept("=") then
+		isNumeric = true
 		self:parseExpression()
 		self:expect(",")
 		self:parseExpression()
@@ -82,11 +86,11 @@ function statements.parseFor(self)
 	else
 		while self:accept(",") do
 			local extra, extraToken = self:parseName()
-			if extra then self:declare(extra, "local", extraToken) end
+			if extra then self:declare(extra, "loop", extraToken) end
 		end
 		self:expect("in")
 		repeat
-			self:parseExpression()
+			values[#values + 1] = self:parseExpression()
 		until not self:accept(",")
 	end
 
@@ -95,11 +99,15 @@ function statements.parseFor(self)
 	local doStart = self:peek().start
 	self:parseDoBlock(doStart)
 	self:popScope(self.arena[self.index - 1].stop)
-	self:emit("for", start, self.arena[self.index - 1].stop)
+	local forIdx = self:emit("for", start, self.arena[self.index - 1].stop,
+		{ isNumeric = isNumeric })
+	-- The expressions a generic `for` iterates over, so the loop's names can be typed from what
+	-- the iterator yields.
+	if #values > 0 then self:adopt(forIdx, values) end
 end
 
 ---@return string? name
----@return lye.lexer.Token? token
+---@return lye.lexer.ffi.token? token
 ---@return boolean isMethod
 function statements.parseFunctionName(self)
 	local name, token = self:parseName()
@@ -198,19 +206,31 @@ end
 function statements.parseConst(self, start)
 	local startIdx = self.index
 	self:expect("const")
+	local first, count = nil, 0
 	repeat
 		local name, token = self:parseName()
 		if name then
 			self:declare(name, "local", token)
+			-- The name is held, so nothing may write it again and its type is what it was given.
+			self.declarations[self.lastDeclaration].isConst = true
 			self.declarations[self.lastDeclaration].anchorIdx = startIdx
+			first = first or self.lastDeclaration
+			count += 1
+		else
+			count = math.max(count, 1)
+			first = first or self.lastDeclaration
 		end
 	until not self:accept(",")
 
+	-- The initializer is read the way `local` reads one, so `const n = 5` is a number rather than
+	-- a name nothing knows.
 	if self:accept("=") then
-		repeat
+		for offset = 0, count - 1 do
 			self.lastKind = nil
-			self:parseExpression()
-		until not self:accept(",")
+			local valueIdx = self:parseExpression()
+			if first then self:setInitializer(first + offset, self.lastKind, valueIdx) end
+			if not self:accept(",") then break end
+		end
 	end
 	self:emit("const", start, self.arena[self.index - 1].stop)
 end

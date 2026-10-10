@@ -6,6 +6,7 @@ local test = require("lde-test")
 local doc = require("lye-doc")
 
 local classes = doc.classes
+local doctype = require("lye-doc.type")
 
 ---@param source string
 ---@return lye.doc.Namespace
@@ -146,15 +147,72 @@ end)
 
 test.it("reads an optional field", function()
 	local namespace = read("---@class Ref\n---@field value? number\nlocal Ref = {}\n")
-	test.equal(table.concat(fields(namespace, "Ref"), ", "), "value: number?")
+	local found = classes.fieldsOf(namespace, "Ref").value
+	test.equal(found.type, "number", "the type it says, without the marker in the text")
+	test.equal(found.optional, true, "and a value may leave it out")
 end)
 
 test.it("reads an alias", function()
 	local namespace = read("---@alias Id number|string\n")
-	test.equal(namespace.aliases.Id, "number|string")
+	test.equal(namespace.aliases.Id.body, "number|string")
+	test.equal(#namespace.aliases.Id.params, 0)
+end)
+
+test.it("substitutes the arguments of a generic alias", function()
+	local namespace = read("---@alias ArrayOfNumberLike<T: number> T[]\n")
+	test.equal(namespace.aliases.ArrayOfNumberLike.body, "T[]", "the limit is not part of the body")
+	local resolve = classes.resolver(namespace)
+	test.equal(doctype.display(resolve("ArrayOfNumberLike<number>")), "number[]")
+	test.equal(doctype.display(resolve("ArrayOfNumberLike<string>")), "string[]")
+	test.equal(doctype.display(resolve("ArrayOfNumberLike")), "unknown[]",
+		"an alias with no argument holds unknown, as a class does")
+end)
+
+test.it("reads an alias that names a class declared below it", function()
+	local namespace = read(table.concat({
+		"---@alias Ids Point[]\n",
+		"---@class Point\n",
+		"---@field x number\n",
+		"local Point = {}\n",
+	}, ""))
+	local resolve = classes.resolver(namespace)
+	test.equal(doctype.display(resolve("Ids")), "Point[]",
+		"the body is resolved where it is used, so a class below it is found")
 end)
 
 test.it("answers nothing for a class it does not know", function()
 	local namespace = read("---@class Point\nlocal Point = {}\n")
 	test.equal(next(classes.fieldsOf(namespace, "Missing")), nil)
+end)
+
+test.it("keeps the name of a parameter that carries a limit", function()
+	local namespace = read("---@class Box<T: number>\n---@field item T\nlocal Box = {}\n")
+	test.equal(namespace.classes.Box.name, "Box")
+	test.equal(table.concat(namespace.classes.Box.params, ","), "T",
+		"the limit is not part of the parameter's name")
+	local resolve = classes.resolver(namespace)
+	test.equal(doctype.display(resolve("Box<string>").fields.item), "string")
+end)
+
+test.it("reads a class whose name carries the internal marker", function()
+	local namespace = read("---@class file*\nlocal file = {}\n")
+	test.equal(namespace.classes["file*"] ~= nil, true, "`file*` is a class the definitions declare")
+end)
+
+test.it("reads a const parameter and what limits it", function()
+	local params, constraints, consts = classes.readParams("A, const B: number")
+	test.equal(table.concat(params, ","), "A,B")
+	test.equal(consts.B, true, "the marked one takes a value")
+	test.equal(consts.A, nil, "and the other takes a type")
+	test.equal(constraints.B, "number")
+end)
+
+test.it("substitutes an argument into arithmetic in a type", function()
+	local namespace = read("---@alias F<A, const B: number> { x: A[], y: B + 2 }\n")
+	local resolve = classes.resolver(namespace)
+	local types = doctype
+	test.equal(types.display(resolve("F<string, 5>")), "{ x: string[], y: 7 }",
+		"the arithmetic is worked out where the type is used")
+	test.equal(types.display(resolve("F<string, 40 + 2>")), "{ x: string[], y: 44 }",
+		"and an argument may be an expression itself")
 end)

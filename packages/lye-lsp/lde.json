@@ -25,6 +25,9 @@
 		},
 		"lye-doc": {
 			"path": "../lye-doc"
+		},
+		"lye-defs": {
+			"path": "../lye-defs"
 		}
 	}
 }

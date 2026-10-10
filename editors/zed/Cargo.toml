@@ -1,0 +1,16 @@
+[package]
+name = "lye"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lye.rs"
+
+[dependencies]
+zed_extension_api = "*"
+
+[profile.release]
+opt-level = "s"
+lto = true

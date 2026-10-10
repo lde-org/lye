@@ -137,8 +137,9 @@ end)
 
 test.it("answers nothing for a position that is not an identifier", function()
 	local results = run({ request(2, "textDocument/hover", { line = 0, character = 9 }) })
-	-- The framework answers an absent result as JSON null; a decoded null is nil here.
-	test.equal(results["2"], nil, "a non-identifier position has no hover")
+	-- The framework answers an absent result as JSON null rather than staying silent, so the
+	-- editor is never left waiting. A decoded null is `json.null`, which is falsy here.
+	test.equal(results["2"], json.null, "a non-identifier position has no hover")
 end)
 
 test.it("jumps to the declaration of a local", function()
@@ -267,6 +268,81 @@ test.it("answers nothing for an identifier with no declaration", function()
 	local stray = run({ request(2, "textDocument/definition", { line = 0, character = 6 }) })
 	test.truthy(results["2"])
 	test.truthy(stray["2"])
+end)
+
+test.it("hints an inferred name and leaves the function it is written in alone", function()
+	local source = table.concat({
+		"---@class Test\n",
+		"local Test = {}\n",
+		"\n",
+		"function Test:fuck()\n",
+		"\tprint(self)\n",
+		"end\n",
+		"\n",
+		"local count = 1\n",
+	}, "")
+	local whole = { start = { line = 0, character = 0 }, ["end"] = { line = 8, character = 0 } }
+	local request2 = {
+		jsonrpc = "2.0", id = 2, method = "textDocument/inlayHint",
+		params = { textDocument = { uri = "file:///f.lua" }, range = whole },
+	}
+	local hints = run({ request2 }, source)["2"]
+	local where = {}
+	for _, hint in ipairs(hints) do where[#where + 1] = hint.label .. " on line " .. hint.position.line end
+	test.equal(#hints, 1, table.concat(where, ", "))
+	test.equal(hints[1].label, ": 1", "the local is the name nobody wrote down")
+	test.equal(hints[1].position.line, 7)
+end)
+
+test.it("takes a method's parameters from the field it implements", function()
+	local source = table.concat({
+		"---@class App\n",
+		"---@field call fun(self: App, x: string): number\n",
+		"\n",
+		"---@type App\n",
+		"local x = {}\n",
+		"\n",
+		"function x:call(y)\n",
+		"\treturn #y\n",
+		"end\n",
+	}, "")
+	local hoverRequest = {
+		jsonrpc = "2.0", id = 2, method = "textDocument/hover",
+		params = {
+			textDocument = { uri = "file:///f.lua" },
+			position = { line = 6, character = 16 },
+		},
+	}
+	local hover = run({ hoverRequest }, source)["2"]
+	test.truthy(hover, "the parameter should answer a hover")
+	test.truthy(hover.contents.value:match("y: string"), hover.contents.value)
+end)
+
+test.it("jumps to a class from an annotation and to a builtin from code", function()
+	local source = table.concat({
+		"---@class App\n",
+		"---@field call fun(self: App): number\n",
+		"local App = {}\n",
+		"\n",
+		"local n = math.floor(1.5)\n",
+	}, "")
+
+	-- The `App` in `---@type App`, which is a type rather than a name the parser declares.
+	local typeResults = run({
+		{ jsonrpc = "2.0", id = 2, method = "textDocument/definition", params = {
+			textDocument = { uri = "file:///f.lua" },
+			position = { line = 3, character = 0 },
+		} },
+	}, source .. "---@type App\nlocal app = {}\n")
+	test.truthy(typeResults["2"], "a name in an annotation should answer")
+
+	-- `math.floor`, which is declared in the definitions rather than in any open document.
+	local results = run({
+		request(2, "textDocument/definition", { line = 4, character = 15 }),
+	}, source)
+	local target = results["2"]
+	test.truthy(target, "a builtin should answer")
+	test.truthy(target.uri:match("lye/defs/math%.lua"), target.uri)
 end)
 
 return true

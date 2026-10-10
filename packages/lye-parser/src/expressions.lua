@@ -120,9 +120,11 @@ end
 ---@return integer
 local function parseTable(self)
 	local start = self:peek().start
-	local fieldKinds = {}
+	local fieldKinds, fieldValues, elementIdxs = {}, {}, {}
 	self:expect("{")
 	while not self:check("}") and not self:isEof(self:peek()) do
+		self:skipComments()
+		if self:check("}") then break end
 		if self:check("[") then
 			self:advance()
 			self:parseExpression()
@@ -133,11 +135,13 @@ local function parseTable(self)
 			local key = self:text(self:advance())
 			self:advance()
 			local from = self.index
-			self:parseExpression()
+			fieldValues[key] = self:parseExpression()
 			fieldKinds[key] = self.lastKind or "unknown"
 			if self.index == from then self:advance() end
 		else
-			self:parseExpression()
+			-- A positional element. Its node is kept, so the literal's element type comes from
+			-- what the elements actually are rather than from a kind name.
+			elementIdxs[#elementIdxs + 1] = self:parseExpression()
 		end
 		if not self:accept(",") and not self:accept(";") then break end
 	end
@@ -145,8 +149,13 @@ local function parseTable(self)
 	local index = self:emit("table", start, self.arena[self.index - 1].stop)
 	-- Keyed by the node, which turns `local x = { foo = 1 }` into an object type without a
 	-- reader having to find the literal again by position.
+	if next(elementIdxs) then self.tableIndexes[index] = elementIdxs end
 	if next(fieldKinds) then
 		self.tableFields[index] = fieldKinds
+		-- The node each value was read from, so a field of a literal is typed by what is written
+		-- there rather than by the kind of thing it looked like: `{ __add = add }` holds a
+		-- function, not a table.
+		self.tableFieldValues[index] = fieldValues
 		self.lastFields = fieldKinds
 	else
 		self.lastFields = nil
@@ -163,7 +172,8 @@ local function parseFunctionBody(self, start, isMethod)
 	local paramsStart = self:peek().start
 	self:expect("(")
 	self:pushScope(paramsStart)
-	if isMethod then self:declare("self", "param", self.arena[self.index]) end
+	local params = {}
+	if isMethod then params[#params + 1] = self:declare("self", "param", self.arena[self.index]) end
 
 	local isVariadic = false
 	while not self:check(")") and not self:isEof(self:peek()) do
@@ -172,7 +182,7 @@ local function parseFunctionBody(self, start, isMethod)
 			break
 		end
 		local name, token = self:parseName()
-		if name then self:declare(name, "param", token) end
+		if name then params[#params + 1] = self:declare(name, "param", token) end
 		if not self:accept(",") then break end
 	end
 	self:expect(")")
@@ -181,7 +191,7 @@ local function parseFunctionBody(self, start, isMethod)
 	self:popScope(self:peek().start - 1)
 	self:expect("end")
 	local index = self:emit("function", start, self.arena[self.index - 1].stop,
-		{ isFunction = true, isVariadic = isVariadic })
+		{ isFunction = true, isVariadic = isVariadic, params = params })
 	-- Set last, since parsing the body overwrites it.
 	self.lastKind = "function"
 	return index
@@ -204,9 +214,10 @@ local function parsePrimary(self, allowTernaryColon)
 		local start = token.start
 		self:advance()
 		self:pushScope(start)
+		local params = {}
 		while not self:check("|") and not self:isEof(self:peek()) do
 			local name, nameToken = self:parseName()
-			if name then self:declare(name, "param", nameToken) end
+			if name then params[#params + 1] = self:declare(name, "param", nameToken) end
 			if not self:accept(",") then break end
 		end
 		self:expect("|")
@@ -215,7 +226,7 @@ local function parsePrimary(self, allowTernaryColon)
 		local bodyIdx = self:parseExpression()
 		self:popScope(self.arena[self.index - 1].stop)
 		local index = self:emit("function", start, self.arena[self.index - 1].stop,
-			{ isFunction = true, body = bodyIdx })
+			{ isFunction = true, body = bodyIdx, params = params })
 		self.lastKind = "function"
 		return index
 	end
@@ -226,7 +237,11 @@ local function parsePrimary(self, allowTernaryColon)
 	local variant = self:variant(token)
 	if variant == "number" or variant == "string" then
 		self:advance()
-		local fields = variant == "string" and { value = stringValue(self:text(token)) } or nil
+		local written = self:text(token)
+		-- A literal is the value it spells, which is what lets `local n = 2149` be 2149 rather
+		-- than the whole of `number`, and `5 + 6912` be worked out where it is written.
+		local fields = variant == "string" and { value = stringValue(written) }
+			or { value = tonumber(written), text = written }
 		local index = self:emit(variant, token.start, token.stop, fields)
 		self.lastKind = variant
 		return index
@@ -278,6 +293,8 @@ end
 ---@param allowTernaryColon boolean
 ---@return integer idx of the node this expression produced
 local function parseBinary(self, minPrecedence, allowTernaryColon)
+	-- An expression never begins at a comment, which can appear before one.
+	self:skipComments()
 	local leftIdx = parseUnary(self, allowTernaryColon)
 	local startOffset = self.nodes[leftIdx].start
 
