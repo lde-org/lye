@@ -168,7 +168,7 @@ function statements.parseLocal(self, start)
 		local name, token = self:parseName()
 		lastToken = token
 		if name then
-			self:declare(name, "local", token)
+			self:declare(name, "local", token, nil, count + 1)
 			first = first or self.lastDeclaration
 			count += 1
 		else
@@ -192,6 +192,21 @@ function statements.parseLocal(self, start)
 			if not self:accept(",") then break end
 		end
 	end
+	-- Only the last expression may give more than one value, and Lua fills the names the explicit
+	-- list does not reach from it: `local a, b, c = 1, f()` is `1`, then `f`'s two. Each of those
+	-- names is recorded as taking that expression, at the position it takes from it, so a reader
+	-- can ask what the second value of the call is rather than only what the first is.
+	local last = valueIdxs[#valueIdxs]
+	if first and last then
+		for offset = #valueIdxs, count - 1 do
+			local declaration = self.declarations[first + offset]
+			if declaration then
+				declaration.valueIdx = last
+				declaration.valuePosition = offset - #valueIdxs + 2
+			end
+		end
+	end
+
 	-- The statement's first token is the anchor: an annotation describes a declaration when it
 	-- is the comment right before it, which is a question about tokens, not offsets.
 	if first then
@@ -210,7 +225,7 @@ function statements.parseConst(self, start)
 	repeat
 		local name, token = self:parseName()
 		if name then
-			self:declare(name, "local", token)
+			self:declare(name, "local", token, nil, count + 1)
 			-- The name is held, so nothing may write it again and its type is what it was given.
 			self.declarations[self.lastDeclaration].isConst = true
 			self.declarations[self.lastDeclaration].anchorIdx = startIdx
@@ -322,14 +337,14 @@ function statements.parseStatement(self)
 	end
 
 	-- A soft keyword starts a goto statement only when a name follows it.
-	if text == "goto" and self:peekAt(2).kind == KIND.name then
+	if text == "goto" and self:isName(self:peekAt(2)) then
 		self:advance()
 		self:advance()
 		self:emit("goto", token.start, self.arena[self.index - 1].stop)
 		return true
 	end
 
-	if token.kind == KIND.name or text == "(" then
+	if self:isName(token) or text == "(" then
 		self:parseExpressionStatement()
 		return true
 	end

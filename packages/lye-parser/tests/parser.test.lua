@@ -165,6 +165,8 @@ test.it("parents every operand, however many there are", function()
 	local source = "local a, b, c, d, e, f = 1, 2, 3, 4, 5, 6\nf(1, 2, 3, 4, 5)\n"
 	local result = Parser.new(source):parse()
 
+	--- Every node, grouped by the kind it was emitted as.
+	---@type table<string, lye.parser.Node[]>
 	local byKind = {}
 	for _, node in ipairs(result.nodes) do
 		if not node.parent and node.kind ~= "chunk" then
@@ -250,6 +252,22 @@ test.it("treats goto as a statement and as a name", function()
 	test.equal(#Parser.new("local goto = 1"):parse().diagnostics, 0)
 end)
 
+test.it("reads const and continue as names where a name belongs", function()
+	-- Both are words this parser knows and neither is a word of Lua's, so they are ordinary
+	-- identifiers everywhere a reader may write one. A table whose *first* field was called
+	-- `const` used to end at that field, and the rest of it was read as statements.
+	test.equal(#Parser.new("local t = { const = true, restrict = true }"):parse().diagnostics, 0)
+	local parsed = Parser.new("local t = { const = true, restrict = true }"):parse()
+	local fields = {}
+	for index, names in pairs(parsed.tableFields) do
+		_ = index
+		for name in pairs(names) do fields[#fields + 1] = name end
+	end
+	table.sort(fields)
+	test.equal(table.concat(fields, ","), "const,restrict", "both fields belong to the table")
+	test.equal(#Parser.new("local const, continue = 1, 2"):parse().diagnostics, 0)
+end)
+
 test.it("keeps comments available to callers", function()
 	local result = Parser.new("---@param x number\nlocal function f(x) end"):parse()
 	local comments = 0
@@ -292,6 +310,30 @@ test.it("keeps an argument's index when it is written as a long string", functio
 				local argument = result.nodes[first]
 				test.truthy(argument, "the index names a node: " .. source)
 			end
+		end
+	end
+end)
+
+test.it("reads a parameter list a comment is written inside", function()
+	-- `f(a --[[string]], b)` is a comment between two parameters. The lexer emits comments as
+	-- tokens, so a list that steps past a name without stepping past the comment finds the comment
+	-- where the comma should be and stops there — which read as a missing `)`.
+	for _, source in ipairs({
+		"local function f(a --[[string]], b --[[number]])\n\treturn a, b\nend\n",
+		"local function f(a, --[[second]] b)\n\treturn a, b\nend\n",
+		"local f = function(x --[[u]])\n\treturn x\nend\n",
+		"local f = |a --[[t]], b| -> a\n",
+	}) do
+		local result = Parser.new(source):parse()
+		test.equal(#result.diagnostics, 0, "a comment between parameters is not an error: " .. source)
+		local fn
+		for _, declaration in ipairs(result.declarations) do
+			if declaration.name == "f" then fn = result.nodes[declaration.valueIdx] end
+		end
+		test.truthy(fn, "the function was read: " .. source)
+		for _, param in ipairs(fn.params or {}) do
+			test.truthy(param.name == "a" or param.name == "b" or param.name == "x",
+				"the parameter is the name, not the comment: " .. tostring(param.name))
 		end
 	end
 end)

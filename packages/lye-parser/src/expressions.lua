@@ -26,7 +26,7 @@ local function parsePrefix(self, allowTernaryColon)
 	local startOffset = token.start
 
 	local callee, groupIdx
-	if token.kind == KIND.name or self:text(token) == "goto" then
+	if self:isName(token) then
 		callee = self:text(token)
 		self:advance()
 	elseif self:text(token) == "(" then
@@ -44,8 +44,13 @@ local function parsePrefix(self, allowTernaryColon)
 	-- auto-parented: the child lists are explicit, so there is one mechanism, not two.
 	local expressionIdx = self:emit("prefix", startOffset, startOffset,
 		{ callee = callee, group = groupIdx })
+	-- The wrapper is the expression's identity while a suffix has something to wrap. A group that
+	-- nothing wrapped is the expression it holds: Lua's parentheses cut a call down to one value,
+	-- and one value is what a call gives here anyway, so `(part:gsub(...))` is the call itself.
+	local wrapper = expressionIdx
 
 	while true do
+		self:skipComments()
 		local nextToken = self:peek()
 		local text = self:text(nextToken)
 		local link
@@ -69,9 +74,12 @@ local function parsePrefix(self, allowTernaryColon)
 			link = { field = method, isMethod = true, args = args, isCall = true }
 		elseif text == "(" or text == "{" or nextToken.kind == KIND.string then
 			local before = self.index
-			local args
-			_, args = self:parseArguments()
-			if self.index > before then link = { callee = callee, args = args, isCall = true } end
+			local _, parsedArgs = self:parseArguments()
+			-- A call names the name it is written on only when nothing has been wrapped yet:
+			-- `load("x").lazy(f)` calls `lazy`, and carrying `load` onto that node had every
+			-- argument of the second call checked against the first call's parameters.
+			local called = expressionIdx == wrapper and callee or nil
+			if self.index > before then link = { callee = called, args = parsedArgs, isCall = true } end
 		end
 
 		if not link then break end
@@ -84,6 +92,7 @@ local function parsePrefix(self, allowTernaryColon)
 		self.lastKind = link.kind
 	end
 
+	if expressionIdx == wrapper and groupIdx then return groupIdx end
 	return expressionIdx
 end
 
@@ -135,7 +144,7 @@ local function parseTable(self)
 			self:expect("]")
 			self:expect("=")
 			self:parseExpression()
-		elseif self:peek().kind == KIND.name and self:text(self:peekAt(2)) == "=" then
+		elseif self:isName(self:peek()) and self:text(self:peekAt(2)) == "=" then
 			local key = self:text(self:advance())
 			self:advance()
 			local from = self.index
@@ -179,16 +188,22 @@ local function parseFunctionBody(self, start, isMethod)
 	local params = {}
 	if isMethod then params[#params + 1] = self:declare("self", "param", self.arena[self.index]) end
 
+	-- A comment may sit between any two of these: `f(a --[[string]], b)` is written that way. The
+	-- lexer emits comments as tokens, so each step past one is a step past a token.
 	local isVariadic = false
-	while not self:check(")") and not self:isEof(self:peek()) do
+	while true do
+		self:skipComments()
+		if self:check(")") or self:isEof(self:peek()) then break end
 		if self:accept("...") then
 			isVariadic = true
 			break
 		end
 		local name, token = self:parseName()
 		if name then params[#params + 1] = self:declare(name, "param", token) end
+		self:skipComments()
 		if not self:accept(",") then break end
 	end
+	self:skipComments()
 	self:expect(")")
 
 	self:parseBlock()
@@ -201,7 +216,6 @@ local function parseFunctionBody(self, start, isMethod)
 	return index
 end
 
----@return integer
 local function parsePrimary(self, allowTernaryColon)
 	local token = self:peek()
 	local text = self:text(token)
@@ -219,11 +233,15 @@ local function parsePrimary(self, allowTernaryColon)
 		self:advance()
 		self:pushScope(start)
 		local params = {}
-		while not self:check("|") and not self:isEof(self:peek()) do
+		while true do
+			self:skipComments()
+			if self:check("|") or self:isEof(self:peek()) then break end
 			local name, nameToken = self:parseName()
 			if name then params[#params + 1] = self:declare(name, "param", nameToken) end
+			self:skipComments()
 			if not self:accept(",") then break end
 		end
+		self:skipComments()
 		self:expect("|")
 		self:expect("->")
 		-- The expression is the body, and what an arrow returns.
@@ -262,7 +280,6 @@ local function parsePrimary(self, allowTernaryColon)
 	return parsePrefix(self, allowTernaryColon)
 end
 
----@return integer
 local function parseUnary(self, allowTernaryColon)
 	local token = self:peek()
 	for _, symbol in ipairs(Parser.UNARY) do
@@ -295,7 +312,6 @@ end
 --- index itself, which is why every name here says which it holds.
 ---@param minPrecedence integer
 ---@param allowTernaryColon boolean
----@return integer idx of the node this expression produced
 local function parseBinary(self, minPrecedence, allowTernaryColon)
 	-- An expression never begins at a comment, which can appear before one.
 	self:skipComments()
@@ -342,11 +358,9 @@ Parser.parsePrimary = parsePrimary
 Parser.parseUnary = parseUnary
 Parser.parseBinary = parseBinary
 
----@param allowTernaryColon boolean?
----@return integer
+---@param allowTernaryColon boolean? absent is the form that allows one
 function Parser:parseExpression(allowTernaryColon)
-	if allowTernaryColon == nil then allowTernaryColon = true end
-	return parseBinary(self, 1, allowTernaryColon)
+	return parseBinary(self, 1, allowTernaryColon ~= false)
 end
 
 return true

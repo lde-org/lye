@@ -59,10 +59,6 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE = join(HERE, "fixtures", "benchmark.lua");
-const SOURCE = readFileSync(FIXTURE, "utf8");
-const ROOT = dirname(FIXTURE);
-const URI = `file://${FIXTURE}`;
 
 const args = process.argv.slice(2);
 /**
@@ -75,6 +71,13 @@ function option(name, fallback) {
 }
 const ITERATIONS = Number(option("iterations", "20"));
 const OUT = option("json", "");
+// What is measured is one document, so the file to open is what decides how much work there is:
+// the small fixture by default, and `--fixture` for a real one — a package of another project,
+// which is the only way the number says anything about editing that project.
+const FIXTURE = option("fixture", join(HERE, "fixtures", "benchmark.lua"));
+const SOURCE = readFileSync(FIXTURE, "utf8");
+const ROOT = dirname(FIXTURE);
+const URI = `file://${FIXTURE}`;
 
 const SERVERS = [
 	{ name: "lye", binary: option("lye", ""), argv: ["--stdio"] },
@@ -528,7 +531,9 @@ async function measure(spec) {
 	};
 
 	// What the server costs to keep around, measured while it is warm and holding the fixture and
-	// everything it has indexed from it.
+	// everything it has indexed from it. `SETTLE=1` waits first, which says how much of that is
+	// pages the allocator has not handed back rather than memory the server is holding.
+	if (process.env.SETTLE) await new Promise((done) => setTimeout(done, 3000));
 	report.memory = { rssMiB: +residentOf(client.child.pid).toFixed(1) };
 
 	await client.request("shutdown", {}, 5000);

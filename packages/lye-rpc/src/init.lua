@@ -35,13 +35,14 @@ rpc.ERROR = {
 ---@field chunk lye.rpc.Chunk
 ---@field handler fun(connection: lye.rpc.Connection, message: lye.rpc.Message)?
 ---@field onParseError fun(err: string)?
+---@field onIdle fun()? work to run when the stream has nothing more waiting
+---@field onBefore fun(message: lye.rpc.Message)? work a handler will read, finished first
 ---@field isShutdown boolean
 ---@field isInitialized boolean
 ---@field nextId integer
 local Connection = {}
 Connection.__index = Connection
 
----@return lye.rpc.Connection
 function Connection.new()
 	return setmetatable({ chunk = stdio.Chunk.new(), nextId = 0, isShutdown = false, isInitialized = false }, Connection)
 end
@@ -54,6 +55,25 @@ end
 ---@param self lye.rpc.Connection
 function Connection:setParseErrorHandler(handler)
 	self.onParseError = handler
+end
+
+--- Work that only has to happen once per burst of input, run when the stream has nothing more
+--- waiting: the moment an editor has stopped sending is the moment its latest text is the one to
+--- work on. Without this, every keystroke in a fast burst is analysed and all but the last are
+--- thrown away.
+---@param self lye.rpc.Connection
+---@param handler fun()
+function Connection:setIdleHandler(handler)
+	self.onIdle = handler
+end
+
+--- Work that has to be finished before a message is handled, because the handler will read it.
+--- Deferring is only safe while nothing is asking: a request that arrives mid-burst must find the
+--- state the burst has already described.
+---@param self lye.rpc.Connection
+---@param handler fun(message: table)
+function Connection:setBeforeHandler(handler)
+	self.onBefore = handler
 end
 
 ---@param self lye.rpc.Connection
@@ -151,10 +171,18 @@ function Connection:listen()
 		if message == nil and not didParseError then return end
 
 		if message ~= nil then
+			if self.onBefore then self.onBefore(message) end
 			local isHandled, err = pcall(self.dispatch, self, message)
 			if not isHandled and message.id ~= nil then
 				self:respondError(message.id, rpc.ERROR.internalError, tostring(err))
 			end
+		end
+
+		-- Bytes still in hand mean more is already on its way, so this is not the pause between
+		-- bursts and the work can wait for the one that is.
+		if self.onIdle and self.chunk.n == 0 then
+			local isHandled, err = pcall(self.onIdle)
+			assert(isHandled, err)
 		end
 	end
 end

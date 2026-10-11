@@ -36,6 +36,8 @@ local ESCAPE_OUT = { ['"'] = '\\"', ["\\"] = "\\\\", ["\b"] = "\\b", ["\f"] = "\
 	["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" }
 local MIN_SAFE_INT, MAX_SAFE_INT = -9007199254740992, 9007199254740992
 
+--- Raises: nothing follows a call to it, which is what `never` says.
+---@return never
 local function fail(pos, msg)
 	assert(false, format("JSON error at byte %d: %s", pos, msg))
 end
@@ -124,7 +126,7 @@ decodeString = function(src, i)
 	return decodeEscapes(src, i, i + 1, nxt)
 end
 
----@return number
+---@return number?
 ---@return integer
 local function decodeNumber(src, i)
 	local stop = find(src, NUMBER_END, i) or (#src + 1)
@@ -183,7 +185,6 @@ end
 
 local decodeValue
 
----@return any
 ---@return integer
 local function decodeArray(src, i)
 	local arr, n = json.array(), 0
@@ -274,7 +275,6 @@ function json.tryDecode(src)
 	return nil, tostring(value)
 end
 
----@return string
 local function encodeString(s)
 	if not find(s, '[%c"\\\127]') then return '"' .. s .. '"' end
 	return '"' .. s:gsub('[%c"\\\127]', function(c)
@@ -282,7 +282,6 @@ local function encodeString(s)
 	end) .. '"'
 end
 
----@return string
 local function encodeNumber(n)
 	assert(n == n and n ~= math.huge and n ~= -math.huge, "cannot encode non-finite number as JSON: " .. tostring(n))
 	-- LSP fields typed `integer` must not serialize as `1.0`.
@@ -333,7 +332,6 @@ encodeValue = function(value)
 	return "{" .. table.concat(parts, ",") .. "}"
 end
 
----@return string
 function json.encode(value)
 	return encodeValue(value)
 end

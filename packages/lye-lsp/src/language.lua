@@ -4,6 +4,7 @@
 
 local rpc = require("lye-rpc")
 local doc = require("lye-doc")
+local classes = require("lye-doc.class")
 local framework = require("lye-framework")
 local position = require("lye-framework.position")
 local json = require("lye-json")
@@ -11,6 +12,7 @@ local definitionsIndex = require("lye-lsp.definitions")
 local Parser = require("lye-parser")
 local analyzer = require("lye-analyzer")
 local cdef = require("lye-cdef")
+local editorconfig = require("lye-lsp.editorconfig")
 local KIND = require("lye-lexer").KIND
 local types = require("lye-doc.type")
 
@@ -23,10 +25,99 @@ local PRELUDE = analyzer.prelude(require("lye-defs"))
 local TOKEN_LEGEND = {
 	tokenTypes = {
 		"keyword", "string", "number", "comment", "operator", "variable", "function", "parameter",
-		"type", "namespace", "class", "property", "method",
+		"type", "namespace", "class", "property", "method", "regexp",
 	},
 	tokenModifiers = { "documentation" },
 }
+
+--- A conversion in a format string: `%d`, `%.2f`, `%%`, with the flags and the width a reader may
+--- write between the `%` and the letter. Only strings handed to `string.format` are read for them.
+local FORMAT_SPECIFIER = "^%%[-+ #0]*%d*%.?%d*[cdiouxXeEfgGqs%%]" 
+
+--- Which argument of which function is interpreted rather than passed on: a `string.format` is
+--- read for its conversions and a pattern function for its pattern. Lua has no annotation for
+--- that, so the list lives in the layer that knows the environment, indexed the way a method
+--- call writes it — a dotted call passes the receiver first.
+---@type table<string, table<integer, string>>
+local INTERPRETED = {
+	["string.format"] = { "format" },
+	["string.pack"] = { "format" },
+	["string.unpack"] = { "format" },
+	["string.packsize"] = { "format" },
+	["os.date"] = { "format" },
+	["string.find"] = { "pattern" },
+	["string.match"] = { "pattern" },
+	["string.gmatch"] = { "pattern" },
+	["string.gsub"] = { "pattern", "replacement" },
+}
+
+--- The functions that take the subject they work on as their first argument, so that a dotted call
+--- writes the literal one place later than a method call does.
+local SUBJECT_FIRST = { find = true, match = true, gmatch = true, gsub = true }
+
+--- The parts of a literal read as something rather than as text: a format's `%` and the flags
+--- between it and the conversion, a pattern's escapes and classes, a replacement's escapes.
+---@param content string the text between the delimiters
+---@param kind string `format`, `pattern` or `replacement`
+---@return { start: integer, stop: integer }[] offsets into the content, 1-based
+local function interpretedSpans(content, kind)
+	local marks = {}
+	if kind == "format" then
+		local at = 1
+		while true do
+			local percent = content:find("%", at, true)
+			if not percent then break end
+			local spec = content:match(FORMAT_SPECIFIER, percent)
+			if spec then
+				marks[#marks + 1] = { start = percent, stop = percent + #spec - 1 }
+				at = percent + #spec
+			else
+				at = percent + 1
+			end
+		end
+		return marks
+	end
+
+	local at = 1
+	while at <= #content do
+		local char = content:sub(at, at)
+		if kind == "replacement" then
+			if char == "%" and at < #content then
+				marks[#marks + 1] = { start = at, stop = at + 1 }
+				at += 2
+			else
+				at += 1
+			end
+		else
+		local class = char == "[" and content:match("^%[%^?%]?[^%]]*%]", at)
+		if char == "%" and at < #content then
+			marks[#marks + 1] = { start = at, stop = at + 1 }
+			at += 2
+		elseif class then
+			marks[#marks + 1] = { start = at, stop = at + #class - 1 }
+			at += #class
+		elseif char:match("[%^%$%.%*%+%-%?%(%)]") then
+			marks[#marks + 1] = { start = at, stop = at }
+			at += 1
+		else
+			at += 1
+		end
+		end
+	end
+	return marks
+end
+
+--- The name a receiver's type is declared under, which is what says whether a field is a function
+--- of the standard library: a string reads `string`'s fields, and a class is its own name.
+---@param held lye.doc.Type?
+local function ownerOf(held)
+	if not held then return nil end
+	if held.variant == "class" then return held.name end
+	if held.variant == "string" then return "string" end
+	-- A value written as a string literal is a string: `("a b"):gsub("%s+", "-")` reads `string`'s
+	-- fields the same way a variable holding one does, and the literal is not a class to be named.
+	if held.variant == "extern" and held.name and held.name:match("^[\"']") then return "string" end
+end
 
 local TOKEN_TYPE = {}
 for index, name in ipairs(TOKEN_LEGEND.tokenTypes) do
@@ -46,9 +137,6 @@ local TYPE_KEYWORD = {
 	["true"] = true, ["false"] = true, ["nil"] = true,
 }
 
---- A conversion in a format string: `%d`, `%.2f`, `%%`, with the flags and the width a reader may
---- write between the `%` and the letter. Only strings handed to `string.format` are read for them.
-local FORMAT_SPECIFIER = "^%%[-+ #0]*%d*%.?%d*[cdiouxXeEfgGqs%%]" 
 
 --- A `---@tag` inside a comment, with the tag's own span. Whitespace is matched without
 --- newlines, so a tag never counts as spanning two lines.
@@ -59,20 +147,30 @@ local DOC_TAG_NAME = "[%a_][%w_]*"
 ---@field server lye.framework.Server
 ---@field analysis table<string, lye.parser.Result>
 ---@field names table<string, lye.analyzer.Result>
+---@field packageRoots table<string, string|boolean>? which package each path belongs to, by `find`
+---@field modules table<string, { text: string, type: lye.doc.Type? }>? what each required file gives
+---@field requiring table<string, boolean>? the files being required now, so a cycle ends
+---@field declared table<string, boolean|lye.doc.Type>? the names the open documents declare
+---@field declaredBy table<string, table<string, boolean|lye.doc.Type>> what each document declares, kept after its analysis is dropped
+---@field known table<string, boolean>? the names every file in the workspace declares
+---@field order string[] the documents whose analyses are held, least recently used first
+---@field order string[] the documents whose analyses are held, least recently used first
+---@field definitions table? the definitions, indexed by name, built once
+---@field cdefCache { text: string, spans: { start: integer, stop: integer, kind: string }[] }?
+---@field workspace table[]? the symbols of the workspace, listed once
+---@field settings table<string, table<string, string>>? the `.editorconfig` per directory
 local Lye = {}
 Lye.__index = Lye
 
----@return lye.Server
 function Lye.new(server)
-	return setmetatable({ server = server, analysis = {}, names = {} }, Lye)
+	return setmetatable({ server = server, analysis = {}, names = {}, declaredBy = {}, order = {}, dirty = {} }, Lye)
 end
 
----@param self lye.Server
 --- The modules a `require("...")` could name, in the layout the workspace uses. The listing comes
 --- from `find`, because a language server has no way to read a directory in Lua.
 ---@param self lye.Server
 ---@param prefix string what has been typed inside the quotes so far
----@return { name: string, path: string }[]
+---@return { name: string, path: string?, detail: string? }[] a workspace file has a path, a module of the engine a detail
 function Lye:moduleNames(prefix)
 	local root = self.server.rootPath
 	local found, seen = {}, {}
@@ -125,10 +223,8 @@ end
 function Lye:moduleFile(name, from)
 	local root = self.server.rootPath
 
-	-- A `lye.json` beside a package or a workspace adds search paths of its own, in the shape
-	-- `package.path` uses: a pattern per line with `?` where the module name goes, relative to the
-	-- file that wrote it. It is asked first because it is written down: a project that says where
-	-- its modules are is answered before anything is guessed.
+	-- A `lye.json` beside a package or workspace adds search paths of its own, in the shape
+	-- `package.path` uses. Asked first, because a project that says where its modules are wins.
 	for _, pattern in ipairs(self:requirePaths(from)) do
 		local path = pattern:gsub("%?", (name:gsub("%%.", "/")))
 		local handle = io.open(path, "rb")
@@ -152,12 +248,8 @@ function Lye:moduleFile(name, from)
 			candidates[#candidates + 1] = root .. "/packages/" .. head .. "/src/" .. under .. "/init.lua"
 		end
 
-		-- What lde itself resolves against. `lde run -C <package>` puts exactly two patterns on
-		-- `package.path` — `<package>/target/?.lua` and `<package>/target/?/init.lua` — and
-		-- `target/` holds a link per dependency, so one rule answers `require("lye-doc.type")` (a
-		-- sibling package) and `require("lye-lsp.language")` (the package's own module) alike. The
-		-- names above are tried first, so a module living in `src/` is found where it is written
-		-- rather than through the link `target/` makes to it.
+		-- What lde itself resolves against: `<package>/target/?.lua` and `<package>/target/?/init.lua`,
+		-- where `target/` holds a link per dependency, so one rule answers a sibling and its own modules.
 		local owner = self:packageRoot(from)
 		if owner then
 			candidates[#candidates + 1] = owner .. "/target/" .. tail .. ".lua"
@@ -173,11 +265,8 @@ function Lye:moduleFile(name, from)
 		end
 	end
 
-	-- A module the engine ships is not a file in this workspace: `require("ffi")`, `require("jit")`
-	-- and `require("string.buffer")` name the definitions, whose text is written to the cache for a
-	-- client to open. The workspace was searched first, so a project's own module of that name
-	-- shadows the builtin — which is what `require` itself does — and a document outside any
-	-- workspace still resolves these, since they belong to no workspace.
+	-- A module the engine ships is not a file in this workspace: `ffi`, `jit` and `string.buffer` name
+	-- the definitions, whose text is written to the cache for a client to open. The workspace is first.
 	local builtin = self:definitionIndex().modules[name]
 	if builtin then return builtin.path end
 end
@@ -240,7 +329,7 @@ function Lye:requirePaths(uri)
 end
 
 --- What `require("name")` is: the type the module file returns, analysed once and kept until its
---- text changes. A module that requires the file being analysed would come back around, so a name
+--- text changes. A module that requires the file being analysed comes back around, so a name
 --- already in progress answers nothing rather than recursing.
 ---@param self lye.Server
 ---@param name string
@@ -280,39 +369,120 @@ function Lye:moduleType(name, from)
 	return names.module
 end
 
---- The type names the documents this server knows declare. An annotation may name a class another
---- file declares, which is not this file's namespace but is still not a typo.
----@return table<string, boolean>
-function Lye:declaredTypes()
+--- The type names the documents this server knows declare, by name: the class, or what an alias
+--- stands for. The names alone keep `---@param t Point` from reading as a typo; the type itself
+--- is handed over where one can be built, since a name resolving to nothing disagrees with every argument.
+---@param file lye.doc.File
+---@return table<string, boolean|lye.doc.Type>
+local function declarationsOf(file)
 	local found = {}
-	for _, names in pairs(self.names) do
-		for _, annotation in ipairs(names.doc and names.doc.annotations or {}) do
-			if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name then
-				found[annotation.name] = true
-			end
+	local namespace = classes.read(file)
+	local resolve = classes.resolver(namespace)
+	for _, annotation in ipairs(file.annotations) do
+		if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name then
+			found[annotation.name] = resolve(annotation.name) or true
 		end
 	end
 	return found
 end
 
+--- The classes and aliases every file in the workspace declares, by name alone. A document is
+--- analysed on its own, so a class another file declares is a name nothing here resolves — which
+--- is not a mistake. Read by parsing each file, never by analysing one: a project holds hundreds.
+---@param self lye.Server
+function Lye:workspaceDeclarations()
+	if self.known then return self.known end
+	local known = {}
+	local root = self.server.rootPath
+	if root then
+		local pipe = io.popen(string.format(
+			"find %q -name '*.lua' -not -path '*/target/*' -not -path '*/.git/*' | head -2000", root))
+		if pipe then
+			for file in pipe:lines() do
+				local handle = io.open(file, "rb")
+				if handle then
+					local source = handle:read("*a")
+					handle:close()
+					for _, annotation in ipairs(doc.parse(source).annotations) do
+						if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name then
+							known[annotation.name] = true
+						end
+					end
+				end
+			end
+			pipe:close()
+		end
+	end
+	self.known = known
+	return known
+end
+
+---@param self lye.Server
+function Lye:declaredTypes()
+	if self.declared then return self.declared end
+	local found = {}
+	-- The workspace first, so a name another file declares is known even when that file is closed;
+	-- an open document's own answer then replaces it with the type itself where one can be built.
+	for name in pairs(self:workspaceDeclarations()) do found[name] = true end
+	-- From what each document declared rather than from the analysis it had: a document whose
+	-- analysis was dropped to keep the process small still declares everything it did, so an
+	-- annotation in another file naming that class goes on meaning it.
+	for _, declarations in pairs(self.declaredBy) do
+		for name, held in pairs(declarations) do found[name] = held end
+	end
+	self.declared = found
+	return found
+end
+
+--- How many analyses are held. One is about eight megabytes for two thousand lines, and what an
+--- editor has open is unbounded, so the least recently used is dropped and analysed again on the
+--- next request for it — which costs one analysis, not correctness. Measured with four such
+--- documents open: two held is 43 MiB where four is 61.
+local KEEP_ANALYSES = 2
+
+---@param self lye.Server
+---@param uri string the document just analysed, which is now the most recently used
+function Lye:keepAnalysis(uri)
+	local order = self.order
+	for index = #order, 1, -1 do
+		if order[index] == uri then table.remove(order, index) end
+	end
+	order[#order + 1] = uri
+	while #order > KEEP_ANALYSES do
+		local dropped = table.remove(order, 1)
+		if dropped and dropped ~= uri then
+			self.analysis[dropped] = nil
+			self.names[dropped] = nil
+		end
+	end
+end
+
+---@param uri string
+---@param from integer? the byte the change starts at, in the text the held analysis was for
 ---@return lye.parser.Result?
-function Lye:analyze(uri)
+function Lye:analyze(uri, from)
 	local document = self.server.documents:get(uri)
 	if not document then return nil end
-
 	-- The analyzer parses the document itself, so its result carries the tree, the scopes and the
 	-- comments this needs. Parsing the same text a second time is a third of the cost of a
 	-- keystroke on a large file, for the same tree.
+	local previous = from and self.analysis[uri]
 	local names = analyzer.analyze(document.text, PRELUDE, self:declaredTypes(), function(name)
 		return self:moduleType(name, uri)
-	end)
+	end, previous and Parser.resumeAt(previous, from) or nil)
 	local result = names.parser
 	self.analysis[uri] = result
 	self.names[uri] = names
+	if names.doc then self.declaredBy[uri] = declarationsOf(names.doc) end
+	-- The names other documents declare are built from what each of them declared, and this
+	-- document has just declared its own.
+	self.declared = nil
 	-- Type errors from annotations belong in the same list as syntax errors.
 	for _, entry in ipairs(names.diagnostics) do
 		result.diagnostics[#result.diagnostics + 1] = entry
 	end
+	self:keepAnalysis(uri)
+	self.dirty[uri] = nil
 	return result
 end
 
@@ -494,13 +664,24 @@ end
 local function typeOfExpression(result, idx, offset)
 	local node = idx and result.parser.nodes[idx]
 	if not node then return nil end
+	-- A group is the expression it holds: `(s:gsub("%s+", "")):gsub(...)` calls `gsub` on the string
+	-- the inner call returned, and `("a b"):gsub(...)` on a string literal.
+	if node.kind == "prefix" and node.group then return typeOfExpression(result, node.group, offset) end
+	if node.kind == "string" then return types.base("string") end
 	if node.kind == "prefix" then
 		local variable = node.callee and analyzer.lookupAt(result, node.callee, offset)
 		return variable and analyzer.typeAt(result, variable, offset) or nil
 	end
 	if node.kind == "index" and node.target then
 		local base = typeOfExpression(result, node.target, offset)
-		if base and node.field then return types.indexResult(base, node.field) end
+		if base and node.field then
+			-- Through the analyzer rather than the type alone, so what the environment arranges is
+			-- applied as well: a string reads the `string` table's fields, which is what makes
+			-- `s.upper` the function it is rather than the string a bare index of one gives.
+			local target = result.parser.nodes[node.target]
+			local baseName = target and target.kind == "prefix" and target.callee or nil
+			return analyzer.fieldTypeAt(result, base, baseName, node.field, offset)
+		end
 	end
 	if node.kind == "call" then
 		-- A generic result belongs to the call rather than to the function, so the analyzer's
@@ -510,10 +691,26 @@ local function typeOfExpression(result, idx, offset)
 		local fnType
 		if node.field and node.target then
 			local base = typeOfExpression(result, node.target, offset)
-			fnType = base and types.indexResult(base, node.field)
+			-- The analyzer's answer, so a string receiver gives the function the `string` table
+			-- holds: `s:sub(2):upper()` is a string either way, and reading the field off the type
+			-- alone gives back the string for both halves of the chain.
+			local target = result.parser.nodes[node.target]
+			local baseName = target and target.kind == "prefix" and target.callee or nil
+			fnType = base and analyzer.fieldTypeAt(result, base, baseName, node.field, offset)
 		else
-			local variable = node.callee and analyzer.lookupAt(result, node.callee, offset)
-			fnType = variable and analyzer.typeAt(result, variable, offset)
+			-- A dotted call keeps its field on the node it targets, so what is being called is that
+			-- field rather than the name the call itself carries: `string.gsub(s, " ", "-")` is
+			-- read off the `string` table, and `string.gsub(s, " ", "-"):upper()` of its result.
+			local target = node.target and result.parser.nodes[node.target]
+			if target and target.kind == "index" and target.field then
+				local base = typeOfExpression(result, target.target, offset)
+				local owner = target.target and result.parser.nodes[target.target]
+				local baseName = owner and owner.kind == "prefix" and owner.callee or nil
+				fnType = base and analyzer.fieldTypeAt(result, base, baseName, target.field, offset)
+			else
+				local variable = node.callee and analyzer.lookupAt(result, node.callee, offset)
+				fnType = variable and analyzer.typeAt(result, variable, offset)
+			end
 		end
 		if fnType and types.isFn(fnType) then return fnType.returns end
 	end
@@ -524,7 +721,6 @@ end
 --- signature: a caller that has none shows the type instead.
 ---@param signature lye.analyzer.Signature?
 ---@param name string?
----@return string
 local function signatureText(signature, name)
 	if not signature then return "" end
 	local parts = {}
@@ -533,7 +729,15 @@ local function signatureText(signature, name)
 		local param = annotation.name
 		parts[#parts + 1] = (param and param ~= "") and (param .. ": " .. held) or held
 	end
-	local returned = signature.returns and signature.returns.type
+	-- Every value it gives back: `fn(...) -> lye.doc.Class?, string[]` is what a caller writing
+	-- `local class, args = resolve(ns, text)` reads, and naming only the first was the complaint.
+	local returned = signature.values and table.concat(signature.values, ", ")
+		or (signature.returns and signature.returns.type)
+	if not returned and signature.inferredValues and #signature.inferredValues > 0 then
+		local values = {}
+		for _, value in ipairs(signature.inferredValues) do values[#values + 1] = types.display(value) end
+		returned = table.concat(values, ", ")
+	end
 	return (name or "") .. "(" .. table.concat(parts, ", ") .. ")"
 		.. (returned and (" -> " .. returned) or "")
 end
@@ -544,7 +748,6 @@ end
 ---@param names lye.analyzer.Result
 ---@param node lye.parser.Node
 ---@param offset integer
----@return lye.analyzer.Signature?
 local function signatureFor(names, node, offset)
 	local signatures = names.signatures or {}
 	if node.callee and signatures[node.callee] then return signatures[node.callee] end
@@ -564,10 +767,12 @@ local function signatureFor(names, node, offset)
 	end
 	if held and PRELUDE.fields[held] then return PRELUDE.fields[held] end
 
-	-- A method of a class this document declares is keyed by the name it was declared under.
-	local base = typeOfExpression(names, node.target, offset)
-	if base and base.variant == "class" then
-		return signatures[base.name .. "." .. node.field] or signatures[base.name .. ":" .. node.field]
+	-- A method of a class this document declares is keyed by the name it was declared under, and a
+	-- method of a *string* is keyed under `string`: a string reads that table's fields, which is
+	-- what Lua arranges with the string metatable, so `s:sub(2)` is `string.sub(s, 2)`.
+	local owner = ownerOf(typeOfExpression(names, node.target, offset))
+	if owner then
+		return signatures[owner .. "." .. node.field] or signatures[owner .. ":" .. node.field]
 	end
 end
 
@@ -606,12 +811,11 @@ local function readAsName(names, name, offset)
 	if names.signatures and names.signatures[name] then return "function" end
 end
 
---- The last byte of a value expression. A `prefix` node spans the first byte of its name — that
---- is where it starts, and the parser records nothing else — so the name's own length is what
---- says where it ends. Everything else spans what it reads.
----@param result lye.parser.Result
+--- The last byte of a value expression. A `prefix` node spans the first byte of its name, so the
+--- name's own length says where it ends. Everything else spans what it reads.
+--- The tree is read from either: an analysis carries the parser's result and both hold the nodes.
+---@param result lye.parser.Result|lye.analyzer.Result
 ---@param node lye.parser.Node
----@return integer
 local function valueStop(result, node)
 	if node.group then return valueStop(result, result.nodes[node.group]) end
 	if node.kind == "prefix" and node.callee then return node.start + #node.callee - 1 end
@@ -624,7 +828,6 @@ end
 ---@param result lye.analyzer.Result
 ---@param node lye.parser.Node
 ---@param source string
----@return string
 local function writtenName(result, node, source)
 	if node.field then
 		local target = node.target and result.parser.nodes[node.target]
@@ -678,8 +881,11 @@ function Lye:requireStringAt(uri, source, offset)
 	return { from = contentFrom, to = contentTo, typed = typed }
 end
 
----@param self lye.Server
----@return table?
+--- The span of the word an offset sits on, which is what a hover is about.
+---@param source string
+---@param offset integer
+---@return integer? start
+---@return integer? stop
 local function wordSpan(source, offset)
 	local at = offset
 	if not source:sub(at, at):match("[%w_%.]") and source:sub(at - 1, at - 1):match("[%w_%.]") then
@@ -719,10 +925,8 @@ function Lye:onHover(params)
 		}
 	end
 
-	-- Nothing is declared here, so the answer is what the expression holds: `math.floor` is a
-	-- function of the standard library, and `first.x` is a number of the class the value is. A
-	-- function is shown by the signature it was declared with, and with what was written above it,
-	-- because that is what a reader of `setmetatable(...)` is asking for.
+	-- Nothing is declared here, so the answer is what the expression holds: `math.floor` is a function of
+	-- the standard library. A function is shown by the signature it was declared with.
 	local node = nodeAt(result, offset)
 	if not node then return nil end
 	local signature = signatureFor(self.names[uri], node, offset)
@@ -754,7 +958,6 @@ end
 --- The name written at an offset, read from the source: an identifier, dotted if it is one.
 ---@param source string
 ---@param offset integer
----@return string?
 local function writtenAt(source, offset)
 	local at = offset
 	if not source:sub(at, at):match("[%w_%.]") and source:sub(at - 1, at - 1):match("[%w_%.]") then
@@ -771,7 +974,6 @@ end
 ---@param names lye.analyzer.Result
 ---@param source string
 ---@param offset integer
----@return string?
 local function nameInAnnotation(names, source, offset)
 	for _, annotation in ipairs(names.doc and names.doc.annotations or {}) do
 		if annotation.nameStart and offset >= annotation.nameStart and offset <= annotation.nameStop then
@@ -787,12 +989,6 @@ local function nameInAnnotation(names, source, offset)
 		if from then return writtenAt(source, offset), nil end
 	end
 end
-
---- The span of the word an offset sits on, which is what a hover is about.
----@param source string
----@param offset integer
----@return integer? start
----@return integer? stop
 
 --- A range in another file, resolved against that file's own text. A definition the server wrote
 --- out is not an open document, so its line index is built when it is first needed.
@@ -879,20 +1075,20 @@ function Lye:targetAt(uri, text, names, offset)
 		return { uri = uri, start = declaration.start, stop = declaration.stop }
 	end
 
-	-- `math.floor` is declared by name in the definitions, and `Point.x` by the class it belongs
-	-- to, which the receiver's own type names.
-	-- `nodeAt` and `writtenName` both read the arena through the analysis result, whose `parser`
-	-- field is the tree.
+	-- `math.floor` is declared by name in the definitions and `Point.x` by the class it belongs to. Both
+	-- readers below go through the analysis result, whose `parser` field is the tree.
 	local node = nodeAt(names, offset)
 	if node then
 		local dotted = writtenName(names, node, text)
 		local found = definitionsIndex.find(self:definitionIndex(), dotted)
 		if found then return found end
-		if node.kind == "index" and node.field then
-			local base = typeOfExpression(names, node.target, offset)
-			local className = base and base.variant == "class" and base.name
-			if className then
-				found = definitionsIndex.find(self:definitionIndex(), className .. "." .. node.field)
+		if node.field and (node.kind == "index" or node.kind == "call") then
+			-- Who declares the field: the class the receiver's type names, or `string` for a
+			-- string, because a string reads that table's fields — which is what Lua's own string
+			-- metatable arranges, and what makes `s:sub(2)` jump to `string.sub`.
+			local owner = ownerOf(typeOfExpression(names, node.target, offset))
+			if owner then
+				found = definitionsIndex.find(self:definitionIndex(), owner .. "." .. node.field)
 				if found then return found end
 			end
 		end
@@ -926,7 +1122,6 @@ end
 --- for on every edit.
 ---@param self lye.Server
 ---@param text string
----@return { start: integer, stop: integer, kind: string }[]
 function Lye:cdefSpans(text)
 	local cached = self.cdefCache
 	if cached and cached.text == text then return cached.spans end
@@ -962,10 +1157,8 @@ function Lye:onSemanticTokens(params)
 	local names = self.names[uri]
 	local annotations = names and names.doc and names.doc.annotations or {}
 
-	-- A name that is not a declaration is a reference, and what it reads as comes from the type
-	-- behind it: `print` is a function of the definitions, `math` the table it holds, and
-	-- `math.random` a function read off it. Colouring every reference as a variable is what left
-	-- the whole standard library white.
+	-- A name that is not a declaration is a reference, and what it reads as comes from the type behind
+	-- it. Colouring every reference as a variable is what left the whole standard library white.
 	if names then
 		for _, node in ipairs(result.nodes) do
 			if node.kind == "prefix" and node.callee and not kinds[node.start] then
@@ -973,10 +1166,17 @@ function Lye:onSemanticTokens(params)
 			elseif node.kind == "index" and node.field and node.isDynamic ~= true then
 				local fieldStart = node.stop - #node.field + 1
 				if not kinds[fieldStart] then
-					local base = typeOfExpression(names, node.target, node.start)
-					local held = base and types.indexResult(base, node.field)
+					-- What the analyzer worked out for the read itself: a string's field is the
+					-- function that table holds, not the string a bare index of one gives.
+					local held = typeOfExpression(names, node.index, node.start)
 					kinds[fieldStart] = held and types.isFn(held) and "function" or "property"
 				end
+			elseif node.kind == "call" and node.isMethod == true and node.field then
+				-- `s:sub(2)` calls the field its receiver holds, so the name is a method rather
+				-- than a variable nothing declares, which is what left it uncoloured.
+				local target = node.target and names.parser.nodes[node.target]
+				local fieldStart = target and target.stop and (target.stop + 2)
+				if fieldStart and not kinds[fieldStart] then kinds[fieldStart] = "method" end
 			end
 		end
 	end
@@ -985,10 +1185,8 @@ function Lye:onSemanticTokens(params)
 	local lastLine, lastStart = 0, 0
 	local isFirst = true
 
-	--- Tokens are relative to the one before, and a token never spans a line. A comment or a string
-	--- that does is emitted as one token per line it covers: emitting it whole is a protocol
-	--- violation, and a client that clips it colours the first line and leaves the rest — which is
-	--- what a multiline comment and an `ffi.cdef` block both looked like.
+	--- Tokens are relative to the one before, and a token never spans a line, so a comment or a
+	--- string that does is emitted as one token per line it covers.
 	---@param spanStart integer
 	---@param spanStop integer
 	---@param target string
@@ -1023,10 +1221,8 @@ function Lye:onSemanticTokens(params)
 		end
 	end
 
-	-- The text of an `ffi.cdef` call is C, and it is coloured from *our* parse of it rather than by
-	-- asking the editor to inject a C grammar: an injection needs that grammar installed, it would
-	-- not know LuaJIT's dialect even then, and a header is more useful coloured by what the names in
-	-- it are — the struct a program uses reads as a class, its members as fields.
+	-- The text of an `ffi.cdef` call is C, coloured from *our* parse of it rather than by asking the
+	-- editor to inject a C grammar: that needs the grammar installed and would not know this dialect.
 	local cdefSpans = {}
 	for _, node in ipairs(result.nodes) do
 		if node.kind == "call" and node.args and node.args[1] then
@@ -1039,6 +1235,51 @@ function Lye:onSemanticTokens(params)
 						spans = self:cdefSpans(argument.value),
 						from = cdef.textStart(text, argument.start, argument.stop),
 					}
+				end
+			end
+		end
+	end
+
+	-- A literal handed to a function that interprets it is a string with a pattern inside it, so the
+	-- parts that are read as a pattern are marked and the rest stays a string.
+	local interpreted = {}
+	if names then
+		for _, node in ipairs(result.nodes) do
+			if node.kind == "call" and node.args then
+				local target = node.target and result.nodes[node.target]
+				local field = node.field or (target and target.field)
+				-- Who the field belongs to, as it is written where a namespace is named — the
+				-- definitions call the `string` table's class `stringlib`, so a dotted call is read
+				-- by the name in the source — and by the receiver's own type for a method call.
+				local owner
+				if node.isMethod then
+					owner = ownerOf(typeOfExpression(names, node.target, node.start))
+				else
+					local base = target and target.target and result.nodes[target.target]
+					owner = base and base.callee
+				end
+				local kinds = field and owner and INTERPRETED[owner .. "." .. field]
+				for index, kind in pairs(kinds or {}) do
+					-- By the position it is written in: the pattern functions take the subject first, so the pattern is
+					-- the second argument of `string.find(s, p)`, while `string.format(fmt, ...)` writes its format first.
+					local shorthand = node.isMethod or not SUBJECT_FIRST[field or ""]
+					local argument = result.nodes[node.args[shorthand and index or index + 1] or 0]
+					local from = argument and argument.kind == "string"
+						and cdef.textStart(text, argument.start, argument.stop)
+					-- Only where the literal reads as it was written: an escape inside it moves every
+					-- offset after it, and marking the wrong bytes is worse than marking none.
+					local plain = from and text:sub(from, argument.stop - 1) == argument.value
+					if plain then
+						local spans = {}
+						for _, mark in ipairs(interpretedSpans(argument.value, kind)) do
+							local piece = { start = from + mark.start - 1, stop = from + mark.stop - 1 }
+							if not text:find("\n", piece.start, true)
+								or text:find("\n", piece.start, true) > piece.stop then
+								spans[#spans + 1] = piece
+							end
+						end
+						if #spans > 0 then interpreted[argument.start] = spans end
+					end
 				end
 			end
 		end
@@ -1066,11 +1307,32 @@ function Lye:onSemanticTokens(params)
 			carved[count_] = { start = from, stop = to, target = target }
 		end
 
+		-- Only the tag the comment *starts* with is an annotation; one mid-sentence is prose about one.
 		local at, stop = written:find(DOC_TAG .. DOC_TAG_NAME)
-		while at do
-			local tagStart = token.start + at - 1
-			carve(tagStart, token.start + stop - 1, "keyword")
+		-- Whether this comment is an annotation at all: one that begins with a tag.
+		local isAnnotation = at ~= nil and written:sub(1, at - 1):match("^[ \t]*$") ~= nil
+		while at and isAnnotation do
+			carve(token.start + at - 1, token.start + stop - 1, "keyword")
 			at, stop = written:find(DOC_TAG .. DOC_TAG_NAME, stop + 1)
+		end
+
+		-- A member of a multi-line alias: `---@alias T` followed by `--- | "a"` lines. The body is
+		-- joined by the reader, so the bar that joins it and the values it names are the pieces an
+		-- editor colours separately.
+		local member = written:match("^%-%-%-?%s*(|.*)$")
+		local bar = member and written:find("|", 1, true)
+		if bar then
+			-- Offsets are inside the comment, so the member's own are found from where it starts.
+			carve(token.start + bar - 1, token.start + bar - 1, "operator")
+			local quote = member:find("[\"']")
+			while quote do
+				local opened = member:sub(quote, quote)
+				local close = member:find(opened, quote + 1, true)
+				if not close then break end
+				local from = token.start + bar + quote - 2
+				carve(from, from + close - quote, "string")
+				quote = member:find("[\"']", close + 1)
+			end
 		end
 
 		-- The name of a parameter reads as a parameter, and the identifiers in a type read as a
@@ -1179,7 +1441,20 @@ function Lye:onSemanticTokens(params)
 			if token.kind == KIND.keyword then
 				target = "keyword"
 			elseif token.kind == KIND.string then
-				target = "string"
+				local spans = interpreted[token.start]
+				if spans then
+					-- The literal is a string, and the parts of it that are interpreted read as what
+					-- they are: the pattern inside a pattern argument is not text.
+					local cursor = token.start
+					for _, span in ipairs(spans) do
+						if span.start > cursor then emitSpan(cursor, span.start - 1, "string") end
+						emitSpan(span.start, span.stop, "regexp")
+						cursor = span.stop + 1
+					end
+					if cursor <= token.stop then emitSpan(cursor, token.stop, "string") end
+				else
+					target = "string"
+				end
 			elseif token.kind == KIND.number then
 				target = "number"
 			elseif token.kind == KIND.symbol and written ~= "::" and written ~= "label" then
@@ -1189,12 +1464,9 @@ function Lye:onSemanticTokens(params)
 			end
 			local declared = cdefSpans[token.start]
 			if declared then
-				-- The brackets are what says this is a string at all, so they keep that colour
-				-- even though nothing between them is coloured as one.
-				-- The delimiter is what the content started after, and a long string is closed the
-				-- way it was opened: `[[` and `]]`, `[==[` and `]==]`. The three go out in the order
-				-- they appear, because a token's position is written as the distance from the one
-				-- before it: out of order, every token after it lands in the wrong place.
+				-- The brackets are what says this is a string at all, so they keep that colour.
+				-- A long string is closed the way it was opened. The three go out in the order they appear: a
+				-- token's position is the distance from the one before it, so out of order every token after lands wrong.
 				local width = declared.from - token.start
 				emitSpan(token.start, declared.from - 1, "string")
 				for _, span in ipairs(declared.spans) do
@@ -1257,10 +1529,8 @@ end
 local function accessAt(result, source, offset)
 	local found
 	for _, node in ipairs(result.parser.nodes) do
-		-- `t["` names no field in the tree, and an `index` or a method call is what has one. The
-		-- node spans its arguments too — and an unterminated call spans the rest of the file —
-		-- so where the cursor is relative to the *field* is what decides, not where it is in
-		-- the node.
+		-- `t["` names no field in the tree, and an `index` or a method call is what has one. The node spans
+		-- its arguments — an unterminated call spans the file — so the field decides, not the node.
 		local isAccess = node.kind == "index" and node.isDynamic ~= true
 			or (node.kind == "call" and node.isMethod == true)
 		if node.target and isAccess then
@@ -1466,15 +1736,9 @@ function Lye:onCompletion(params)
 		end
 	end
 
-	-- The definitions declare functions rather than variables, so `print`, `setmetatable` and the
-	-- rest of the standard library are offered from their signatures. A name the document declares
-	-- itself was already offered above, and a dotted name is reached through its table.
-	--
-	-- The definitions' names are reached through a `__index` metatable, and `pairs` does not see
-	-- through one: iterating the table is how every prelude *function* — `print`, `pairs`,
-	-- `pcall`, `type` and the rest — came to be missing from completion while the prelude *tables*
-	-- beside them were offered, since those are injected as variables. So the list of names the
-	-- definitions declare is walked, and the signature is looked up per name.
+	-- The definitions declare functions rather than variables, so the standard library is offered from
+	-- their signatures; a name the document declares was offered above, and a dotted name is reached
+	-- through its table. `pairs` does not see through an `__index` metatable, so the names are walked.
 	local declaredSignatures = self.names[uri].signatures or {}
 	---@param name string
 	local function offerGlobal(name)
@@ -1504,12 +1768,65 @@ function Lye:onCompletion(params)
 end
 
 ---@param self lye.Server
-function Lye:onDocumentChanged(params)
+---@param params table
+---@param atOnce boolean? analyse now rather than with the rest of the burst. Opening a document
+--- is the first look at it and nothing is following, so it is answered at once; a keystroke is
+--- one of many and only the last of them is worth analysing.
+function Lye:onDocumentChanged(params, atOnce)
 	local uri = params.textDocument?.uri
 	if not uri then return end
 
-	local result = self:analyze(uri)
-	if result then self:publishDiagnostics(uri, result) end
+	-- The text has moved on, so what was worked out for the old text is not an answer about this
+	-- one. It is dropped rather than analysed over: a burst of keystrokes arrives faster than a
+	-- file can be analysed, and the ones in between are answers nobody reads.
+	self:forget(uri)
+
+	if atOnce then
+		local result = self:analyze(uri, params)
+		if result then self:publishDiagnostics(uri, result) end
+		return
+	end
+	self.dirty[uri] = true
+end
+
+--- Every document whose text has changed since it was last analysed, read once the editor has
+--- stopped sending. This is what makes typing cost one analysis rather than one per keystroke.
+function Lye:onIdle()
+	for uri in pairs(self.dirty) do
+		self.dirty[uri] = nil
+		local result = self:analyze(uri)
+		if result then self:publishDiagnostics(uri, result) end
+	end
+end
+
+--- Everything held for a document, dropped: the analysis, the names it declared, and its place in
+--- the order the cache keeps.
+---@param self lye.Server
+---@param uri string
+function Lye:forget(uri)
+	self.analysis[uri] = nil
+	self.names[uri] = nil
+	self.declaredBy[uri] = nil
+	for index = #self.order, 1, -1 do
+		if self.order[index] == uri then table.remove(self.order, index) end
+	end
+	self.declared = nil
+end
+
+--- The byte a change starts at, against the text the held analysis was for: the statement to
+--- re-read is the one the writer was in.
+---@param self lye.Server
+---@param uri string
+---@param params table
+---@return integer?
+function Lye:changedAt(uri, params)
+	local previous = self.analysis[uri]
+	local change = params.contentChanges and params.contentChanges[1]
+	local range = change and change.range
+	if not previous or not range then return nil end
+	local old = previous.source
+	return position.toOffset(old, position.buildLineIndex(old), range.start.line,
+		range.start.character, self.server.encoding)
 end
 
 ---@param self lye.Server
@@ -1517,8 +1834,8 @@ function Lye:onDocumentClosed(params)
 	local uri = params.textDocument?.uri
 	if not uri then return end
 
-	self.analysis[uri] = nil
-	self.names[uri] = nil
+	self:forget(uri)
+	self.dirty[uri] = nil
 	self.server:notify(framework.METHOD.publishDiagnostics, { uri = uri, diagnostics = json.array() })
 end
 
@@ -1530,7 +1847,7 @@ end
 ---@return lye.analyzer.Result?
 ---@return lye.parser.Result?
 local function targetAt(self, params)
-	local uri, _, _, names, offset = self:resolvePosition(params)
+	local _, _, _, names, offset = self:resolvePosition(params)
 	if not names then return nil, nil, nil end
 	local name = nameAt(names.parser, offset)
 	local variable = name and analyzer.lookupAt(names, name, offset)
@@ -1555,7 +1872,7 @@ end
 ---@param self lye.Server
 ---@return table?
 function Lye:onReferences(params)
-	local variable, names = targetAt(self, params)
+	local variable = targetAt(self, params)
 	local uri = params.textDocument?.uri
 	local document = uri and self.server.documents:get(uri)
 	if not variable or not document then return json.array() end
@@ -1572,7 +1889,7 @@ end
 ---@param self lye.Server
 ---@return table?
 function Lye:onDocumentHighlight(params)
-	local variable, names = targetAt(self, params)
+	local variable = targetAt(self, params)
 	local uri = params.textDocument?.uri
 	local document = uri and self.server.documents:get(uri)
 	if not variable or not document then return json.array() end
@@ -1801,7 +2118,7 @@ end
 ---@param self lye.Server
 ---@return table?
 function Lye:onSignatureHelp(params)
-	local uri, text, index, names, offset = self:resolvePosition(params)
+	local _, text, _, names, offset = self:resolvePosition(params)
 	local result = names and names.parser
 	if not names or not result then return nil end
 
@@ -1984,13 +2301,17 @@ end
 local function indentAt(parsed, offset)
 	local depth, seen = 0, {}
 	for _, scope in ipairs(parsed.scopes) do
-		if scope.start <= offset and offset <= scope.stop and not seen[scope.start] then
-			seen[scope.start] = true
+		-- Keyed by the scope itself: an `if` clause and the block it opens begin at the same
+		-- offset when the clause is the block's first statement, and keying by the offset counted
+		-- one of them and threw the other away — which is a body at the depth of its own header.
+		if scope.start <= offset and offset <= scope.stop and not seen[scope] then
+			seen[scope] = true
 			depth = depth + 1
 		end
 	end
-	-- The outermost scope is the chunk, which is not something a line is indented inside of.
-	return math.max(depth - 1, 0)
+	-- A line at the top of the file is inside no block at all: the chunk is not among the scopes the
+	-- parser records, so what is counted here is exactly the nesting a reader sees.
+	return depth
 end
 
 --- Whether a line starts inside a string that runs over more than one line, which no formatter can
@@ -2028,6 +2349,10 @@ function Lye:formatRange(uri, firstLine, lastLine)
 
 	local text, index, encoding = document.text, document.lineIndex, self.server.encoding
 	local edits = json.array()
+	-- What the project asks for, and lye's own style where it asks nothing: tabs, one blank line
+	-- between things, a trailing newline, nothing left hanging at the end of a line.
+	local settings = self:editorSettings(uri)
+	local unit = settings.indent_style == "space" and (" "):rep(tonumber(settings.indent_size) or 2) or "\t"
 	local line, at = 0, 1
 	while at <= #text do
 		local newline = text:find("\n", at, true)
@@ -2036,8 +2361,15 @@ function Lye:formatRange(uri, firstLine, lastLine)
 		if line >= firstLine and line <= lastLine then
 			local trimmed = written:gsub("%s+$", "")
 			if not insideLongString(parsed, text, at, stop) then
-				local wanted = ("\t"):rep(indentAt(parsed, math.min(at, #text)))
-					.. (trimmed:gsub("^[ \t]+", ""))
+				-- The offset of the line's own text, not of the line: a block opens *after* the
+				-- newline, so the leading whitespace sits outside it and every body came out at the
+				-- depth of the thing it was written inside.
+				local body = written:find("[^ \t]")
+				local first = body and (at + body - 1) or at
+				-- A blank line holds nothing, so it stays empty rather than indented to whatever
+				-- depth it happens to sit at.
+				local wanted = trimmed == "" and ""
+					or unit:rep(indentAt(parsed, math.min(first, #text))) .. (trimmed:gsub("^[ \t]+", ""))
 				if wanted ~= written then
 					edits[#edits + 1] = {
 						range = {
@@ -2073,9 +2405,57 @@ function Lye:onFormatting(params)
 	local uri = params.textDocument?.uri
 	local document = uri and self.server.documents:get(uri)
 	if not document then return json.array() end
+	local text = document.text
 	local lines = 0
-	for _ in document.text:gmatch("\n") do lines = lines + 1 end
-	return self:formatRange(uri, 0, lines)
+	for _ in text:gmatch("\n") do lines += 1 end
+	local edits = self:formatRange(uri, 0, lines)
+
+	-- The rest of the style is about the document rather than one line, so it is applied only when the
+	-- whole file is asked for: one blank line between things, and a single newline at the end.
+	local settings = self:editorSettings(uri)
+	local blankRun, at = 0, 1
+	local line = 0
+	while at <= #text do
+		local newline = text:find("\n", at, true)
+		local stop = (newline and newline - 1) or #text
+		local written = text:sub(at, stop)
+		if written:match("^%s*$") then
+			blankRun += 1
+			if blankRun > 1 then
+				edits[#edits + 1] = {
+					range = {
+						start = { line = line, character = 0 },
+						["end"] = { line = line + 1, character = 0 },
+					},
+					newText = "",
+				}
+			end
+		else
+			blankRun = 0
+		end
+		line += 1
+		at = stop + 2
+		if not newline then
+			-- The last line, when the file does not end where it should. The indentation may have
+			-- rewritten this very line, so the newline joins that edit rather than racing it.
+			if settings.insert_final_newline ~= "false" and written ~= "" then
+				local existing = edits[#edits]
+				if existing and existing.range.start.line == line - 1 then
+					existing.newText = existing.newText .. "\n"
+				else
+					edits[#edits + 1] = {
+						range = {
+							start = { line = line - 1, character = #written },
+							["end"] = { line = line - 1, character = #written },
+						},
+						newText = "\n",
+					}
+				end
+			end
+			break
+		end
+	end
+	return edits
 end
 
 ---@param self lye.Server
@@ -2088,7 +2468,26 @@ function Lye:onFormattingRange(params)
 	return self:formatRange(uri, range.start.line, range["end"].line)
 end
 
+--- The `.editorconfig` that covers a document, read once per directory: the file is opened on
+--- every keystroke otherwise, and it changes about as often as never.
+---@param self lye.Server
+---@param uri string
+---@return table<string, string>
+function Lye:editorSettings(uri)
+	local path = uri:gsub("^file://", "")
+	local directory = path:match("^(.*)/[^/]*$")
+	self.settings = self.settings or {}
+	local cached = self.settings[directory]
+	if not cached then
+		cached = editorconfig.forFile(directory, path)
+		self.settings[directory] = cached
+	end
+	return cached
+end
+
 --- `textDocument/onTypeFormatting`: after a newline, the line being written gets its indentation.
+--- A new line inside an alias gets the `--- | ` that continues it instead, and that is the only
+--- edit then, because the indentation it needs is the alias's own.
 ---@param self lye.Server
 ---@param params table
 ---@return table[]
@@ -2096,7 +2495,35 @@ function Lye:onTypeFormatting(params)
 	local uri = params.textDocument?.uri
 	local where = params.position
 	if not uri or not where then return json.array() end
+	local continuation = self:aliasContinuation(uri, where.line)
+	if continuation then
+		local out = json.array()
+		out[1] = continuation
+		return out
+	end
 	return self:formatRange(uri, where.line, where.line)
+end
+
+--- The `--- | ` a new line inside an alias wants, or nil when the line above it is not one, or when
+--- the line being written already holds something: enter in the middle of a line is a split rather
+--- than the start of another member.
+---@param self lye.Server
+---@param uri string
+---@param line integer
+---@return table?
+function Lye:aliasContinuation(uri, line)
+	local document = self.server.documents:get(uri)
+	if not document or line < 1 then return nil end
+	local lines = {}
+	for piece in (document.text .. "\n"):gmatch("([^\n]*)\n") do lines[#lines + 1] = piece end
+	local writing, above = lines[line + 1], lines[line]
+	if writing == nil or above == nil or not writing:match("^%s*$") then return nil end
+	local body = above:match("^%s*%-%-%-?%s*(.*)$")
+	if not body or not (body:match("^@alias%s") or body:match("^|")) then return nil end
+	return {
+		range = { start = { line = line, character = 0 }, ["end"] = { line = line, character = 0 } },
+		newText = (above:match("^(%s*)") or "") .. "--- | ",
+	}
 end
 
 --- The classes that extend the one under the cursor, which is what "go to implementations" asks
@@ -2247,7 +2674,6 @@ end
 --- kept until a file in it changes. LuaLS indexes the workspace the same way; the difference is that
 --- this reads the files when the first symbol is asked for rather than while the editor starts.
 ---@param self lye.Server
----@return table[]
 function Lye:workspaceSymbols()
 	if self.workspace then return self.workspace end
 
@@ -2267,13 +2693,16 @@ function Lye:workspaceSymbols()
 		if handle then
 			local source = handle:read("*a")
 			handle:close()
-			local names = analyzer.analyze(source, PRELUDE)
-			local result = names.parser
+			-- A symbol is a name the file declares, so the tree is all that is needed: analysing
+			-- every file of a project to list them typed and checked a workspace nobody asked
+			-- about, and one request over 126 files took the process from 17 MiB to 44.
+			local result = Parser.new(source):parse()
+			local index = nameIndex(source)
 			local uri = "file://" .. file
 			for _, declaration in ipairs(result.declarations) do
 				if declaration.qualifier ~= "param" and declaration.qualifier ~= "label"
 					and not declaration.name:find("[%.:]") then
-					local range = self:toRange(source, nameIndex(source), declaration.start, declaration.stop)
+					local range = self:toRange(source, index, declaration.start, declaration.stop)
 					out[#out + 1] = {
 						name = declaration.name,
 						kind = declaration.isFunction and 12 or 13,
@@ -2335,16 +2764,23 @@ function Lye:register()
 	server:capability("semanticTokensProvider", {
 		legend = TOKEN_LEGEND, full = true, range = true,
 	})
-	-- `.` and `:` are what a field or a method call starts with; a name is completed as it is typed,
-	-- which is what the client's own quick suggestions ask for.
-	-- `[` is a trigger, not just `.` and `:`: `t[` is where a field with a name that is not an
-	-- identifier is reached, and the client must ask there for the list to appear.
+	-- `.` and `:` are what a field or method call starts with; a name is completed as it is typed.
+	-- `[` is a trigger too: `t[` is where a field with a name that is not an identifier is reached.
+	server.connection:setIdleHandler(function() self:onIdle() end)
+	-- A change may be followed by more of the same burst, which is worth waiting for; anything else
+	-- is reading what the burst described and has to find it done.
+	server.connection:setBeforeHandler(function(message)
+		local method = message.method
+		if method ~= framework.METHOD.didChange and method ~= framework.METHOD.didOpen then
+			self:onIdle()
+		end
+	end)
 	server:capability("completionProvider", { triggerCharacters = { ".", ":", "[", '"', "'" } })
 	server:capability("signatureHelpProvider", { triggerCharacters = { "(", "," } })
 
 	server:on(method.didOpen, function(_, params)
 		self.server:onDidOpen(params or {})
-		self:onDocumentChanged(params or {})
+		self:onDocumentChanged(params or {}, true)
 	end)
 
 	server:on(method.didChange, function(_, params)
@@ -2395,11 +2831,17 @@ function Lye:register()
 	server:on(method.typeFormatting, function(_, params) return self:onTypeFormatting(params or {}) end)
 	server:on(method.workspaceDidChangeWatchedFiles, function()
 		self.workspace = nil
+		self.known = nil
+		self.declared = nil
 	end)
 end
 
 ---@return lye.Server
 function Lye.start()
+	-- A server runs for hours, and every analysis leaves a tree, its scopes and its facts for the
+	-- collector to find later. LuaJIT waits until the heap has *doubled*, which puts the resident set
+	-- above the size of any file the editor asked about.
+	collectgarbage("setpause", 150)
 	local connection = rpc.Connection.new()
 	local server = framework.Server.new(connection, { name = "lye", version = "0.1.0" })
 	local lye = Lye.new(server)

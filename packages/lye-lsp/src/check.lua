@@ -54,6 +54,65 @@ function check.file(path, elsewhere)
 	return not failed
 end
 
+--- Directories that never hold source to check: a build output and a fetched dependency tree.
+--- Anything whose name begins with a dot is skipped too — version control, editor state, and the
+--- like — because a walk over those is most of the cost on a project that has been built.
+local SKIPPED = { ["target"] = true, ["node_modules"] = true }
+
+--- Every Lua file under `root`, which is what a check with no paths named checks.
+--- `find` does the walk: the runtime has no directory listing of its own, and a project tree is
+--- the one thing here that is not worth a syscall shim to avoid a process.
+---@param root string
+---@return string[]
+function check.discover(root)
+	local found = {}
+	local pipe = io.popen(string.format("find %s -type f -name '*.lua' 2>/dev/null", root:find("[%s'\"]") and string.format("%q", root) or "'" .. root .. "'"))
+	if not pipe then return found end
+	for path in pipe:lines() do
+		local skipped = false
+		-- `find .` writes every path with a leading `./`, and the dot of that is not a directory name.
+		local parts = path:gsub("^%./", "")
+		for part in parts:gmatch("[^/]+") do
+			if SKIPPED[part] or part:sub(1, 1) == "." then
+				skipped = true
+				break
+			end
+		end
+		if not skipped then found[#found + 1] = path end
+	end
+	pipe:close()
+	table.sort(found)
+	return found
+end
+
+--- Whether `path` is a directory. A directory opens as a handle on Linux and then reads as nil,
+--- where an empty file reads as an empty string, which is what tells the two apart.
+---@param path string
+---@return boolean
+local function isDirectory(path)
+	local handle = io.open(path, "rb")
+	if not handle then return false end
+	local first = handle:read(0)
+	handle:close()
+	return first == nil
+end
+
+--- The files a list of arguments names: a directory stands for every Lua file under it, so
+--- `lye check packages` means what it says.
+---@param paths string[]
+---@return string[]
+function check.expand(paths)
+	local named = {}
+	for _, path in ipairs(paths) do
+		if isDirectory(path) then
+			for _, found in ipairs(check.discover(path)) do named[#named + 1] = found end
+		else
+			named[#named + 1] = path
+		end
+	end
+	return named
+end
+
 ---@return boolean isOk
 function check.files(paths)
 	-- Every file in the batch is read first, so a name one of them declares is not a typo in

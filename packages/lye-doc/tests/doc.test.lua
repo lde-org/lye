@@ -138,6 +138,24 @@ test.it("reads a function signature", function()
 		"the spelling LuaLS uses reads the same")
 end)
 
+test.it("reads the marker and the bar after a signature as the return they follow", function()
+	-- Both follow the return type, so both belong to it: a resolver that returns `Type?` returns
+	-- one, and is not a function that may be absent. What may be absent is written without a
+	-- return at all, which is the `fun()?` a parameter takes.
+	test.equal(doctype.display(doctype.parse("fun(text: string): string?")), "fn(string) -> string?")
+	test.equal(doctype.display(doctype.parse("fun(text: string): string|nil")), "fn(string) -> string?",
+		"the two spellings are one type")
+	test.equal(doctype.display(doctype.parse("fun(text: string): string[]")), "fn(string) -> string[]")
+	test.equal(doctype.display(doctype.parse("fun()?")), "(fn() -> any)?",
+		"with no return written the marker is the function's own")
+	test.equal(doctype.display(doctype.parse("fun()[]")), "(fn() -> any)[]",
+		"and a list of them is bracketed so it does not read as a function returning a list")
+	local declared = doctype.parse("fun(text: string): string?")
+	local inferred = doctype.parse("fun(text: string): string|nil")
+	test.equal(doctype.satisfies(inferred, declared), true)
+	test.equal(doctype.satisfies(declared, inferred), true, "and either satisfies the other")
+end)
+
 test.it("treats a bare function as any signature", function()
 	local signature = doctype.parse("fn(a: number) -> string")
 	test.equal(doctype.display(doctype.parse("function")), "function")

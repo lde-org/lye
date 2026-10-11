@@ -6,7 +6,7 @@
 
 **An incredibly fast and powerful language server written in and for LuaJIT**
 
-`7.28 ms` to diagnostics, `11.8 MiB` resident, `7.3k` lines of Lua.
+`3.6 ms` to diagnostics, `12.6 MiB` resident, `13.5k` lines of Lua.
 
 </div>
 
@@ -75,12 +75,37 @@ end
 
 ## Numbers
 
-Measured with `editors/vscode/tests/compare.mjs` on one machine, one fixture, one harness:
+Measured with `editors/vscode/tests/compare.mjs` on one machine, one fixture, one harness. The
+second pair is a real 2331-line file of another project rather than a fixture written to be easy:
 
 | | lye | LuaLS | EmmyLua |
 |---|---|---|---|
-| keystroke → diagnostics | **7.28 ms** | 202.08 ms | 503.98 ms |
-| resident | **11.8 MiB** | 20.7 MiB | 61.2 MiB |
+| keystroke → diagnostics (74-line fixture) | **3.6 ms** | 201.17 ms | 502.55 ms |
+| resident | **12.6 MiB** | 34.9 MiB | 64.6 MiB |
+| keystroke → diagnostics (2331-line file) | **59 ms** | 208.95 ms | 513.05 ms |
+| resident | **41 MiB** | 46.3 MiB | 86.6 MiB |
+
+Runs vary, so read the times as within about a tenth. lye's figures are medians of interleaved runs;
+the other two servers' are as last measured with this same harness on this machine.
+
+Most of the 2331-line file's residency is the JIT. One analysis of a file that size compiles
+thousands of traces and LuaJIT's default cache holds a thousand, so out of the box it flushes and
+refills for as long as the server runs — that is the 98 ms and 31 MiB row. Keeping the traces takes
+the file to 59 ms and 41 MiB.
+
+Semantic tokens come with their own number, since colouring a whole file at once is the request no
+editor batches: on the 2331-line file lye answers 9884 tokens in 34 ms, LuaLS 4089 tokens in
+95.19 ms, EmmyLua 9581 tokens in 7.20 ms.
+
+What a process holds is the runtime and the allocator's high-water mark more than the shape of one
+tree, which is why the memory work went into the collector — `collectgarbage("setpause", 150)` took
+28.4 MiB to 22.3 for one line — rather than into the parser's node tables, which a full ffi arena
+would cut by about a megabyte, 4% of what an editor sees.
+
+`tools/memory.lua` reports where one document's memory goes — 0.79 MiB to lex it, 2.30 MiB to parse
+it (1.20 of that the node tables, 316 bytes a node), 0.87 MiB for the definitions, 3.92 MiB for the
+analysis itself — and `tools/sweep.lua` type-checks this repository with the same analyzer, which is
+what keeps the numbers above honest about the code that produced them.
 
 ## Editors
 

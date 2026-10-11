@@ -1,23 +1,24 @@
 --[[
-	Recursive typing over the arena.
+	Recursive typing over the arena: a node's type comes from its operands.
 
-	A node's type comes from its operands, so this is a fold over `left`/`right`/`target`/`args`
-	starting at the expression and descending. Every node kind the parser emits is handled;
-	a kind that is not understood yields a **mutable** unknown rather than a guess, so an
-	unfinished corner produces no false error and can still be refined later.
-
-	Results are memoised per arena index, so a node inside two expressions is typed once.
+	Memoised per arena index, and a node kind nothing understands yields a mutable unknown, not a guess.
 ]]
 
 local types = require("lye-doc.type")
+local pattern = require("lye-doc.pattern")
 
 local infer = {}
 
 ---@class lye.infer.Context
 ---@field parser lye.parser.Result
 ---@field typeOfName fun(name: string, offset: integer): lye.doc.Type
+---@field typeOfField fun(base: lye.doc.Type, baseName: string?, field: string, offset: integer): lye.doc.Type?
 ---@field returns table<string, lye.doc.Type>
----@field cache table<integer, lye.doc.Type>
+---@field cache table<integer, lye.doc.Type> what each node was typed as, by arena index
+---@field fnTypes table<integer, lye.doc.Type> one callable per function node, filled from its body
+---@field callTypes table<integer, lye.doc.Type> what a generic call was bound to, by node
+---@field callValues table<integer, lye.doc.Type[]>? every value a call gives, when more than its signature says
+---@field building table<integer, boolean> the nodes being typed now, so a self-reach ends
 ---@field modules fun(name: string): lye.doc.Type? what `require("name")` is, when the caller can say
 ---@field ctypes fun(node: lye.parser.Node): lye.doc.Type? what a call naming a C type is worth
 
@@ -26,9 +27,6 @@ local KNOWN = {
 	call = true, binary = true, unary = true, ternary = true, index = true, name = true, prefix = true,
 }
 
----@param ctx lye.infer.Context
----@param idx integer?
----@return lye.doc.Type
 --- The type a literal kind stands for. The parser records what a table field holds as the kind
 --- of the value, and only some of those kinds are types: a field holding a call or a sum is a
 --- node whose type typing works out separately, so it stays unknown here.
@@ -44,6 +42,22 @@ local function literalType(kind)
 	return types.mutable()
 end
 
+--- What a string reads a field from. Lua gives every string the `string` table as its metatable's
+--- `__index`, which is measurable — `getmetatable("").__index == string` — so `s:sub(2)` calls
+--- `string.sub(s, 2)` and `s.len` is a function. A type library cannot know that, because it is how
+--- the environment is arranged rather than what a string is, and this is the layer that knows the
+--- environment.
+---@param ctx lye.infer.Context
+---@param base lye.doc.Type
+---@param field string?
+---@param start integer
+---@return lye.doc.Type?
+local function stringFieldOf(ctx, base, field, start)
+	if base.variant ~= "string" or not field or not ctx.typeOfName then return nil end
+	local library = ctx.typeOfName("string", start)
+	return library and types.fieldOf(library, field) or nil
+end
+
 local function of(ctx, idx)
 	if not idx then return types.mutable() end
 	local cached = ctx.cache[idx]
@@ -51,6 +65,14 @@ local function of(ctx, idx)
 
 	local node = ctx.parser.nodes[idx]
 	if not node then return types.mutable() end
+
+	-- A cast written beside the expression stands for it: `f --[[@as Vec]].x` reads `f` as a Vec,
+	-- which is the only way to say what a value is where nothing declares it.
+	local cast = ctx.casts and ctx.casts[idx]
+	if cast then
+		ctx.cache[idx] = cast
+		return cast
+	end
 
 	local result
 	local kind = node.kind
@@ -130,7 +152,8 @@ local function of(ctx, idx)
 		local base = of(ctx, node.target)
 		local target = node.target and ctx.parser.nodes[node.target]
 		local baseName = node.isDynamic ~= true and target and target.callee or nil
-		result = ctx.typeOfField and ctx.typeOfField(base, baseName, node.field, node.start)
+		result = node.isDynamic ~= true and stringFieldOf(ctx, base, node.field, node.start)
+			or ctx.typeOfField and ctx.typeOfField(base, baseName, node.field, node.start)
 			or types.indexResult(base, node.field)
 	elseif kind == "call" then
 		-- `require("a.b")` is the module that file returns: asking the caller for it is what turns a
@@ -155,6 +178,17 @@ local function of(ctx, idx)
 				end
 			end
 		end
+		-- `assert(x)` hands back `x`, and by returning it has said that `x` was neither nil nor
+		-- false. `local found = assert(source:find(...))` is how Lua writes "this is there", so
+		-- reading the call as an optional `number` made the next line a mistake the `assert` had
+		-- already ruled out.
+		if node.callee == "assert" and node.args and node.args[1] then
+			local held = of(ctx, node.args[1])
+			result = types.narrowTruthiness(held, true) or held
+			ctx.cache[idx] = result
+			return result
+		end
+
 		-- A call yields what its callee returns, whether that came from an annotation or from the
 		-- callee's own body. While that is still unknown the answer is a mutable unknown, so the
 		-- refinement pass can fill it in rather than this being cached as settled.
@@ -203,6 +237,7 @@ function infer.context(parser, typeOfName, returns, typeOfField, modules, ctypes
 	return {
 		parser = parser, typeOfName = typeOfName, returns = returns or {}, typeOfField = typeOfField, cache = {}, fnTypes = {},
 		callTypes = {},
+		callValues = {},
 		building = {},
 		modules = modules,
 		ctypes = ctypes,
@@ -217,6 +252,66 @@ function infer.at(ctx, idx)
 	return of(ctx, idx)
 end
 
+--- The values an expression gives where several are wanted. Lua asks this of the last expression
+--- of an assignment and of every expression of a `return`: `local a, b = f()` takes both from `f`,
+--- and a literal gives its one value and nothing after it. A call whose values are not known answers
+--- `unknown` rather than nil, so a callee that returns several values for a reason this round has
+--- not worked out yet is not reported as returning nothing.
+---@param ctx lye.infer.Context
+---@param idx integer?
+---@param position integer which value is wanted, 1 for the first
+---@return lye.doc.Type
+function infer.valuesAt(ctx, idx, position)
+	if position <= 1 then return of(ctx, idx) end
+	local node = idx and ctx.parser.nodes[idx]
+	if not node or node.kind ~= "call" then return types.NIL_TYPE end
+	-- What this very call gives back, when the analyzer worked it out from something the signature
+	-- cannot know — a pattern written at the call site, most of all.
+	local callValues = ctx.callValues[node.index]
+	if callValues then return callValues[position] or types.NIL_TYPE end
+	-- A pattern written at the call is read here rather than left to a later pass: a name is typed
+	-- the first time round, and a value that only arrives in the second never reaches it.
+	if node.args then
+		-- The field a dotted call is written with is on the node it targets — `string.find(s, p)`
+		-- is an index of `string` — and only a method call carries it itself.
+		local target = node.target and ctx.parser.nodes[node.target]
+		local field = node.field or (target and target.field)
+		local subject = field and field:match("([%w_]+)$")
+		local at = subject and pattern.CALLS[subject] and node.args[node.isMethod and 1 or 2]
+		local literal = at and ctx.parser.nodes[at]
+		if literal and literal.kind == "string" and type(literal.value) == "string" then
+			local values = pattern.values(subject, literal.value)
+			if values and values[position] then return values[position] end
+		end
+	end
+	local calleeType = infer.calleeTypeOf(ctx, node)
+	if calleeType and types.isFn(calleeType) then
+		-- Several values written down: `---@return A, B` gives A first and B second, and a body
+		-- that returns two values is read the same way. A name of the signature's own binds from
+		-- this call, so the second value is as substituted as the first.
+		if calleeType.values then
+			local value = calleeType.values[position]
+			if not value then return types.NIL_TYPE end
+			if calleeType.generics and next(calleeType.generics) then
+				local bindings = {}
+				for index, argIdx in ipairs(node.args or {}) do
+					local wanted = calleeType.params[index]
+					local actual = of(ctx, argIdx)
+					if wanted and actual then
+						infer.bind(wanted, actual, calleeType.generics, bindings)
+					end
+				end
+				return types.substitute(value, bindings)
+			end
+			return value
+		end
+		-- `---@return T...` gives every value after the ones it names, so there is no end to reach:
+		-- what the call itself was bound to is what the second name is too.
+		if calleeType.isSpread then return ctx.callTypes[node.index] or of(ctx, idx) end
+	end
+	return types.UNKNOWN_TYPE
+end
+
 --- The type a call's callee holds. A plain call names one; a method call names none, and calls
 --- the field its target carries, which is where the signature is.
 ---@param ctx lye.infer.Context
@@ -228,7 +323,10 @@ function infer.calleeTypeOf(ctx, node)
 	-- callee of `math`, which is the class and not the function.
 	if node.target then
 		local targetType = of(ctx, node.target)
-		if node.field then return types.indexResult(targetType, node.field) end
+		if node.field then
+			return stringFieldOf(ctx, targetType, node.field, node.start)
+				or types.indexResult(targetType, node.field)
+		end
 		if types.isFn(targetType) then return targetType end
 		-- A table with a `__call` metamethod can be called: Lua runs the metamethod, with the
 		-- table itself as its first argument.
@@ -289,7 +387,6 @@ end
 --- Whether typing reached a verdict for this node, which is what refinement waits on.
 ---@param ctx lye.infer.Context
 ---@param idx integer
----@return boolean
 function infer.isResolved(ctx, idx)
 	local cached = ctx.cache[idx]
 	return cached ~= nil and cached.variant ~= "unknown"

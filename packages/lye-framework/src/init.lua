@@ -91,7 +91,6 @@ end
 local Server = {}
 Server.__index = Server
 
----@return lye.framework.Server
 function Server.new(connection, options)
 	local caps = { textDocumentSync = { openClose = true, change = 2 } }
 	return setmetatable({ connection = connection, documents = DocumentStore.new(), capabilities = caps, encoding = position.UTF16, isInitialized = false, isShutdown = false, handlers = {}, answered = {}, options = options or {} }, Server)
@@ -116,11 +115,6 @@ end
 ---@return boolean
 local function isRequest(message)
 	return message.id ~= nil
-end
-
----@return boolean
-local function isDollarMethod(method)
-	return method:sub(1, 2) == "$/"
 end
 
 ---@param self lye.framework.Server

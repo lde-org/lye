@@ -1,12 +1,8 @@
 --[[
 	Type system: variants, subtyping, narrowing and display.
 
-	A type is a table with a `variant`, so everything is data rather than a string re-parsed
-	on each question. `nil` is its own variant, which is what lets `number?` reject a string
-	while still accepting nil.
-
-	`unknown` is the honest answer when inference cannot tell, and it satisfies everything:
-	reporting an error against an unknown is how a checker becomes noise.
+	A type is a table with a `variant`, so everything is data rather than a string re-parsed on each
+	question. `unknown` is the honest answer when inference cannot tell, and it satisfies everything.
 ]]
 
 local types = {}
@@ -18,7 +14,7 @@ local types = {}
 ---| { variant: "boolean" }
 ---| { variant: "nil" }
 ---| { variant: "table" }
----| { variant: "fn", params: lye.doc.Type[], returns: lye.doc.Type, isVariadic: boolean? }
+---| { variant: "fn", params: lye.doc.Type[], returns: lye.doc.Type, isVariadic: boolean?, values: lye.doc.Type[]? }
 ---| { variant: "any" }
 ---| { variant: "unknown" }
 ---| { variant: "extern", name: string }
@@ -32,9 +28,8 @@ types.UNKNOWN = "unknown"
 types.ANY = "any"
 types.NIL = "nil"
 
--- The names that are a type on their own. `thread`, `userdata`, `lightuserdata` and `cdata` are
--- the engine's own — the definitions annotate with them — and `bool` and `void` are spellings
--- LuaLS accepts for a boolean and for nothing at all.
+-- The names that are a type on their own; `bool` and `void` are LuaLS's spellings for a
+-- boolean and for nothing at all.
 local SIMPLE = {
 	number = true, string = true, boolean = true, ["nil"] = true, any = true, unknown = true,
 	thread = true, userdata = true, lightuserdata = true, cdata = true, bool = true, void = true,
@@ -51,16 +46,14 @@ local function make(variant, fields)
 	return out
 end
 
---- An `unknown` that can still be promoted. A type is mutable when a later assignment may
---- tell us what it actually is, which is the difference between "we do not know yet" and
---- "this is genuinely unknown".
+--- An `unknown` that can still be promoted: a later assignment may tell us what it is.
+--- That is the difference between "not known yet" and "genuinely unknown".
 ---@return lye.doc.Type
 function types.mutable()
 	return { variant = "unknown", isMutable = true }
 end
 
 ---@param type lye.doc.Type
----@return boolean
 function types.isMutable(type)
 	return type.isMutable == true
 end
@@ -89,17 +82,14 @@ types.TABLE = make("table")
 --- A boolean written out: `true` in a `---@field ok: true` is that value, not a name, which is
 --- what makes it usable as the discriminant of a union.
 ---@param value boolean
----@return lye.doc.Type
 function types.booleanValue(value)
 	return make("boolean", { value = value })
 end
 
---- The number a literal spells. A number type without a value is any number; with one it is that
---- number and no other, which is what makes `---@type 2149 | 231` a type a reader can write down
---- and a comparison a plugin can check.
+--- The number a literal spells. Without one it is any number; with one it is that number and
+--- no other, which is what a `---@type 2149 | 231` a comparison can be checked against is.
 ---@param value number
 ---@param text string? the number as written, so `0x10` reads back as it was typed
----@return lye.doc.Type
 function types.numberValue(value, text)
 	return make("number", { value = value, text = text or tostring(value) })
 end
@@ -111,9 +101,8 @@ function types.numericValue(type)
 	return type and type.variant == "number" and type.value or nil
 end
 
---- A function that hands back no value at all: `function() end` and `function() return end`. It
---- is not `nil`, which is a value a caller can read; there is nothing here to read. Anywhere a
---- `nil` would fit, so does this.
+--- A function that hands back no value at all: not `nil`, which a caller can read, but
+--- nothing to read. Anywhere a `nil` would fit, so does this.
 types.VOID = make("void")
 
 --- The bottom type: a call that does not come back, as `error` does. Nothing is a `never`, and a
@@ -126,7 +115,6 @@ types.NEVER = make("never")
 ---@param fields table<string, lye.doc.Type>?
 ---@param parents lye.doc.Type[]?
 ---@param visibility table<string, string>? who may read each field
----@return lye.doc.Type
 function types.classType(name, args, fields, parents, visibility)
 	return make("class", {
 		name = name, args = args or {}, fields = fields or {}, parents = parents or {},
@@ -139,7 +127,6 @@ end
 ---@param params lye.doc.Type[]
 ---@param returns lye.doc.Type
 ---@param isVariadic boolean? accepts any number of arguments
----@return lye.doc.Type
 ---@param isSpread boolean? returns a sequence, so every call result is that type
 function types.fn(params, returns, isVariadic, isSpread)
 	return make("fn", {
@@ -148,7 +135,6 @@ function types.fn(params, returns, isVariadic, isSpread)
 end
 
 ---@param type lye.doc.Type
----@return boolean
 function types.isFn(type)
 	return type.variant == "fn"
 end
@@ -170,26 +156,21 @@ types.UNKNOWN_TYPE = make("unknown")
 types.ANY_TYPE = make("any")
 
 --- What a bare `function` means: `fn(...any) -> ...any`, so annotations written before
---- signatures keep working and a function literal satisfies any signature it is given. It is
---- built here because it is made of them.
+--- signatures keep working. Built here because it is made of them.
 types.FUNCTION = types.fn({}, types.ANY_TYPE, true)
 
 ---@param name string
----@return lye.doc.Type
 function types.extern(name) return make("extern", { name = name }) end
 
 ---@param inner lye.doc.Type
----@return lye.doc.Type
 function types.array(inner) return make("array", { type = inner }) end
 
 ---@param fields table<string, lye.doc.Type>
----@return lye.doc.Type
 ---@param indexed { key: string, type: lye.doc.Type }? what any other key holds
 function types.object(fields, indexed) return make("object", { fields = fields, indexed = indexed }) end
 
---- Flatten nested unions and drop duplicates, so `a | (b | c)` is one flat set. An unknown
---- member absorbs the whole union: `string | unknown` is unknown, since it tells us no more
---- than the unknown did.
+--- Flatten nested unions and drop duplicates. An unknown member absorbs the whole union,
+--- since `string | unknown` tells us no more than the unknown did.
 ---@param members lye.doc.Type[]
 ---@return lye.doc.Type
 function types.union(members)
@@ -222,17 +203,22 @@ end
 ---@param right lye.doc.Type
 ---@return lye.doc.Type
 function types.combine(left, right)
+	-- A *mutable* unknown is a promise rather than an answer: it holds the place of a value not yet
+	-- typed. Taking the other side throws the promise away and turns a guard into a contradiction.
+	if types.isMutable(left) then return left end
+	if types.isMutable(right) then return right end
 	if left.variant == "unknown" then return right end
 	if right.variant == "unknown" then return left end
 	if types.display(left) == types.display(right) then return left end
+	-- An empty table is a container waiting to be filled, so where the other side is one too it takes
+	-- that shape instead of widening it. Asked of the other side, so `nil` still combines with it.
+	if types.isUnknownShape(left) and types.satisfies(left, right) then return right end
+	if types.isUnknownShape(right) and types.satisfies(right, left) then return left end
 	return types.union({ left, right })
 end
 
 --- Whether every possible value of `type` fits `constraint`.
---- The text of a string written out in an annotation, or nil when the type is not one. A
---- literal is one string whichever quotes it was written with, so the quotes are not part of it.
 ---@param type lye.doc.Type
----@return string?
 local function stringValueOf(type)
 	if type.variant ~= "extern" then return nil end
 	local first, last = type.name:sub(1, 1), type.name:sub(-1)
@@ -250,9 +236,8 @@ function types.satisfies(type, constraint)
 		return type.variant == "boolean" and type.value == constraint.value
 	end
 
-	-- One number is an exact value, and a value nothing is known about cannot be shown to be it:
-	-- `---@return 521` asks the body to return 521, not any number at all. Every other constraint
-	-- accepts an unknown, which is what keeps a value the analysis has not settled out of trouble.
+	-- One number is an exact value and nothing is known cannot be shown to be it: `---@return 521`
+	-- asks for 521, not any number. Every other constraint accepts an unknown.
 	if constraint.variant == "number" and constraint.value then
 		return type.variant == "number" and type.value == constraint.value
 	end
@@ -260,11 +245,8 @@ function types.satisfies(type, constraint)
 	if constraint.variant == "any" or constraint.variant == "unknown" then return true end
 	if type.variant == "unknown" or type.variant == "any" then return true end
 
-	-- A C number is a cdata the engine converts wherever a number is wanted, and between C numbers:
-	-- `size * nmemb` is arithmetic and `putcdata(buf, len)` takes the `size_t` it is given. The
-	-- difference that remains is in what a value *is* — `tostring` of one reads `5LL`, a 64-bit one
-	-- does not fit in a double — and a check that refused these would report code the engine runs.
-	-- The class keeps the name it was written with, marker and all: `ffi.cnum*`.
+	-- A C number is a cdata the engine converts wherever a number is wanted, so refusing it would
+	-- report code the engine runs. The class keeps the name it was written with, marker and all.
 	local function isCNumber(candidate)
 		local function named(one)
 			return one and one.name and (one.name:gsub("%*$", "")) == "ffi.cnum" or false
@@ -281,31 +263,24 @@ function types.satisfies(type, constraint)
 	end
 
 	-- And the other way: a Lua number written into a C number is converted by the engine, which is
-	-- what assigning `32` to a `size_t` field does. The difference the types make is in what a
-	-- value *is* when it is read back, which is what the display says.
+	-- what assigning `32` to a `size_t` does. The difference shows in what a value *is*.
 	if isCNumber(constraint) and (type.variant == "number" or type.variant == "integer") then
 		return true
 	end
 
-	-- A quoted name is a string value rather than a name to look up, which is how the definitions
-	-- write `select("#", ...)` and their option flags. It is one of the strings, so it fits
-	-- `string`, and only that same string fits it.
-	-- A call that never returns has no value to be wrong, so a `never` fits every constraint;
-	-- nothing else fits a `never`, which is what makes code after one unreachable.
+	-- A quoted name is a string value rather than a name to look up, so it is one of the strings and
+	-- only that same string fits it. A `never` fits every constraint, and nothing else fits a `never`.
 	if type.variant == "never" then return true end
 	if constraint.variant == "never" then return false end
 
 	-- Returning nothing is not returning nil, but a caller cannot tell the two apart, so either
-	-- spelling fits the other: `function() end` satisfies `fn(): nil`, and a function declared to
-	-- return nothing accepts one that returns nil.
+	-- spelling fits the other.
 	if constraint.variant == "void" then return type.variant == "void" or type.variant == "nil" end
 	if type.variant == "void" then return constraint.variant == "nil" end
 
 	local wanted = stringValueOf(constraint)
-	-- A string value names one string. Any string satisfies it, because a string literal in a
-	-- table constructor is typed as the string it is rather than as one value, and reporting a
-	-- `string` for a field that names a particular string would flag ordinary code. A number
-	-- value is exact, because a number literal is typed as its own value.
+	-- A string value names one string and any string satisfies it, because a literal in a table
+	-- is typed as the string it is. A number value is exact, since a literal is its own value.
 	if wanted then
 		local have = stringValueOf(type)
 		if have then return have == wanted end
@@ -313,9 +288,8 @@ function types.satisfies(type, constraint)
 	end
 	if constraint.variant == "string" and stringValueOf(type) then return true end
 
-	-- A union fits only when every member does, and this is asked first: `A|B` fits `A|B`
-	-- because each member fits the constraint, while the other order would ask whether one
-	-- member of the constraint accepts the whole union.
+	-- A union fits only when every member does, and this is asked first: `A|B` fits `A|B`, while
+	-- the other order would ask whether one member accepts the whole union.
 	if type.variant == "union" then
 		for _, member in ipairs(type.types) do
 			if not types.satisfies(member, constraint) then return false end
@@ -337,10 +311,15 @@ function types.satisfies(type, constraint)
 			or type.variant == "array"
 	end
 
+	if constraint.variant == "extern" then
+		-- The other direction of the same thing: a class fits a name written for it.
+		if type.name == constraint.name then return true end
+		return false
+	end
+
 	if constraint.variant == "class" then
-		-- A table is how a class is built, and `local Foo = {}` is how the class itself is
-		-- declared, so a table fits. Only the fields it does have are checked: an instance is
-		-- routinely built in pieces, and requiring all of them would report that as an error.
+		-- A table is how a class is built, so a table fits. Only the fields it does have are
+		-- checked: an instance is routinely built in pieces.
 		if type.variant == "table" then return true end
 		if type.variant == "object" then
 			for name, have in pairs(type.fields) do
@@ -350,23 +329,21 @@ function types.satisfies(type, constraint)
 			return true
 		end
 		-- A class named after a builtin type *is* that type: `builtin.lua` declares
-		-- `---@class string`, so what fits `string` fits it — a quoted value among them, which is
-		-- what makes `ffi.new("Vec")` fit the `ffi.cdecl*` that extends it.
+		-- `---@class string`, which is what makes `ffi.new("Vec")` fit the `ffi.cdecl*` extending it.
 		if SIMPLE[constraint.name] then
 			return types.satisfies(type, types.base(constraint.name))
 		end
 		-- A value that fits what the class extends fits the class: the definitions write
 		-- `---@class ffi.cdecl*: string`, and a string is exactly what a parameter of it takes.
-		-- This is asked before the value is required to be a class of its own, because a plain
-		-- string is one of these.
 		for _, parent in ipairs(constraint.parents or {}) do
 			if types.satisfies(type, parent) then return true end
 		end
+		-- A name this document never resolved is that name's class when the class is called the
+		-- same thing, and the file that declares it is what makes it the class.
+		if type.variant == "extern" and type.name == constraint.name then return true end
 		if type.variant ~= "class" then return false end
-		-- A class whose every field is optional describes a shape rather than a name: there is
-		-- nothing an instance must have that another table could not, so a class fits it by
-		-- carrying those fields. `lye.Metatable` is one — what makes a table a metatable is which
-		-- metamethods it has, not what it is called.
+		-- A class whose every field is optional describes a shape rather than a name, so a class fits it
+		-- by carrying those fields. What makes a table a metatable is which metamethods it has.
 		local shaped, some = true, false
 		for _, wanted in pairs(constraint.fields) do
 			some = true
@@ -388,7 +365,7 @@ function types.satisfies(type, constraint)
 			end
 			return false
 		end
-		for index, wanted in ipairs(constraint.args) do
+		for index, wanted in ipairs(constraint.args or {}) do
 			local have = type.args[index] or types.UNKNOWN_TYPE
 			if not types.satisfies(have, wanted) then return false end
 		end
@@ -401,12 +378,11 @@ function types.satisfies(type, constraint)
 		-- means and what keeps unannotated literals out of trouble.
 		if types.isAnyFn(constraint) then return true end
 		-- A variadic constraint asks for a callable that accepts at least what it names, which a
-		-- fixed signature does when its own parameters fit: `fun(self: T, ...): ...` accepts
-		-- `fn(Vec, number) -> Vec`, which is what a `__call` metamethod looks like.
+		-- fixed signature does when its own parameters fit.
 		if #type.params ~= #constraint.params and not type.isVariadic and not constraint.isVariadic then
 			return false
 		end
-		for index, wanted in ipairs(constraint.params) do
+		for index, wanted in ipairs(constraint.params or {}) do
 			local have = type.params[index] or types.UNKNOWN_TYPE
 			-- Contravariant: the value has to accept what the constraint will pass it.
 			if not types.satisfies(wanted, have) then return false end
@@ -417,6 +393,12 @@ function types.satisfies(type, constraint)
 	if constraint.variant == "array" then
 		-- `local names = {}` declares a list before it holds anything, so a table fits.
 		if types.isUnknownShape(type) then return true end
+		-- A list literal is an object with an integer index, so whichever way the list was written,
+		-- the elements are what has to fit.
+		if type.variant == "object" and type.indexed
+			and (type.indexed.key == "integer" or type.indexed.key == "number") then
+			return types.satisfies(type.indexed.type, constraint.type)
+		end
 		if type.variant ~= "array" then return false end
 		return types.satisfies(type.type, constraint.type)
 	end
@@ -427,6 +409,15 @@ function types.satisfies(type, constraint)
 			return types.satisfies(type.type, constraint.indexed.type)
 		end
 		if type.variant == "table" and next(constraint.fields) == nil then return true end
+		-- A class is a table as well, and the fields it declares are the ones a shape asks about:
+		-- a class is routinely built in pieces, so a field it does not name is not held against it.
+		if type.variant == "class" then
+			for name, wanted in pairs(constraint.fields) do
+				local have = type.fields[name]
+				if have and not types.satisfies(have, wanted) then return false end
+			end
+			return true
+		end
 		if type.variant ~= "object" then return false end
 		for name, wanted in pairs(constraint.fields) do
 			-- A field the literal leaves out is nil, which is what an optional field accepts:
@@ -451,8 +442,7 @@ function types.satisfies(type, constraint)
 
 	if constraint.variant == "table" then
 		-- A table is the shape every Lua container has, so a list, an object and a class are all
-		-- tables to it: the standard library writes `table` where it does not care what is
-		-- inside, and `setmetatable({}, Point)` passes an instance where it says `table`.
+		-- tables to it: the standard library writes `table` where it does not care what is inside.
 		return type.variant == "table" or type.variant == "array"
 			or type.variant == "object" or type.variant == "class"
 	end
@@ -465,14 +455,13 @@ function types.satisfies(type, constraint)
 	return type.variant == constraint.variant
 end
 
---- A table nothing is known about: `local t = {}` before anything gives it a field. That is what
---- `types.TABLE` is — a fresh literal is its own object so its shape can grow — and it fits wherever
---- a bare table fits, because there is no shape yet to disagree with.
+--- A table nothing is known about: a fresh literal is its own object so its shape can grow, and
+--- it fits wherever a bare table fits because there is no shape yet to disagree with.
 ---@param type lye.doc.Type
 ---@return boolean
 function types.isUnknownShape(type)
 	if type.variant == "table" then return true end
-	return type.variant == "object" and type.indexed == nil and next(type.fields) == nil
+	return type.variant == "object" and type.indexed == nil and next(type.fields or {}) == nil
 end
 
 --- Whether the value is definitely truthy, definitely falsy, or either.
@@ -505,8 +494,12 @@ end
 --- narrowing: `if y then` on `string|nil` leaves `string` in the branch.
 ---@param type lye.doc.Type
 ---@param wantTruthy boolean
----@return lye.doc.Type? narrowed
 function types.narrowTruthiness(type, wantTruthy)
+	-- A plain boolean is either of its two values, so asking which one a branch holds answers with
+	-- that value rather than with "a boolean".
+	if type.variant == "boolean" and type.value == nil then
+		return types.booleanValue(wantTruthy)
+	end
 	if type.variant ~= "union" then
 		local known = types.truthiness(type)
 		if known == nil or known == wantTruthy then return type end
@@ -547,7 +540,6 @@ end
 --- test asserts. A name that resolves to nothing keeps the type unchanged rather than emptying it.
 ---@param type lye.doc.Type
 ---@param wanted lye.doc.Type?
----@return lye.doc.Type? narrowed
 function types.narrowToType(type, wanted)
 	if not wanted then return type end
 	if type.variant ~= "union" then
@@ -563,25 +555,33 @@ end
 
 ---@param type lye.doc.Type
 ---@param typeName string
----@return lye.doc.Type? narrowed
 function types.narrowTo(type, typeName)
 	return types.narrowToType(type, types.parse(typeName))
+end
+
+--- Whether every value of a type is that one. `satisfies` is loose about a string value on
+--- purpose, but ruling something out needs the strict reading: a `string` is not *only* `""`.
+---@param type lye.doc.Type
+---@param value lye.doc.Type
+function types.isExactly(type, value)
+	local wanted = stringValueOf(value)
+	if wanted then return stringValueOf(type) == wanted end
+	return types.satisfies(type, value)
 end
 
 --- Keep only the members that do not fit a type.
 ---@param type lye.doc.Type
 ---@param unwanted lye.doc.Type?
----@return lye.doc.Type? narrowed
 function types.excludeType(type, unwanted)
 	if not unwanted then return type end
 	if type.variant ~= "union" then
 		-- `and nil or type` cannot yield nil, so ruling the type out has to be explicit.
-		if types.satisfies(type, unwanted) then return nil end
+		if types.isExactly(type, unwanted) then return nil end
 		return type
 	end
 	local kept = {}
 	for _, member in ipairs(type.types) do
-		if not types.satisfies(member, unwanted) then kept[#kept + 1] = member end
+		if not types.isExactly(member, unwanted) then kept[#kept + 1] = member end
 	end
 	if #kept == 0 then return nil end
 	return types.union(kept)
@@ -589,7 +589,6 @@ end
 
 ---@param type lye.doc.Type
 ---@param typeName string
----@return lye.doc.Type? narrowed
 function types.exclude(type, typeName)
 	return types.excludeType(type, types.parse(typeName))
 end
@@ -598,11 +597,8 @@ end
 ---@param want boolean
 ---@return lye.doc.Type? narrowed
 function types.narrowField(type, field, want)
-	--- Whether a member survives the condition. A field whose truth is written down decides it —
-	--- that is what makes a tagged union narrow: `{ ok: true, value: T } | { ok: false, message }`
-	--- read with `if parsed.ok then` is the first member and nothing else. A field nothing is known
-	--- about keeps the member when truth is wanted, and a member that does not have the field at
-	--- all reads it as nil, which is falsy.
+	--- Whether a member survives the condition. A field whose truth is written down decides it,
+	--- which is what makes `{ ok: true, v: T } | { ok: false, e: string }` narrow on `parsed.ok`.
 	---@param member lye.doc.Type
 	---@return boolean
 	local function survives(member)
@@ -627,14 +623,37 @@ function types.narrowField(type, field, want)
 	return types.union(kept)
 end
 
---- The type an arithmetic or logical operator produces from its operands. `unknown` on
---- either side yields unknown, which is what keeps a chain from inventing a type.
----@param op string
----@param left lye.doc.Type
----@param right lye.doc.Type
----@return lye.doc.Type
---- Whether every value of this type is a number, which is what makes arithmetic a number. An
---- `any` is not: it could be a table whose metamethod returns anything at all.
+--- Keep only the members whose own `field` could hold what a condition compared it against:
+--- `if kind ~= "fn" then return end` is how a tagged union is read. A member without the
+--- field reads it as nil, so it only survives the negative form.
+---@param type lye.doc.Type
+---@param field string
+---@param wanted lye.doc.Type the value the condition compared against
+---@param want boolean whether the condition was the equality
+---@return lye.doc.Type? narrowed
+function types.narrowDiscriminant(type, field, wanted, want)
+	---@param member lye.doc.Type
+	local function couldBe(member)
+		local held = member.variant == "object" and member.fields[field] or nil
+		if not held then
+			-- A class is built at runtime, so a field it does not name may still be there; an
+			-- object literal says what it holds and nothing else.
+			return member.variant == "class"
+		end
+		return types.satisfies(wanted, held)
+	end
+
+	if type.variant ~= "union" then return couldBe(type) == want and type or nil end
+	local kept = {}
+	for _, member in ipairs(type.types) do
+		if couldBe(member) == want then kept[#kept + 1] = member end
+	end
+	if #kept == 0 then return nil end
+	return types.union(kept)
+end
+
+--- The type an arithmetic or logical operator produces, and whether every value of a type is a
+--- number. An `any` is not: it could be a table whose metamethod returns anything at all.
 ---@param type lye.doc.Type
 ---@return boolean
 local function isNumeric(type)
@@ -684,32 +703,46 @@ function types.binaryResult(op, left, right)
 		return types.BOOLEAN
 	end
 	if op == "and" or op == "&&" or op == "or" or op == "||" then
-		-- `a and b` is `a` when `a` is falsy and `b` otherwise; `or` is the other way round. When
-		-- the left side is definitely one of the two, the answer is one of the operands rather
-		-- than a union: `byteAt and byteAt >= 48` is a boolean, since a number is never falsy.
+		-- `a and b` is `a` when `a` is falsy and `b` otherwise; `or` the other way round. When the
+		-- left side is definitely one of the two, the answer is one of the operands, not a union.
 		local isAnd = op == "and" or op == "&&"
+		-- An `any` on the left answers with itself: nothing can be said about which side it takes,
+		-- so combining it with the right side lets the right side stand for the answer.
+		if left.variant == "any" or left.variant == "unknown" then return left end
 		local known = types.truthiness(left)
-		if known == nil then return types.combine(left, right) end
-		if isAnd == known then return right end
-		return left
+		if known ~= nil then
+			if isAnd == known then return right end
+			return left
+		end
+		-- Nothing is known about which side answers, and the union of both operands is not the answer
+		-- either: `a` cannot be here twice. `x and x.field` is the field or nothing.
+		if isAnd then
+			local absent = types.narrowTruthiness(left, false)
+			-- When the right side already covers what the left is when it is absent — a `boolean`
+			-- covers the `false` a boolean becomes — the answer is just the right side.
+			if not absent or types.satisfies(absent, right) then return right end
+			return types.combine(absent, right)
+		end
+		local present = types.excludeType(left, types.NIL_TYPE)
+		if present then present = types.excludeType(present, types.booleanValue(false)) end
+		if not present then return right end
+		return types.combine(present, right)
 	end
 	if op == "??" then return types.combine(left, right) end
 
 	local isArithmetic = op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
 		or op == "^" or op == "&" or op == "|" or op == "~" or op == "<<" or op == ">>" or op == "~>>"
 	if isArithmetic then
-		-- Two numbers written down are a number this file already knows: `5 + 6912` is 6917.
-		-- Anything the file does not know — a parameter, a field, a call — leaves the result a
-		-- plain number, which is the wider type the literal was always usable as.
+		-- Two numbers written down are a number this file already knows. Anything it does not know
+		-- leaves the result a plain number, the wider type the literal was always usable as.
 		local leftValue, rightValue = types.numericValue(left), types.numericValue(right)
 		if leftValue and rightValue then
 			local ok, folded = pcall(ARITHMETIC_RESULT[op], leftValue, rightValue)
 			if ok and type(folded) == "number" then return types.numberValue(folded) end
 		end
 		if isNumeric(left) and isNumeric(right) then return types.NUMBER end
-		-- Anything else could be a table with a metamethod, so the result is not claimed. `any`
-		-- is in that group: it satisfies `number`, and a value that satisfies a constraint is not
-		-- a guarantee that the constraint is what it is.
+		-- Anything else could be a table with a metamethod, so the result is not claimed. `any` is
+		-- in that group: satisfying a constraint is not a guarantee that it is one.
 		return types.mutable()
 	end
 	return types.mutable()
@@ -744,18 +777,19 @@ local METAMETHODS = {
 	["unary-"] = "__unm",
 }
 
---- The same type, with the metatable Lua consults for the operations it does not define itself.
---- A copy rather than a change in place: a class type is built once and shared by every use of it,
---- and one `setmetatable` call must not hand every other reader the same metatable.
+--- The same type, with the metatable Lua consults for what it does not define itself. A copy,
+--- because a class type is shared and one `setmetatable` must not reach every other reader.
 ---@param type lye.doc.Type
 ---@param metatable lye.doc.Type?
----@return lye.doc.Type
 function types.withMetatable(type, metatable)
 	if not metatable or types.isMutable(type) then return type end
-	local out = {}
-	for key, value in pairs(type) do out[key] = value end
-	out.metatable = metatable
-	return out
+	local copy = {}
+	for key, value in pairs(type) do copy[key] = value end
+	copy.metatable = metatable
+	-- The copy carries every field the original has, which a table built in a loop cannot say: it is
+	-- the same type, with the metatable beside it.
+	---@cast copy lye.doc.Type
+	return copy
 end
 
 --- The metatable a type carries, when it carries one.
@@ -821,7 +855,6 @@ end
 ---@param op string
 ---@param left lye.doc.Type
 ---@param right lye.doc.Type
----@return lye.doc.Type? metamethod
 function types.metamethodFor(op, left, right)
 	local name = METAMETHODS[op]
 	if not name then return nil end
@@ -868,8 +901,11 @@ function types.indexResult(target, field)
 	return types.mutable()
 end
 
+--- Where a text splits at the separators that are not inside brackets. The pieces are the text
+--- between them, so they are strings however the text they came from is spelled.
 ---@param text string
----@return lye.doc.Type[]
+---@param separator integer the byte to split at
+---@return string[]
 local function splitTopLevel(text, separator)
 	local parts, depth, from = {}, 0, 1
 	for at = 1, #text do
@@ -888,41 +924,20 @@ local function splitTopLevel(text, separator)
 	return parts
 end
 
---- The values a multi-value type text names, split where the commas are not inside brackets.
---- `integer, V` is two values; `fun(a: number, b: string) -> nil` is one.
+--- Split a parameter list on the commas that are not inside a nested shape.
 ---@param text string
----@return string[]
-function types.splitValues(text)
+local function splitParams(text)
 	return splitTopLevel(text, 44)
 end
 
----@param text string
----@return lye.doc.Type?
---- Split a parameter list on the commas that are not inside a nested shape.
----@param text string
----@return string[]
-local function splitParams(text)
-	local parts, depth, from = {}, 0, 1
-	for index = 1, #text do
-		local char = text:sub(index, index)
-		if char == "(" or char == "{" or char == "<" then
-			depth += 1
-		elseif char == ")" or char == "}" or char == ">" then
-			depth -= 1
-		elseif char == "," and depth == 0 then
-			parts[#parts + 1] = text:sub(from, index - 1)
-			from = index + 1
-		end
-	end
-	parts[#parts + 1] = text:sub(from)
-	return parts
-end
+types.splitAt = splitTopLevel
 
 --- Characters a space may precede inside a type: a marker that continues it, rather than the
---- description a writer put after it.
+--- description a writer put after it. A closing bracket is not one: `string[] the names it takes`
+--- is a type and a description, and `)` and `]` here made the whole sentence part of the type.
 local CONTINUES = {
 	["-"] = true, [":"] = true, ["|"] = true, [","] = true,
-	["<"] = true, ["["] = true, [")"] = true, ["]"] = true, ["}"] = true,
+	["<"] = true, ["["] = true, ["{"] = true,
 }
 
 --- Where the type ends in annotation text. A space inside `<...>`, `{...}` or `(...)` is part of
@@ -935,6 +950,9 @@ local function typeEnd(text)
 	local depth = 0
 	for at = 1, #text do
 		local char = text:sub(at, at)
+		-- A `--` is never part of a type, wherever it appears: what follows one is prose. The two hyphens
+		-- otherwise read as the arrow of a signature, and the sentence's first words became the type.
+		if char == "-" and text:sub(at + 1, at + 1) == "-" and depth == 0 then return at - 1 end
 		if char == "<" or char == "{" or char == "(" or char == "[" then
 			depth += 1
 		elseif char == ">" or char == "}" or char == ")" or char == "]" then
@@ -949,10 +967,16 @@ local function typeEnd(text)
 	end
 end
 
---- `fn(a: number, b: string) -> boolean`, and the `fun(a): boolean` spelling LuaLS uses.
---- A parameter may be named or not, may be optional, and `...` stands for the rest.
+--- The values a multi-value type text names, split where the commas are not inside brackets.
+--- `integer, V` is two values; `fun(a: number, b: string) -> nil` is one. Only the type itself is
+--- read: a description after it may hold a comma of its own — `---@return string? kind "number" or
+--- "string"` is one value — and splitting the sentence made a value named `or`.
 ---@param text string
----@return lye.doc.Type?
+function types.splitValues(text)
+	local stop = typeEnd(text)
+	return splitTopLevel(stop and text:sub(1, stop) or text, 44)
+end
+
 --- The names a signature declares for itself, and what each is limited to: `T, U: number`.
 ---@param text string the text between the angle brackets
 ---@return table<string, boolean> names
@@ -980,10 +1004,14 @@ local function readGenericNames(text)
 	return names, constraints
 end
 
-local function parseFn(text, resolve)
-	-- `fn(` or the `fun(` spelling; `f?un` would read as "un" or "fun", which is neither. A
-	-- signature may declare parameters of its own — `fn<T>(x: T) -> T` — which are bound where the
-	-- function is called, the way a declaration's `---@generic` names are.
+--- Where a signature's parameter list is. `fn(` or the `fun(` spelling; `f?un` would read as "un"
+--- or "fun", which is neither. A signature may declare parameters of its own — `fn<T>(x: T) -> T` —
+--- which are bound where the function is called, the way a declaration's `---@generic` names are,
+--- and they are read on the way because they sit before the list rather than in it.
+---@param text string
+---@return integer? closeAt
+---@return string? declared the names between the angle brackets, when it declares any
+local function fnParams(text)
 	local head = text:match("^fu?n%s*%(")
 	local declared
 	if not head then
@@ -1005,9 +1033,8 @@ local function parseFn(text, resolve)
 				end
 			end
 		end
-		if not closeAt or not text:sub(closeAt + 1):match("^%s*%(") then return nil end
+		if not openAt or not closeAt or not text:sub(closeAt + 1):match("^%s*%(") then return nil end
 		declared = text:sub(openAt + 1, closeAt - 1)
-		head = "fn("
 	end
 
 	-- The parameter list ends at its own closing parenthesis: a parameter's type can be a
@@ -1027,6 +1054,27 @@ local function parseFn(text, resolve)
 		end
 	end
 	if not closeAt then return nil end
+	return openAt, closeAt, declared
+end
+
+--- Whether a written type is a signature with a return of its own. A `?` at the end of one belongs
+--- to that return — `fun(x): T?` hands back an optional `T` — while the `?` of `fun(x)?` is the
+--- function that may be absent. Read inside a parameter list the two are one character apart, and
+--- taking the wrong one made a callback's return optional instead of what it returns.
+---@param text string
+local function hasReturn(text)
+	local openAt, closeAt = fnParams(text)
+	local tail = closeAt and text:sub(closeAt + 1) or ""
+	return openAt ~= nil and (tail:match("^%s*[-:]?>") ~= nil or tail:match("^%s*:") ~= nil)
+end
+
+--- `fn(a: number, b: string) -> boolean`, and the `fun(a): boolean` spelling LuaLS uses.
+--- A parameter may be named or not, may be optional, and `...` stands for the rest.
+---@param text string
+---@param resolve fun(text: string): lye.doc.Type? a class or alias, where the annotations declare one
+local function parseFn(text, resolve)
+	local openAt, closeAt, declared = fnParams(text)
+	if not openAt then return nil end
 
 	local returns = types.ANY_TYPE
 	local rest = text:sub(closeAt + 1):gsub("^%s*", "")
@@ -1046,10 +1094,11 @@ local function parseFn(text, resolve)
 			isVariadic = true
 		elseif one ~= "" then
 			-- `name: type` names the parameter; a bare type is the type itself. Either the
-			-- name or the type may carry the `?` that makes it optional.
-			local name, marker, named = one:match("^([%w_]+)(%??)%s*:%s*(.*)$")
+			-- name or the type may carry the `?` that makes it optional, and on a signature it is
+			-- the return that carries it.
+			local _, marker, named = one:match("^([%w_]+)(%??)%s*:%s*(.*)$")
 			local typeText = named or one
-			local hasMarker = typeText:sub(-1) == "?"
+			local hasMarker = typeText:sub(-1) == "?" and not hasReturn(typeText)
 			if hasMarker then typeText = typeText:sub(1, -2) end
 			local optional = marker == "?" or hasMarker
 			local paramType = types.parse(typeText, resolve) or types.UNKNOWN_TYPE
@@ -1064,12 +1113,8 @@ local function parseFn(text, resolve)
 	return signature
 end
 
----@param text string?
----@param resolve fun(text: string): lye.doc.Type? a class or alias, where the annotations declare one
----@return lye.doc.Type?
 --- Write a string value the way an annotation would, choosing quotes the text does not use.
 ---@param text string
----@return string
 local function quoted(text)
 	if text:find('"', 1, true) and not text:find("'", 1, true) then return "'" .. text .. "'" end
 	return '"' .. (text:gsub('"', '\\"')) .. '"'
@@ -1080,12 +1125,9 @@ end
 --- engine would make a cdata of, a description after the type — because a type that cannot be
 --- worked out is left as the expression that was written.
 ---@param text string
----@return string? kind "number" or "string"
----@return number|string? value the number itself, or the text of the string
 local function foldExpression(text)
 	local rest = (text:gsub("^%s+", ""):gsub("%s+$", ""))
 
-	---@return string? kind
 	---@return number|string? value
 	local function operand()
 		local number = rest:match("^%-?%d[%d%.]*")
@@ -1142,7 +1184,6 @@ end
 --- type nobody declared.
 ---@param type lye.doc.Type
 ---@param bindings table<string, lye.doc.Type>
----@return lye.doc.Type
 function types.substitute(type, bindings)
 	if type.variant == "extern" then return bindings[type.name] or type end
 	if type.variant == "fn" then
@@ -1150,6 +1191,15 @@ function types.substitute(type, bindings)
 		for index, param in ipairs(type.params) do params[index] = types.substitute(param, bindings) end
 		local out = types.fn(params, types.substitute(type.returns, bindings), type.isVariadic, type.isSpread)
 		out.generics, out.constraints = type.generics, type.constraints
+		-- A generic call substitutes into every value it gives back, not only the first: reading
+		-- `---@return T...` through a binding otherwise lost that it was a spread at all.
+		if type.values then
+			local values = {}
+			for index, value in ipairs(type.values) do
+				values[index] = types.substitute(value, bindings)
+			end
+			out.values = values
+		end
 		return out
 	end
 	if type.variant == "array" then return types.array(types.substitute(type.type, bindings)) end
@@ -1175,7 +1225,6 @@ end
 --- A string written out in an annotation or in code, quoted the way the annotation language
 --- writes one: the value of a literal, so `"a" .. "b"` and `"ab"` are the same string.
 ---@param text string the text of the string, without quotes
----@return lye.doc.Type
 function types.stringValue(text)
 	return types.extern(quoted(text))
 end
@@ -1184,18 +1233,16 @@ end
 --- worked out. Substituting a folded argument keeps its value: `B * 2` with `B` given `3 + 4` is
 --- 14 rather than `3 + 4 * 2`, which is 11.
 ---@param text string
----@return string?
 function types.foldToText(text)
 	local kind, value = foldExpression(text)
-	if kind == "number" then return tostring(value) end
-	if kind == "string" then return quoted(value) end
+	if kind == "number" and type(value) == "number" then return tostring(value) end
+	if kind == "string" and type(value) == "string" then return quoted(value) end
 	return nil
 end
 
 --- What kind of value a type text is, when it is one: a number, a quoted string or a boolean, with
 --- an expression of literals folded first, so `5 + 2` is a number and `"a" .. "b"` a string.
 ---@param text string
----@return string? kind
 function types.literalKind(text)
 	local trimmed = (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	if trimmed == "true" or trimmed == "false" then return "boolean" end
@@ -1208,6 +1255,17 @@ end
 function types.parse(text, resolve)
 	local trimmed = (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	if trimmed == "" then return nil end
+
+	-- A signature is read before the bar and the marker that may follow its return, because both
+	-- follow the *return type* and belong to it: `fun(): T?` returns a `T?` rather than being a
+	-- function that may be absent. `fun()?` writes no return at all, so that stays the optional function.
+	local shaped = trimmed:sub(1, 6) == "async " and trimmed:sub(7) or trimmed
+	local stop = typeEnd(shaped)
+	if stop then shaped = (shaped:sub(1, stop):gsub("%s+$", "")) end
+	if hasReturn(shaped) then
+		local signature = parseFn(shaped, resolve)
+		if signature then return signature end
+	end
 
 	-- A union is split before anything else the text may carry, so `nil|string[]` is nil or a
 	-- list of strings rather than a list of `nil|string`, and a description or a marker inside
@@ -1244,18 +1302,16 @@ function types.parse(text, resolve)
 		end
 	end
 
-	-- Arithmetic written in a type: a const parameter substituted with what it was given leaves
-	-- `5 + 2` behind, and the type says what that is rather than a name nothing declares. A name
-	-- still unbound leaves the expression alone, so a generic type can be written before anyone
-	-- says what it holds.
+	-- Arithmetic written in a type: a const parameter substituted with what it was given leaves `5 + 2`
+	-- behind, and the type says what that is. A name still unbound leaves the expression alone.
 	local kind, value = foldExpression(trimmed)
-	if kind == "number" then return types.numberValue(value) end
-	if kind == "string" then return types.extern(quoted(value)) end
+	if kind == "number" and type(value) == "number" then return types.numberValue(value) end
+	if kind == "string" and type(value) == "string" then return types.extern(quoted(value)) end
 
 	-- Annotations often carry a description after the type. Everything past where the type ends
 	-- is prose, and reading it as part of the type would make the annotation mean nothing.
 	local stop = typeEnd(trimmed)
-	if stop then trimmed = trimmed:sub(1, stop) end
+	if stop then trimmed = (trimmed:sub(1, stop):gsub("%s+$", "")) end
 
 	if trimmed:sub(-1) == "?" then
 		-- An annotation says what may arrive, so an optional type is the union of the two: a name
@@ -1280,7 +1336,10 @@ function types.parse(text, resolve)
 
 	if trimmed:sub(1, 1) == "{" and trimmed:sub(-1) == "}" then
 		local fields, indexed = {}, nil
-		for field in trimmed:sub(2, -2):gmatch("[^,;]+") do
+		-- Split at the commas that separate fields, not at every comma there is: a field whose type
+		-- is `table<string, number>` carries one of its own, and cutting there leaves two fields —
+		-- `fields: table<string` and `number>` — which is a shape nothing can use.
+		for _, field in ipairs(splitTopLevel(trimmed:sub(2, -2), 44)) do
 			-- `[integer]: T` is an index signature: every key of that kind holds T, which is how
 			-- a list is written. It is the only thing that makes a generic element reachable.
 			local key, value = field:match("^%s*%[%s*([%w_]+)%s*%]%s*:?%s*(.*)$")
@@ -1321,9 +1380,26 @@ function types.parse(text, resolve)
 	return types.extern(trimmed)
 end
 
+--- The types being written out right now. A type may contain itself, and a value can only be
+--- printed by printing what it holds, so the walk stops where it came in — a class already
+--- being written is printed as its name.
+local displaying = {}
+
 ---@param type lye.doc.Type
 ---@return string
 function types.display(type)
+	if displaying[type] then
+		return type.variant == "class" and type.name or type.variant
+	end
+	displaying[type] = true
+	local shown = types.displayOf(type)
+	displaying[type] = nil
+	return shown
+end
+
+---@param type lye.doc.Type
+---@return string
+function types.displayOf(type)
 	if type.variant == "class" then
 		if #type.args == 0 then return type.name end
 		local parts = {}
@@ -1335,8 +1411,15 @@ function types.display(type)
 	if type.variant == "fn" then
 		if types.isAnyFn(type) then return "function" end
 		local parts = {}
-		for _, param in ipairs(type.params) do parts[#parts + 1] = types.display(param) end
+		for _, param in ipairs(type.params or {}) do parts[#parts + 1] = types.display(param) end
 		if type.isVariadic then parts[#parts + 1] = "..." end
+		-- Every value it gives back, not only the first: a caller writing `local a, b = find(x)`
+		-- takes both, and a signature that named one of them was the shape of the bug.
+		if type.values and #type.values > 1 and not type.isSpread then
+			local values = {}
+			for _, value in ipairs(type.values) do values[#values + 1] = types.display(value) end
+			return string.format("fn(%s) -> %s", table.concat(parts, ", "), table.concat(values, ", "))
+		end
 		local spread = type.isSpread and "..." or ""
 		-- A function that returns nothing has no result to write down, so the arrow goes too.
 		if type.returns == types.VOID then
@@ -1345,9 +1428,10 @@ function types.display(type)
 		return "fn(" .. table.concat(parts, ", ") .. ") -> " .. types.display(type.returns) .. spread
 	end
 	if type.variant == "array" then
-		-- A union needs its own brackets, or `(number|string)[]` reads as `number|string[]`.
+		-- A union and a signature need their own brackets, or `(number|string)[]` reads as
+		-- `number|string[]` and `(fn() -> number)[]` reads as a function that returns a list.
 		local inner = types.display(type.type)
-		if type.type.variant == "union" then inner = "(" .. inner .. ")" end
+		if type.type.variant == "union" or type.type.variant == "fn" then inner = "(" .. inner .. ")" end
 		return inner .. "[]"
 	end
 	if type.variant == "object" then
@@ -1361,6 +1445,14 @@ function types.display(type)
 		-- A table whose shape is not known *yet* is a table, not an empty one: `local t = {}` reads
 		-- as `table` until something gives it a field, which is what a reader expects to see.
 		if #parts == 0 and not type.metatable then return "table" end
+		-- A table that is only what it holds at a key reads the way an annotation writes one:
+		-- `string[]` for a list, `table<string, true>` for a set built by marking keys.
+		if next(type.fields) == nil and type.indexed and not type.metatable then
+			if type.indexed.key == "integer" or type.indexed.key == "number" then
+				return types.display(type.indexed.type) .. "[]"
+			end
+			return "table<" .. type.indexed.key .. ", " .. types.display(type.indexed.type) .. ">"
+		end
 		table.sort(parts)
 		return "{ " .. table.concat(parts, ", ") .. " }"
 	end
@@ -1377,9 +1469,13 @@ function types.display(type)
 			for _, part in ipairs(parts) do
 				if part == "nil" then hasNil = true else other = part end
 			end
-			-- Not for a signature: `fn() -> number?` would read as a function returning a number,
-			-- which is a different type from one that may be absent.
-			if hasNil and other and other:sub(1, 2) ~= "fn" then return other .. "?" end
+			-- A signature is bracketed first, because `fn() -> number?` reads as a function that
+			-- returns a number — a different type from one that may be absent — while
+			-- `(fn() -> number)?` is exactly the two things this union holds.
+			if hasNil and other then
+				if other:sub(1, 2) == "fn" then return "(" .. other .. ")?" end
+				return other .. "?"
+			end
 		end
 		return table.concat(parts, "|")
 	end
@@ -1391,7 +1487,6 @@ end
 ---@param declared lye.doc.Type
 ---@param actual lye.doc.Type
 ---@param name string
----@return string?
 function types.mismatch(declared, actual, name)
 	if types.satisfies(actual, declared) then return nil end
 	return string.format("%s is declared as %s but is assigned %s", name, types.display(declared), types.display(actual))

@@ -272,6 +272,181 @@ test.it("resolves a require a lye.json points at", function()
 	test.truthy(shown:match("true"), "the module lye.json names resolves: " .. shown)
 end)
 
+test.it("reads a collection from the writes to it and a string's methods off the string table", function()
+	-- The two things that make a collection readable in Lua. `consts[name] = true` is what says the
+	-- table is a set and `names[#names + 1] = name` is what says it is a list; `part:gsub(...)` is
+	-- what says a name cut out of a string is a string, which Lua arranges by pointing a string's
+	-- metatable `__index` at the `string` table rather than by anything a type carries.
+	local source = table.concat({
+		"---@param text string\n",
+		"local function readParams(text)\n",
+		"\tlocal names, consts = {}, {}\n",
+		"\tfor _, part in ipairs({ text }) do\n",
+		"\t\tlocal name = (part:gsub(\"^%s+\", \"\"))\n",
+		"\t\tconsts[name] = true\n",
+		"\t\tnames[#names + 1] = name\n",
+		"\tend\n",
+		"\treturn names, consts\n",
+		"end\n",
+	}, "")
+	local results = run({
+		request(2, "textDocument/hover", { line = 8, character = 9 }),
+		request(3, "textDocument/hover", { line = 8, character = 16 }),
+		request(4, "textDocument/hover", { line = 4, character = 9 }),
+	}, source)
+	local function shown(id)
+		local answer = results[id]
+		return answer and answer.contents and answer.contents.value or ""
+	end
+	test.truthy(shown("2"):find("string[]", 1, true),
+		"a name written one past the end makes the table a list: " .. shown("2"))
+	test.truthy(shown("3"):find("table<string, true>", 1, true),
+		"a true written at a string key makes the table a set: " .. shown("3"))
+	test.truthy(shown("4"):match("string") ~= nil and shown("4"):match("table") == nil,
+		"and a method call on a string is a string, not a table: " .. shown("4"))
+end)
+
+test.it("continues an alias when a new line is started in one", function()
+	-- A body is a list of members, one per line, so pressing enter at the end of one is how the next
+	-- is added. The bar is what makes the line part of the type rather than a sentence beside it.
+	local source = table.concat({
+		"---@alias lye.doc.Visibility\n",
+		"--- | \"public\"\n",
+		"\n",
+		"local x = 1\n",
+	}, "")
+	local results = run({
+		{ jsonrpc = "2.0", id = 2, method = "textDocument/onTypeFormatting",
+			params = { textDocument = { uri = "file:///f.lua" }, position = { line = 2, character = 0 }, ch = "\n" } },
+	}, source)
+	local edits = results["2"]
+	test.equal(#edits, 1, "the line being written gets one edit, not an indentation as well")
+	test.equal(edits[1].newText, "--- | ")
+	test.equal(edits[1].range.start.line, 2)
+
+	local plain = run({
+		{ jsonrpc = "2.0", id = 2, method = "textDocument/onTypeFormatting",
+			params = { textDocument = { uri = "file:///f.lua" }, position = { line = 2, character = 0 }, ch = "\n" } },
+	}, "local x = 1\nlocal y = 2\n\nlocal z = 3\n")
+	test.equal(#(plain["2"] or {}), 0, "a new line outside an alias is left alone here")
+end)
+
+test.it("resolves a method call to the function it calls", function()
+	-- `s:gsub(...)` is `string.gsub(s, ...)`: a string reads that table's fields, which is what
+	-- Lua's own string metatable arranges. A method resolved to nothing at all without it, so the
+	-- hover was empty, the colouring was a bare variable and there was nowhere to jump to.
+	local source = table.concat({
+		"local s = \"a b\"\n",
+		"local cut = s:gsub(\" \", \"-\")\n",
+	}, "")
+	local results = run({
+		request(2, "textDocument/hover", { line = 1, character = 14 }),
+		request(3, "textDocument/definition", { line = 1, character = 14 }),
+	}, source)
+	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(shown:match("gsub%("), "the hover is the signature being called: " .. shown)
+	local target = results["3"]
+	test.truthy(target and target.uri and target.uri:match("string%.lua"),
+		"and the jump goes where it is declared: " .. tostring(target and target.uri))
+end)
+
+test.it("resolves a method called on the result of another call", function()
+	-- `s:sub(2):upper()` is a method of the *result*, so what the second half is called on is a
+	-- string that a call produced. Reading the field off the type alone gives the string back for
+	-- both halves, so the analyzer is asked instead — the same answer the call itself was typed by.
+	local source = table.concat({
+		"local s = \"a b\"\n",
+		"local one = s:sub(2):upper()\n",
+		"local two = string.gsub(s, \" \", \"-\"):upper()\n",
+	}, "")
+	local results = run({
+		request(2, "textDocument/hover", { line = 1, character = 24 }),
+		request(3, "textDocument/definition", { line = 1, character = 24 }),
+		request(4, "textDocument/hover", { line = 2, character = 39 }),
+	}, source)
+	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(shown:match("upper"), "a chained method reads as the method it calls: " .. shown)
+	test.truthy(results["3"] and results["3"].uri, "and the jump finds it")
+	local dotted = results["4"] and results["4"].contents and results["4"].contents.value or ""
+	test.truthy(dotted:match("upper"), "a dotted call chains the same way: " .. dotted)
+end)
+
+test.it("formats the way the project's editorconfig asks", function()
+	-- A formatter that imposes its own indentation on a project that asked for spaces is one nobody
+	-- leaves switched on. The `.editorconfig` above the file decides, and lye's own style — tabs,
+	-- one blank line between things, a newline at the end — is what stands where it says nothing.
+	local project = TESTS_DIR .. "/fixtures/spaces"
+	local uri = "file://" .. project .. "/src/tidy.lua"
+	local source = table.concat({
+		"local function f(x)\n",
+		"    if x then\n",
+		"            return 1\n",
+		"\n",
+		"\n",
+		"    end\n",
+		"end",
+	}, "")
+	local results = run({
+		{ jsonrpc = "2.0", id = 2, method = "textDocument/formatting",
+			params = { textDocument = { uri = uri }, options = { tabSize = 4, insertSpaces = true } } },
+	}, source, project, uri)
+	local edits = results["2"] or {}
+	local replaced, deleted = {}, 0
+	for _, edit in ipairs(edits) do
+		if edit.newText == "" then
+			deleted += 1
+		else
+			replaced[edit.range.start.line] = edit.newText
+		end
+	end
+	test.equal(replaced[2], "        return 1", "the nested line is indented the way the project asks")
+	test.equal(deleted, 1, "and one of the two blank lines goes")
+	test.truthy((replaced[6] or ""):find("\n", 1, true) ~= nil, "with a newline at the end of the file")
+end)
+
+test.it("colours the conversions and the pattern inside a literal a function interprets", function()
+	-- `string.format("%d")` reads its first argument as conversions and the pattern functions read
+	-- theirs as patterns, so the parts that are interpreted are not text. Nothing in the definitions
+	-- says which argument that is — they all say `string` — so the argument is marked from the table
+	-- of them the server keeps.
+	local source = table.concat({
+		"local s = \"a b\"\n",
+		"local f = string.format(\"%d/%s\", 1, s)\n",
+		"local g = s:gsub(\"%s+\", \"-\")\n",
+		"local plain = \"no marks here\"\n",
+	}, "")
+	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
+	local data = results["2"].data
+	local counts = {}
+	for index = 1, #data, 5 do
+		-- A token is five numbers from where `index` points: the two deltas, the length, the kind.
+		local kind = data[index + 3]
+		counts[kind] = (counts[kind] or 0) + 1
+	end
+	test.equal(counts[13] or 0, 4, "the two conversions and the two halves of the pattern are marked")
+	test.truthy((counts[1] or 0) > 0, "while the strings they sit in are still strings")
+end)
+
+test.it("colours a pattern a method is called on a value rather than a name", function()
+	-- `(s:gsub(...)):gsub(...)` and `("a b"):gsub(...)` are method calls on a *value* — a call's
+	-- result and a string literal — so the receiver's type is what says the field is `string.gsub`.
+	local source = table.concat({
+		"local s = \"a b\"\n",
+		"local one = (s:gsub(\"%s+\", \"-\")):gsub(\"^%s+\", \"\")\n",
+		"local two = (\"a b\"):gsub(\"%s+\", \"-\")\n",
+	}, "")
+	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
+	local data = results["2"].data
+	local counts = {}
+	for index = 1, #data, 5 do
+		local kind = data[index + 3]
+		counts[kind] = (counts[kind] or 0) + 1
+	end
+	-- Three pieces from each `%s+` — the class and its quantifier — and two from `^%s+`, which is
+	-- the two of them plus the anchor.
+	test.equal(counts[13] or 0, 7, "both halves of the chained pattern and the literal's own")
+end)
+
 test.it("colours an ffi.cdef from its own parse", function()
 	-- Not by asking the editor to inject a C grammar: an injection needs that grammar installed, and
 	-- even then it would not know LuaJIT's dialect. The header is coloured by what its names *are* —

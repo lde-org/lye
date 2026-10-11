@@ -22,7 +22,6 @@ Document.__index = Document
 ---@field range lye.framework.Range?
 ---@field text string
 
----@return lye.framework.Document
 function Document.new(uri, text, version)
 	return setmetatable({ uri = uri, text = text, version = version, lineIndex = position.buildLineIndex(text) }, Document)
 end
@@ -62,7 +61,6 @@ end
 local DocumentStore = {}
 DocumentStore.__index = DocumentStore
 
----@return lye.framework.DocumentStore
 function DocumentStore.new()
 	return setmetatable({ byUri = {} }, DocumentStore)
 end

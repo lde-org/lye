@@ -1,16 +1,9 @@
 --[[
-	A parser for the C a `ffi.cdef` call declares.
+	A parser for the C a `ffi.cdef` call declares: the subset LuaJIT's own parser accepts.
 
-	The subset is the one LuaJIT's own parser accepts: the builtin types, `struct`, `union`,
-	`enum`, `typedef`, arrays, pointers, function pointers, bitfields, and the qualifiers it
-	ignores. Nothing is compiled and nothing is sized — a declaration becomes a table naming what
-	it declared, and `annotations` writes those out as `---@` classes so the analyzer can resolve
-	`---@type Vec` and check `v.nope` against the members the header actually has.
-
-	Declarators are the one part worth care: `int *f(void)` is a function returning a pointer and
-	`int (*f)(void)` is a pointer to a function, and the difference is where the parentheses are.
-	A declarator is read into a chain of wrappers ordered from the name outwards, which is then
-	folded onto the base type from the inside out.
+	A declaration becomes a table naming what it declared, and `annotations` writes those out as
+	`---@` classes so the analyzer can resolve `---@type Vec`. A declarator is read into a chain of
+	wrappers ordered from the name outwards, then folded onto the base type from the inside out.
 ]]
 
 local cdef = {}
@@ -43,9 +36,7 @@ local cdef = {}
 ---@field text string the declaration text itself, which `spans` reads again for its tokens
 
 --- The C scalars the engine hands Lua as cdata rather than as a Lua number, by the name each is
---- written with. Measured against the engine: a `long`, a `size_t` or an `int64_t` read out of a
---- struct comes back as `cdata<...>: 5LL`, while an `int`, a `short` or an `int32_t` comes back as a
---- plain Lua number — 64 bits do not fit in a double, so those are the ones carried as cdata.
+--- written with: 64 bits do not fit in a double, so a `long` or a `size_t` comes back as cdata.
 local CDATA_SCALAR = {
 	["long"] = "ffi.long", ["long long"] = "ffi.longlong",
 	["unsigned long"] = "ffi.ulong", ["unsigned long long"] = "ffi.ulonglong",
@@ -54,9 +45,8 @@ local CDATA_SCALAR = {
 	intptr_t = "ffi.intptr_t", uintptr_t = "ffi.uintptr_t",
 }
 
---- What each scalar C type is called in the definitions, by the name it is written with. Every
---- one of them has a class there, whether or not a *value* of it is handed over as a cdata: a
---- pointer to a `char` points at a `ffi.char`, and a value read out of one is a Lua number.
+--- What each scalar C type is called in the definitions. Every one has a class there, whether
+--- or not a value of it is handed over as a cdata.
 local SCALAR_CLASS = {}
 for name, class in pairs({
 	["char"] = "ffi.char", ["short"] = "ffi.short", ["int"] = "ffi.int", ["long"] = "ffi.long",
@@ -80,9 +70,8 @@ local DECLARATION_WORD = {
 	["_Noreturn"] = true, ["__attribute__"] = true, ["__declspec"] = true,
 }
 
---- The builtin types, by the word they are written with. LuaJIT accepts the C99 spellings and the
---- fixed-width ones, and treats `signed` and `unsigned` as part of the type rather than as words
---- to keep.
+--- The builtin types, by the word they are written with. LuaJIT accepts the C99 and fixed-width
+--- spellings, and treats `signed` and `unsigned` as part of the type.
 local BUILTIN = {
 	void = { kind = "void" },
 	["_Bool"] = { kind = "bool" }, bool = { kind = "bool" },
@@ -103,9 +92,8 @@ local BUILTIN = {
 	ssize_t = { kind = "int", name = "ssize_t" }, wchar_t = { kind = "int", name = "wchar_t" },
 }
 
---- Words that change how a type is used rather than what it is. They are read and dropped: what
---- matters for an annotation is that the value is an integer, not that a header called it
---- `volatile`.
+--- Words that change how a type is used rather than what it is: read and dropped, because what
+--- matters for an annotation is that the value is an integer.
 local QUALIFIER = {
 	const = true, volatile = true, restrict = true, register = true, extern = true,
 	inline = true, static = true, auto = true, _Noreturn = true,
@@ -122,7 +110,7 @@ local DOUBLE = {
 local ATTRIBUTE = { ["__attribute__"] = true, ["__declspec"] = true, ["__asm__"] = true }
 
 ---@param text string
----@return string[] tokens
+---@return { kind: string, text: string, start: integer, stop: integer }[] tokens
 local function tokenize(text)
 	local tokens, i, n = {}, 1, #text
 	while i <= n do
@@ -171,7 +159,6 @@ local function tokenize(text)
 end
 
 ---@param tokens table[]
----@return integer
 local function numberOf(tokens)
 	local text = tokens.text:gsub("[uUlLfF]+$", "")
 	if text:match("^0[xX]") then return tonumber(text) end
@@ -208,8 +195,7 @@ function Parser:accept(text)
 end
 
 --- Record what could not be read and stop the declaration it was in. A header is often mostly
---- right, and a reader wants the rest of the types it declares: the caller skips to the next `;` or
---- `}` and carries on, the way a parser with error recovery does.
+--- right, and the caller skips to the next `;` or `}` and carries on.
 ---@param message string
 ---@param token table?
 function Parser:problem(message, token)
@@ -255,8 +241,7 @@ local LEVELS = {
 }
 
 --- A constant expression, evaluated as it is parsed: array lengths and enum values are numbers a
---- reader wants, and `1 << 4` is as good as `16`. A level folds the tighter level beside it, so
---- `1 << 3 | 4` is `12` rather than `32`.
+--- reader wants, and `1 << 4` is as good as `16`.
 ---@param level integer?
 ---@return integer?
 function Parser:expression(level)
@@ -293,7 +278,6 @@ end
 
 --- The smallest operands: a number, a constant an `enum` named earlier, or a parenthesised
 --- expression. A name that is not a constant is not something this parser can evaluate.
----@return integer?
 function Parser:unary()
 	local word = self:word()
 	if word == "(" then
@@ -417,11 +401,10 @@ function Parser:tagged(tag)
 			self:expect(";")
 		end
 	end
-	-- The `;` is left for the caller: a member `struct { int x; };` ends with one the member loop
-	-- has to see, and a top-level declaration ends with one `declaration` takes.
-	-- The `}` that closed the body is where this declaration ends: whatever could not be read was
-	-- reported, and the type is usable with the members that were. Clearing the failure here is what
-	-- keeps the *next* declaration — the one after this struct — from being skipped as well.
+	-- The `;` is left for the caller: a member ends with one the member loop has to see, and a
+	-- top-level declaration ends with one `declaration` takes.
+	-- The `}` that closed the body is where this declaration ends. Clearing the failure here is
+	-- what keeps the *next* declaration from being skipped as well.
 	self.failed = false
 	local declared = { kind = tag, tag = tag, name = name, fields = fields }
 	if name then self:define(name, declared) end
@@ -450,20 +433,17 @@ function Parser:enumerated()
 		if not self:accept(",") then self:accept("}") break end
 	end
 
-	-- An enum's values are integers to the engine, which is why they do not get a class of their
-	-- own: `enum Color` is a name for a number the header gave names to.
-	-- An enum's values are cdata the engine converts like numbers, so a named one is a type of its
-	-- own — that is what makes `---@type Color` mean the values the header named.
+	-- An enum's values are integers to the engine, so the enum itself gets no class: `enum Color`
+	-- is a name for a number the header gave names to.
 	local declared = { kind = "enum", name = name }
 	if name then self:define(name, declared) end
 	return declared
 end
 
 --- A declarator, read as the chain of wrappers ordered from the name outwards: this level's
---- suffixes, then this level's pointers, wrapped around whatever the name was nested in. The
---- parentheses are what the order turns on — `int *f(void)` is a function returning a pointer
---- while `int (*f)(void)` is a pointer to one — so the chain is built here and folded in
---- `fold`, outermost last.
+--- suffixes, then its pointers, wrapped around whatever the name was nested in. The parentheses
+--- are what the order turns on — `int *f(void)` is a function returning a pointer while
+--- `int (*f)(void)` is a pointer to one — so the chain is folded outermost last.
 ---@return string? name
 ---@return table[] chain
 function Parser:declaratorChain()
@@ -542,7 +522,6 @@ end
 --- outermost, so it is applied last.
 ---@param base lye.cdef.Type
 ---@param chain table[]
----@return lye.cdef.Type
 local function fold(base, chain)
 	for index = #chain, 1, -1 do
 		local wrapper = chain[index]
@@ -621,10 +600,8 @@ function Parser:declaration()
 end
 
 --- Parse the text of a `ffi.cdef` call. Nothing is raised: a declaration that cannot be read is
---- reported in `problems` and the rest of the header is still read, because what a reader wants to
---- know is where the header went wrong, not that it did.
+--- reported in `problems` and the rest of the header is still read.
 ---@param text string
----@return lye.cdef.Namespace
 function cdef.parse(text)
 	assert(type(text) == "string", "cdef.parse expects a string")
 	-- Comments are tokens so a reader can colour them, and not part of what is parsed: a
@@ -681,9 +658,8 @@ local function isCdata(namespace, type)
 	return false
 end
 
---- The type a string names, as a `ffi.typeof` or a `ffi.new` writes one: `Vec`, `Vec *`,
---- `unsigned char[4]`, `const char *`. A name the block never declared is no type at all, which is
---- what makes the string form of these calls checkable: the answer is known before the program runs.
+--- The type a string names, as a `ffi.typeof` or `ffi.new` writes one. A name the block never
+--- declared is no type at all, which is what makes the string form of these calls checkable.
 ---@param namespace lye.cdef.Namespace
 ---@param text string
 ---@return lye.cdef.Type?
@@ -701,10 +677,12 @@ end
 --- The name a type is an instance of, looking through the pointers and arrays in front of it:
 --- `Vec *` is a `Vec` written with a star, and that is the class a reader can name.
 ---@param type lye.cdef.Type
----@return string?
 function cdef.className(type)
-	while type and (type.kind == "pointer" or type.kind == "array") do type = type.target end
-	return type and type.name
+	local current = type
+	while current and (current.kind == "pointer" or current.kind == "array") do
+		current = current.target
+	end
+	return current and current.name
 end
 
 --- The annotation type for a C type, as the text a `---@field` or `---@type` is written with.
@@ -723,7 +701,7 @@ function cdef.notation(namespace, type, where)
 		-- A typedef of a struct keeps its own name: `Vec` is what the header's users write, and
 		-- the tag behind it may not even have one. A callback typedef keeps its name too: it is
 		-- the type a `ffi.cast` is written with.
-		local resolved = cdef.resolve(namespace, type.name)
+		local resolved = type.name and cdef.resolve(namespace, type.name)
 		if resolved and isCdata(namespace, resolved) then return type.name end
 		-- A typedef of a 64-bit scalar keeps its own name too: the header wrote `size_t` and a
 		-- reader annotating with it gets the cdata type the engine hands over.
@@ -741,7 +719,7 @@ function cdef.notation(namespace, type, where)
 		-- element is named as the C names it — a `char` array holds `ffi.char` — rather than as
 		-- the Lua number a value read out of one would be.
 		local held = SCALAR_CLASS[type.target and type.target.name or ""]
-			or cdef.notation(namespace, type.target, where)
+			or (type.target and cdef.notation(namespace, type.target, where))
 		if type.length then return string.format("ffi.array<%s, %d>", held, type.length) end
 		return string.format("ffi.array<%s>", held)
 	end
@@ -750,7 +728,7 @@ function cdef.notation(namespace, type, where)
 		-- A pointer to a struct is the struct: LuaJIT reaches `p.x` through the pointer, and that
 		-- is how the code that uses one is written.
 		if target and target.kind == "typedef" then
-			local named = cdef.resolve(namespace, target.name)
+			local named = target.name and cdef.resolve(namespace, target.name)
 			if named and (named.kind == "struct" or named.kind == "union") then return target.name end
 		end
 		local pointed = target and cdef.resolve(namespace, target.name or "") or target
@@ -786,7 +764,6 @@ end
 --- struct is a class of the same shape; a typedef of an integer is an alias of that integer, since
 --- that is what a value of it is.
 ---@param namespace lye.cdef.Namespace
----@return string
 function cdef.annotations(namespace)
 	local parts = {}
 
@@ -848,7 +825,6 @@ end
 ---@param written string the source
 ---@param from integer the first byte of the string literal
 ---@param stop integer its last byte
----@return integer
 function cdef.textStart(written, from, stop)
 	local literal = written:sub(from, stop)
 	local level = literal:match("^%[(=*)%[")
@@ -877,7 +853,10 @@ function cdef.spans(namespace)
 		elseif token.kind == "number" then
 			spans[#spans + 1] = { start = token.start, stop = token.stop, kind = "number" }
 		elseif token.kind == "name" then
-			local word, kind = token.text, nil
+			-- The name nothing else claims is a variable, which is the default rather than the last
+			-- branch: a `kind` that starts as nil is an optional one to a reader, and every entry
+			-- here is a kind.
+			local word, kind = token.text, "variable"
 			if DECLARATION_WORD[word] then
 				kind = "keyword"
 			elseif BUILTIN[word] then
@@ -897,8 +876,6 @@ function cdef.spans(namespace)
 				-- A name inside braces is a member: a cdef declares no function bodies, so the only
 				-- braces in one are a struct, a union or an enum.
 				kind = "member"
-			else
-				kind = "variable"
 			end
 			spans[#spans + 1] = { start = token.start, stop = token.stop, kind = kind }
 		end

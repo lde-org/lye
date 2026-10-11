@@ -1,13 +1,8 @@
 --[[
 	LuaLS annotation parsing.
 
-	Annotations are comments, so they are read from the token stream rather than from the
-	parser, which discards them. Each one is attached to the next declaration at or after it,
-	which is the convention LuaLS uses: the comment describes what follows.
-
-	Types are kept as written and interpreted by `lye-doc.type` only where a check is
-	actually made, so an annotation this reader does not understand is carried through
-	rather than dropped.
+	Annotations are comments, so they are read from the token stream rather than the parser, which
+	discards them. Types are kept as written and interpreted only where a check is made.
 ]]
 
 local lexer = require("lye-lexer")
@@ -15,7 +10,7 @@ local lexer = require("lye-lexer")
 local doc = {}
 
 ---@alias lye.doc.Tag
----| "type"|"param"|"return"|"class"|"field"|"alias"|"cast"|"generic"
+---| "type"|"param"|"return"|"class"|"field"|"alias"|"cast"|"as"|"generic"
 ---| "overload"|"deprecated"|"meta"|"diagnostic"|"async"|"nodiscard"|"operator"|"unknown"
 
 ---@class lye.doc.Annotation
@@ -39,7 +34,7 @@ local doc = {}
 -- Tags this reader understands, and whether they name an identifier.
 local TAGS = {
 	["type"] = true, ["param"] = true, ["return"] = true, ["class"] = true,
-	["field"] = true, ["alias"] = true, ["cast"] = true, ["generic"] = true,
+	["field"] = true, ["alias"] = true, ["cast"] = true, ["as"] = true, ["generic"] = true,
 	["overload"] = true, ["deprecated"] = true, ["meta"] = true, ["diagnostic"] = true,
 	["async"] = true, ["nodiscard"] = true, ["operator"] = true,
 	["enum"] = false, ["package"] = false, ["private"] = false, ["protected"] = false,
@@ -64,17 +59,11 @@ end
 --- insisted on the tight form would silently ignore half of someone's file.
 doc.TAG_PATTERN = "%-%-%-[ \t]*@"
 
----@param comment string
----@param start integer
----@param stop integer
----@return lye.doc.Annotation?
 --- The span a piece of an annotation occupies in the line it was written on. The pieces are
 --- located by their own text, read forwards from where the previous one ended.
 ---@param comment string
 ---@param text string
 ---@param from integer
----@return integer? start
----@return integer? stop
 local function spanOf(comment, text, from)
 	local at = comment:find(text, from, true)
 	if not at then return nil end
@@ -82,7 +71,15 @@ local function spanOf(comment, text, from)
 end
 
 local function parse(comment, start, stop)
-	local body = comment:match("^%-%-%-?%s*(.*)$")
+	-- `---@param x T`, and the bracketed `--[[@as T]]` a cast is written with inside an
+	-- expression. Both spellings are read here so the spans a caller computes stay the ones the
+	-- text has: the closing brackets are the piece's own and are dropped with the opener.
+	local body
+	if comment:sub(1, 4) == "--[[" then
+		body = comment:match("^%-%-%[%[%s*(.-)%s*%]%]%s*$")
+	else
+		body = comment:match("^%-%-%-?%s*(.*)$")
+	end
 	if not body or body == "" then return nil end
 
 	local tag = body:match("^@([%w_]+)")
@@ -120,7 +117,8 @@ local function parse(comment, start, stop)
 		annotation.name = name
 		annotation.type = trim((remaining or ""):gsub("^=", ""))
 		annotation.typeText = annotation.type
-	elseif tag == "return" or tag == "type" or tag == "cast" or tag == "overload" then
+	elseif tag == "return" or tag == "type" or tag == "cast" or tag == "as"
+		or tag == "overload" then
 		annotation.type = rest
 		annotation.typeText = rest
 	elseif tag == "meta" or tag == "diagnostic" then
@@ -151,8 +149,7 @@ local function parse(comment, start, stop)
 	return annotation
 end
 
----@param source string
----@return lye.doc.File
+--- Read a source's annotations: what each one says, and where the parts of it are written.
 ---@param source string
 ---@param tokens lye.lexer.Tokens? the tokens of this source, when the caller already has them
 ---@return lye.doc.File
@@ -160,6 +157,11 @@ function doc.parse(source, tokens)
 	assert(type(source) == "string", "doc.parse expects a string")
 
 	local annotations = {}
+	-- The body of an alias may be written a member per line — `---@alias X` and then `--- | "a"` —
+	-- which is the spelling LuaLS uses and the one this package's own annotations use. A line
+	-- holding nothing but a `|` continues the alias above it, and the members are joined with the
+	-- bars they were written with, so the body that comes out is the one a single line would give.
+	local continued = nil
 	-- The parser lexes the same text on its way to a tree, and a caller that has done so already
 	-- hands the tokens over rather than paying for a second pass over every byte.
 	tokens = tokens or lexer.tokenize(source)
@@ -170,6 +172,10 @@ function doc.parse(source, tokens)
 			-- advances by the real line length either way.
 			local index = token.start
 			local rest = tokens.texts[token.index]
+			-- Whether this comment *is* a bracketed annotation, which is what the inline form is:
+			-- `--[[@as Vec]]` written in the middle of an expression. The same text inside a `---`
+			-- line is prose about the spelling, and is read as prose.
+			local bracketedToken = rest:match("^%-%-%[%[%s*@") ~= nil
 			while true do
 				local newline = rest:find("\n", 1, true)
 				local line = newline and rest:sub(1, newline - 1) or rest
@@ -183,12 +189,43 @@ function doc.parse(source, tokens)
 				if at and not line:sub(1, at - 1):match("^%s*$") and not line:sub(1, at - 1):match("^%s*%-%-%-?%s*$") then
 					at = nil
 				end
+				local last = nil
 				while at do
 					local nextAt = line:find(doc.TAG_PATTERN, at + 4)
 					local piece = line:sub(at, nextAt and nextAt - 1 or #line)
 					local found = parse(piece, index + at - 1, index + at - 1 + #piece - 1)
-					if found then annotations[#annotations + 1] = found end
+					if found then
+						annotations[#annotations + 1] = found
+						last = found
+					end
 					at = nextAt
+				end
+				-- A bracketed annotation is written *inside* an expression — `f --[[@as Vec]].x` — so it
+				-- is read from the comment token it forms rather than from a tag that starts a line.
+				-- Only from a token that *is* one: those same characters turn up quoted in prose that
+				-- explains the spelling, and reading that as a cast attached the type to whatever
+				-- expression happened to sit above the sentence.
+				if bracketedToken then
+					local bracketed = line:find("%-%-%[%[%s*@")
+					while bracketed do
+						local close = line:find("]]", bracketed, true)
+						if not close then break end
+						local found = parse(line:sub(bracketed, close + 1),
+							index + bracketed - 1, index + close)
+						if found then annotations[#annotations + 1] = found end
+						bracketed = line:find("%-%-%[%[%s*@", close)
+					end
+				end
+				if last then
+					continued = last.tag == "alias" and last or nil
+				elseif continued then
+					local member = line:gsub("^%s*%-%-%-?", ""):match("^%s*|%s*(.-)%s*$")
+					if member then
+						local written = continued.type and (continued.type .. "|" .. member) or member
+						continued.type, continued.typeText = written, written
+					else
+						continued = nil
+					end
 				end
 				if not newline then break end
 				index += newline

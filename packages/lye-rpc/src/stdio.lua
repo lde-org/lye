@@ -1,8 +1,8 @@
 --[[
 	Byte-exact stdio for the LSP transport.
 
-	`io.stdin:read(n)` blocks until it has all `n` bytes, which deadlocks on a partial
-	frame, and `io.stdout` on Windows rewrites `\n` as `\r\n`. Hence raw syscalls.
+	`io.stdin:read(n)` blocks until it has all `n` bytes, which deadlocks on a partial frame, and
+	`io.stdout` on Windows rewrites `\n` as `\r\n`. Hence raw syscalls.
 ]]
 
 local ffi = require("ffi")
@@ -35,7 +35,6 @@ local BUFFER_SIZE = 65536
 local Chunk = {}
 Chunk.__index = Chunk
 
----@return lye.rpc.Chunk
 function Chunk.new()
 	return setmetatable({
 		buf = ffi.new("char[?]", BUFFER_SIZE), n = 0, capacity = BUFFER_SIZE,
@@ -61,7 +60,7 @@ end
 ---@return integer
 function stdio.read(chunk)
 	if chunk.n == chunk.capacity then grow(chunk) end
-	local got = tonumber(C.read(0, chunk.buf + chunk.n, chunk.capacity - chunk.n))
+	local got = tonumber(C.read(0, chunk.buf + chunk.n, chunk.capacity - chunk.n)) or 0
 	if got <= 0 then return stdio.EOF end
 	chunk.n += got
 	return got

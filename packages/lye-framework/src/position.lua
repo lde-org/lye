@@ -36,8 +36,6 @@ end
 --- Binary search, because a linear scan on every conversion is unusable in a large file.
 ---@param index lye.framework.LineIndex
 ---@param offset integer 1-based
----@return integer line
----@return integer lineStart 1-based byte offset of that line's first byte
 local function lineAt(index, offset)
 	local starts = index.starts
 	local low, high = 1, #starts
@@ -56,7 +54,6 @@ function position.lineStart(index, line)
 	return index.starts[line + 1]
 end
 
----@return string
 function position.lineText(text, index, line)
 	local start = index.starts[line + 1]
 	if not start then return "" end
@@ -117,7 +114,6 @@ end
 ---@param line integer
 ---@param character integer
 ---@param encoding string
----@return integer
 function position.toOffset(text, index, line, character, encoding)
 	local start = index.starts[line + 1]
 	if not start then return index.length + 1 end

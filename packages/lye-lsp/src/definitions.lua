@@ -1,10 +1,8 @@
 --[[
 	Where a builtin is declared.
 
-	The definitions are embedded in the binary, so they have no file of their own to open. They are
-	written into a cache directory instead and every jump into them points at that copy: it is the
-	same text the analyzer reads, so offsets line up, and a client that lets one be edited changes a
-	file nothing ever reads back.
+	The definitions are embedded in the binary, so they are written into a cache directory and every
+	jump into them points at that copy: the same text the analyzer reads, so offsets line up.
 ]]
 
 local Parser = require("lye-parser")
@@ -17,7 +15,6 @@ local definitions = {}
 ---@field start integer
 ---@field stop integer
 
----@return string
 local function cacheDir()
 	local root = os.getenv("XDG_CACHE_HOME")
 	if not root or root == "" then root = (os.getenv("HOME") or ".") .. "/.cache" end
@@ -118,7 +115,6 @@ end
 --- The builtin a name refers to, when it is one.
 ---@param index table
 ---@param name string?
----@return lye.DefinitionLocation?
 function definitions.find(index, name)
 	return locationOf(index, name)
 end

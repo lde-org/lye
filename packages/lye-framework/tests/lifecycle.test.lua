@@ -34,7 +34,8 @@ end
 --- correctly answer ServerNotInitialized.
 ---@param messages table[]
 ---@param isRaw boolean? skip the automatic initialize
----@return string[] responses
+--- Decoded messages, one per response the server wrote.
+---@return table[] responses
 ---@return integer exitCode
 local function run(messages, isRaw)
 	local handle = assert(io.open(INPUT, "wb"))
@@ -200,8 +201,11 @@ local function didChange(version, changes)
 	}
 end
 
----@param change table
----@return table
+---@param startLine integer
+---@param startChar integer
+---@param endLine integer
+---@param endChar integer
+---@param text string
 local function range(startLine, startChar, endLine, endChar, text)
 	return {
 		range = {

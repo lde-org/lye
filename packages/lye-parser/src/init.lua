@@ -39,6 +39,8 @@ local lexer = require("lye-lexer")
 ---@field initializer string? kind of the expression it was assigned
 ---@field valueIdx integer? arena index of the assigned expression
 ---@field anchorIdx integer? token index of the statement opening the declaration
+---@field position integer? which name of its statement this is, 1 for the first
+---@field valuePosition integer? which value of its initializer this name takes, 1 unless the last expression gives several
 
 --- A scope is guarded by a condition when the block only runs under one, as `if`/`while`
 --- bodies do.
@@ -63,9 +65,17 @@ local lexer = require("lye-lexer")
 ---@field conditionIdx integer?
 
 ---@class lye.parser.Parser
+---@field KIND table? the lexical kinds, as the lexer names them
+---@field MAX_DIAGNOSTICS integer? how many problems are kept before the rest are dropped
+---@field KEYWORD_LIST string[] the reserved words, in the order they are written
+---@field KEYWORDS table<string, boolean>? the same set, for lookup
+---@field UNARY string[]? the operators that take one operand
+---@field BINARY string[][] those that take two, grouped by precedence
+---@field BINARY_LEVEL table<integer, string[]>? those operators grouped by precedence
+---@field COMPOUND table<string, boolean>? the assignments that also compute: `+=`, `..=`
 ---@field source string
 ---@field tokens lye.lexer.Tokens
----@field arena lye.lexer.ffi.token*
+---@field arena lye.lexer.ffi.token[]
 ---@field texts string[]
 ---@field tokenCount integer
 ---@field index integer
@@ -74,6 +84,8 @@ local lexer = require("lye-lexer")
 ---@field declarations lye.parser.Declaration[]
 ---@field depth integer
 ---@field scopes string[][]
+---@field count_ integer how many nodes have been emitted, which the next one's index is
+---@field tableFieldValues table<integer, table>?
 ---@field lastKind string?
 ---@field lastDeclaration integer?
 ---@field scopeStarts lye.parser.Frame[]
@@ -129,10 +141,24 @@ for _, symbol in ipairs({"+=", "-=", "*=", "/=", "%=", "^=", "..=", "|=", "&=", 
 	Parser.COMPOUND[symbol] = true
 end
 
----@return lye.parser.Parser
-function Parser.new(source)
-	local tokens = lexer.tokenize(source)
-	return setmetatable({
+---@class lye.parser.Resume
+---@field from integer the byte a statement starts at, where scanning resumes
+---@field tokenIndex integer the token that statement starts with
+---@field nodeCount integer how many nodes were emitted before it
+---@field chunkIndex integer the chunk node of the parse being continued
+---@field tokens lye.lexer.Tokens
+---@field nodes lye.parser.Node[]
+---@field declarations lye.parser.Declaration[]
+---@field scopes lye.parser.Scope[]
+---@field tableFields table
+---@field tableFieldValues table
+---@field tableIndexes table
+
+---@param source string
+---@param resume lye.parser.Resume? a parse to carry on from, when the text before it is unchanged
+function Parser.new(source, resume)
+	local tokens = resume and lexer.resume(source, resume.from, resume.tokens) or lexer.tokenize(source)
+	local self = setmetatable({
 		source = source,
 		tokens = tokens,
 		arena = tokens.arena,
@@ -155,6 +181,94 @@ function Parser.new(source)
 		building = {},
 		lastKind = nil,
 	}, Parser)
+	if not resume then return self end
+
+	-- The same nodes at the same indices spanning the same bytes, which is what lets the passes
+	-- above reuse what they worked out for them.
+	local nodes, keep = resume.nodes, resume.nodeCount
+	for index = 1, keep do
+		local node = nodes[index]
+		-- The old chunk is not kept, so its statements answer as parentless and the new one takes them.
+		if node.parent == resume.chunkIndex then node.parent = nil end
+		self.nodes[index] = node
+	end
+	self.index = resume.tokenIndex
+	self.count_ = keep
+	self.declarations = resume.declarations
+	self.scopes_ = resume.scopes
+	self.tableFields = resume.tableFields
+	self.tableFieldValues = resume.tableFieldValues
+	self.tableIndexes = resume.tableIndexes
+	return self
+end
+
+--- Where a parse could carry on from if `offset` changed, or nil when nothing is gained.
+--- A top-level statement is the unit: statements share no state, so the ones before the change can
+--- be kept whole. Their node count is found by span, because emission follows the source.
+---@param parsed lye.parser.Result
+---@param offset integer the byte the change starts at
+---@return lye.parser.Resume?
+function Parser.resumeAt(parsed, offset)
+	local nodes = parsed.nodes
+	local chunk = nodes[parsed.root]
+	local statements = chunk and chunk.children
+	if not statements then return nil end
+
+	-- The last statement that begins at or before the change, which is the one holding it or the
+	-- one it was written after. It has to begin before, not merely end after: an edit in the
+	-- comments above a statement is inside the text the scan would otherwise keep.
+	-- A nested statement is met part-way through the block holding it and that state is gone, and
+	-- the chunk's children are not all statements, so the depth is what says which are.
+	local first
+	for _, childIdx in ipairs(statements) do
+		local node = nodes[childIdx]
+		if node and node.depth == 0 and node.start <= offset then first = node end
+	end
+	if not first then return nil end
+
+	local keep = 0
+	while keep < #nodes and nodes[keep + 1].stop < first.start do keep += 1 end
+	if keep == 0 then return nil end
+
+	local found, low, high = nil, 1, parsed.tokens.count
+	while low <= high do
+		local mid = math.floor((low + high) / 2)
+		if parsed.tokens.arena[mid].start >= first.start then
+			found = mid
+			high = mid - 1
+		else
+			low = mid + 1
+		end
+	end
+	if not found or parsed.tokens.arena[found].start ~= first.start then return nil end
+
+	-- The lists a parse builds run to the end of the file, so keeping them whole would count the
+	-- suffix twice.
+	---@param list table[]
+	---@return table[]
+	local function before(list)
+		local held = {}
+		for _, entry in ipairs(list or {}) do
+			if (entry.start or 0) < first.start then held[#held + 1] = entry end
+		end
+		return held
+	end
+	---@param keyed table<integer, unknown>
+	---@return table<integer, unknown>
+	local function indexed(keyed)
+		local held = {}
+		for key, value in pairs(keyed or {}) do
+			if type(key) == "number" and key <= keep then held[key] = value end
+		end
+		return held
+	end
+
+	return {
+		from = first.start, tokenIndex = found, nodeCount = keep, chunkIndex = parsed.root,
+		tokens = parsed.tokens, nodes = nodes, declarations = before(parsed.declarations),
+		scopes = before(parsed.scopes), tableFields = indexed(parsed.tableFields),
+		tableFieldValues = indexed(parsed.tableFieldValues), tableIndexes = indexed(parsed.tableIndexes),
+	}
 end
 
 ---@return lye.lexer.ffi.token?
@@ -318,9 +432,22 @@ end
 --- statement when a name follows, so anywhere a name is expected it is a name.
 ---@return string?
 ---@return lye.lexer.ffi.token?
+--- Whether a token is a name a reader may write. `const` and `continue` are words this parser
+--- knows — a `const` parameter and a `continue` statement — but Lua has neither, so both are
+--- ordinary identifiers wherever a name is wanted: `{ const = true }` is a table, and reading the
+--- first field as something else left the rest of the table parsed as statements.
+---@param token lye.lexer.ffi.token
+---@return boolean
+function Parser:isName(token)
+	if token.kind == lexer.KIND.name then return true end
+	if token.kind ~= lexer.KIND.keyword then return false end
+	local text = self.texts[token.index]
+	return text == "const" or text == "continue" or text == "goto"
+end
+
 function Parser:parseName()
 	local token = self:peek()
-	if token.kind == lexer.KIND.name or self.texts[token.index] == "goto" then
+	if self:isName(token) then
 		self:advance()
 		return self.texts[token.index], token
 	end
@@ -339,8 +466,9 @@ end
 ---@param qualifier lye.parser.Qualifier
 ---@param token lye.lexer.ffi.token
 ---@param isFunction boolean?
+---@param position integer? which name of its statement this is, so a `---@type A, B` above two names is read one type per name
 ---@return lye.parser.Declaration
-function Parser:declare(name, qualifier, token, isFunction)
+function Parser:declare(name, qualifier, token, isFunction, position)
 	local declaration = {
 		name = name,
 		qualifier = qualifier,
@@ -348,6 +476,7 @@ function Parser:declare(name, qualifier, token, isFunction)
 		stop = token.stop,
 		depth = self.depth,
 		isFunction = isFunction,
+		position = position,
 	}
 	-- The initializer is parsed *after* the name, so the kind is recorded later by
 	-- `setInitializer` via the index returned here.
@@ -409,8 +538,11 @@ function Parser:parse()
 	self:adopt(chunkIdx, topLevel)
 	self.rootIdx = chunkIdx
 
-		return {
+	-- The text the tree was read from, so a reader that wants what a node *spells* — the exact
+	-- literal a condition compared against, say — does not have to be handed it separately.
+	return {
 		root = chunkIdx,
+		source = self.source,
 		scopes = self.scopes_,
 		tableFields = self.tableFields,
 		tableFieldValues = self.tableFieldValues,

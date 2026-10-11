@@ -1,0 +1,2331 @@
+---@class Vector
+---@field x number
+---@field y number
+local Vector = {}
+Vector.__index = Vector
+
+---@param x number
+---@param y number
+---@return Vector
+function Vector.new(x, y)
+	return setmetatable({ x = x, y = y }, Vector)
+end
+
+---@param other Vector
+---@return Vector
+function Vector:add(other)
+	return Vector.new(self.x + other.x, self.y + other.y)
+end
+
+---@param names string[]
+---@return string
+local function join(names)
+	return table.concat(names, ", ")
+end
+
+---@param values number[]
+---@return number
+local function total(values)
+	local sum = 0
+	for index = 1, #values do
+		sum = sum + math.floor(values[index])
+	end
+	return sum
+end
+
+---@param path string
+---@return string?
+local function read(path)
+	local handle = io.open(path, "r")
+	if not handle then
+		error("cannot open " .. path)
+	end
+	local body = handle:read("*a")
+	handle:close()
+	return body
+end
+
+---@param name string?
+---@return string
+local function greet(name)
+	assert(name)
+	return string.format("hello %s", name)
+end
+
+local numbers = { 1, 2, 3 }
+local labels = { "a", "b" }
+
+local first = Vector.new(1, 2)
+local second = first:add(Vector.new(3, 4))
+
+print(join(labels), total(numbers), greet("world"), first.x + second.y)
+
+local TINT = 0x336699
+--- Shared machinery for compilers that turn a source language into Lua
+--- (Moonscript, Teal, ...). A language is a spec; the compiler guest state
+--- that runs the translator stays loaded across compiles.
+---
+--- The guest state is created once per process: the compiler package is
+--- resolved via luarocks, built, and installed as a dependency, then the
+--- driver chunk is loaded into a fresh lua-sys state with the package path
+--- the runner would use. Every subsequent compile reuses that state.
+---
+---@class lde.CompilerSpec
+---@field name string # language name for error messages ("Moonscript", "Teal")
+---@field packageName string # luarocks package providing the compiler
+---@field loadExpr string # expression evaluated to verify the compiler loads
+---@field extension string # source file extension (".moon", ".tl")
+---@field driver string # chunk body: receives (source, filename), returns { code } or { err }
+---@field matchSource fun(rel: string): boolean # true when rel is a compilable source file
+---@field outRel fun(rel: string): string # output path for a matched source file
+---@field hasSourceFilter (fun(rel: string): boolean)? # extra filter for hasSource scans
+---@field writeExtras fun(outDir: string, rel: string, source: string)? # extra outputs beside the compiled file
+
+---@class lde.Compiler
+---@field spec lde.CompilerSpec
+---@field state lua.State?
+---@field chunk lua.Chunk?
+local Compiler = {}
+Compiler.__index = Compiler
+
+local fs = require("fs")
+local path = require("path")
+local lua = require("lua-sys")
+
+local errorMod = require("lde-core.error")
+
+---@param spec lde.CompilerSpec
+---@return lde.Compiler
+function Compiler.new(spec)
+	return setmetatable({ spec = spec }, Compiler)
+end
+
+---@param dir string
+local function mkdirp(dir)
+	if fs.isdir(dir) then return end
+	mkdirp(path.dirname(dir))
+	fs.mkdir(dir)
+end
+
+--- Ensure the compiler guest state exists, resolving + building the compiler
+--- package first if needed. Retries once after clearing the cached archive,
+--- in case the first resolution produced a broken install.
+---@return lua.State
+function Compiler:ensure()
+	if self.state then return self.state end
+
+	local ldeUtil = require("lde-core.util")
+	for attempt = 1, 2 do
+		local pkg, _, err = ldeUtil.openLuarocksPackage(self.spec.packageName)
+		if not pkg then
+			errorMod.raise("Failed to resolve the " .. self.spec.name .. " compiler (luarocks:" .. self.spec.packageName .. "): " .. (err or "unknown error"))
+		end ---@cast pkg -nil
+
+		pkg:build()
+		pkg:installDependencies()
+
+		-- Reuse the package path setup shared by the runner and build scripts.
+		local luaPath, luaCPath = require("lde-core.package.run").getLuaPaths(pkg)
+		local st = lua.new()
+		local g = st:globals() --[[@as { package: { path: string?, cpath: string? } }]]
+		g.package.path = luaPath
+		g.package.cpath = luaCPath
+
+		if pcall(st.eval, st, self.spec.loadExpr) then
+			self.state = st
+			self.chunk = st:load(self.spec.driver, "@lde-" .. self.spec.packageName .. "-compile")
+			return st
+		end
+		st:close()
+
+		if attempt == 2 then
+			errorMod.raise("The " .. self.spec.name .. " compiler installed but failed to load")
+		end
+
+		local url = ldeUtil.resolveLuarocksSource(self.spec.packageName)
+		if url then
+			local archiveDir = require("lde-core.global").getArchiveDir(url)
+			fs.rmdir(archiveDir)
+			fs.delete(archiveDir .. ".archive")
+		end
+	end
+
+	errorMod.raise("The " .. self.spec.name .. " compiler could not be loaded")
+	error("unreachable", 0)
+end
+
+--- Whether a directory contains any source files in this language.
+---@param dir string
+---@return boolean
+function Compiler:hasSource(dir)
+	if not fs.isdir(dir) then return false end
+	for _, rel in ipairs(fs.scan(dir, "**" .. path.separator .. "*" .. self.spec.extension)) do
+		if not self.spec.hasSourceFilter or self.spec.hasSourceFilter(rel) then
+			return true
+		end
+	end
+	return false
+end
+
+---@param source string
+---@param file string
+---@return string? code
+---@return string? err
+function Compiler:compileSource(source, file)
+	self:ensure()
+	local ok, result = pcall(self.chunk.eval, self.chunk, source, file)
+	if not ok then return nil, tostring(result) end
+	if result.err then return nil, result.err end
+	return result.code
+end
+
+---@param file string
+---@return string? code
+---@return string? err
+function Compiler:compileFile(file)
+	local source = fs.read(file)
+	if not source then return nil, "Failed to read " .. file end
+	return self:compileSource(source, file)
+end
+
+--- Compile every source file under srcDir into outDir (mirroring the
+--- directory structure) and copy everything else, so outDir is a drop-in Lua
+--- mirror of srcDir.
+---@param srcDir string
+---@param outDir string
+function Compiler:compileDir(srcDir, outDir)
+	self:ensure()
+	for _, rel in ipairs(fs.scan(srcDir, "**")) do
+		local absSrc = path.join(srcDir, rel)
+		if fs.isdir(absSrc) then
+			mkdirp(path.join(outDir, rel))
+		elseif self.spec.matchSource(rel) then
+			local outPath = path.join(outDir, self.spec.outRel(rel))
+			mkdirp(path.dirname(outPath))
+			local source = fs.read(absSrc)
+			if not source then
+				errorMod.raise("Failed to read " .. absSrc)
+			end ---@cast source -nil
+			local code, err = self:compileSource(source, absSrc)
+			if not code then
+				errorMod.raise("Failed to compile " .. absSrc .. ":\n" .. (err or "unknown error"))
+			end
+			fs.write(outPath, code --[[@as string]])
+			if self.spec.writeExtras then
+				self.spec.writeExtras(outDir, rel, source --[[@as string]])
+			end
+		else
+			local outPath = path.join(outDir, rel)
+			mkdirp(path.dirname(outPath))
+			local content = fs.read(absSrc)
+			if content then fs.write(outPath, content) end
+		end
+	end
+end
+
+return Compiler
+--- Line coverage collection for `lde test --coverage`.
+---
+--- A line hook is installed on each guest test state
+--- (state:setHook(hook, "line")) and records every executed line in files
+--- belonging to the package under test. Everything else the guest loads —
+--- dependencies, the test framework, the guest standard library — is
+--- filtered out by the in-scope directory prefixes. Hits are shared across
+--- all test files (each file runs in its own fresh state) and merged into a
+--- single report by Coverage:compute().
+
+local fs   = require("fs")
+local path = require("path")
+
+---@class lde.CoverageFile
+---@field file      string # absolute path of the covered source file
+---@field executable number # lines that can hold bytecode (non-blank, non-comment)
+---@field covered   number # distinct lines executed by the test suite
+
+---@class lde.Coverage
+---@field prefixes string[] # absolute dirs (with trailing separator) whose files are in scope
+---@field baseDir  string?   # package dir; relative chunk names (dofile/loadfile) resolve against it
+---@field hits     table<string, table<number, number>> # file -> line -> hit count
+local Coverage = {}
+Coverage.__index = Coverage
+
+---@param prefixes string[] # absolute dirs (with trailing separator) whose files are in scope
+---@param baseDir  string?   # package dir used to resolve relative chunk names
+---@return lde.Coverage
+function Coverage.new(prefixes, baseDir)
+	return setmetatable({ prefixes = prefixes, baseDir = baseDir, hits = {} }, Coverage)
+end
+
+--- Line hook handler; install via `state:setHook(hook, "line")`. Only "line"
+--- events for files under one of the collector's prefixes are recorded.
+--- `info.source` is "@<chunk path>" — the path require resolved from the
+--- guest's package.path, i.e. the package's built output under target/<name>.
+---
+---@param event string
+---@param info  { source: string, currentline: number }
+function Coverage:hook(event, info)
+	if event ~= "line" then return end
+	local src = info.source
+	if not src or src:sub(1, 1) ~= "@" then return end
+	local file = src:sub(2)
+	-- Relative chunk names come from dofile/loadfile with relative paths;
+	-- resolve them against the package dir so the prefix filter can match.
+	-- Chunk names use "/" separators on every platform, so the joined path is
+	-- normalized to the native separator ("src/mod.lua" must equal the
+	-- backslash-joined key tests and the hook's own prefixes use).
+	if not (file:sub(1, 1) == "/" or file:sub(1, 1) == "\\" or file:match("^%a:[/\\]")) then
+		if not self.baseDir then return end
+		file = (path.join(self.baseDir, file):gsub("\\", "/")):gsub("/", path.separator)
+	end
+	for i = 1, #self.prefixes do
+		if file:sub(1, #self.prefixes[i]) == self.prefixes[i] then
+			local lines = self.hits[file]
+			if not lines then
+				lines = {}
+				self.hits[file] = lines
+			end
+			lines[info.currentline] = (lines[info.currentline] or 0) + 1
+			return
+		end
+	end
+end
+
+--- Blank lines, comments, and the interiors of multi-line strings / block
+--- comments never produce a line event, so they don't count toward the
+--- executable total. Counting is done with a small Lua lexer that tracks long
+--- bracket state (strings `[[...]]` / `[=[...]=]` and comments `--[[...]]`)
+--- across lines, so string-literal-heavy modules (embedded driver chunks,
+--- HTML templates) aren't penalized with lines that can never be covered.
+---@param src string
+---@param out table<number, true>? # receives the executable line numbers
+---@return number
+local function countExecutableLines(src, out)
+	local n = 0
+	local lineNo = 0
+	local pos = 1
+	local len = #src
+	-- Level of the long bracket (string or block comment) we're inside; nil
+	-- when not inside one. A level-0 opener can contain higher-level brackets.
+	local level ---@type number?
+
+	---@param i number
+	---@return integer
+	local function charAt(i) return i <= len and string.byte(src, i) or -1 end
+
+	-- Level of a long-bracket opener at i ("[" + n*"=" + "["), or nil.
+	---@param i number
+	---@return integer?
+	local function openerLevelAt(i)
+		if charAt(i) ~= 91 then return nil end -- '['
+		local j = i + 1
+		while charAt(j) == 61 do j = j + 1 end -- '='
+		if charAt(j) == 91 then return j - i - 1 end -- '['
+		return nil
+	end
+
+	while pos <= len do
+		local nl = src:find("\n", pos, true)
+		lineNo = lineNo + 1
+		local lineEnd = (nl or len + 1) - 1
+
+		local executable = false
+		-- LuaJIT skips a leading shebang line; it never executes.
+		if not (lineNo == 1 and charAt(pos) == 35) then -- '#'
+			local i = pos
+			while i <= lineEnd do
+				if level then
+					-- Inside a long string/comment: find the matching closer.
+					local lit = "]" .. string.rep("=", level) .. "]"
+					local close = src:find(lit, i, true)
+					if not close or close > lineEnd then
+						break -- still inside; the rest of the line is string/comment
+					end
+					i = close + level + 2
+					level = nil
+					if i > lineEnd then break end -- closer ends the line
+				end
+
+				local c = charAt(i)
+				if c == 45 and charAt(i + 1) == 45 then -- '--'
+					local lvl = openerLevelAt(i + 2)
+					if lvl then
+						level = lvl
+						i = i + 2
+					else
+						break -- line comment to end of line
+					end
+				elseif c == 34 or c == 39 then -- '"' or "'"
+					-- Regular string literal (cannot span lines).
+					local j = i + 1
+					while j <= lineEnd do
+						local sc = charAt(j)
+						if sc == 92 then -- '\\'
+							j = j + 2
+						elseif sc == c then
+							j = j + 1
+							break
+						else
+							j = j + 1
+						end
+					end
+					executable = true
+					i = j
+				elseif c == 91 then -- '['
+					local lvl = openerLevelAt(i)
+					if lvl then
+						level = lvl
+						i = i + lvl + 2
+					else
+						executable = true
+						i = i + 1
+					end
+				elseif c == 32 or c == 9 or c == 13 then -- ' ' '\t' '\r'
+					i = i + 1
+				else
+					executable = true
+					i = i + 1
+				end
+			end
+		end
+
+		if executable then
+			n = n + 1
+			if out then out[lineNo] = true end
+		end
+		pos = (nl or len) + 1
+	end
+	return n
+end
+
+--- Compute per-file stats by reading each hit file's source. Files that can
+--- no longer be read (deleted mid-run) are skipped.
+---
+---@return lde.CoverageFile[] files
+---@return number totalExecutable
+---@return number totalCovered
+function Coverage:compute()
+	local files = {}
+	local totalExecutable, totalCovered = 0, 0
+	for file, lines in pairs(self.hits) do
+		local src = fs.read(file)
+		if src then
+			local execLines = {}
+			local executable = countExecutableLines(src, execLines)
+			local covered = 0
+			for ln in pairs(lines) do
+				if execLines[ln] then covered = covered + 1 end
+			end
+			files[#files + 1] = {
+				file = file,
+				executable = executable,
+				covered = covered,
+			}
+			totalExecutable = totalExecutable + executable
+			totalCovered = totalCovered + covered
+		end
+	end
+	return files, totalExecutable, totalCovered
+end
+
+return Coverage
+-- lde-core/src/error.lua
+--
+-- lde's error convention. Two kinds of failure exist:
+--
+--   * Known errors — problems the user can act on (bad flags, missing files,
+--     network failures, unresolvable deps). Raised with lde.error.raise(),
+--     rendered by the CLI boundary as a single clean message, exit code 1.
+--   * Bugs — anything else that escapes to the CLI boundary. Rendered as the
+--     "lde crashed" screen with a full traceback, exit code 2.
+--
+-- Library code should prefer returning `nil, err` (idiomatic Lua) and reserve
+-- raise() for deep call stacks where threading the error out isn't practical.
+--
+-- __tostring returns the message, so existing `tostring(err)` and `".. " .. err`
+-- catchers keep working while error() sites migrate to raise().
+
+---@class lde.Error
+---@field message string # user-facing message
+---@field kind string? # error category ("usage", "network", "build", ...)
+---@field code integer? # process exit code (default 1)
+---@field hint string? # optional follow-up suggestion shown under the message
+local Error = {}
+Error.__index = Error
+
+local M = {}
+
+---@param message string
+---@param opts { kind?: string, code?: integer, hint?: string }?
+---@return lde.Error
+function M.new(message, opts)
+	opts = opts or {}
+	return setmetatable({
+		message = message,
+		kind = opts.kind,
+		code = opts.code,
+		hint = opts.hint,
+	}, Error)
+end
+
+Error.__tostring = function(self)
+	return self.message
+end
+
+--- Raise a known, user-facing error. The CLI boundary renders it cleanly
+--- (never a traceback). Pass an existing lde.Error to re-raise it unchanged.
+---@param message string? | lde.Error
+---@param opts { kind?: string, code?: integer, hint?: string }?
+function M.raise(message, opts)
+	if type(message) == "table" and getmetatable(message) == Error then
+		error(message, 0)
+	end
+	if message == nil then message = "Unknown error" end
+	error(M.new(tostring(message), opts), 0)
+end
+
+---@param err any
+---@return boolean
+function M.isKnown(err)
+	return type(err) == "table" and getmetatable(err) == Error
+end
+
+--- Safe unwrap of any error value to a user-facing string.
+---@param err any
+---@return string
+function M.message(err)
+	if M.isKnown(err) then return err.message end
+	return tostring(err)
+end
+
+--- Strip a nested chunk-loader frame from a message. Compiling source raises
+--- through lua-sys's loader, which prefixes the real error with its own frame:
+---   [string "lua-sys"]:459: [string "-e"]:1: msg
+--- Only strip when another chunk frame follows, so a single-frame error (the
+--- real one) keeps its source position.
+---@param msg string
+---@return string
+local function stripLoaderFrame(msg)
+	return (msg:gsub("^%[string \"[^\"]*\"%]:%d+: %[", "%[", 1))
+end
+
+--- Renders the boundary's catch and exits. Known errors print one clean line
+--- (exit 1); anything else is treated as a bug in lde and prints the crash
+--- screen with the traceback (exit 2).
+---@param err any # the value the boundary's xpcall caught
+---@param trace string? # traceback string captured by the boundary
+function M.show(err, trace)
+	local ansi = require("ansi")
+
+	if M.isKnown(err) then
+		ansi.error("%s", stripLoaderFrame(err.message))
+		if err.hint then
+			ansi.tip("%s", err.hint)
+		end
+		os.exit(err.code or 1)
+	end
+
+	-- Unexpected: an actual bug in lde (or an error() site that hasn't been
+	-- migrated to raise() yet).
+	local version = "unknown"
+	local ok, v = pcall(require, "lde.version")
+	if ok and type(v) == "string" then version = v end
+
+	ansi.printf("{bold}{red}lde crashed.{reset}")
+	ansi.printf("{reset}")
+	ansi.printf("{red}This is a bug in lde{reset} ({gray}v%s{reset}). Please file an issue at:", version)
+	ansi.printf("{cyan}https://github.com/lde-org/lde/issues/new")
+	ansi.printf("{reset}")
+	ansi.printf("{gray}%s", trace or tostring(err))
+	os.exit(2)
+end
+
+return M
+local fs = require("fs")
+
+local M = {}
+
+--- Build a tree from { "outerFrame;...;innerFrame" = count } folded stacks.
+---@param stacks table<string, number>
+---@param rootName string?
+--- Build a tree from { "outerFrame;...;innerFrame" = count } folded stacks.
+function M.buildTree(stacks, rootName)
+	local root = { n = rootName or "root", v = 0, c = {} }
+
+	for stackStr, count in pairs(stacks) do
+		root.v += count
+		local node = root
+		for frame in stackStr:gmatch("([^;]+)") do
+			local child
+			for _, c in ipairs(node.c) do
+				if c.n == frame then child = c; break end
+			end
+			if not child then
+				child = { n = frame, v = 0, c = {} }
+				node.c[#node.c + 1] = child
+			end
+			child.v += count
+			node = child
+		end
+	end
+
+	return root
+end
+
+--- Minimal JSON encoder for the tree (only needs string keys n, integer v, array c).
+---@param s string
+---@return string
+--- Minimal JSON encoder for the tree (only needs string keys n, integer v, array c).
+local function jsonStr(s)
+	return '"' .. s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
+end
+
+---@param node table
+---@return string
+local function jsonNode(node)
+	local s = '{"n":' .. jsonStr(node.n) .. ',"v":' .. node.v
+	if #node.c > 0 then
+		local parts = {}
+		for i, child in ipairs(node.c) do parts[i] = jsonNode(child) end
+		s = s .. ',"c":[' .. table.concat(parts, ',') .. ']'
+	end
+	return s .. '}'
+end
+
+local TEMPLATE = [==[<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Flamegraph · __TITLE__</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111;color:#ccc;font:13px/1.4 monospace;overflow:hidden}
+#bar{display:flex;align-items:center;gap:14px;padding:8px 14px;
+     background:#1c1c1c;border-bottom:1px solid #2a2a2a;user-select:none}
+#bar h1{font-size:13px;font-weight:bold;color:#eee}
+#info{color:#666;font-size:12px}
+#back{display:none;color:#888;font-size:12px;cursor:pointer;border:none;
+      background:none;padding:2px 6px;border:1px solid #444;border-radius:3px;color:#aaa}
+#back:hover{background:#2a2a2a}
+#tt{position:fixed;background:#222;border:1px solid #444;padding:6px 10px;
+    font-size:12px;pointer-events:none;display:none;white-space:nowrap;color:#eee;
+    border-radius:3px;box-shadow:0 2px 8px #0008}
+canvas{display:block;cursor:crosshair}
+</style>
+</head>
+<body>
+<div id="bar">
+  <h1>__TITLE__</h1>
+  <span id="info"></span>
+  <button id="back">&#8592; back</button>
+</div>
+<div id="tt"></div>
+<canvas id="cv"></canvas>
+<script>
+var D=__DATA__,MS=__MS__;
+var ROOT=D,FOC=D,PATH=[],HOV=null;
+var cv=document.getElementById('cv');
+var ct=cv.getContext('2d');
+var tt=document.getElementById('tt');
+var RH=22;
+
+function clr(name){
+  if(name===FOC.n)return'#3a3a3a';
+  var h=0;for(var i=0;i<name.length;i++)h=(h*31+name.charCodeAt(i))|0;
+  return'hsl('+((h>>>0)%50+12)+',70%,42%)';
+}
+function fmt(v){var ms=v*MS;return ms<1000?'~'+ms+'ms':'~'+(ms/1000).toFixed(1)+'s';}
+function bySize(a,b){return b.v-a.v;}
+function kids(n){return(n.c||[]).slice().sort(bySize);}
+
+function resize(){
+  cv.width=window.innerWidth;
+  cv.height=window.innerHeight-document.getElementById('bar').offsetHeight;
+  draw();
+}
+
+function draw(){
+  ct.clearRect(0,0,cv.width,cv.height);
+  paint(FOC,0,cv.height-RH,cv.width);
+}
+
+function paint(node,x,y,w){
+  if(w<0.5||y+RH<0)return;
+  ct.fillStyle=node===HOV?'#ddd':clr(node.n);
+  ct.fillRect(x,y,Math.max(0,w-1),RH-1);
+  if(w>24){
+    ct.fillStyle=node===HOV?'#111':(node===FOC?'#bbb':'#fff');
+    ct.font='11px monospace';
+    var max=Math.floor((w-6)/6.4);
+    var lbl=node.n.length>max?node.n.slice(0,Math.max(1,max-1))+'\u2026':node.n;
+    ct.fillText(lbl,x+3,y+RH-6);
+  }
+  var kx=x,ks=kids(node);
+  for(var i=0;i<ks.length;i++){
+    var kw=w*ks[i].v/node.v;
+    paint(ks[i],kx,y-RH,kw);
+    kx+=kw;
+  }
+}
+
+function hit(node,x,y,w,mx,my){
+  if(w<0.5||mx<x||mx>=x+w)return null;
+  var kx=x,ks=kids(node);
+  for(var i=0;i<ks.length;i++){
+    var kw=w*ks[i].v/node.v;
+    var r=hit(ks[i],kx,y-RH,kw,mx,my);
+    if(r)return r;
+    kx+=kw;
+  }
+  return(my>=y&&my<y+RH)?node:null;
+}
+
+function gpos(e){var r=cv.getBoundingClientRect();return[e.clientX-r.left,e.clientY-r.top];}
+
+cv.addEventListener('mousemove',function(e){
+  var p=gpos(e),n=hit(FOC,0,cv.height-RH,cv.width,p[0],p[1]);
+  HOV=n;
+  if(n){
+    var pct=(n.v/ROOT.v*100).toFixed(1);
+    tt.innerHTML='<b>'+n.n+'</b>  '+pct+'%  '+fmt(n.v)
+      +'  <span style="color:#666">'+n.v+' samples</span>';
+    var tx=Math.min(e.clientX+14,window.innerWidth-280);
+    tt.style.cssText='display:block;left:'+tx+'px;top:'+(e.clientY-40)+'px';
+  }else{tt.style.display='none';}
+  draw();
+});
+
+cv.addEventListener('mouseleave',function(){HOV=null;tt.style.display='none';draw();});
+
+cv.addEventListener('click',function(e){
+  var p=gpos(e),n=hit(FOC,0,cv.height-RH,cv.width,p[0],p[1]);
+  if(!n)return;
+  if(n===FOC){if(PATH.length)FOC=PATH.pop();}
+  else{PATH.push(FOC);FOC=n;}
+  HOV=null;tt.style.display='none';
+  document.getElementById('back').style.display=PATH.length?'inline':'none';
+  resize();
+});
+
+document.getElementById('back').addEventListener('click',function(){
+  if(PATH.length)FOC=PATH.pop();
+  this.style.display=PATH.length?'inline':'none';
+  resize();
+});
+
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape'){PATH=[];FOC=ROOT;
+    document.getElementById('back').style.display='none';resize();}
+});
+
+window.addEventListener('resize',resize);
+document.getElementById('info').textContent=ROOT.v+' samples · '+fmt(ROOT.v);
+resize();
+</script>
+</body>
+</html>]==]
+
+--- Write a self-contained flamegraph HTML file.
+---@param stacks table<string, number> folded stack strings → sample count
+---@param total number total sample count
+---@param intervalMs number sampling interval in ms
+---@param path string output file path
+---@param title string? display title
+---@return boolean? ok
+---@return string? err
+function M.write(stacks, total, intervalMs, path, title)
+	if not next(stacks) then return nil, "no stack data collected" end
+
+	local root = M.buildTree(stacks, title or "root")
+	local json = jsonNode(root):gsub("</%f[a-z]", "<\\/")  -- escape </tag> sequences
+
+	local safeTitle = (title or "profile"):gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0")
+	local html = TEMPLATE
+		:gsub("__TITLE__", safeTitle)
+		:gsub("__DATA__", (json:gsub("%%", "%%%%")))
+		:gsub("__MS__", tostring(intervalMs))
+
+	if not fs.write(path, html) then
+		return nil, "failed to write " .. path
+	end
+	return true
+end
+
+return M
+local lde = {}
+
+package.loaded[(...)] = lde
+
+lde.isVerbose = false
+-- Suppresses even the compact install progress line (e.g. `lde bloat --json`
+-- pipes a report to stdout and must not have progress output mixed in).
+lde.isQuiet = false
+
+lde.error = require("lde-core.error")
+lde.timings = require("lde-core.util.timings")
+
+lde.Registry = require("lde-registry")
+
+lde.Package = require("lde-core.package")
+lde.Lockfile = require("lde-core.lockfile")
+
+lde.global = require("lde-core.global")
+lde.runtime = require("lde-core.runtime")
+lde.flamegraph = require("lde-core.flamegraph")
+lde.watchrun = require("lde-core.watchrun")
+
+lde.util = require("lde-core.util")
+
+return lde
+local fs = require("fs")
+local json = require("json")
+local util = require("util")
+
+local lde = require("lde-core")
+
+---@class lde.Lockfile.BaseDependency
+---@field name string?
+---@field rockspec string? # URL or relative path to the rockspec file
+---@field optional boolean? # If true, only installed when enabled via features
+---@field features lde.Package.Config.FeatureFlag[]? # Feature flags to enable for this dependency
+
+---@class lde.Lockfile.GitDependency: lde.Lockfile.BaseDependency
+---@field git string
+---@field commit string # Always resolved to a specific commit hash
+---@field branch string?
+
+---@class lde.Lockfile.PathDependency: lde.Lockfile.BaseDependency
+---@field path string
+
+---@class lde.Lockfile.ArchiveDependency: lde.Lockfile.BaseDependency
+---@field archive string # URL to the archive
+
+---@alias lde.Lockfile.Dependency
+--- | lde.Lockfile.GitDependency
+--- | lde.Lockfile.PathDependency
+--- | lde.Lockfile.ArchiveDependency
+
+---@class lde.Lockfile.Raw
+---@field version "1"
+---@field manifestHash string? # hash of lde.json's dependency declarations; a mismatch means the pins are stale
+---@field dependencies table<string, lde.Lockfile.Dependency>
+
+---@class lde.Lockfile
+---@field path string
+---@field raw lde.Lockfile.Raw
+local Lockfile = {}
+Lockfile.__index = Lockfile
+
+---@param p string
+---@return lde.Lockfile?
+function Lockfile.open(p)
+	local content = fs.read(p)
+	if not content then
+		return nil
+	end
+
+	-- A corrupt lockfile is treated as absent: the next install regenerates
+	-- it, instead of crashing every command on the package.
+	local decoded = lde.util.decodeJson(content)
+	if not decoded then
+		return nil
+	end
+
+	return setmetatable({ path = p, raw = decoded }, Lockfile)
+end
+
+---@param p string
+---@param dependencies table<string, lde.Lockfile.Dependency>
+function Lockfile.new(p, dependencies)
+	return setmetatable({
+		path = p,
+		raw = {
+			version = "1",
+			dependencies = dependencies
+		}
+	}, Lockfile)
+end
+
+function Lockfile:save()
+	local content = json.encode(self.raw)
+	return fs.write(self.path, content)
+end
+
+function Lockfile:getVersion()
+	return self.raw.version
+end
+
+function Lockfile:getDependencies()
+	if self:getVersion() == "1" then
+		return self.raw.dependencies
+	else
+		lde.error.raise("Unsupported lockfile version: " .. tostring(self.raw.version))
+	end
+end
+
+--- Deterministic hash of the manifest's dependency declarations. Any change to
+--- `dependencies`, `devDependencies`, or `features` changes the hash, which
+--- invalidates the lockfile's pins (see `Lockfile:isStale`). `json.encode`
+--- sorts the keys of tables it hasn't decoded itself, so the hash is stable
+--- regardless of key order in the manifest file.
+---@param config lde.Package.Config
+---@return string
+function Lockfile.manifestHash(config)
+	return util.hash(json.encode({
+		dependencies = config.dependencies or {},
+		devDependencies = config.devDependencies or {},
+		features = config.features or {},
+	}))
+end
+
+---@return string?
+function Lockfile:getManifestHash()
+	return self.raw.manifestHash
+end
+
+---@param hash string
+function Lockfile:setManifestHash(hash)
+	self.raw.manifestHash = hash
+end
+
+--- True when the manifest's dependency declarations no longer match the
+--- declarations the lockfile was resolved from. A stale lockfile must not pin
+--- resolution — e.g. a dep switched from git to registry in lde.json would
+--- otherwise keep installing the old git source (or conflict with the new
+--- registry requests). Lockfiles written before the hash existed count as
+--- stale so they re-resolve exactly once and are rewritten with a hash.
+---@param config lde.Package.Config
+---@return boolean
+function Lockfile:isStale(config)
+	return self.raw.manifestHash ~= Lockfile.manifestHash(config)
+end
+
+---@param name string
+---@return lde.Lockfile.Dependency?
+function Lockfile:getDependency(name)
+	return self:getDependencies()[name]
+end
+
+return Lockfile
+--- Moonscript compiler, built on the shared compiler guest machinery.
+---@type lde.Compiler
+local moonscript = require("lde-core.compiler").new({
+	name = "Moonscript",
+	packageName = "moonscript",
+	loadExpr = 'return require("moonscript.base")',
+	extension = ".moon",
+	-- Runs inside the compiler guest: to_lua returns the compiled Lua or a
+	-- formatted error.
+	driver = [[
+		local source = ...
+		local base = require("moonscript.base")
+		local code, err = base.to_lua(source)
+		if not code then
+			return { err = err }
+		end
+		return { code = code }
+	]],
+	matchSource = function(rel) return rel:match("%.moon$") ~= nil end,
+	-- Parenthesized: gsub returns a second (count) value that would leak into
+	-- path.join's varargs.
+	outRel = function(rel) return (rel:gsub("%.moon$", ".lua")) end,
+})
+
+return moonscript
+local lua  = require("lua-sys")
+local env  = require("env")
+local fs   = require("fs")
+local path = require("path")
+local ansi = require("ansi")
+local lde  = require("lde-core")
+local teal = require("lde-core.teal")
+local moonscript = require("lde-core.moonscript")
+
+local PROFILER_MS_PER_SAMPLE = 1
+
+--- Prints a fancy profile report: VM state bars + hotspot table.
+---@param counts   table<string, number>  stack → sample count
+---@param vmstates table<string, number>  vmstate char → sample count
+---@param total    number
+---@param cwd      string?
+local function printProfileReport(counts, vmstates, total, cwd)
+	---@param s string
+	local function wln(s) io.write(s .. "\n") end
+
+	if total == 0 then
+		wln(ansi.format("  {yellow}Profile: no samples collected"))
+		return
+	end
+
+	local totalMs = total * PROFILER_MS_PER_SAMPLE
+	---@param ms number
+	---@return string
+	local function fmtTime(ms)
+		if ms < 1000 then return string.format("~%dms", ms) end
+		return string.format("~%.1fs", ms / 1000)
+	end
+
+	local BAR_WIDTH = 20
+	local vmColors = { N = "green", I = "yellow", C = "cyan", G = "red", J = "magenta" }
+	local vmLabels = { N = "JIT compiled", I = "Interpreted", C = "C code", G = "GC", J = "JIT compiler" }
+	local vmOrder  = { "N", "I", "C", "G", "J" }
+
+	---@param n number
+	---@param color string
+	---@return string
+	local function bar(n, color)
+		local filled = math.max(0, math.min(BAR_WIDTH, math.floor(n / total * BAR_WIDTH + 0.5)))
+		local s = filled > 0 and ansi.colorize(color, string.rep("█", filled)) or ""
+		local empty = BAR_WIDTH - filled
+		return empty > 0 and s .. ansi.colorize("gray", string.rep("░", empty)) or s
+	end
+
+	---@param loc string
+	---@return string
+	local function relativize(loc)
+		if cwd and loc:sub(1, #cwd + 1) == cwd .. "/" then
+			loc = loc:sub(#cwd + 2)
+		end
+		return (loc:gsub("^target/[^/]+/", ""))
+	end
+
+	local sep = ansi.colorize("gray", string.rep("─", 54))
+
+	io.write("\n")
+	wln(ansi.format("  {bold}Profile{reset} · {cyan}%s{reset} · {gray}%d samples @ %dms",
+		fmtTime(totalMs), total, PROFILER_MS_PER_SAMPLE))
+	wln("  " .. sep)
+	io.write("\n")
+
+	wln(ansi.format("  {bold}VM State"))
+	for _, state in ipairs(vmOrder) do
+		local n = vmstates[state] or 0
+		if n > 0 then
+			local color = vmColors[state]
+			wln("  "
+				.. ansi.colorize(color, string.format("%-12s", vmLabels[state]))
+				.. "  " .. bar(n, color)
+				.. "  " .. ansi.colorize("gray", string.format("%5.1f%%", n / total * 100)))
+		end
+	end
+
+	io.write("\n")
+	wln(ansi.format("  {bold}Hotspots"))
+	wln("  " .. sep)
+
+	local sorted = {}
+	for loc, count in pairs(counts) do sorted[#sorted + 1] = { loc = loc, count = count } end
+	table.sort(sorted, function(a, b) return a.count > b.count end)
+
+	for i = 1, math.min(#sorted, 20) do
+		local e     = sorted[i]
+		local pct   = e.count / total * 100
+		local color = i == 1 and "red" or i <= 3 and "yellow" or "white"
+		wln("  "
+			.. ansi.colorize(color, string.format("%5.1f%%", pct))
+			.. "  " .. ansi.colorize("gray", string.format("%-7s", fmtTime(e.count * PROFILER_MS_PER_SAMPLE)))
+			.. "  " .. relativize(e.loc))
+	end
+
+	io.write("\n")
+end
+
+--- Start the profiler using a custom callback so we get vmstate per tick.
+--- Returns a stop() function that returns counts, vmstates, stacks, total.
+---@param state lua.State
+---@return fun(): table, table, table, number
+local function startProfiler(state)
+	local counts   = {}
+	local vmstates = {}
+	local stacks   = {}
+	local total    = 0
+
+	-- Frames to skip when looking for a meaningful hotspot key.
+	-- These are lde internals or Lua builtins that appear at the top of every stack.
+	local skipFrames = {
+		["require"]    = true,
+		["pcall"]      = true,
+		["xpcall"]     = true,
+		["[string]"]   = true,
+		["chunk"]      = true,
+	}
+
+	-- Strip the name:line suffix that luajit appends in "f;" mode (e.g. "foo:42" → "foo").
+	---@param f string
+	---@return string
+	local function frameName(f)
+		return (f:gsub(":%d+$", ""))
+	end
+
+	lua.profiler.start(state, "fi" .. PROFILER_MS_PER_SAMPLE, function(stack, samples, vmstate)
+		total = total + samples
+		vmstates[vmstate] = (vmstates[vmstate] or 0) + samples
+		if vmstate == "G" or not stack or stack == "" then return end
+
+		-- Accumulate the full stack for flamegraph (clean frame names).
+		local cleanParts = {}
+		for frame in stack:gmatch("([^;]+)") do
+			local name = frameName(frame)
+			if name ~= "" and name ~= "?" then
+				cleanParts[#cleanParts + 1] = name
+			end
+		end
+		local cleanStack = table.concat(cleanParts, ";")
+		if cleanStack ~= "" then
+			stacks[cleanStack] = (stacks[cleanStack] or 0) + samples
+		end
+
+		-- Hotspot key: first frame that isn't a generic builtin.
+		local key
+		for _, part in ipairs(cleanParts) do
+			if not skipFrames[part] then
+				key = part
+				break
+			end
+		end
+		key = key or cleanParts[1]
+		if key then
+			counts[key] = (counts[key] or 0) + samples
+		end
+	end)
+
+	return function()
+		lua.profiler.stop(state)
+		return counts, vmstates, stacks, total
+	end
+end
+
+--- Write the sampled profile data as JSON so tools and tests can consume it
+--- programmatically (the text report and HTML flamegraph are human-facing).
+---@param filePath string
+---@param counts table<string, number> # function -> sample count
+---@param vmstates table<string, number> # vmstate char -> sample count
+---@param stacks table<string, number> # folded stack -> sample count
+---@param total number
+---@return boolean? ok
+---@return string? err
+local function writeProfileJson(filePath, counts, vmstates, stacks, total)
+	local hotspots = {}
+	for loc, count in pairs(counts) do
+		hotspots[#hotspots + 1] = { loc = loc, count = count }
+	end
+	table.sort(hotspots, function(a, b) return a.count > b.count end)
+
+	local json = require("json")
+	local content = json.encode({
+		version = 1,
+		intervalMs = PROFILER_MS_PER_SAMPLE,
+		total = total,
+		totalMs = total * PROFILER_MS_PER_SAMPLE,
+		vmstates = vmstates,
+		hotspots = hotspots,
+		stacks = stacks,
+	})
+	if not content then return nil, "failed to encode profile data" end
+	if not fs.write(filePath, content) then
+		return nil, "failed to write " .. filePath
+	end
+	return true
+end
+
+---@class lde.ExecuteOptions
+---@field env          table<string, string>?
+---@field args         string[]?  # positional args; args[0] is arg[0] (chunk name / script path)
+---@field globals      table<string, any>?
+---@field packagePath  string?
+---@field packageCPath string?
+---@field preload      table<string, function>?  modules injected into package.loaded before execution
+---@field cwd          string?
+---@field profile      boolean?
+---@field flamegraph   string?
+---@field profileJson  string? # path: also write the sampled data as JSON
+
+--- Create a fresh isolated guest state with the standard lde runtime setup:
+--- cwd/env handling, package.path/cpath, preloads, injected globals, and arg[].
+--- This is the single source of truth for the guest environment — callers keep
+--- the state open to drive it (eval chunks, a REPL loop, ...). Call cleanup()
+--- to restore the host cwd/env and state:close() to free the guest.
+---
+---@param opts lde.ExecuteOptions?
+---@return lua.State state
+---@return lua.Table g      # live proxy of the guest globals
+---@return fun()     cleanup # restores cwd and env vars on the host
+local function createState(opts)
+	opts = opts or {}
+
+	-- Change cwd on the host process (guest inherits the same OS environment)
+	local oldCwd
+	if opts.cwd then
+		oldCwd = env.cwd()
+		env.chdir(opts.cwd)
+	end
+
+	-- Apply env vars; save originals for restore
+	local oldEnvVars = {}
+	if opts.env then
+		for k, v in pairs(opts.env) do
+			oldEnvVars[k] = env.var(k)
+			env.set(k, v)
+		end
+	end
+
+	local function cleanup()
+		for k, v in pairs(oldEnvVars) do env.set(k, v) end
+		if oldCwd then env.chdir(oldCwd) end
+	end
+
+	-- Fresh isolated state
+	local state = lua.new()
+	local g     = state:globals() --[[@as { package: { path: string?, cpath: string?, loaded: table<string, any> }, arg: any }]]
+
+	-- Set package.path / package.cpath
+	local pkg = g.package
+	if opts.packagePath  then pkg.path  = opts.packagePath  end
+	if opts.packageCPath then pkg.cpath = opts.packageCPath end
+
+	-- Inject preloaded modules directly into package.loaded so require() returns
+	-- them immediately — no loader function or cross-boundary callback needed.
+	if opts.preload then
+		local loaded = pkg.loaded
+		for modname, loader in pairs(opts.preload) do
+			if type(loader) == "function" then
+				loaded[modname] = loader()
+			end
+		end
+	end
+
+	-- Inject extra globals. toLua handles all types including plain host tables.
+	if opts.globals then
+		for k, v in pairs(opts.globals) do
+			if v ~= nil then g[k] = v end
+		end
+	end
+
+	-- Populate arg[] — args[0] is arg[0] (the chunk name / script path),
+	-- args[1..] are the positional arguments.
+	local args   = opts.args or {}
+	local argTbl = state:table()
+	argTbl[0]   = args[0] or "?"
+	for i, v in ipairs(args) do argTbl[i] = v end
+	g.arg = argTbl
+
+	return state, g, cleanup
+end
+
+--- Run Lua source inside a fresh lua-sys guest state (see createState for
+--- the environment setup).
+---
+---@param source    string  Lua source code to run
+---@param chunkName string  Label shown in error traces
+---@param opts      lde.ExecuteOptions?
+---@return boolean ok
+---@return any ...  error message on failure, return values on success
+local function executeSource(source, chunkName, opts)
+	opts = opts or {}
+	local args = opts.args or {}
+
+	local state, _, cleanup = createState({
+		args = { [0] = chunkName, unpack(args) },
+		cwd = opts.cwd,
+		env = opts.env,
+		packagePath = opts.packagePath,
+		packageCPath = opts.packageCPath,
+		preload = opts.preload,
+		globals = opts.globals,
+	})
+
+	-- Start profiler if requested
+	local stopProfiler
+	if opts.profile or opts.flamegraph or opts.profileJson then
+		stopProfiler = startProfiler(state)
+	end
+
+	-- Execute the script, passing args as varargs so { ... } in the script works
+	local chunk = state:load(source, chunkName)
+	local ok, a, b, c, d, e, f = pcall(chunk.eval, chunk, unpack(args))
+
+	-- Collect profiling results
+	if stopProfiler then
+		local counts, vmstates, stacks, total = stopProfiler()
+		-- Profiling is explicitly requested via --profile/--flamegraph/--json,
+		-- so its report is always printed (independent of --verbose).
+		if opts.profile then
+			printProfileReport(counts, vmstates, total, opts.cwd or env.cwd())
+		end
+		if opts.flamegraph then
+			local title = chunkName and chunkName:match("[^/\\\\]+$")
+			local fgOk, fgErr = lde.flamegraph.write(
+				stacks, total, PROFILER_MS_PER_SAMPLE, opts.flamegraph, title)
+			if fgOk then
+				ansi.printf("{cyan}Flamegraph written to %s", opts.flamegraph)
+			else
+				ansi.printf("{red}Flamegraph error: %s", fgErr or "unknown error")
+			end
+		end
+		if opts.profileJson then
+			local jOk, jErr = writeProfileJson(opts.profileJson, counts, vmstates, stacks, total)
+			if jOk then
+				ansi.printf("{cyan}Profile JSON written to %s", opts.profileJson)
+			else
+				ansi.printf("{red}Profile JSON error: %s", jErr or "unknown error")
+			end
+		end
+	end
+
+	state:close()
+	cleanup()
+
+	return ok, a, b, c, d, e, f
+end
+
+--- Read a script file, compiling Teal/Moonscript sources to Lua when needed.
+--- Shared by executeFile and the --hot/--watch driver so both re-read the
+--- entry point the same way on every run.
+---@param filePath string
+---@return string? source
+---@return string? err
+local function readCompiledFile(filePath)
+	local source, err = fs.read(filePath)
+	if not source then
+		return nil, "Failed to read " .. filePath .. ": " .. (err or "unknown error")
+	end
+	if filePath:match("%.tl$") and not filePath:match("%.d%.tl$") then
+		-- Teal entry point: compile to Lua before handing it to the guest state.
+		local code, cerr = teal:compileFile(filePath)
+		if not code then
+			return nil, "Failed to compile " .. filePath .. ":\n" .. (cerr or "unknown error")
+		end
+		return code, nil
+	elseif filePath:match("%.moon$") then
+		-- Moonscript entry point: compile to Lua before handing it to the guest state.
+		local code, cerr = moonscript:compileFile(filePath)
+		if not code then
+			return nil, "Failed to compile " .. filePath .. ":\n" .. (cerr or "unknown error")
+		end
+		return code, nil
+	end
+	return source, nil
+end
+
+---@param scriptPath string
+---@param opts lde.ExecuteOptions?
+local function executeFile(scriptPath, opts)
+	-- Resolve relative paths before reading, using opts.cwd if provided,
+	-- so that callers can pass e.g. "./scripts/foo.lua" with a cwd override.
+	local resolvedPath = scriptPath
+	if opts and opts.cwd and not path.isAbsolute(scriptPath) then
+		resolvedPath = path.join(opts.cwd, scriptPath)
+	end
+	local source, err = readCompiledFile(resolvedPath)
+	if not source then return false, err end
+	return executeSource(source, resolvedPath, opts)
+end
+
+---@param code string
+---@param opts lde.ExecuteOptions?
+local function executeString(code, opts)
+	return executeSource(code, "-e", opts)
+end
+
+--- Run arguments as a Lua interpreter would: zero or more `-e <code>` chunks,
+--- then an optional script with its args (or an interactive REPL when the
+--- script slot is `-i`). Test harnesses shell out through the lde binary as
+--- their Lua interpreter, and depend on the chaining semantics — a prelude
+--- chunk (e.g. luacov's runner) must run before the script *in the same
+--- state*, and the script must see a rebuilt arg table (arg[0] = script,
+--- arg[1..] = its args), matching stock `lua -e ... script args`.
+---@param args string[] # the command line after `--lua`
+---@param opts lde.ExecuteOptions?
+---@return boolean ok
+---@return any err
+local function executeLuaCLI(args, opts)
+	opts = opts or {}
+
+	-- Parse `-e <code>` chunks at the front, then an optional script.
+	local eChunks = {}
+	local i = 1
+	while args[i] == "-e" do
+		i = i + 1
+		if args[i] == nil then
+			return false, "no code given for -e"
+		end
+		eChunks[#eChunks + 1] = args[i]
+		i = i + 1
+	end
+	---@type string?
+	local script = args[i]
+	local scriptArgs = {}
+	for j = i + 1, #args do scriptArgs[#scriptArgs + 1] = args[j] end
+	local interactive = script == "-i"
+	if interactive then script = nil end
+	if not script and #eChunks == 0 and not interactive then
+		return false, "no script or -e chunk given after --lua"
+	end
+
+	-- arg[0] = the script path (real Lua semantics); -e chunks see the same
+	-- table the script would.
+	scriptArgs[0] = script or "-e"
+	local state, _, cleanup = createState({
+		args = scriptArgs,
+		cwd = opts.cwd,
+		env = opts.env,
+		packagePath = opts.packagePath,
+		packageCPath = opts.packageCPath,
+	})
+
+	local ok, r = true, nil
+	for _, code in ipairs(eChunks) do
+		local chunk, err = state:load(code, "-e")
+		if not chunk then
+			ok, r = false, err
+			break
+		end
+		ok, r = pcall(chunk.eval, chunk)
+		if not ok then break end
+	end
+
+	if ok and interactive then
+		local repl, err = state:load([[
+			while true do
+				io.write("> ")
+				io.flush()
+				local line = io.read()
+				if not line then break end
+				local chunk = line:match("^=(.*)$")
+				if chunk then chunk = "return " .. chunk else chunk = line end
+				local f, err = loadstring(chunk)
+				if f then
+					local pok, a = pcall(f)
+					if not pok then print(tostring(a))
+					elseif a ~= nil then print(tostring(a)) end
+				else
+					print(tostring(err))
+				end
+			end
+		]], "@repl")
+		if not repl then
+			ok, r = false, err
+		else
+			ok, r = pcall(repl.eval, repl)
+		end
+	elseif ok and script then
+		local source, err = fs.read(script)
+		if not source then
+			ok, r = false, "Failed to read " .. script .. ": " .. (err or "unknown error")
+		else
+			local chunk, lerr = state:load(source, "@" .. script)
+			if not chunk then
+				ok, r = false, lerr
+			else
+				ok, r = pcall(chunk.eval, chunk, unpack(scriptArgs))
+			end
+		end
+	end
+
+	state:close()
+	cleanup()
+	return ok, r
+end
+
+return {
+	createState     = createState,
+	executeFile     = executeFile,
+	executeString   = executeString,
+	executeLuaCLI   = executeLuaCLI,
+	readCompiledFile = readCompiledFile,
+}
+--- Teal compiler, built on the shared compiler guest machinery.
+local fs = require("fs")
+local path = require("path")
+
+---@type lde.Compiler
+local teal = require("lde-core.compiler").new({
+	name = "Teal",
+	packageName = "tl",
+	loadExpr = 'return require("tl")',
+	extension = ".tl",
+	hasSourceFilter = function(rel) return not rel:match("%.d%.tl$") end,
+	-- Runs inside the compiler guest: the tl module and the shared env stay
+	-- loaded in that state across compiles. Type errors never block codegen
+	-- (only syntax errors do); `tl check` remains the strict tool.
+	driver = [[
+		local source, filename = ...
+		local tl = require("tl")
+		if not _lde_tl_env then
+			_lde_tl_env = tl.init_env(false, false, "5.1")
+		end
+		local result = tl.process_string(source, false, _lde_tl_env, filename)
+		if not result.ast then
+			local msgs = {}
+			for _, e in ipairs(result.syntax_errors or {}) do
+				msgs[#msgs + 1] = string.format("%s:%d:%d: %s", e.filename or filename, e.y, e.x, e.msg)
+			end
+			return { err = table.concat(msgs, "\n") }
+		end
+		return { code = tl.generate(result.ast, _lde_tl_env.defaults.gen_target) }
+	]],
+	matchSource = function(rel)
+		return rel:match("%.tl$") ~= nil and not rel:match("%.d%.tl$")
+	end,
+	-- Parenthesized: gsub returns a second (count) value that would leak into
+	-- path.join's varargs.
+	outRel = function(rel) return (rel:gsub("%.tl$", ".lua")) end,
+	writeExtras = function(outDir, rel, source)
+		-- Keep the .tl source alongside the compiled .lua so `tl check` can
+		-- resolve this package's modules with full type info (see compileDir).
+		fs.write(path.join(outDir, rel), source)
+	end,
+})
+
+return teal
+local env  = require("env")
+local fs   = require("fs")
+local ffi  = require("ffi")
+local path = require("path")
+local ansi = require("ansi")
+
+local runtime = require("lde-core.runtime")
+
+-- Cross-platform sleep used to debounce the file watchers.
+local sleep
+if jit.os == "Windows" then
+	pcall(ffi.cdef, "void Sleep(unsigned long dwMilliseconds);")
+	sleep = function(ms) ffi.C.Sleep(ms) end
+else
+	pcall(ffi.cdef, "int usleep(unsigned int usec);")
+	sleep = function(ms) ffi.C.usleep(ms * 1000) end
+end
+
+-- Error markers raised inside the guest state:
+--   RELOAD_MARKER — a relevant file changed while the app was running; the
+--                   driver catches it, invalidates the affected modules and
+--                   re-runs the entry point.
+--   EXIT_MARKER   — the app called os.exit(); treat it as "run finished" and
+--                   keep watching instead of killing the whole process.
+local RELOAD_MARKER = "__lde_hot_reload__"
+local EXIT_MARKER   = "__lde_exit__"
+
+-- Count-hook interval: the guest runs at most this many VM instructions
+-- between watcher polls. Larger values reduce overhead, smaller values make
+-- reload detection snappier. Hooks only fire on interpreted code, so the
+-- guest JIT is disabled while one is installed (same tradeoff as a debugger).
+local HOOK_INTERVAL = 10000
+
+-- Guest-side infrastructure for `lde run --hot` / `lde run --watch`.
+-- Evaluated once per guest state, before the entry point runs. It:
+--   1. wraps the Lua file searcher to record which source file backs each module,
+--   2. wraps require() to record module → module dependency edges,
+--   3. wraps os.exit() so it aborts the run instead of the whole process,
+--   4. returns reload() / reloadAll() / checkKey() on the module table.
+local BOOTSTRAP = [==[
+-- The config table (prefixes, entry key, abs() helper, exit marker) is passed
+-- as the first vararg by the driver — same convention as lua-sys chunks.
+local hot = ...
+
+local M = {
+	fileModules = {}, -- normalized source key -> { [modname] = true }
+	moduleFile  = {}, -- modname -> normalized source key
+	dependents  = {}, -- modname -> { [dependent] = true }
+	lastReloaded = {},
+}
+
+-- Map a module's file path to a reload key. A package's own modules live
+-- under target/<name>/ (a copy of src/, or a symlink to it), so they are
+-- keyed by their src/ identity: "src:foo.lua". Everything else (deps,
+-- stdlib, loose files) keeps its absolute path.
+---@param p string
+---@return string
+local function normKey(p)
+	local t = hot.targetPrefix
+	if t and p:sub(1, #t) == t then
+		return "src:" .. p:sub(#t + 1)
+	end
+	local s = hot.srcPrefix
+	if s and p:sub(1, #s) == s then
+		return "src:" .. p:sub(#s + 1)
+	end
+	return p
+end
+
+-- Wrap the Lua file searcher so every freshly loaded module records which
+-- source file backs it. LuaJIT's searcher only returns the loader, so the
+-- file is recovered from the loader's debug source ("@<path>"). C modules
+-- are left alone (they cannot be unloaded).
+local searchers = package.searchers or package.loaders
+local origLuaSearcher = searchers[2]
+searchers[2] = function(name)
+	local loader, file = origLuaSearcher(name)
+	if type(loader) == "function" then
+		local info = debug.getinfo(loader, "S")
+		local src = info and info.source
+		if src and src:sub(1, 1) == "@" then
+			local key = normKey(hot.abs(src:sub(2)))
+			M.moduleFile[name] = key
+			local set = M.fileModules[key]
+			if not set then set = {}; M.fileModules[key] = set end
+			set[name] = true
+		end
+	end
+	return loader, file
+end
+
+-- Wrap require() to record dependency edges (caller -> required module) so
+-- invalidating a module also invalidates everything that transitively
+-- depends on it.
+local origRequire = require
+local loadStack = {}
+require = function(name)
+	if type(name) ~= "string" then return origRequire(name) end
+	local caller = loadStack[#loadStack]
+	loadStack[#loadStack + 1] = name
+	local ok, result = pcall(origRequire, name)
+	loadStack[#loadStack] = nil
+	if not ok then error(result, 0) end
+	if caller and caller ~= name then
+		local deps = M.dependents[name]
+		if not deps then deps = {}; M.dependents[name] = deps end
+		deps[caller] = true
+	end
+	return result
+end
+
+-- os.exit() would terminate the whole process (the guest shares it with
+-- lde). Intercept it: the driver turns the marker into "run finished" and
+-- keeps watching, so a one-shot script gets re-run on the next change.
+os.exit = function(code)
+	if code == true then code = 0 end
+	error(hot.exitMarker .. tostring(code or 0), 0)
+end
+
+---@param names table<string, boolean>
+---@param out table<string, boolean>
+local function collect(names, out)
+	for name in pairs(names) do
+		if not out[name] then
+			out[name] = true
+			local deps = M.dependents[name]
+			if deps then collect(deps, out) end
+		end
+	end
+end
+
+---@param name string
+local function drop(name)
+	package.loaded[name] = nil
+	local key = M.moduleFile[name]
+	if key then
+		local set = M.fileModules[key]
+		if set then
+			set[name] = nil
+			if next(set) == nil then M.fileModules[key] = nil end
+		end
+		M.moduleFile[name] = nil
+	end
+	M.dependents[name] = nil
+end
+
+-- Invalidate the modules backed by a changed source file, plus everything
+-- that transitively depends on them. Returns the number of modules dropped.
+---@param changedKey string
+---@return integer
+function M.reload(changedKey)
+	local names = M.fileModules[changedKey]
+	if not names or next(names) == nil then return 0 end
+	local out = {}
+	collect(names, out)
+	local list = {}
+	for name in pairs(out) do
+		list[#list + 1] = name
+		drop(name)
+	end
+	table.sort(list)
+	M.lastReloaded = list
+	return #list
+end
+
+-- Drop every tracked module. Used after a failed run so the next reload
+-- starts from a clean slate.
+function M.reloadAll()
+	local list = {}
+	for name in pairs(M.moduleFile) do list[#list + 1] = name end
+	for i, name in ipairs(list) do drop(name) end
+	table.sort(list)
+	M.lastReloaded = list
+	return #list
+end
+
+-- True when a changed file maps to a tracked module or the entry point.
+---@param absPath string
+---@return boolean
+function M.checkKey(absPath)
+	local key = normKey(absPath)
+	return key == hot.entryKey or M.fileModules[key] ~= nil
+end
+
+return M
+]==]
+
+--- Map an absolute file path to a reload key. Mirrors the guest's normKey.
+---@param p string
+---@param srcPrefix string?
+---@param targetPrefix string?
+---@return string
+local function normalizeKey(p, srcPrefix, targetPrefix)
+	if targetPrefix and p:sub(1, #targetPrefix) == targetPrefix then
+		return "src:" .. p:sub(#targetPrefix + 1)
+	end
+	if srcPrefix and p:sub(1, #srcPrefix) == srcPrefix then
+		return "src:" .. p:sub(#srcPrefix + 1)
+	end
+	return p
+end
+
+---@class lde.WatchOptions
+---@field mode "hot"|"watch"          # hot = same state, patch package.loaded; watch = fresh state per run
+---@field createState fun(): lua.State, lua.Table, fun()  # state, globals, cleanup
+---@field entry string                # absolute path to the entry script, re-read every run
+---@field args string[]?              # [0] = entry, [1..] = script args; re-passed on each run
+---@field watchDirs { dir: string, recursive: boolean }[]
+---@field srcPrefix string?           # package src dir + path.separator
+---@field targetPrefix string?        # package target/<name> dir + path.separator
+---@field preReload fun()?              # runs before each reload (e.g. rebuild); false = skip the re-run
+
+--- Run the entry point in a guest state, watching for file changes. In "hot"
+--- mode the state survives reloads and only the changed modules' package.loaded
+--- entries are dropped; in "watch" mode the state is recreated fresh. Runs
+--- until the process is killed (Ctrl+C).
+---@param opts lde.WatchOptions
+local function run(opts)
+	local state, cleanup ---@type lua.State?, fun()?
+	local hotStateTbl, reloadFn, reloadAllFn, checkKeyFn ---@type lua.Table?, function?, function?, function?
+
+	local entryKey = normalizeKey(opts.entry, opts.srcPrefix, opts.targetPrefix)
+
+	-- Absolute paths of changed files, drained by the driver between runs.
+	local pending = {} ---@type string[]
+	-- True only while the entry chunk is executing: the hook is what gives the
+	-- driver control while the app runs, so it must not fire during the
+	-- driver's own guest calls (reload/checkKey).
+	local running = false
+	-- Re-entrancy guard: checkKey() executes guest code, which fires this
+	-- hook again from inside itself.
+	local inHook = false
+	-- Set after a failed run: the next reload drops every tracked module.
+	local fullReload = false
+
+	local watchers = {}
+	for _, w in ipairs(opts.watchDirs) do
+		local dir = w.dir
+		if fs.isdir(dir) then
+			local watcher = fs.watch(dir, function(_event, name)
+				if name and name ~= "" then pending[#pending + 1] = path.join(dir, name) end
+			end, { recursive = w.recursive })
+			if watcher then
+				watchers[#watchers + 1] = watcher
+			else
+				ansi.printf("{red}Failed to watch: %s", dir)
+			end
+		end
+	end
+	if #watchers == 0 then
+		ansi.printf("{red}Nothing to watch (no watchable directory found)")
+		return
+	end
+
+	-- Count hook: fires every HOOK_INTERVAL guest instructions. Polls the
+	-- watchers; when a relevant change is pending it aborts the running app
+	-- with RELOAD_MARKER so the driver can invalidate and re-run. Irrelevant
+	-- churn (logs, caches) is dropped here so it can't interrupt the app.
+	local function hook()
+		if inHook or not running then return end
+		inHook = true
+
+		for _, watcher in ipairs(watchers) do watcher.poll() end
+		if #pending > 0 then
+			for i = #pending, 1, -1 do
+				local abs = pending[i]
+				local relevant = opts.mode == "watch" or fullReload or (checkKeyFn and checkKeyFn(abs))
+				if relevant then
+					-- Leave pending intact: the driver processes it after the
+					-- error unwinds the guest stack.
+					inHook = false
+					error(RELOAD_MARKER, 0)
+				end
+				pending[i] = pending[#pending]
+				pending[#pending] = nil
+			end
+		end
+		inHook = false
+	end
+
+	local function installState()
+		state, _, cleanup = opts.createState()
+
+		-- The bootstrap closes over this config; it's passed as the chunk's
+		-- varargs. abs() resolves the searcher's relative file paths against
+		-- the guest cwd.
+		local boot = state:load(BOOTSTRAP, "@lde-watchrun")
+		local ok, hotState = boot:pcall({
+			abs = function(p) return path.resolve(env.cwd(), p) end,
+			srcPrefix = opts.srcPrefix,
+			targetPrefix = opts.targetPrefix,
+			entryKey = entryKey,
+			exitMarker = EXIT_MARKER,
+		})
+		if not ok then
+			ansi.printf("{red}Failed to install watch hooks: %s", tostring(hotState))
+			state:close()
+			if cleanup then cleanup() end
+			state, cleanup = nil, nil
+			return false
+		end
+
+		---@cast hotState lua.Table
+		hotStateTbl = hotState
+
+		local rf = hotState:get("reload") ---@cast rf function
+		reloadFn = rf
+
+		local raf = hotState:get("reloadAll") ---@cast raf function
+		reloadAllFn = raf
+
+		local ckf = hotState:get("checkKey") ---@cast ckf function
+		checkKeyFn = ckf
+
+		-- Disables the guest JIT for the whole session (hooks only fire on
+		-- interpreted code) — the price of being able to interrupt the app.
+		state:setHook(hook, "count", HOOK_INTERVAL)
+		return true
+	end
+
+	local function disposeState()
+		if state then
+			state:close()
+			state = nil
+		end
+		if cleanup then
+			cleanup()
+			cleanup = nil
+		end
+	end
+
+	local function runEntry() ---@cast state lua.State
+		local source, chunkName, readErr = runtime.readCompiledFile(opts.entry)
+		if not source then
+			return "error", readErr
+		end
+		local chunk = state:load(source, chunkName)
+		running = true
+		local ok, result = chunk:pcall(unpack(opts.args or {}))
+		running = false
+
+		if not ok then
+			local msg = tostring(result)
+			if msg:find(RELOAD_MARKER, 1, true) then
+				return "reload"
+			end
+			local exitCode = msg:match(EXIT_MARKER .. "([0-9]+)")
+			if exitCode then
+				return "exit", tonumber(exitCode)
+			end
+			return "error", result
+		end
+		return "ok"
+	end
+
+	local function runAndReport()
+		local result, info = runEntry()
+		if result == "error" then
+			ansi.printf("{red}Error: %s", tostring(info))
+			fullReload = true
+		elseif result == "exit" and info and info ~= 0 then
+			ansi.printf("{yellow}Process exited with code %d", info)
+		end
+		return result
+	end
+
+	-- Drop cached modules for the pending changes; returns whether the entry
+	-- point should be re-run.
+	local function processPendingChanges()
+		local changes = pending
+		pending = {}
+		if #changes == 0 then return false end
+
+		if opts.mode == "watch" then
+			return true
+		end
+
+		local entryChanged = false
+		local reloaded = 0
+		for i = 1, #changes do
+			local key = normalizeKey(changes[i], opts.srcPrefix, opts.targetPrefix)
+			if key == entryKey then
+				entryChanged = true
+			elseif reloadFn then
+				reloaded = reloaded + reloadFn(key)
+			end
+		end
+
+		local shouldRun = entryChanged or reloaded > 0 or fullReload
+		if shouldRun then
+			if fullReload then
+				fullReload = false
+				reloaded = reloaded + (reloadAllFn and reloadAllFn() or 0)
+			end
+			if reloaded > 0 then
+				local names = {}
+				local lst = hotStateTbl and hotStateTbl:get("lastReloaded") ---@cast lst lua.Table
+				if lst then
+					for _i, v in lst:ipairs() do names[#names + 1] = v end
+					ansi.printf("{cyan}Reloaded: {yellow}%s", table.concat(names, ", "))
+				end
+			end
+		end
+		return shouldRun
+	end
+
+	if not installState() then return end
+
+	ansi.printf("{cyan}Watching %s for changes...", opts.watchDirs[1].dir)
+	local result ---@type string?
+	result = runAndReport()
+
+	while true do
+		-- If the app was interrupted by the hook, the pending changes are
+		-- already collected; otherwise wait for a change. Polling instead of
+		-- watcher.wait() keeps the inotify fd nonblocking, so the settle and
+		-- hook polls below never block (fs.watch's wait() leaves it blocking
+		-- on Linux).
+		if not (opts.mode == "hot" and result == "reload") then
+			while #pending == 0 do
+				for _, watcher in ipairs(watchers) do watcher.poll() end
+				if #pending == 0 then sleep(50) end
+			end
+		end
+
+		-- Settle: a single editor save can emit several inotify events
+		-- (truncate + write [+ rename]); let the stragglers arrive, then drain
+		-- them so one save triggers one reload.
+		sleep(30)
+		for _, watcher in ipairs(watchers) do watcher.poll() end
+
+		if processPendingChanges() then
+			if opts.mode == "watch" then
+				ansi.printf("{cyan}Change detected, restarting...")
+			end
+
+			local buildOk = opts.preReload == nil or opts.preReload()
+			if not buildOk then
+				-- Keep the previous state; the next change retries.
+				result = nil
+			else
+				if opts.mode == "watch" then
+					disposeState()
+					if not installState() then return end
+				end
+				result = runAndReport()
+			end
+		else
+			result = nil
+		end
+	end
+end
+
+return { run = run, bootstrap = BOOTSTRAP }
+---@meta
+
+---@alias lde.test.Result
+--- | { name: string, ok: true }
+--- | { name: string, ok: false, error: string }
+--- | { name: string, ok: true, skipped: true }
+
+---@class lde.TestReporter
+---@field onFileStart? fun(file: string)
+---@field onFileDone?  fun(file: string)
+---@field onStart?     fun(name: string): any
+---@field onPass?      fun(name: string, handle: any)
+---@field onFail?      fun(name: string, err: string, handle: any, file?: string)
+---@field onSkip?      fun(name: string)
+
+--- Every assertion takes an optional trailing context message, appended to
+--- the failure output.
+---@class lde.test
+---@field it fun(name: string, fn: fun())
+---@field skip fun(name: string, fn: fun()?)
+---@field skipIf fun(condition: boolean): fun(name: string, fn: fun())
+---@field afterEach fun(fn: fun())
+---@field afterAll fun(fn: fun())
+---@field run fun(reporter?: lde.TestReporter): lde.test.Result[]
+---@field equal fun(a: any, b: any, msg?: string)
+---@field notEqual fun(a: any, b: any, msg?: string)
+---@field truthy fun(value: any, msg?: string)
+---@field falsy fun(value: any, msg?: string)
+---@field includes fun(haystack: string, needle: string, msg?: string)
+---@field greater fun(a: number, b: number, msg?: string)
+---@field less fun(a: number, b: number, msg?: string)
+---@field greaterEqual fun(a: number, b: number, msg?: string)
+---@field lessEqual fun(a: number, b: number, msg?: string)
+---@field count fun(tbl: table): number
+---@field deepEqual fun(a: any, b: any, msg?: string)
+---@field match fun(actual: table, expected: table, msg?: string)
+---@field errors fun(fn: fun(), expected?: any, msg?: string) # fn must throw; with expected, the error must match it
+
+---@return lde.test
+local function create() end
+
+return create()
+--- Host side of the lde-test framework.
+---
+--- The framework itself runs inside each test file's guest state, so its
+--- implementation is embedded below as a string — the single source of
+--- truth for how lde-test behaves. The host side only crosses primitives
+--- (test names, booleans, error strings) across the state boundary: the
+--- reporter is adapted here into primitive-only host callbacks, which are
+--- passed into the guest as varargs when the framework is injected.
+
+-- Minimal lua-sys surface used here (the full classes live in the lua-sys
+-- package, which is a dependency of the caller, not of lde-test).
+---@class lua.State
+---@field load fun(self: lua.State, code: string, name?: string): lua.Chunk
+---@class lua.Chunk
+---@field eval fun(self: lua.Chunk, ...: any): any
+
+--- The guest-side framework. Receives the host reporter callbacks as varargs
+--- (primitives only), exposes itself via package.preload so require("lde-test")
+--- and require("lpm-test") resolve to a fresh instance, and returns the suite
+--- runner the host invokes once the test file has been evaluated.
+---
+--- The assertion and runner logic stays guest-side: tests register guest
+--- closures and compare guest tables, and neither can cross to the host.
+local SOURCE = [==[
+	local onResult, onStart, onPass, onFail, onSkip = ...
+
+	local M = {}
+
+	--- Append a caller-provided context message to a default failure message.
+	local function withMsg(msg, default)
+		if msg == nil or msg == "" then return default end
+		return default .. " (" .. msg .. ")"
+	end
+
+	--- pcall prefixes string errors with "path:line: "; strip it so expected
+	--- error messages can be written without position info.
+	local function stripPosition(err)
+		return (err:gsub("^.-:%d+: ", "", 1))
+	end
+
+	local function equal(a, b, msg)
+		if a ~= b then error(withMsg(msg, "Expected " .. tostring(a) .. " to equal " .. tostring(b)), 2) end
+	end
+
+	local function notEqual(a, b, msg)
+		if a == b then error(withMsg(msg, "Expected " .. tostring(a) .. " not to equal " .. tostring(b)), 2) end
+	end
+
+	local function truthy(v, msg)
+		if not v then error(withMsg(msg, "Expected value to be truthy, got " .. tostring(v)), 2) end
+	end
+
+	local function falsy(v, msg)
+		if v then error(withMsg(msg, "Expected value to be falsy, got " .. tostring(v)), 2) end
+	end
+
+	local function includes(haystack, needle, msg)
+		if not string.find(haystack, needle, 1, true) then
+			error(withMsg(msg, "Expected string to include '" .. needle .. "'"), 2)
+		end
+	end
+
+	local function greater(a, b, msg)
+		if not (a > b) then
+			error(withMsg(msg, "Expected " .. tostring(a) .. " to be greater than " .. tostring(b)), 2)
+		end
+	end
+
+	local function less(a, b, msg)
+		if not (a < b) then
+			error(withMsg(msg, "Expected " .. tostring(a) .. " to be less than " .. tostring(b)), 2)
+		end
+	end
+
+	local function greaterEqual(a, b, msg)
+		if not (a >= b) then
+			error(withMsg(msg, "Expected " .. tostring(a) .. " to be greater than or equal to " .. tostring(b)), 2)
+		end
+	end
+
+	local function lessEqual(a, b, msg)
+		if not (a <= b) then
+			error(withMsg(msg, "Expected " .. tostring(a) .. " to be less than or equal to " .. tostring(b)), 2)
+		end
+	end
+
+	local function count(tbl)
+		local n = 0
+		for _ in pairs(tbl) do n = n + 1 end
+		return n
+	end
+
+	local function deepEqualInner(a, b, path)
+		if a == b then return end
+		if type(a) ~= type(b) then
+			error("Expected " .. path .. " to be " .. type(b) .. ", got " .. type(a), 0)
+		end
+		if type(a) ~= "table" then
+			error("Expected " .. path .. " to equal " .. tostring(b) .. ", got " .. tostring(a), 0)
+		end
+		if getmetatable(a) ~= getmetatable(b) then
+			error("Expected " .. path .. " metatables to match", 0)
+		end
+		for k, v in pairs(b) do
+			deepEqualInner(a[k], v, path .. "." .. tostring(k))
+		end
+		for k in pairs(a) do
+			if b[k] == nil then
+				error("Unexpected key " .. path .. "." .. tostring(k), 0)
+			end
+		end
+	end
+
+	local function deepEqual(a, b, msg)
+		local ok, err = pcall(deepEqualInner, a, b, "<root>")
+		if not ok then error(withMsg(msg, tostring(err)), 2) end
+	end
+
+	local function matchInner(actual, expected, path)
+		for k, v in pairs(expected) do
+			local ap = path .. "." .. tostring(k)
+			if type(v) == "table" and type(actual[k]) == "table" then
+				matchInner(actual[k], v, ap)
+			else
+				if actual[k] ~= v then
+					error("Expected " .. ap .. " to equal " .. tostring(v) .. ", got " .. tostring(actual[k]), 0)
+				end
+			end
+		end
+	end
+
+	local function match(actual, expected, msg)
+		if type(actual) ~= "table" then
+			error(withMsg(msg, "Expected a table, got " .. type(actual)), 2)
+		end
+		local ok, err = pcall(matchInner, actual, expected, "<root>")
+		if not ok then error(withMsg(msg, tostring(err)), 2) end
+	end
+
+	--- Asserts that fn throws. With `expected`, the thrown error must equal it
+	--- (string messages are compared without pcall's "path:line: " prefix;
+	--- non-string errors by identity).
+	local function errors(fn, expected, msg)
+		local ok, err = pcall(fn)
+		if ok then
+			error(withMsg(msg, "Expected function to throw an error, but it did not"), 2)
+		end
+		if expected ~= nil then
+			if type(err) == "string" and type(expected) == "string" then
+				err = stripPosition(err)
+			end
+			if err ~= expected then
+				error(withMsg(msg, "Expected error to equal " .. tostring(expected) .. ", got " .. tostring(err)), 2)
+			end
+		end
+	end
+
+	function M.new()
+		local callbacks, afterEachFns, afterAllFns = {}, {}, {}
+
+		local instance = {}
+
+		function instance.it(name, fn)
+			table.insert(callbacks, { name = name, callback = fn })
+		end
+
+		function instance.skip(name, _fn)
+			table.insert(callbacks, { name = name, skipped = true })
+		end
+
+		function instance.skipIf(condition)
+			return function(name, fn)
+				table.insert(callbacks, condition
+					and { name = name, skipped = true }
+					or { name = name, callback = fn })
+			end
+		end
+
+		function instance.afterEach(fn)
+			table.insert(afterEachFns, fn)
+		end
+
+		function instance.afterAll(fn)
+			table.insert(afterAllFns, fn)
+		end
+
+		function instance.run(reporter)
+			local results = {}
+			reporter = reporter or {}
+
+			for _, callback in ipairs(callbacks) do
+				if callback.skipped then
+					if reporter.onSkip then reporter.onSkip(callback.name) end
+					table.insert(results, { name = callback.name, ok = true, skipped = true })
+				else
+					local handle = reporter.onStart and reporter.onStart(callback.name)
+					local ok, err = pcall(callback.callback)
+					for _, fn in ipairs(afterEachFns) do
+						local aok, aerr = pcall(fn)
+						if not aok then ok, err = false, aerr end
+					end
+					-- Report errors as strings: a table error (raised guest-side)
+					-- crosses to the host reporter as an opaque proxy whose
+					-- :match() in errorsnippet would crash with a confusing
+					-- "attempt to call method 'match' (a nil value)" instead of
+					-- the real failure. tostring honors __tostring.
+					if not ok and type(err) ~= "string" then
+						err = tostring(err)
+					end
+					if ok and reporter.onPass then
+						reporter.onPass(callback.name, handle)
+					elseif not ok and reporter.onFail then
+						reporter.onFail(callback.name, err, handle)
+					end
+					table.insert(results, { name = callback.name, ok = ok, error = err })
+				end
+			end
+
+			for i, fn in ipairs(afterAllFns) do
+				local ok, err = pcall(fn)
+				if not ok then
+					table.insert(results, { name = "afterAll #" .. i, ok = false, error = err })
+				end
+			end
+
+			return results
+		end
+
+		instance.equal = equal
+		instance.notEqual = notEqual
+		instance.truthy = truthy
+		instance.falsy = falsy
+		instance.includes = includes
+		instance.greater = greater
+		instance.less = less
+		instance.greaterEqual = greaterEqual
+		instance.lessEqual = lessEqual
+		instance.count = count
+		instance.deepEqual = deepEqual
+		instance.match = match
+		instance.errors = errors
+
+		return instance
+	end
+
+	local instance = M.new()
+	package.preload["lde-test"] = function() return instance end
+	package.preload["lpm-test"] = function() return instance end
+
+	return function()
+		local reporter = {}
+		if onStart then reporter.onStart = function(name)         onStart(name)        end end
+		if onPass  then reporter.onPass  = function(name, _)      onPass(name)         end end
+		if onFail  then reporter.onFail  = function(name, err, _) onFail(name, err)    end end
+		if onSkip  then reporter.onSkip  = function(name)         onSkip(name)         end end
+		for _, r in ipairs(instance.run(reporter)) do
+			onResult(r.name, r.ok == true, r.skipped == true, r.error or "")
+		end
+	end
+]==]
+
+---@class lde.testHost
+---@field file string? # test file path, forwarded to reporter.onFail for error snippets
+---@field onResult fun(name: string, ok: boolean, skipped: boolean, err: string)
+
+--- Inject lde-test into a guest state.
+---
+--- Sets up package.preload["lde-test"] / ["lpm-test"] inside the guest and
+--- returns the suite runner: call it once the test file source has been
+--- evaluated (state:eval). The reporter is adapted to primitive-only host
+--- callbacks — no compound values cross the state boundary.
+---
+---@param state    lua.State
+---@param reporter lde.TestReporter?
+---@param host     lde.testHost
+---@return fun() runSuite
+local function setup(state, reporter, host)
+	-- Handles (e.g. progress spinners) live entirely host-side: onStart
+	-- stores one per test name, onPass/onFail retrieve it by name.
+	local handles = {}
+
+	local onStart = reporter and reporter.onStart and function(name)
+		handles[name] = reporter.onStart(name)
+		-- no return: a handle cannot cross back into the guest
+	end or nil
+	local onPass = reporter and reporter.onPass and function(name)
+		reporter.onPass(name, handles[name])
+		handles[name] = nil
+	end or nil
+	local onFail = reporter and reporter.onFail and function(name, err)
+		reporter.onFail(name, err, handles[name], host.file)
+		handles[name] = nil
+	end or nil
+	local onSkip = reporter and reporter.onSkip and function(name)
+		reporter.onSkip(name)
+	end or nil
+
+	local runSuite = state:load(SOURCE, "@lde-test.test"):eval(host.onResult, onStart, onPass, onFail, onSkip) ---@cast runSuite fun()
+	return runSuite
+end
+
+return { setup = setup }
+local util = {}
+
+local rapidhash = require("rapidhash")
+
+---@param str string
+function util.dedent(str)
+	local lines = {}
+	for line in (str .. "\n"):gmatch("(.-)\n") do
+		table.insert(lines, line)
+	end
+
+	local minIndent = math.huge
+	for _, line in ipairs(lines) do
+		if line:match("%S") then
+			local indent = line:match("^%s*")
+			minIndent = math.min(minIndent, #indent)
+		end
+	end
+
+	if minIndent == math.huge or minIndent == 0 then
+		return str
+	end
+
+	for i, line in ipairs(lines) do
+		if line:match("%S") then
+			lines[i] = line:sub(minIndent + 1)
+		end
+	end
+
+	local result = table.concat(lines, "\n")
+	return result:match("^(.-)%s*$") or result
+end
+
+---Compute a 64-bit rapidhash of a string, returned as a 16-char lowercase hex string.
+---@param s string
+---@return string
+function util.hash(s)
+	return rapidhash.hex(s)
+end
+
+--- Returns a lazily evaluated value: `factory()` runs on the first call,
+--- every call after that returns the cached value.
+---@generic T
+---@param factory fun(): T
+---@return fun(): T
+function util.lazy(factory)
+	local value
+	return function()
+		if value == nil then value = factory() end
+		return value
+	end
+end
+
+return util

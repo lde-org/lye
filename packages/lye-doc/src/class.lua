@@ -1,15 +1,15 @@
 --[[
 	Classes and aliases, as their annotations declare them.
 
-	A `---@class` names a type, its parameters, and what it extends; the `---@field` lines that
-	follow belong to it until another class begins. Nothing here resolves a type: a field keeps
-	the text it was written as, so the analyzer can parse it with the parameters of the class it
-	was read from already substituted.
+	A field keeps the text it was written as; nothing here resolves a type.
 ]]
 
 local classes = {}
 
----@alias lye.doc.Visibility "public"|"private"|"protected"
+---@alias lye.doc.Visibility
+--- | "public"
+--- | "private"
+--- | "protected"
 
 ---@class lye.doc.Alias
 ---@field params string[] the names it takes, `ArrayOfNumberLike<T>` written `<T>`
@@ -31,28 +31,36 @@ local classes = {}
 
 ---@class lye.doc.Namespace
 ---@field classes table<string, lye.doc.Class>
----@field aliases table<string, string>
+---@field aliases table<string, lye.doc.Alias>
+---@field built table<string, lye.doc.Type>? each spelling built once, so a class is one table
+---@field evolved table<string, table<string, lye.doc.Type>>? fields a method added, by class
 
---- Split `Foo<A, B>` into its name and arguments. Angles nest, as `Map<K, List<V>>` shows.
+--- The index of the `>` closing the `<` at `from`, or nil when the angles do not balance.
 ---@param text string
----@return string name
----@return string? args
-local function splitGeneric(text)
-	local openAt = text:find("<", 1, true)
-	if not openAt then return text, nil end
-	local depth, closeAt = 0, nil
-	for index = openAt, #text do
+---@param from integer
+---@return integer?
+local function closeAngle(text, from)
+	local depth = 0
+	for index = from, #text do
 		local char = text:sub(index, index)
 		if char == "<" then
 			depth += 1
 		elseif char == ">" then
 			depth -= 1
-			if depth == 0 then
-				closeAt = index
-				break
-			end
+			if depth == 0 then return index end
 		end
 	end
+end
+
+--- Split `Foo<A, B>` into its name and arguments. Angles nest, as `Map<K, List<V>>` shows.
+---@param text string
+---@return string name
+---@return string? args
+
+local function splitGeneric(text)
+	local openAt = text:find("<", 1, true)
+	if not openAt then return text, nil end
+	local closeAt = closeAngle(text, openAt)
 	if not closeAt then return text, nil end
 	return text:sub(1, openAt - 1), text:sub(openAt + 1, closeAt - 1)
 end
@@ -85,20 +93,12 @@ end
 ---@param text string
 ---@return string[]
 function classes.splitList(text)
-	local parts, depth, from = {}, 0, 1
-	for index = 1, #text do
-		local char = text:sub(index, index)
-		if char == "<" or char == "{" or char == "(" then
-			depth += 1
-		elseif char == ">" or char == "}" or char == ")" then
-			depth -= 1
-		elseif char == "," and depth == 0 then
-			parts[#parts + 1] = (text:sub(from, index - 1):gsub("^%s+", ""):gsub("%s+$", ""))
-			from = index + 1
-		end
+	local types = require("lye-doc.type")
+	local parts = {}
+	for _, part in ipairs(types.splitAt(text, 44)) do
+		local trimmed = (part:gsub("^%s+", ""):gsub("%s+$", ""))
+		if trimmed ~= "" then parts[#parts + 1] = trimmed end
 	end
-	local last = (text:sub(from):gsub("^%s+", ""):gsub("%s+$", ""))
-	if last ~= "" then parts[#parts + 1] = last end
 	return parts
 end
 
@@ -141,19 +141,7 @@ end
 local function readAlias(text)
 	local trimmed = text:gsub("^%s+", "")
 	if trimmed:sub(1, 1) ~= "<" then return {}, trimmed, {}, {} end
-	local depth, closeAt = 0, nil
-	for index = 1, #trimmed do
-		local char = trimmed:sub(index, index)
-		if char == "<" then
-			depth += 1
-		elseif char == ">" then
-			depth -= 1
-			if depth == 0 then
-				closeAt = index
-				break
-			end
-		end
-	end
+	local closeAt = closeAngle(trimmed, 1)
 	if not closeAt then return {}, trimmed, {}, {} end
 	local params, constraints, consts = classes.readParams(trimmed:sub(2, closeAt - 1))
 	return params, (trimmed:sub(closeAt + 1):gsub("^%s+", "")), consts, constraints
@@ -193,6 +181,7 @@ local function readField(annotation, fallback)
 		typeText = (typeText:sub(2):gsub("^%s+", ""))
 		optional = true
 	end
+
 	return { name = name, type = typeText, optional = optional, visibility = visibility }
 end
 
@@ -222,7 +211,6 @@ end
 --- is called, so a name written with it in one place and without it in another has to be one type —
 --- which is how `ffi.gc` came to reject the very cdata it had been handed.
 ---@param name string
----@return string
 local function bareName(name)
 	return (name:gsub("%s*%*$", ""))
 end
@@ -230,14 +218,17 @@ end
 --- The class a name refers to, with whatever arguments were written.
 ---@param namespace lye.doc.Namespace
 ---@param text string
----@return lye.doc.Class? class
----@return string[] args as written, empty when none were
 function classes.resolve(namespace, text)
 	local name, argsText = splitGeneric(text)
+
 	local found = namespace.classes[bareName(name)]
-	if not found then return nil end
-	local args = argsText and classes.splitList(argsText) or {}
-	return found, args
+	if not found then
+		return nil
+	end
+
+	-- A name written without arguments — `Vec` rather than `Vec<number>` — has none to split:
+	-- `splitGeneric` gives nil, and splitting that raised on every class read without parameters.
+	return found, argsText ? classes.splitList(argsText) : {}
 end
 
 --- The fields a class has, its parents' included. A parameter is substituted with the argument
@@ -271,11 +262,13 @@ function classes.fieldsOf(namespace, text)
 	return fields
 end
 
+local x, y, z = string.match("foo", "%d+(%d+)")
+
 --- A function that turns written type text into a type, resolving class names and aliases.
 --- Class fields are resolved once, here, so the type system never has to know about annotations.
 ---@param namespace lye.doc.Namespace
----@return fun(text: string): lye.doc.Type?
-function classes.resolver(namespace)
+---@param elsewhere table<string, lye.doc.Type|boolean>? what another file's names stand for, which the caller is the one that can say
+function classes.resolver(namespace, elsewhere)
 	local types = require("lye-doc.type")
 	local active = {}
 	-- A class grows as its methods are declared, so what a method adds is remembered on the
@@ -288,6 +281,14 @@ function classes.resolver(namespace)
 	---@return lye.doc.Type?
 	local function resolve(text)
 		local found, args = classes.resolve(namespace, text)
+		-- A field's type is text until here too, so a name this file does not declare has to be
+		-- answered the same way one written in the file would be: `---@field value lye.doc.Type`
+		-- in a file that never declares it reads as that type rather than as a bare name, which
+		-- is what lets the two compare equal.
+		if not found then
+			local foreign = elsewhere and elsewhere[text]
+			if type(foreign) == "table" then return foreign end
+		end
 		if found then
 			if built[text] then return built[text] end
 
@@ -336,10 +337,18 @@ function classes.resolver(namespace)
 			if #alias.params > 0 then
 				body = substitute(body, alias.params, argsText and classes.splitList(argsText) or {})
 			end
+			-- A body may name the alias being read: `lye.doc.Type` holds a list of `lye.doc.Type`.
+			-- A class may reach itself because it is *named* — reading a field of it stops at the
+			-- name — while an alias has no name to stop at, so a body that mentions itself is read
+			-- as `any` rather than built into a type that contains itself, which nothing can walk.
+			active[aliasName] = "self"
 			local resolved = types.parse(body, resolve)
 			active[aliasName] = nil
 			return resolved
 		end
+		-- Reading the body of an alias that names itself: `any` says the same thing a class's own
+		-- name does, that the value fits wherever it is used.
+		if active[aliasName] == "self" then return types.ANY_TYPE end
 	end
 	return resolve
 end
@@ -357,7 +366,7 @@ function classes.evolve(namespace, className, field, method)
 	namespace.built = namespace.built or {}
 	namespace.evolved[className] = namespace.evolved[className] or {}
 	namespace.evolved[className][field] = method
-	for _, classType in pairs(namespace.built) do
+	for _, classType in pairs(namespace.built or {}) do
 		if classType.name == className then classType.fields[field] = method end
 	end
 end

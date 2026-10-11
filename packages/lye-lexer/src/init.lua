@@ -1,10 +1,8 @@
 --[[
 	Tokenizer for LuaJIT, including its LuaJIT 3.0 syntax backports.
 
-	Tokens live in an FFI arena: one struct per token holding its kind, its source span and a
-	number's value, with the text beside it in a parallel array. A scan therefore allocates
-	nothing per token. Whitespace is not emitted; comments are, because a comment is content
-	that a later annotation pass needs.
+	Tokens live in an FFI arena, so a scan allocates nothing per token. Whitespace is not emitted;
+	comments are, because a later annotation pass needs them.
 ]]
 
 local ffi = require("ffi")
@@ -75,7 +73,7 @@ end
 ---@field stop integer
 
 ---@class lye.lexer.Tokens
----@field arena lye.lexer.ffi.token* the struct array; index 0 is unused
+---@field arena lye.lexer.ffi.token[] the struct array; index 0 is unused
 ---@field texts string[] one entry per token, indexed like the arena
 ---@field count integer how many tokens there are, the eof token included
 ---@field problems lye.lexer.Problem[] what a scan could not finish, empty for a whole source
@@ -83,7 +81,7 @@ end
 ---@class lye.lexer.Lexer
 ---@field source string
 ---@field pos integer
----@field arena lye.lexer.ffi.token*
+---@field arena lye.lexer.ffi.token[]
 ---@field texts string[]
 ---@field capacity integer
 ---@field count integer
@@ -93,7 +91,6 @@ Lexer.__index = Lexer
 --- Tokens run about one per four bytes of source, so the arena starts near its final size and
 --- doubles if the estimate is low.
 ---@param source string
----@return lye.lexer.Lexer
 function Lexer.new(source)
 	local capacity = math.floor(#source / 4) + 16
 	return setmetatable({
@@ -111,7 +108,6 @@ local function grow(self)
 end
 
 ---@param token lye.lexer.ffi.token
----@return string
 function lexer.variantOf(token)
 	return VARIANT[token.kind]
 end
@@ -224,13 +220,11 @@ local function scanComment(self)
 end
 
 ---@param byteAt integer
----@return boolean
 local function isDigit(byteAt)
 	return byteAt and byteAt >= 48 and byteAt <= 57
 end
 
 ---@param byteAt integer
----@return boolean
 local function isHexDigit(byteAt)
 	return isDigit(byteAt)
 		or (byteAt and byteAt >= 97 and byteAt <= 102)
@@ -423,6 +417,29 @@ function Lexer:tokenize()
 
 	emit(self, KIND.eof, len + 1, len, nil, "")
 	return { arena = self.arena, texts = self.texts, count = self.count, problems = self.problems }
+end
+
+--- Tokens for `source` from `from` on, with everything before it taken from `prefix`.
+--- `from` must be a point where no literal or comment is open, which a statement's first byte is.
+---@param source string
+---@param from integer byte offset to resume at, 1-based
+---@param prefix lye.lexer.Tokens the scan being continued
+---@return lye.lexer.Tokens
+function lexer.resume(source, from, prefix)
+	local self = Lexer.new(source)
+	local keep = 0
+	while keep < prefix.count and prefix.arena[keep + 1].start < from do keep += 1 end
+	-- `ffi.copy` counts from the start of the array and index 0 is unused, so one slot more.
+	ffi.copy(self.arena, prefix.arena, (keep + 1) * ffi.sizeof("lye_token"))
+	for index = 1, keep do self.texts[index] = prefix.texts[index] end
+	self.count = keep
+	local problems = {}
+	for _, problem in ipairs(prefix.problems or {}) do
+		if problem.start < from then problems[#problems + 1] = problem end
+	end
+	self.problems = problems
+	self.pos = from
+	return self:tokenize()
 end
 
 ---@return lye.lexer.Tokens
