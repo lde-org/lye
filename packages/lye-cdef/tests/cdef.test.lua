@@ -115,8 +115,11 @@ test.it("reads bitfields, qualifiers and unnamed members", function()
 	test.equal(cdef.resolve(namespace, "Bits").fields[1].bits, 3)
 	test.equal(memberType(namespace, "Bits", "name"), "ffi.ptr<ffi.char>")
 
+	-- An anonymous member has no name to be written by, so it is written as the members it holds:
+	-- a cdata here left everything reached through `inner` unknown, and Win32 headers are full of
+	-- structs shaped this way.
 	local nested = parse("struct Outer { struct { int x; } inner; };")
-	test.equal(memberType(nested, "Outer", "inner"), "ffi.cdata")
+	test.equal(memberType(nested, "Outer", "inner"), "{ x: number }")
 end)
 
 test.it("reads the standard library declarations a header repeats", function()

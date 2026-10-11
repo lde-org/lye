@@ -527,10 +527,14 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 	for _, node in ipairs(parsed.nodes) do
 		if node.kind == "binary" and (node.op == "and" or node.op == "or") then
 			local left = parsed.nodes[node.left]
+			local right = parsed.nodes[node.right]
 			local scope = left and scopeAtOffset(left.stop)
-			if scope then
+			if scope and right then
 				for _, condition in ipairs(readConditions(parsed, node.left, node.op == "or", signatures)) do
-					add(condition, scope, left.stop, left.stop + (node.stop - left.stop))
+					-- The fact holds while the right operand runs, so it starts where that operand
+					-- starts. Starting at the left operand's own `stop` covered its name: a prefix
+					-- node's span is a point, so `opts or {}` read the left `opts` as already falsy.
+					add(condition, scope, right.start, node.stop)
 				end
 			end
 		end
@@ -543,12 +547,16 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 		if annotation.tag == "cast" then
 			local written = (annotation.type or ""):gsub("^%s*", "")
 			local subject, rest = written:match("^([%w_%.]+)%s*(.*)$")
+			-- Which way the assertion goes, which the marker says: `+T` is the value being a T and
+			-- `-T` is it not being one. Reading every cast as `+` made `---@cast query -nil` assert
+			-- the value *is* nil, the opposite of taking the nil out of it.
+			local marker = rest and rest:match("^%s*([%+%-])")
 			local wanted = rest and (rest:gsub("^%s*[%+%-!%?]%s*", ""))
 			local scope = scopeAtOffset(annotation.stop)
 			local held = wanted and wanted ~= "" and types.parse(wanted, resolve)
 			if subject and held and scope then
-				add({ name = subject, kind = "cast", type = held, wantTruthy = true },
-					scope, annotation.stop)
+				add({ name = subject, kind = marker == "-" and "nottype" or "cast",
+					type = held, wantTruthy = true }, scope, annotation.stop)
 			end
 		end
 	end

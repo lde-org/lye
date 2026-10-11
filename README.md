@@ -27,7 +27,7 @@ It is written in the language it serves, compiles to one standalone executable, 
 - **Callbacks are typed** — a function cast to a C callback keeps the header's parameter types
 - **`require`, the lde way** — `<package>/target/?.lua`, plus `ffi`, `jit`, `string.buffer` and friends
 - **The standard library** — LuaJIT's and Lua 5.1's, from eighteen definition files
-- **Headless too** — the same binary checks files for CI: `lye --check src/**.lua`
+- **Headless too** — the same binary checks files for CI: `lye --check src/**.lua`, handing each package to a worker process so the batch runs on the machine's cores (`LYE_WORKERS=1` checks in one)
 
 ## Examples
 

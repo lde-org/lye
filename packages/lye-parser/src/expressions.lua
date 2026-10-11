@@ -17,6 +17,10 @@ local function stringValue(text)
 	return text
 end
 
+--- The suffixes a guard covers rather than a field name. `.` is not among them: the guard owns its
+--- own dot, so `a?..b` writes a second one, which the engine rejects.
+local GUARDED = { ["["] = true, [":"] = true, ["("] = true, ["{"] = true }
+
 --- Prefix expressions, with the suffix chain attached: calls, indexing, fields, method
 --- calls and safe navigation all belong to one loop, which is how the engine parses them.
 ---@param allowTernaryColon boolean
@@ -55,8 +59,23 @@ local function parsePrefix(self, allowTernaryColon)
 		local text = self:text(nextToken)
 		local link
 
-		if text == "." or text == "?." then
+		-- `?.` guards whatever suffix is written after it: `a?.b`, `a?.[k]`, `a?.:m()`, `a?.(x)`.
+		-- Only the field form was read, so every other spelling stopped there.
+		local isSafe = text == "?."
+		if isSafe then
 			self:advance()
+			nextToken = self:peek()
+			text = self:text(nextToken)
+		end
+
+		-- A guard is read as the suffix after it. A name is the field it reads, and so is nothing at
+		-- all: `a?.` is an access being written, and the value's fields are what is about to be
+		-- offered. The rest — `[`, `:`, `(` and a literal — are suffixes of their own, read below.
+		local isField = isSafe and not (GUARDED[text] or nextToken.kind == KIND.string)
+
+		if isField or (text == "." and not isSafe) then
+			-- The guard consumed its own dot, so only a plain `.` has one left to step past.
+			if not isField then self:advance() end
 			link = { field = self:parseName(), isField = true }
 		elseif text == "[" then
 			self:advance()
@@ -134,16 +153,26 @@ end
 local function parseTable(self)
 	local start = self:peek().start
 	local fieldKinds, fieldValues, elementIdxs = {}, {}, {}
+	local keyIdxs = {}
 	self:expect("{")
 	while not self:check("}") and not self:isEof(self:peek()) do
 		self:skipComments()
 		if self:check("}") then break end
 		if self:check("[") then
 			self:advance()
-			self:parseExpression()
+			local keyIdx = self:parseExpression()
+			keyIdxs[#keyIdxs + 1] = keyIdx
 			self:expect("]")
 			self:expect("=")
-			self:parseExpression()
+			local valueIdx = self:parseExpression()
+			-- A key written as a string literal is a field like any other: `["end"] = v` holds what
+			-- `{ end = v }` holds, and leaving it out made a shape miss a member an annotation asked
+			-- for — `{ end = 2 }` read as an object with no `end` at all.
+			local keyNode = self.nodes[keyIdx]
+			if keyNode and keyNode.kind == "string" and type(keyNode.value) == "string" then
+				fieldValues[keyNode.value] = valueIdx
+				fieldKinds[keyNode.value] = self.lastKind or "unknown"
+			end
 		elseif self:isName(self:peek()) and self:text(self:peekAt(2)) == "=" then
 			local key = self:text(self:advance())
 			self:advance()
@@ -160,6 +189,15 @@ local function parseTable(self)
 	end
 	self:expect("}")
 	local index = self:emit("table", start, self.arena[self.index - 1].stop)
+	-- The members belong to the literal, the way an operator's operands belong to it: without this
+	-- they stayed unparented and were taken for statements of the chunk, which is what a guard's
+	-- `fallsThrough` reads when it asks whether the clause ends in a `return` — `if not x then
+	-- return { y = "z" } end` looked like it fell through, so nothing after it was narrowed.
+	local members = {}
+	for _, valueIdx in pairs(fieldValues) do members[#members + 1] = valueIdx end
+	for _, elementIdx in ipairs(elementIdxs) do members[#members + 1] = elementIdx end
+	for _, keyIdx in ipairs(keyIdxs) do members[#members + 1] = keyIdx end
+	if next(members) then self:adopt(index, members) end
 	-- Keyed by the node, which turns `local x = { foo = 1 }` into an object type without a
 	-- reader having to find the literal again by position.
 	if next(elementIdxs) then self.tableIndexes[index] = elementIdxs end
@@ -226,23 +264,27 @@ local function parsePrimary(self, allowTernaryColon)
 		return parseFunctionBody(self, start, false)
 	end
 
-	-- Only `|a, b| -> expr` is a complete parameter list here; `x -> e` is recognised
-	-- once the left operand has been parsed.
-	if text == "|" then
+	-- A complete parameter list here is `|a, b| -> expr`, or `|| -> expr` for one that takes
+	-- nothing — the two bars are one token when there is nothing between them. `x -> e` is
+	-- recognised once the left operand has been parsed.
+	if text == "|" or text == "||" then
 		local start = token.start
+		local takesNothing = text == "||"
 		self:advance()
 		self:pushScope(start)
 		local params = {}
-		while true do
+		if not takesNothing then
+			while true do
+				self:skipComments()
+				if self:check("|") or self:isEof(self:peek()) then break end
+				local name, nameToken = self:parseName()
+				if name then params[#params + 1] = self:declare(name, "param", nameToken) end
+				self:skipComments()
+				if not self:accept(",") then break end
+			end
 			self:skipComments()
-			if self:check("|") or self:isEof(self:peek()) then break end
-			local name, nameToken = self:parseName()
-			if name then params[#params + 1] = self:declare(name, "param", nameToken) end
-			self:skipComments()
-			if not self:accept(",") then break end
+			self:expect("|")
 		end
-		self:skipComments()
-		self:expect("|")
 		self:expect("->")
 		-- The expression is the body, and what an arrow returns.
 		local bodyIdx = self:parseExpression()
@@ -296,9 +338,22 @@ local function parseUnary(self, allowTernaryColon)
 	if self:check("->") then
 		local startOffset = self.nodes[idx].start
 		self:advance()
+		-- `x -> e` names its one parameter on the left of the arrow. That name was read as an
+		-- expression, so it has to be declared as the parameter here: without it every use inside
+		-- the body is an undefined global, and the argument a caller passes is never bound.
+		local params = {}
+		local node = self.nodes[idx]
+		local written
+		if node.kind == "prefix" then written = node.callee
+		elseif node.kind == "name" then written = node.name end
+		if written then
+			self:pushScope(startOffset)
+			params[1] = self:declare(written, "param", { start = node.start, stop = node.stop })
+		end
 		local bodyIdx = self:parseBinary(1, allowTernaryColon)
+		if written then self:popScope(self.nodes[bodyIdx].stop) end
 		idx = self:emit("function", startOffset, self.nodes[bodyIdx].stop,
-			{ isFunction = true, body = bodyIdx }, { bodyIdx })
+			{ isFunction = true, body = bodyIdx, params = params }, { bodyIdx })
 		-- Set last, since parsing the body overwrites it.
 		self.lastKind = "function"
 	end

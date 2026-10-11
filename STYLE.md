@@ -193,7 +193,7 @@ Allowed and encouraged:
 |---|---|
 | `cond ? a : b` | `cond and a or b` (and its `false` pitfall) |
 | `x ?? default` | `x or default` when `x` can be `false` |
-| `x?.field` | `x and x.field` chains |
+| `x?.field`, `x?.[k]`, `x?.:m()`, `x?.()` | `x and x.field` chains |
 | `a += b`, `s ..= t` | `a = a + b`, `s = s .. t` |
 | `a & b`, `a \| b`, `~a` | `bit.band`, `bit.bor`, `bit.bnot` |
 | `x = || -> expr` | anonymous function literals |
@@ -203,17 +203,20 @@ Forbidden:
 1. Do NOT use `||` (logical or), `&&` (logical and), or `!=` (not equal).
    Use `or`, `and`, `~=`. (The `||` in the lambda syntax `|| ->` is the empty
    parameter list, not a logical operator.)
-2. Do NOT use the optional method-call form `obj?:method()`. It is confusing
-   and the language server cannot parse it.
+2. Do NOT use the optional method-call form `obj?:method()`. The dialect has
+   no `?:` operator — `loadstring` rejects it as `unexpected symbol near ':'`,
+   so it is broken code rather than a style the server dislikes. `obj?.:method()`
+   is the spelling that is accepted.
 3. Do NOT use `//` (floor division). It is NOT backported to this LuaJIT.
 
 Language-server caveats:
 
-1. The language server cannot parse `a?.[key]` (bracket safe-navigation) —
-   write `a and a[key]`.
-2. The language server still reports `need-check-nil` on `?.` bases and in
-   some ternary branches. Prefer `and`/`or` when the checker complains rather
-   than adding casts.
+1. A guard may be written before any suffix, not only before a field: `a?.b`,
+   `a?.[k]`, `a?.:m()` and `a?.()` are all read, as are `a?.b?.c` and `a?.[k]:m()`.
+   The guard owns its own dot, so `a?..b` and `a?:b` are errors.
+2. Nothing checks a value that may be absent. `x.field` and `x:method()` are
+   accepted on a `T?` base without a word, so a `?.` records intent for a reader
+   rather than being something the checker will ask you for.
 
 ## 7. Performance
 

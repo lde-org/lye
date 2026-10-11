@@ -31,6 +31,15 @@
 		},
 		"lye-cdef": {
 			"path": "../lye-cdef"
+		},
+		"fs": {
+			"version": "^0.3.0"
+		},
+		"rapidhash": {
+			"version": "^0.1.0"
+		},
+		"env": {
+			"version": "^0.1.0"
 		}
 	}
 }

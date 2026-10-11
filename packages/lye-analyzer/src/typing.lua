@@ -54,8 +54,13 @@ local typing = {}
 			for position, valueIdx in ipairs(statement.children or {}) do
 				local valueType = infer.at(inferCtx, valueIdx)
 				if valueType then
+					-- A union, not a combination: the value at this position is one of what the
+					-- body returns there, so a `return decoded` whose type is not known yet leaves
+					-- the position unknown rather than reading as the nil of the `return nil` above
+					-- it — `decodeJson` returns a table or says why not, and only the "why not" was
+					-- ever seen.
 					values[position] = values[position]
-						and types.combine(values[position], valueType) or valueType
+						and types.union({ values[position], valueType }) or valueType
 				end
 			end
 		end
@@ -69,9 +74,6 @@ local typing = {}
 		return typing.inferredValuesOf(ctx, index)[1]
 	end
 
-	--- Type every variable from the arena. Run until it settles: a call can be met before
-	--- its callee's `@return` is known, which leaves a mutable unknown for `refine` to
-	--- promote in place, so one pass is not enough on its own.
 	--- What a generic `for` gives its *second* name: `for key, value in pairs(map)`, `for index,
 	--- item in ipairs(list)`. The iterator's own type carries the first name and nothing about the
 	--- second — `ipairs` is written as returning a function of `V[]` — so the table it walks is
@@ -100,7 +102,21 @@ local typing = {}
 		end
 	end
 
-	function typing.typeAll(ctx)
+	--- Whether a value may still be settled by another pass: a placeholder nothing filled in, a
+	--- type nothing is known about, and the permissive `any` an unannotated `@return` gives. All
+	--- three are read before what they depend on was typed, and all three can change.
+	---@param held lye.doc.Type
+	---@return boolean
+	local function unsettled(held)
+		return types.isMutable(held) or held.variant == "unknown" or held.variant == "any"
+	end
+
+	--- Type every variable from the arena. Run until it settles: a call can be met before
+	--- its callee's `@return` is known, which leaves a mutable unknown for `refine` to
+	--- promote in place, so one pass is not enough on its own.
+	---@param ctx lye.typing.Context
+	---@param only table<lye.analyzer.Variable, boolean>? the names a later pass has to read again
+	function typing.typeAll(ctx, only)
 	local parsed, self = ctx.parsed, ctx.self
 	local inferCtx, signatures = ctx.inferCtx, ctx.signatures
 	local returns, resolve = ctx.returns, ctx.resolve
@@ -136,15 +152,16 @@ local typing = {}
 		-- Assignments are typed before initializers, and both re-run to the fixpoint, so
 		-- `local y = x` sees what `x` was assigned above it rather than what it started as.
 		for _, variable in ipairs(self.variables) do
-			-- A standard library constant is not this document's to type.
-			if not variable.isPrelude then
+			-- A standard library constant is not this document's to type, and a later pass reads
+			-- again only the names the pass before it left unsettled.
+			if not variable.isPrelude and (only == nil or only[variable]) then
 				local declaration = variable.declaration
 				-- The initializer of a name the explicit list did not reach is the value at its position in what
 				-- the last expression gives: `local a, b = find(x)` takes the second value of `find`.
 				local initialPosition = declaration.valuePosition or 1
 				for _, assignment in ipairs(variable.assignments) do
 					local position = assignment.valueIdx == declaration.valueIdx
-						and initialPosition or 1
+						and initialPosition or (assignment.valuePosition or 1)
 					local settled = infer.valuesAt(inferCtx, assignment.valueIdx, position)
 					-- `---@return T...` gives every value after the ones it names, so there is no
 					-- end to reach: what this call was bound to is what its second name takes too.
@@ -161,6 +178,13 @@ local typing = {}
 					-- it was typed. Filling it in where the answer arrives keeps those reads from staying unknown.
 					if types.isMutable(assignment.type) and settled then types.promote(assignment.type, settled) end
 					assignment.type = settled
+					-- What a later pass is for: this value was read before what it depends on was
+					-- known — a callee written below, a `@return` not yet read — and only the names
+					-- holding one of those have to be read again.
+					if settled and unsettled(settled) then
+						variable.pending = true
+						ctx.pending = true
+					end
 				end
 				local position = declaration.valuePosition or 1
 				variable.initializer = declaration.valueIdx
@@ -179,6 +203,10 @@ local typing = {}
 				end
 				-- A declared type says what the value is, and the initializer may say what Lua
 				-- consults about it: `---@type Box local b = setmetatable({}, mt)` keeps both.
+				if variable.initializer and unsettled(variable.initializer) then
+					variable.pending = true
+					ctx.pending = true
+				end
 				local metatable = types.metatableOf(variable.initializer)
 				if metatable and variable.declared and not types.metatableOf(variable.declared) then
 					variable.declared = types.withMetatable(variable.declared, metatable)

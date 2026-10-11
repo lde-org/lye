@@ -131,4 +131,84 @@ test.it("prints its version and exits 0", function()
 	test.truthy(out:match("0%s*$"))
 end)
 
+test.it("checks a batch across processes the way one process does", function()
+	-- A batch runs as several processes when the machine has cores to spare, and a package is
+	-- handed over whole so the files of one are read in the order one process would read them.
+	-- What comes back has to be what one process came back with — a check that answered
+	-- differently depending on how many cores the machine had would fail a build on some of them
+	-- and pass it on others. The fixture is two packages: one whose files require each other in a
+	-- circle, and one that requires a copy of the other through its own `target/`, which is what a
+	-- dependency looks like and where the two reads meet.
+	local fs = require("fs")
+	local root = PACKAGE_DIR .. "/target/batch-fixture"
+	local manifest = '{\n\t"name": "%s",\n\t"version": "0.1.0"\n}\n'
+	local mainSource = table.concat({
+		'local ring = require("ring")\n',
+		'\n',
+		'---@return integer\n',
+		'local function go(round)\n',
+		'\treturn ring.go(round)\n',
+		'end\n',
+		'\n',
+		'return { go = go }\n',
+	})
+	local ringSource = table.concat({
+		'local main = require("main")\n',
+		'\n',
+		'---@return integer\n',
+		'local function go(round)\n',
+		'\tif round > 0 then return main.go(round - 1) end\n',
+		'\treturn 0\n',
+		'end\n',
+		'\n',
+		'return { go = go }\n',
+	})
+	local sources = {
+		["alpha/lde.json"] = manifest:format("fixture-alpha"),
+		["alpha/src/main.lua"] = mainSource,
+		["alpha/src/ring.lua"] = ringSource,
+		-- `require("ring")` resolves through `<package>/target/ring.lua`, which is where lde links
+		-- what a package depends on — its own files among them.
+		["alpha/target/main.lua"] = mainSource,
+		["alpha/target/ring.lua"] = ringSource,
+		["beta/lde.json"] = manifest:format("fixture-beta"),
+		["beta/src/use.lua"] = table.concat({
+			'local helper = require("helper")\n',
+			'\n',
+			'return helper.go(3)\n',
+		}),
+		["beta/src/tool.lua"] = table.concat({
+			'local helper = require("helper")\n',
+			'\n',
+			'---@param text string\n',
+			'---@return string\n',
+			'local function shout(text)\n',
+			'\treturn text:upper()\n',
+			'end\n',
+			'\n',
+			'return { shout = shout, go = helper.go }\n',
+		}),
+		-- A dependency is the same text under another package's `target/`, which is the case the
+		-- order of two processes could tell apart.
+		["beta/target/helper.lua"] = ringSource,
+	}
+	fs.mkdirAll(root)
+	for path in pairs(sources) do
+		local dir = path:match("^(.*)/[^/]+$")
+		if dir then fs.mkdirAll(root .. "/" .. dir) end
+	end
+	for path, source in pairs(sources) do
+		fs.write(root .. "/" .. path, source)
+	end
+
+	local function checkIn(workers)
+		return run(string.format("LYE_WORKERS=%d lde run %q -- --check %q 2>/dev/null",
+			workers, MAIN, root))
+	end
+	local one = checkIn(1)
+	test.truthy(one:match(": hint: "), "the fixture has something to compare, got: " .. one)
+	test.equal(checkIn(2), one, "two processes must say what one said")
+	test.equal(checkIn(4), one, "and so must four")
+end)
+
 return true

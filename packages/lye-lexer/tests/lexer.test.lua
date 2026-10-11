@@ -291,4 +291,63 @@ test.it("lexes an empty and a whitespace-only file", function()
 	test.equal(variantString("\n\n  \t\n"), "eof")
 end)
 
+--- The comments a full scan reports, as `start:stop` with their text, which is what a reader
+--- that only wants the annotations asks for.
+---@param source string
+---@return string[]
+local function commentsOf(source)
+	local found = {}
+	for at = 1, lexer.tokenize(source).count do
+		local token = lexer.tokenize(source).arena[at]
+		if token.kind == lexer.KIND.comment then found[#found + 1] = token.start .. ":" .. token.stop end
+	end
+	return found
+end
+
+---@param source string
+---@return string[]
+local function scannedCommentsOf(source)
+	local tokens = lexer.comments(source)
+	local found = {}
+	for at = 1, tokens.count do
+		local token = tokens.arena[at]
+		found[#found + 1] = token.start .. ":" .. token.stop
+		test.equal(token.kind, lexer.KIND.comment, "only comments are handed back")
+		test.equal(tokens.texts[token.index], source:sub(token.start, token.stop), "the text is the slice")
+	end
+	return found
+end
+
+test.it("comments finds what a full scan finds", function()
+	local cases = {
+		"---@class Point\nlocal x = 1",
+		"local s = \"-- not a comment\" -- this is",
+		"local s = '--[[ not a comment ]]'",
+		"local s = [[\n-- neither is this\n]] -- but this is",
+		"local s = [==[\n-- nor this\n]==] -- yes",
+		"--[[@as Vec]] x.y = 1",
+		"--[==[ long\ncomment ]==] local a = 1 -- tail",
+		"local a = 1 --\nlocal b = 2",
+		"--",
+		"----",
+		"local s = \"unterminated -- not a comment",
+		"local s = [[unterminated -- not a comment",
+		"local a = [[b]] --[[c]] --[=[d]=]",
+		"local t = { a = 1 } -- trailing",
+		"local x = 5 --[[\nblock\n]] local y = 6",
+	}
+	for _, source in ipairs(cases) do
+		test.equal(
+			table.concat(scannedCommentsOf(source), ","),
+			table.concat(commentsOf(source), ","),
+			"comments of " .. string.format("%q", source)
+		)
+	end
+end)
+
+test.it("comments hands back nothing for a file without any", function()
+	local tokens = lexer.comments("local a = 1\nreturn a\n")
+	test.equal(tokens.count, 0)
+end)
+
 return true

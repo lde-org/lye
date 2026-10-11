@@ -133,7 +133,9 @@ local function tokenize(text)
 			local stop = text:find("\n", i, true)
 			i = stop and (stop + 1) or (n + 1)
 		elseif at:match("[%a_]") then
-			local word = text:match("^[%a_][%w_]*", i)
+			-- The branch is `at:match("[%a_]")`, so the pattern below always matches; the assert
+			-- says so, and keeps the token's text a string for everything that reads it.
+			local word = assert(text:match("^[%a_][%w_]*", i))
 			tokens[#tokens + 1] = { kind = "name", text = word, start = i, stop = i + #word - 1 }
 			i += #word
 		elseif at:match("%d") or (at == "." and text:sub(i + 1, i + 1):match("%d")) then
@@ -375,6 +377,11 @@ function Parser:tagged(tag)
 	local name = self:peek().kind == "name" and self:name() or nil
 	if not self:accept("{") then
 		-- `struct Foo;` declares the name and nothing else, which is how a header hides its layout.
+		-- The same words also spell a reference — `int tcgetattr(int fd, struct termios *t)` — and
+		-- defining the forward over the definition dropped every field it had, so a struct mentioned
+		-- by a function that takes one lost its members and read as unknown wherever it was used.
+		local known = name and self.namespace.types[name]
+		if known then return known end
 		local forward = { kind = tag, tag = tag, name = name, incomplete = true }
 		if name then self:define(name, forward) end
 		return forward
@@ -755,7 +762,20 @@ function cdef.notation(namespace, type, where)
 	end
 	if kind == "void" then return "nil" end
 	if kind == "enum" then return type.name or "ffi.int" end
-	if kind == "struct" or kind == "union" then return type.name or "ffi.cdata" end
+	if kind == "struct" or kind == "union" then
+		-- An anonymous struct or union has no name to be written by, and the members it holds are
+		-- what a reader reaches through it: `union { WCHAR UnicodeChar; char AsciiChar; } uChar`
+		-- is those two members, not a cdata nothing can be read from. Win32 headers are full of
+		-- them, and one in the middle of a chain left everything past it unknown.
+		if not type.name and type.fields and #type.fields > 0 then
+			local parts = {}
+			for _, field in ipairs(type.fields) do
+				parts[#parts + 1] = string.format("%s: %s", field.name, cdef.notation(namespace, field.type, where))
+			end
+			return "{ " .. table.concat(parts, ", ") .. " }"
+		end
+		return type.name or "ffi.cdata"
+	end
 	return "ffi.cdata"
 end
 

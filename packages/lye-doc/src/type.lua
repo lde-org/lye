@@ -225,10 +225,87 @@ local function stringValueOf(type)
 	if (first == '"' or first == "'") and last == first then return type.name:sub(2, -2) end
 end
 
+--- Whether a value of this type is one of these variants, or a union holding one. This is the
+--- question a builtin's fields are read with: a value that may be absent is still a string wherever
+--- it is one, so `string?` reads the string library while the nil member contributes nothing.
+--- `satisfies` is the wrong question there — it accepts an unknown for every constraint, so asking
+--- it made every untyped name a string and read `symbol.len` off the string library.
+---@param type lye.doc.Type
+---@param variant string
+function types.mayBe(type, variant)
+	if type.variant == "union" then
+		for _, member in ipairs(type.types) do
+			if member.variant == variant then return true end
+		end
+		return false
+	end
+	return type.variant == variant
+end
+
+--- How deep a comparison walks before it stops asking. A type can hold itself — a class with a
+--- `---@field target lye.cdef.Type` field is one — and two of those walk each other without end.
+local MAX_COMPARE_DEPTH = 64
+
+--- The comparison itself, at a depth. Declared before the wrapper so `methodFits` can walk into it
+--- without starting the count over.
+---@type fun(type: lye.doc.Type, constraint: lye.doc.Type, depth: integer): boolean
+local fits
+
+--- A method written without its receiver fits one written with it, which is how a field declared
+--- `fun(self: P, label: string)` and a body declared `function p:set(label)` describe the same
+--- callable. The extra parameter has to be what the method is called on, or it is not a receiver.
+---@param have lye.doc.Type
+---@param wanted lye.doc.Type
+---@param owner lye.doc.Type the class the field belongs to
+---@param depth integer
+---@return boolean
+local function methodFits(have, wanted, owner, depth)
+	if not types.isFn(have) then return false end
+	-- A field written optional is that signature with `nil` beside it, and a body that is a callable
+	-- fits it: the member to compare against is the signature, not the union.
+	if wanted.variant == "union" then
+		for _, member in ipairs(wanted.types) do
+			if types.isFn(member) and methodFits(have, member, owner, depth + 1) then return true end
+		end
+		return false
+	end
+	if not types.isFn(wanted) then return false end
+	if #wanted.params ~= #have.params + 1 then return false end
+	if not fits(wanted.params[1], owner, depth + 1) then return false end
+	local rest = {}
+	for index = 2, #wanted.params do rest[#rest + 1] = wanted.params[index] end
+	return fits(have, types.fn(rest, wanted.returns, wanted.isVariadic, wanted.isSpread), depth + 1)
+end
+
 ---@param type lye.doc.Type
 ---@param constraint lye.doc.Type
 ---@return boolean
 function types.satisfies(type, constraint)
+	return fits(type, constraint, 0)
+end
+
+---@param candidate table?
+local function isCNumber(candidate)
+	local name = candidate and candidate.name
+	if name == "ffi.cnum" or name == "ffi.cnum*" then return true end
+	local parents = candidate and candidate.parents
+	if parents then
+		for _, parent in ipairs(parents) do
+			name = parent.name
+			if name == "ffi.cnum" or name == "ffi.cnum*" then return true end
+		end
+	end
+	return false
+end
+
+--- The comparison, at a depth: past the cap the same pair is being asked again, and the answer it
+--- is being worked out for is what the outer ask returns, so it fits.
+---@param type lye.doc.Type
+---@param constraint lye.doc.Type
+---@param depth integer
+---@return boolean
+fits = function(type, constraint, depth)
+	if depth >= MAX_COMPARE_DEPTH then return true end
 	if types.isMutable(constraint) then types.promote(constraint, type) end
 
 	-- A boolean written out is that value too, which is what a discriminant is compared against.
@@ -247,16 +324,6 @@ function types.satisfies(type, constraint)
 
 	-- A C number is a cdata the engine converts wherever a number is wanted, so refusing it would
 	-- report code the engine runs. The class keeps the name it was written with, marker and all.
-	local function isCNumber(candidate)
-		local function named(one)
-			return one and one.name and (one.name:gsub("%*$", "")) == "ffi.cnum" or false
-		end
-		if named(candidate) then return true end
-		for _, parent in ipairs(candidate and candidate.parents or {}) do
-			if named(parent) then return true end
-		end
-		return false
-	end
 	if isCNumber(type) and (constraint.variant == "number" or constraint.variant == "integer"
 		or isCNumber(constraint)) then
 		return true
@@ -292,14 +359,14 @@ function types.satisfies(type, constraint)
 	-- the other order would ask whether one member accepts the whole union.
 	if type.variant == "union" then
 		for _, member in ipairs(type.types) do
-			if not types.satisfies(member, constraint) then return false end
+			if not fits(member, constraint, depth + 1) then return false end
 		end
 		return true
 	end
 
 	if constraint.variant == "union" then
 		for _, member in ipairs(constraint.types) do
-			if types.satisfies(type, member) then return true end
+			if fits(type, member, depth + 1) then return true end
 		end
 		return false
 	end
@@ -324,19 +391,20 @@ function types.satisfies(type, constraint)
 		if type.variant == "object" then
 			for name, have in pairs(type.fields) do
 				local wanted = constraint.fields[name]
-				if wanted and not types.satisfies(have, wanted) then return false end
+				if wanted and not fits(have, wanted, depth + 1)
+					and not methodFits(have, wanted, constraint, depth + 1) then return false end
 			end
 			return true
 		end
 		-- A class named after a builtin type *is* that type: `builtin.lua` declares
 		-- `---@class string`, which is what makes `ffi.new("Vec")` fit the `ffi.cdecl*` extending it.
 		if SIMPLE[constraint.name] then
-			return types.satisfies(type, types.base(constraint.name))
+			return fits(type, types.base(constraint.name), depth + 1)
 		end
 		-- A value that fits what the class extends fits the class: the definitions write
 		-- `---@class ffi.cdecl*: string`, and a string is exactly what a parameter of it takes.
 		for _, parent in ipairs(constraint.parents or {}) do
-			if types.satisfies(type, parent) then return true end
+			if fits(type, parent, depth + 1) then return true end
 		end
 		-- A name this document never resolved is that name's class when the class is called the
 		-- same thing, and the file that declares it is what makes it the class.
@@ -347,7 +415,7 @@ function types.satisfies(type, constraint)
 		local shaped, some = true, false
 		for _, wanted in pairs(constraint.fields) do
 			some = true
-			if not types.satisfies(types.NIL_TYPE, wanted) then
+			if not fits(types.NIL_TYPE, wanted, depth + 1) then
 				shaped = false
 				break
 			end
@@ -355,19 +423,21 @@ function types.satisfies(type, constraint)
 		if shaped and some then
 			for name, wanted in pairs(constraint.fields) do
 				local have = type.fields[name]
-				if have and not types.satisfies(have, wanted) then return false end
+				if have and not fits(have, wanted, depth + 1) and not methodFits(have, wanted, constraint, depth + 1) then
+					return false
+				end
 			end
 			return true
 		end
 		if type.name ~= constraint.name then
 			for _, parent in ipairs(type.parents) do
-				if types.satisfies(parent, constraint) then return true end
+				if fits(parent, constraint, depth + 1) then return true end
 			end
 			return false
 		end
 		for index, wanted in ipairs(constraint.args or {}) do
 			local have = type.args[index] or types.UNKNOWN_TYPE
-			if not types.satisfies(have, wanted) then return false end
+			if not fits(have, wanted, depth + 1) then return false end
 		end
 		return true
 	end
@@ -378,16 +448,22 @@ function types.satisfies(type, constraint)
 		-- means and what keeps unannotated literals out of trouble.
 		if types.isAnyFn(constraint) then return true end
 		-- A variadic constraint asks for a callable that accepts at least what it names, which a
-		-- fixed signature does when its own parameters fit.
-		if #type.params ~= #constraint.params and not type.isVariadic and not constraint.isVariadic then
-			return false
+		-- fixed signature does when its own parameters fit. Parameters past the ones a signature
+		-- names are discarded by the engine, so a callable with fewer fits — `function() end` is
+		-- what a handler that ignores its arguments is written as. A signature that takes *more*
+		-- than the constraint hands it has to make each extra one optional: the caller omits it,
+		-- and `raise(message, info?)` is a `fun(message: string)`.
+		if not type.isVariadic and not constraint.isVariadic and #type.params > #constraint.params then
+			for index = #constraint.params + 1, #type.params do
+				if not fits(types.NIL_TYPE, type.params[index], depth + 1) then return false end
+			end
 		end
 		for index, wanted in ipairs(constraint.params or {}) do
 			local have = type.params[index] or types.UNKNOWN_TYPE
 			-- Contravariant: the value has to accept what the constraint will pass it.
-			if not types.satisfies(wanted, have) then return false end
+			if not fits(wanted, have, depth + 1) then return false end
 		end
-		return types.satisfies(type.returns, constraint.returns)
+		return fits(type.returns, constraint.returns, depth + 1)
 	end
 
 	if constraint.variant == "array" then
@@ -397,24 +473,27 @@ function types.satisfies(type, constraint)
 		-- the elements are what has to fit.
 		if type.variant == "object" and type.indexed
 			and (type.indexed.key == "integer" or type.indexed.key == "number") then
-			return types.satisfies(type.indexed.type, constraint.type)
+			return fits(type.indexed.type, constraint.type, depth + 1)
 		end
 		if type.variant ~= "array" then return false end
-		return types.satisfies(type.type, constraint.type)
+		return fits(type.type, constraint.type, depth + 1)
 	end
 
 	if constraint.variant == "object" then
+		-- A bare `table` is the `any` of tables: nothing was said about what is in it, so it fits
+		-- any shape — a table literal, an empty table, an array, a class. It fits nothing else,
+		-- which is the whole difference from `any`.
+		if type.variant == "table" then return true end
 		-- A list is what `{ [integer]: T }` describes, so an array fits it when its elements do.
 		if type.variant == "array" and constraint.indexed then
-			return types.satisfies(type.type, constraint.indexed.type)
+			return fits(type.type, constraint.indexed.type, depth + 1)
 		end
-		if type.variant == "table" and next(constraint.fields) == nil then return true end
 		-- A class is a table as well, and the fields it declares are the ones a shape asks about:
 		-- a class is routinely built in pieces, so a field it does not name is not held against it.
 		if type.variant == "class" then
 			for name, wanted in pairs(constraint.fields) do
 				local have = type.fields[name]
-				if have and not types.satisfies(have, wanted) then return false end
+				if have and not fits(have, wanted, depth + 1) then return false end
 			end
 			return true
 		end
@@ -423,17 +502,17 @@ function types.satisfies(type, constraint)
 			-- A field the literal leaves out is nil, which is what an optional field accepts:
 			-- `---@field weight? number` does not ask the caller to write it down.
 			local have = type.fields[name] or types.NIL_TYPE
-			if not types.satisfies(have, wanted) then return false end
+			if not fits(have, wanted, depth + 1) then return false end
 		end
 		if constraint.indexed then
 			local have = type.indexed and type.indexed.type
 			if have then
-				if not types.satisfies(have, constraint.indexed.type) then return false end
+				if not fits(have, constraint.indexed.type, depth + 1) then return false end
 			else
 				-- A table of named fields is a map as well: `{ a = 1 }` fits `table<string,
 				-- number>` when each value in it does. That is what the literal's fields say.
 				for _, field in pairs(type.fields) do
-					if not types.satisfies(field, constraint.indexed.type) then return false end
+					if not fits(field, constraint.indexed.type, depth + 1) then return false end
 				end
 			end
 		end
@@ -506,13 +585,21 @@ function types.narrowTruthiness(type, wantTruthy)
 		return nil
 	end
 
-	local kept = {}
+	local kept, changed = {}, false
 	for _, member in ipairs(type.types) do
-		local known = types.truthiness(member)
-		if known == nil or known == wantTruthy then kept[#kept + 1] = member end
+		-- Each member is narrowed by the same question, so a plain `boolean` in a union becomes the
+		-- value the branch holds — `false` on the falsy side — rather than staying a whole boolean
+		-- that a later `or` cannot tell apart from its truthy half.
+		local one = types.narrowTruthiness(member, wantTruthy)
+		if one then
+			kept[#kept + 1] = one
+			if one ~= member then changed = true end
+		else
+			changed = true
+		end
 	end
 	if #kept == 0 then return nil end
-	if #kept == #type.types then return type end
+	if not changed then return type end
 	return types.union(kept)
 end
 
@@ -522,7 +609,6 @@ end
 --- Keep only the members that are nil, or only those that are not.
 ---@param type lye.doc.Type
 ---@param wantNil boolean
----@return lye.doc.Type? narrowed
 function types.narrowNil(type, wantNil)
 	if type.variant ~= "union" then
 		local isNil = type.variant == "nil"
@@ -630,7 +716,6 @@ end
 ---@param field string
 ---@param wanted lye.doc.Type the value the condition compared against
 ---@param want boolean whether the condition was the equality
----@return lye.doc.Type? narrowed
 function types.narrowDiscriminant(type, field, wanted, want)
 	---@param member lye.doc.Type
 	local function couldBe(member)
@@ -870,8 +955,21 @@ end
 ---@return lye.doc.Type
 function types.indexResult(target, field)
 	if target.variant == "unknown" or target.variant == "any" then return types.mutable() end
+	-- A value that may be more than one thing reads the field off whichever member has it, which is
+	-- the only one that can answer: `local raw = onWindows and require("a.windows") or require("a.posix")`
+	-- is a union of two modules, and asking it for a field read as unknown when one of them had it.
+	if target.variant == "union" and field then
+		local found = types.fieldOf(target, field)
+		if found then return found end
+	end
 	if target.variant == "object" and field then
-		return types.fieldOf(target, field) or types.NIL_TYPE
+		local found = types.fieldOf(target, field)
+		if found then return found end
+		-- A string index signature answers for a name as well as for a key: `table<string, integer>`
+		-- says what reading one gives, so a field the table does not list holds that rather than
+		-- nil — reading one as nil reported every `flags.anything` as a number that was not there.
+		if target.indexed and target.indexed.key == "string" then return target.indexed.type end
+		return types.NIL_TYPE
 	end
 	-- A key that is not a name, as `list[i]` writes one, is what an index signature describes.
 	if target.variant == "object" and target.indexed and not field then
@@ -1342,12 +1440,22 @@ function types.parse(text, resolve)
 		for _, field in ipairs(splitTopLevel(trimmed:sub(2, -2), 44)) do
 			-- `[integer]: T` is an index signature: every key of that kind holds T, which is how
 			-- a list is written. It is the only thing that makes a generic element reachable.
-			local key, value = field:match("^%s*%[%s*([%w_]+)%s*%]%s*:?%s*(.*)$")
+			-- The capture is trimmed: a field's text carries the spaces around it, and one left
+			-- on the end of a type becomes part of it — `string ?` ends where the space is, so the
+			-- marker a caller appended was dropped.
+			local key, value = field:match("^%s*%[%s*([%w_]+)%s*%]%s*:?%s*(.-)%s*$")
 			if key then
 				indexed = { key = key, type = types.parse(value, resolve) or types.UNKNOWN_TYPE }
 			else
-				local name, held = field:match("^%s*([%w_]+)%s*:?%s*(.*)$")
-				if name then fields[name] = types.parse(held, resolve) or types.UNKNOWN_TYPE end
+				-- `kind?: string` marks the field optional with a `?` on its own name, which is
+				-- how LuaLS writes it and what the definitions use; `kind: string?` says the same
+				-- thing with the marker on the type. Reading the name's marker as part of the type
+				-- left the field required and its type spelled `?: string`.
+				local name, marker, held = field:match("^%s*([%w_]+)%s*(%??)%s*:?%s*(.-)%s*$")
+				if name then
+					fields[name] = types.parse(marker == "?" and (held .. "?") or held, resolve)
+						or types.UNKNOWN_TYPE
+				end
 			end
 		end
 		return types.object(fields, indexed)
@@ -1448,10 +1556,16 @@ function types.displayOf(type)
 		-- A table that is only what it holds at a key reads the way an annotation writes one:
 		-- `string[]` for a list, `table<string, true>` for a set built by marking keys.
 		if next(type.fields) == nil and type.indexed and not type.metatable then
+			local inner = types.display(type.indexed.type)
 			if type.indexed.key == "integer" or type.indexed.key == "number" then
-				return types.display(type.indexed.type) .. "[]"
+				-- A union and a signature are bracketed here for the same reason the `array`
+				-- variant brackets them: `A|B[]` reads as an `B` array beside an `A`.
+				if type.indexed.type.variant == "union" or type.indexed.type.variant == "fn" then
+					inner = "(" .. inner .. ")"
+				end
+				return inner .. "[]"
 			end
-			return "table<" .. type.indexed.key .. ", " .. types.display(type.indexed.type) .. ">"
+			return "table<" .. type.indexed.key .. ", " .. inner .. ">"
 		end
 		table.sort(parts)
 		return "{ " .. table.concat(parts, ", ") .. " }"

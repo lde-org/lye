@@ -38,18 +38,46 @@ local collectAssignments, isNeverNumeric, callLabel =
 
 local checks = {}
 
----@param ctx lye.analyzer.CheckContext
+---@param first lye.parser.Node
+---@param second lye.parser.Node
+local function startsBefore(first, second)
+	return first.start < second.start
+end
 
+---@param ctx lye.analyzer.CheckContext
 local function returnHints(ctx)
 	local parsed, self = ctx.parsed, ctx.self
 	local signatures = ctx.signatures
 	local resolve = ctx.resolve
 	local inferredValuesOf = ctx.inferredValuesOf
+
+	-- Where each `---@return` line is written, so a declaration can be asked how many describe it.
+	-- A function returning two values writes two, and the first of them agreeing with the body is
+	-- not a line to drop: the second moves up into its place and every caller then reads the wrong
+	-- value, which is what deleting the `---@return string` above `---@return number excluded` did
+	-- to `makeMainLua`.
+	local written = {}
+	for _, annotation in ipairs(self.doc and self.doc.annotations or {}) do
+		if annotation.tag == "return" then written[#written + 1] = annotation.start end
+	end
+	table.sort(written)
+
+	---@param declaration lye.parser.Declaration
+	---@param previous lye.parser.Declaration?
+	local function returnsWritten(declaration, previous)
+		local from, count = previous and previous.stop or 0, 0
+		for _, start in ipairs(written) do
+			if start > from and start < declaration.start then count = count + 1 end
+		end
+		return count
+	end
+
+	local previous
 	for _, declaration in ipairs(parsed.declarations) do
 		---@type lye.analyzer.Signature?
 		local signature = declaration.name and signatures[declaration.name]
 		local annotation = signature and signature.returns
-		local written = annotation and annotation.type and types.parse(annotation.type, resolve)
+		local held = annotation and annotation.type and types.parse(annotation.type, resolve)
 		if signature and declaration.valueIdx then
 			local values = inferredValuesOf(declaration.valueIdx)
 			signature.inferred = values[1]
@@ -57,16 +85,19 @@ local function returnHints(ctx)
 			-- it, not only the value a call in an expression is worth.
 			if not signature.values then signature.inferredValues = values end
 		end
-		-- An annotation that says exactly what the body says is a line kept in step with the code for
-		-- nothing. A hint rather than a warning, since a written signature is often what a reader wants.
+		-- An annotation that says exactly what the body says is a line kept in step with the code
+		-- for nothing. A hint rather than a warning, since a written signature is often what a
+		-- reader wants. Only a lone one: with a second line below it, the line is a position.
 		local inferred = signature and signature.inferred
-		-- One value only: `---@return number, string` is one signature, and its first half agreeing says
-		-- nothing about the second. The shape has to match too, not just what it prints.
+		-- One value only: `---@return number, string` is one signature, and its first half agreeing
+		-- says nothing about the second. The shape has to match too, not just what it prints.
 		local single = annotation and annotation.type and #types.splitValues(annotation.type) == 1
-		if single and written and inferred and written.variant == inferred.variant
-			and types.display(written) == types.display(inferred) then
+			and returnsWritten(declaration, previous) == 1
+		if single and held and inferred and held.variant == inferred.variant
+			and types.display(held) == types.display(inferred) then
 			diagnostic.add(self, string.format("`---@return %s` says what the body already infers", annotation.type), annotation.start, annotation.stop, 3)
 		end
+		previous = declaration
 	end
 
 	-- A fixed type does not evolve, so every assignment is checked against it, each reported on its
@@ -88,7 +119,9 @@ end
 local function declaredMismatches(ctx)
 	local parsed, self = ctx.parsed, ctx.self
 	for _, variable in ipairs(self.variables) do
-		if variable.declared then
+		-- A name starting with `_` is a discard: what is written to it is not meant to be read, so
+		-- the type it happens to have — often a loop's own index — is not a promise to check against.
+		if variable.declared and not variable.name:match("^_") then
 			local declaration = variable.declaration
 			local message = types.mismatch(variable.declared, variable.initializer, variable.name)
 			if message then
@@ -269,12 +302,15 @@ local function deadCode(ctx)
 	end
 
 	for _, list in pairs(dead) do
-		table.sort(list, function(a, b) return a.start < b.start end)
+		table.sort(list, startsBefore)
 		local stopped, stopping = false, nil
 		for _, node in ipairs(list) do
-			-- What cannot run is what comes *after* the call that never comes back, not that call itself,
-			-- which a block may list twice. Reporting it reads as the opposite of true.
-			if stopped and node ~= stopping then
+			-- What cannot run is what comes *after* the call that never comes back. The call itself is
+			-- not it, and a block lists a statement more than once — the call, and whatever the arena
+			-- holds over the same span — so being a different node is not enough: the statement has to
+			-- begin past the end of the one that stopped. Reading it by node identity reported the
+			-- `error(...)` call as the thing that could not run, which is the opposite of true.
+			if stopped and node.start > stopping.stop then
 				diagnostic.add(self, string.format("%s never returns, so this cannot run", stopped), node.start, node.stop, 1)
 				break
 			end
@@ -333,7 +369,14 @@ local function indexedReads(ctx)
 		if node.kind == "index" and node.isDynamic == true and node.target and node.key then
 			local base = infer.at(inferCtx, node.target)
 			local key = infer.at(inferCtx, node.key)
-			if base and base.variant == "class" and not base.indexed and key and key.variant == "number" then
+			-- A value whose metatable answers `__index`/`__newindex` can be indexed whatever its
+			-- class declares: `lua.Table` is written `argTbl[0] = v` for that very reason, and the
+			-- metamethod is the class saying it holds things at keys.
+			local parent = node.parent and parsed.nodes[node.parent]
+			local isWrite = parent and parent.kind == "assignment" and parent.target == node.index
+			local answers = base and types.metamethod(base, isWrite and "__newindex" or "__index")
+			if base and base.variant == "class" and not base.indexed and not answers
+				and key and key.variant == "number" then
 				local at = parsed.nodes[node.key]
 				diagnostic.add(self, string.format("%s cannot be indexed by a number", types.display(base)),
 					at.start, at.stop)
@@ -368,23 +411,8 @@ local function globalNames(ctx)
 	-- The definitions declare globals of their own: `arg`, `_VERSION`, and whatever else the
 	-- standard library puts in the environment.
 	for name in pairs(prepared and prepared.globalNames or {}) do globals[name] = true end
-	--- The keys a table literal writes with a bare word: `{ const = true, fn = true }` names two
-	--- fields, and neither word is a name a reader is asking the environment for.
-	---@type table<integer, table<string, boolean>>
-
-	local keyTexts = {}
-	for index, fields in pairs(parsed.tableFields or {}) do
-		local names = {}
-		for key in pairs(fields) do names[key] = true end
-		keyTexts[index] = names
-	end
-
 	for _, node in ipairs(parsed.nodes) do
-		local parent = node.parent and parsed.nodes[node.parent]
-		--- Whether the word is a key a table literal writes rather than a name being read.
-		local isKey = parent and node.callee and parent.kind == "table" and node.start == node.stop
-			and keyTexts[parent.index] and keyTexts[parent.index][node.callee]
-		local name = node.kind == "prefix" and not isKey and node.callee
+		local name = node.kind == "prefix" and node.callee
 		if name then
 			local found = lookupIn(scopeAt(self, node.start), name, node.start)
 			if found then

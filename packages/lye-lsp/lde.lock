@@ -1,5 +1,13 @@
 {
 	"dependencies": {
+		"env": {
+			"commit": "0d77f4911e5538ac537cce2a436f09651c1148e1",
+			"git": "https://github.com/lde-org/env.git"
+		},
+		"fs": {
+			"commit": "54160bc07dd1afedbf449843f1564bfbd6b82960",
+			"git": "https://github.com/lde-org/fs.git"
+		},
 		"lye-analyzer": {
 			"path": "../lye-analyzer"
 		},
@@ -26,8 +34,16 @@
 		},
 		"lye-rpc": {
 			"path": "../lye-rpc"
+		},
+		"path": {
+			"commit": "72c972d5818a2b496666e00103f4d1b582c728fa",
+			"git": "https://github.com/lde-org/path.git"
+		},
+		"rapidhash": {
+			"commit": "937ef6654bd5c8afb0a3fe61593f8c2419627f89",
+			"git": "https://github.com/lde-org/rapidhash.git"
 		}
 	},
-	"manifestHash": "646c3e08f95f54f8",
+	"manifestHash": "477cffd3490530b9",
 	"version": "1"
 }

@@ -299,8 +299,8 @@ test.it("infers a type from what a name was assigned", function()
 	test.equal(typeOf("local f = function() end", "f"), "fn()", "nothing is returned, so there is no result")
 	test.equal(typeOf("local f = function(a, b) return 1 end", "f"), "fn(any, any) -> 1")
 	test.equal(typeOf("local f = function(...) return 1 end", "f"), "fn(...) -> 1")
-	-- The bare `x -> e` shorthand does not declare its parameter, so this has none yet.
-	test.equal(typeOf("local a = x -> x", "a"), "fn() -> unknown")
+	-- The bare `x -> e` shorthand names its one parameter the way the barred form does.
+	test.equal(typeOf("local a = x -> x", "a"), "fn(any) -> any")
 	test.equal(typeOf("local a = |x| -> x", "a"), "fn(any) -> any",
 		"the named parameter is declared, and the body is what it returns")
 	test.equal(typeOf("local g = true", "g"), "true")
@@ -494,6 +494,24 @@ test.it("does not resolve a name outside the block that declared it", function()
 	test.equal(#result.variables[1].references, 0, "the use after `end` is out of scope")
 end)
 
+test.it("does not carry a closed sibling scope into the next block", function()
+	local source = table.concat({
+		"do\n",
+		"\tlocal first = 1\n",
+		"\tprint(first)\n",
+		"end\n",
+		"do\n",
+		"\tlocal second = 2\n",
+		"\tprint(second)\n",
+		"end\n",
+		"print(first, second)\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	local after = offsetOf(source, "print(first, second)")
+	test.equal(analyzer.lookupAt(result, "first", after), nil)
+	test.equal(analyzer.lookupAt(result, "second", after), nil)
+end)
+
 test.it("offers only the names visible at an offset", function()
 	local source = table.concat({
 		"local outer = 1\n",
@@ -539,9 +557,14 @@ test.it("evolves a type as later assignments widen it", function()
 	test.equal(typeAtOffset(source, "x", 12), "5")
 end)
 
-test.it("does not evolve a type that an annotation fixed", function()
+test.it("takes a declared type as where a name starts and narrows it at the next write", function()
+	-- An annotation says what the name is where it is written. Every assignment below is still
+	-- checked against it — a string into a `number` is an error either way — but the name is the
+	-- written value from there on, which is what makes `x = x or default` narrow `x?` to `x`.
 	local source = "---@type number\nlocal x = 5\nx = \"foo\"\n"
-	test.equal(typeAtOffset(source, "x", #source), "number")
+	local beforeWrite = source:find('x = "foo"', 1, true) - 1
+	test.equal(typeAtOffset(source, "x", beforeWrite), "number", "the annotation, until something writes")
+	test.equal(typeAtOffset(source, "x", #source), "string", "and the last write after it")
 
 	local result = analyzer.analyze(source)
 	test.equal(#result.diagnostics, 1, "assigning a string to a number is an error")
@@ -617,8 +640,11 @@ test.it("reads a multi-value `---@type` one type per name", function()
 		"return depType, depValue\n",
 	}, "")
 	test.equal(#analyzer.analyze(source).diagnostics, 0)
-	test.equal(typeOf(source, "depType"), '"git"|"path"', "the first name takes the first type")
-	test.equal(typeOf(source, "depValue"), "string?", "and the second the second")
+	-- Read where each is written, before the assignment below replaces it.
+	test.equal(typeAtOffset(source, "depType", source:find("depType =", 1, true) - 1), '"git"|"path"',
+		"the first name takes the first type")
+	test.equal(typeAtOffset(source, "depValue", source:find("depValue =", 1, true) - 1), "string?",
+		"and the second the second")
 end)
 
 test.it("lets a class table be built by assignment", function()
@@ -1943,6 +1969,148 @@ test.it("reports a parameter annotation naming nothing the function takes", func
 		"", "the receiver a method takes is a parameter like any other")
 	test.equal(said("---@param ... number\nlocal function f(...)\n\treturn ...\nend\n"),
 		"", "the variadic parameter is annotated `...`")
+end)
+
+test.it("reads the direction a `---@cast` asserts", function()
+	-- `+T` is the value being a T and `-T` is it not being one. Discarding the marker and reading
+	-- every cast as `+` made `---@cast query -nil` assert the value *is* nil, which is the opposite
+	-- of taking the nil out of it — and the writer sees a wrong type rather than an error.
+	local function after(held, cast)
+		local source = "---@param q " .. held .. "\nlocal function f(q)\n\t" .. cast
+			.. "\n\tlocal here = 1\nend\n"
+		local result = analyzer.analyze(source)
+		local variable
+		for _, one in ipairs(result.variables) do
+			if one.name == "q" then variable = one end
+		end
+		local at = analyzer.typeAt(result, variable, source:find("local here", 1, true) + 4)
+		return at and types.display(at) or nil
+	end
+
+	test.equal(after("string?", "---@cast q -nil"), "string", "the nil comes out of an optional")
+	test.equal(after("string|number", "---@cast q -string"), "number", "and a member out of a union")
+	test.equal(after("string|number", "---@cast q -number"), "string")
+	test.equal(after("any", "---@cast q +string"), "string", "`+T` says the value is a T")
+	test.equal(after("any", "---@cast q string"), "string", "and a bare type says the same thing")
+	test.equal(after("string?", "---@cast q +nil"), "nil", "`+nil` says it is nil")
+end)
+
+test.it("does not widen a list when a nil write pops it", function()
+	-- `t[#t] = nil` removes the last element rather than storing a nil under the key, and taking
+	-- the element type to `T?` afterwards made every read of a list optional for one pop.
+	local source = "---@type string[]\nlocal pending = {}\npending[#pending + 1] = \"a\"\npending[#pending] = nil\n"
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+	test.equal(typeOf(source, "pending"), "string[]")
+end)
+
+test.it("gives a name the value at its own position in a multi-value assignment", function()
+	-- `a, b = f()` hands `b` the second value; checked against the first, every second name of a
+	-- call was reported as a value of the type that came before it.
+	local head = "---@return number, string\nlocal function pair() end\n"
+		.. "---@type number\nlocal a\n---@type string\nlocal b\n"
+	test.equal(#analyzer.analyze(head .. "a, b = pair()\n").diagnostics, 0,
+		"the second name takes the second value")
+	test.equal(#analyzer.analyze(head .. "a, b = 1, \"s\"\n").diagnostics, 0,
+		"a name with an expression of its own takes that one")
+	test.equal(#analyzer.analyze(head .. "a = 1, \"s\"\n").diagnostics, 0,
+		"and a lone name before several values takes the first")
+end)
+
+test.it("keeps the class a name was assigned, not the placeholder it settled from", function()
+	-- `cache = defaults` reads as the value written even while that value's type is still being
+	-- worked out, so `cache` is a C and not the `C?` it was declared as.
+	local source = "---@class C\nlocal C = {}\n"
+		.. "---@return C\nfunction C.new() end\n"
+		.. "---@type C?\nlocal cache = nil\nconst defaults = C.new()\n"
+		.. "---@return C\nlocal function getConfig()\n\tcache = defaults\n\treturn cache\nend\n"
+		.. "local held = cache\n"
+	local result = analyzer.analyze(source)
+	for _, entry in ipairs(result.diagnostics) do
+		-- A hint that the `@return C` is redundant is the point: the body is read as giving one.
+		test.truthy((entry.severity or 1) >= 3, "no mismatch is reported: " .. entry.message)
+	end
+	test.equal(typeOf(source, "held"), "C")
+end)
+
+test.it("evolves a method onto the class its table declares", function()
+	-- `---@class pkg.Thing` above `local Thing = {}` names the class for a table of another name,
+	-- and `function Thing:grow()` is a method of it: without the link a call through the class had
+	-- no method to read, and its arguments went unchecked.
+	local source = "---@class pkg.Thing\n---@field size number\nlocal Thing = {}\n"
+		.. "---@param by number\nfunction Thing:grow(by) end\n"
+		.. "---@param thing pkg.Thing\nlocal function use(thing)\n\tthing:grow(\"s\")\nend\n"
+	local bad = analyzer.analyze(source)
+	test.equal(#bad.diagnostics, 1)
+	test.truthy(bad.diagnostics[1].message:match("expects number"))
+	test.equal(#analyzer.analyze((source:gsub(':grow%("s"%)', ":grow(1)"))).diagnostics, 0)
+end)
+
+test.it("narrows after a guard that returns a table literal", function()
+	-- The members of a literal belong to it, not to the chunk: taken for statements they made the
+	-- clause look like it fell through, and nothing after the guard was narrowed.
+	local source = "---@return string?\nlocal function find() end\n"
+		.. "local function f()\n\tlocal tag = find()\n"
+		.. "\tif not tag then return { error = \"none\" } end\n"
+		.. "\tlocal held = tag\n\treturn held\nend\n"
+	test.equal(typeOf(source, "held"), "string")
+end)
+
+test.it("keeps a class when a fallback is written for it", function()
+	-- `opts or {}` is the class when there is one and an empty table otherwise; the fact that the
+	-- right operand only runs when `opts` was falsy must not reach back over the left one.
+	local source = "---@class Opts\n---@field name string?\n"
+		.. "---@param opts Opts?\nlocal function f(opts)\n\topts = opts or {}\n"
+		.. "\tlocal held = opts\n\treturn held\nend\n"
+	test.equal(typeOf(source, "held"), "Opts")
+end)
+
+test.it("types a field of a literal from the name as it is narrowed there", function()
+	-- The field is read where the condition holds, so it is the narrowed type and not the optional
+	-- one the name was declared with.
+	local source = "---@return string?\nlocal function find() end\n"
+		.. "local function f()\n\tlocal dir = find()\n\tif dir then\n"
+		.. "\t\t---@type { archive: string }\n\t\tlocal entry = { archive = dir }\n"
+		.. "\t\treturn entry\n\tend\nend\n"
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
+test.it("reads a string key in brackets as a field", function()
+	-- `["end"] = v` holds what `{ end = v }` holds; leaving it out made the literal miss a member
+	-- the annotation that describes it asked for.
+	local source = "---@return { duration: number, [\"end\"]: number }\n"
+		.. "local function f()\n\tlocal out = { name = \"x\", [\"end\"] = 2, duration = 1 }\n"
+		.. "\treturn out\nend\n"
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
+test.it("does not cast an expression of another branch from a trailing `@cast`", function()
+	-- `else ---@cast flag string` has no expression before it: the node ending just above the
+	-- annotation belongs to the branch that came before, and casting it turned that branch's
+	-- literal into a string.
+	local source = "---@param flag boolean\n---@return { a: number }\n"
+		.. "local function f(flag)\n\tif flag then\n\t\treturn { a = 1 }\n"
+		.. "\telse ---@cast flag string\n\t\treturn { a = 2 }\n\tend\nend\n"
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
+test.it("reads an `and`/`or` chain as the table it picks", function()
+	-- The falsy side of the middle `and` is a value of its own — `false`, not a whole boolean —
+	-- and the `or` that follows has to be able to tell it apart from the truthy side.
+	local prelude = analyzer.prelude({
+		lib = "---@param v any\n---@return string\nfunction type(v) end\n",
+	})
+	local source = "---@class Port\n---@field versions table<string, string>?\n"
+		.. "---@param existing Port?\n---@param fallback table<string, string>\n"
+		.. "local function f(existing, fallback)\n"
+		.. "\tlocal held = (existing and type(existing.versions) == \"table\") and existing.versions or fallback\n"
+		.. "\treturn held\nend\n"
+	local result = analyzer.analyze(source, prelude)
+	test.equal(#result.diagnostics, 0)
+	for _, variable in ipairs(result.variables) do
+		if variable.name == "held" then
+			test.equal(types.display(analyzer.typeAt(result, variable, #source)), "table<string, string>")
+		end
+	end
 end)
 
 return true

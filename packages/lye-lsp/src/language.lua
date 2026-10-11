@@ -112,6 +112,16 @@ end
 ---@param held lye.doc.Type?
 local function ownerOf(held)
 	if not held then return nil end
+	-- A value that may be absent still names what it is where it is one, which is the case a `?.` is
+	-- written for: `s?.:lower()` on a `string?` jumps to `string.lower`, where `s:lower()` on a
+	-- plain string already lands. Reading only the variant left every optional receiver ownerless.
+	if held.variant == "union" then
+		for _, member in ipairs(held.types) do
+			local owner = ownerOf(member)
+			if owner then return owner end
+		end
+		return nil
+	end
 	if held.variant == "class" then return held.name end
 	if held.variant == "string" then return "string" end
 	-- A value written as a string literal is a string: `("a b"):gsub("%s+", "-")` reads `string`'s
@@ -148,9 +158,9 @@ local DOC_TAG_NAME = "[%a_][%w_]*"
 ---@field analysis table<string, lye.parser.Result>
 ---@field names table<string, lye.analyzer.Result>
 ---@field packageRoots table<string, string|boolean>? which package each path belongs to, by `find`
+---@field packageNames table<string, table<string, boolean>>? the names each package's `target/` declares
 ---@field modules table<string, { text: string, type: lye.doc.Type? }>? what each required file gives
 ---@field requiring table<string, boolean>? the files being required now, so a cycle ends
----@field declared table<string, boolean|lye.doc.Type>? the names the open documents declare
 ---@field declaredBy table<string, table<string, boolean|lye.doc.Type>> what each document declares, kept after its analysis is dropped
 ---@field known table<string, boolean>? the names every file in the workspace declares
 ---@field order string[] the documents whose analyses are held, least recently used first
@@ -176,7 +186,7 @@ function Lye:moduleNames(prefix)
 	local found, seen = {}, {}
 	if root then
 		local pipe = io.popen(string.format(
-			"find %q -name '*.lua' -not -path '*/target/*' -not -path '*/.git/*' 2>/dev/null", root))
+			"find %q -type f -name '*.lua' -not -path '*/target/*' -not -path '*/.*/*' 2>/dev/null", root))
 		if pipe then
 			for path in pipe:lines() do
 				local relative = path:sub(#root + 2)
@@ -361,7 +371,7 @@ function Lye:moduleType(name, from)
 	self.requiring[path] = true
 	-- The module's own `require`s resolve within *its* package: a dependency's file is a document
 	-- of that package, and what it can reach is what lde linked into that package's `target/`.
-	local names = analyzer.analyze(written, PRELUDE, self:declaredTypes(), function(inner)
+	local names = analyzer.analyze(written, PRELUDE, self:declaredTypes("file://" .. path), function(inner)
 		return self:moduleType(inner, "file://" .. path)
 	end)
 	self.requiring[path] = nil
@@ -396,13 +406,16 @@ function Lye:workspaceDeclarations()
 	local root = self.server.rootPath
 	if root then
 		local pipe = io.popen(string.format(
-			"find %q -name '*.lua' -not -path '*/target/*' -not -path '*/.git/*' | head -2000", root))
+			"find %q -type f -name '*.lua' -not -path '*/target/*' -not -path '*/.*/*' | head -2000", root))
 		if pipe then
 			for file in pipe:lines() do
 				local handle = io.open(file, "rb")
-				if handle then
-					local source = handle:read("*a")
-					handle:close()
+				-- A read that comes back with nothing is not a file this can read — a directory
+				-- opens and then reads as nil — and skipping it is the difference between one file
+				-- going unchecked and the whole workspace never being analysed.
+				local source = handle and handle:read("*a")
+				if handle then handle:close() end
+				if type(source) == "string" then
 					for _, annotation in ipairs(doc.parse(source).annotations) do
 						if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name then
 							known[annotation.name] = true
@@ -418,19 +431,63 @@ function Lye:workspaceDeclarations()
 end
 
 ---@param self lye.Server
-function Lye:declaredTypes()
-	if self.declared then return self.declared end
+--- The names the modules linked into a package's `target/` declare.
+---
+--- This is what a project laid out as several lde packages needs and a flat repository does not:
+--- the modules a document can `require` are exactly the ones lde linked beside it, and a
+--- dependency's classes are as real to it as its own. `target/` is left out of the workspace walk
+--- — it mirrors other packages and would be walked many times over — so it is read here, once per
+--- package, and only for the package the document belongs to.
+---@param self lye.Server
+---@param root string the package root
+---@return table<string, boolean>
+function Lye:packageDeclarations(root)
+	self.packageNames = self.packageNames or {}
+	local held = self.packageNames[root]
+	if held ~= nil then return held end
+	local found = {}
+	local pipe = io.popen(string.format(
+		"find -L %q -type f -name '*.lua' -not -path '*/.*/*' 2>/dev/null | head -2000", root .. "/target"))
+	if pipe then
+		for file in pipe:lines() do
+			local handle = io.open(file, "rb")
+			local source = handle and handle:read("*a")
+			if handle then handle:close() end
+			if type(source) == "string" then
+				local isOk, file_ = pcall(doc.parse, source)
+				for _, annotation in ipairs(isOk and file_.annotations or {}) do
+					if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name then
+						found[annotation.name] = true
+					end
+				end
+			end
+		end
+		pipe:close()
+	end
+	self.packageNames[root] = found
+	return found
+end
+
+---@param self lye.Server
+---@param uri string? the document the names are for, which decides which package's modules count
+---@return table<string, boolean|lye.doc.Type>
+function Lye:declaredTypes(uri)
 	local found = {}
 	-- The workspace first, so a name another file declares is known even when that file is closed;
 	-- an open document's own answer then replaces it with the type itself where one can be built.
 	for name in pairs(self:workspaceDeclarations()) do found[name] = true end
+	-- Then what the document's own package can reach: a monorepo is several packages, and each
+	-- resolves its `require`s through its own `target/`.
+	local root = uri and self:packageRoot(uri)
+	if root then
+		for name in pairs(self:packageDeclarations(root)) do found[name] = true end
+	end
 	-- From what each document declared rather than from the analysis it had: a document whose
 	-- analysis was dropped to keep the process small still declares everything it did, so an
 	-- annotation in another file naming that class goes on meaning it.
 	for _, declarations in pairs(self.declaredBy) do
 		for name, held in pairs(declarations) do found[name] = held end
 	end
-	self.declared = found
 	return found
 end
 
@@ -467,7 +524,7 @@ function Lye:analyze(uri, from)
 	-- comments this needs. Parsing the same text a second time is a third of the cost of a
 	-- keystroke on a large file, for the same tree.
 	local previous = from and self.analysis[uri]
-	local names = analyzer.analyze(document.text, PRELUDE, self:declaredTypes(), function(name)
+	local names = analyzer.analyze(document.text, PRELUDE, self:declaredTypes(uri), function(name)
 		return self:moduleType(name, uri)
 	end, previous and Parser.resumeAt(previous, from) or nil)
 	local result = names.parser
@@ -476,7 +533,6 @@ function Lye:analyze(uri, from)
 	if names.doc then self.declaredBy[uri] = declarationsOf(names.doc) end
 	-- The names other documents declare are built from what each of them declared, and this
 	-- document has just declared its own.
-	self.declared = nil
 	-- Type errors from annotations belong in the same list as syntax errors.
 	for _, entry in ipairs(names.diagnostics) do
 		result.diagnostics[#result.diagnostics + 1] = entry
@@ -683,6 +739,15 @@ local function typeOfExpression(result, idx, offset)
 			return analyzer.fieldTypeAt(result, base, baseName, node.field, offset)
 		end
 	end
+	if node.kind == "binary" then
+		-- A value written as an expression is still a value: `(s or ""):lower()` calls a method on
+		-- what the `or` gave. Only `prefix`, `index`, `call` and a literal were read here, so a
+		-- grouped `or` — the shape a writer reaches for exactly when a value may be absent —
+		-- resolved to nothing at all.
+		local left, right = typeOfExpression(result, node.left, offset), typeOfExpression(result, node.right, offset)
+		if left and right then return types.binaryResult(node.op or "", left, right) end
+		return nil
+	end
 	if node.kind == "call" then
 		-- A generic result belongs to the call rather than to the function, so the analyzer's
 		-- binding is read first and the callee's own return type is the fallback.
@@ -813,11 +878,19 @@ end
 
 --- The last byte of a value expression. A `prefix` node spans the first byte of its name, so the
 --- name's own length says where it ends. Everything else spans what it reads.
+--- A grouped expression is the exception: the node spans its opening `(` alone, so its inner
+--- expression's end is one byte short of where the value ends — and every reader of the text after
+--- it, like the `:` of a method call, was one byte out because of that.
 --- The tree is read from either: an analysis carries the parser's result and both hold the nodes.
 ---@param result lye.parser.Result|lye.analyzer.Result
 ---@param node lye.parser.Node
 local function valueStop(result, node)
-	if node.group then return valueStop(result, result.nodes[node.group]) end
+	-- An analysis carries the parser's result rather than the nodes themselves, so the arena is
+	-- reached through whichever of the two was handed over. Reading `result.nodes` alone raised on
+	-- every grouped expression, and because the walk is one loop the raise took the whole answer
+	-- with it — which is why a method written on `(a or b)` resolved to nothing at all.
+	local nodes = result.nodes or (result.parser and result.parser.nodes)
+	if node.group then return valueStop(result, nodes[node.group]) + 1 end
 	if node.kind == "prefix" and node.callee then return node.start + #node.callee - 1 end
 	return node.stop
 end
@@ -838,6 +911,20 @@ local function writtenName(result, node, source)
 	end
 	if node.callee then return node.callee end
 	return (source:sub(node.start, valueStop(result, node)))
+end
+
+--- Where the name of an access starts: past the guard and the separator that introduce it. The
+--- guard `?.` is two bytes and the `.`, `:` or `[` of the access itself is one more, so `a?.b`
+--- names its field one byte later than `a.b`, and `a?.:m()` and `t?.[k]` two bytes later than
+--- `a:m()` and `t[k]`. Reading the run as the single one it is without a guard named every guarded
+--- field early — the name was there, and what was coloured was the byte before it.
+---@param text string
+---@param targetStop integer
+local function fieldStartAt(text, targetStop)
+	local at = targetStop + 1
+	if text:sub(at, at + 1) == "?." then at = at + 2 end
+	local delimiter = text:sub(at, at)
+	return (delimiter == "." or delimiter == ":" or delimiter == "[") and at + 1 or at
 end
 
 --- The expression node holding an offset, innermost first. Spans are enough: the arena already
@@ -1108,7 +1195,9 @@ end
 ---@return table?
 function Lye:onDefinition(params)
 	local uri, text, index, names, offset = self:resolvePosition(params)
-	if not uri then return nil end
+	-- A document the server has not read has no text and no analysis, and there is nothing to
+	-- define in it.
+	if not uri or not text or not names then return nil end
 
 	local target = self:targetAt(uri, text, names, offset)
 	if not target then return nil end
@@ -1173,9 +1262,13 @@ function Lye:onSemanticTokens(params)
 				end
 			elseif node.kind == "call" and node.isMethod == true and node.field then
 				-- `s:sub(2)` calls the field its receiver holds, so the name is a method rather
-				-- than a variable nothing declares, which is what left it uncoloured.
-				local target = node.target and names.parser.nodes[node.target]
-				local fieldStart = target and target.stop and (target.stop + 2)
+				-- than a variable nothing declares, which is what left it uncoloured. Where the
+				-- name starts comes from `valueStop`, not from the node's own span: a receiver
+				-- written as an expression records only its opening `(`, so `(a or b):lower()`
+				-- coloured a byte two past the bracket and left the name plain.
+				local target = node.target and result.nodes[node.target]
+				local stop = target and valueStop(result, target)
+				local fieldStart = stop and fieldStartAt(text, stop)
 				if fieldStart and not kinds[fieldStart] then kinds[fieldStart] = "method" end
 			end
 		end
@@ -1495,24 +1588,37 @@ local COMPLETION_KIND = {
 --- sides of a union. A field the class keeps to itself is left out, since reading one is reported.
 ---@param type lye.doc.Type
 ---@param out table<string, lye.doc.Type>
-local function collectFields(type, out)
+---@param type lye.doc.Type
+---@param out table<string, lye.doc.Type>
+---@param result lye.analyzer.Result?
+---@param offset integer?
+local function collectFields(type, out, result, offset)
 	if type.variant == "class" or type.variant == "object" then
 		for name, field in pairs(type.fields or {}) do
 			local visibility = type.visibility and type.visibility[name]
 			if not out[name] and visibility ~= "private" then out[name] = field end
 		end
-		for _, parent in ipairs(type.parents or {}) do collectFields(parent, out) end
+		for _, parent in ipairs(type.parents or {}) do collectFields(parent, out, result, offset) end
 	elseif type.variant == "union" then
-		for _, member in ipairs(type.types) do collectFields(member, out) end
+		for _, member in ipairs(type.types) do collectFields(member, out, result, offset) end
+	elseif result and offset then
+		-- A value of a base type reads the library of the same name: `s:lower()` is `string.lower`.
+		-- That library is a global the definitions declare, so it is read the way any other name is
+		-- — the class the prelude holds is the annotations as written, not a type with fields.
+		-- Without this a method on a string, the commonest receiver there is, completed to nothing
+		-- while `math.floor` resolved, because `math` is a class of its own.
+		local variable = analyzer.lookupAt(result, type.variant, offset)
+		local library = variable and analyzer.typeAt(result, variable, offset)
+		if library and library ~= type then collectFields(library, out, result, offset) end
 	end
 end
 
 --- Everything a value carries, by name.
 ---@param type lye.doc.Type
 ---@return table<string, lye.doc.Type>
-local function fieldsOf(type)
+local function fieldsOf(type, result, offset)
 	local out = {}
-	collectFields(type, out)
+	collectFields(type, out, result, offset)
 	return out
 end
 
@@ -1537,7 +1643,7 @@ local function accessAt(result, source, offset)
 			local target = result.parser.nodes[node.target]
 			-- The field starts after the `.` or `:` that follows the value it is read on.
 			local targetStop = target and valueStop(result, target)
-			local fieldStart = targetStop and (targetStop + 2)
+			local fieldStart = targetStop and fieldStartAt(source, targetStop)
 			local upToCursor = targetStop and source:sub(targetStop, offset - 1)
 			if fieldStart and fieldStart <= offset
 				and not upToCursor:find("\n", 1, true) then
@@ -1556,7 +1662,7 @@ local function accessAt(result, source, offset)
 			-- field name — `t[i]` reads one the writer named elsewhere.
 			local target = result.parser.nodes[node.target]
 			local targetStop = target and valueStop(result, target)
-			local keyStart = targetStop and (targetStop + 2)
+			local keyStart = targetStop and fieldStartAt(source, targetStop)
 			if keyStart and keyStart <= offset and (not found or keyStart > found.start) then
 				local typed = source:sub(keyStart, offset - 1)
 				local opening = typed:sub(1, 1)
@@ -1675,7 +1781,7 @@ function Lye:onCompletion(params)
 		local base = typeOfExpression(names, target, offset)
 		if base then
 			local signatures = names.signatures or {}
-			for name, field in pairs(fieldsOf(base)) do
+			for name, field in pairs(fieldsOf(base, names, offset)) do
 				if prefix == "" or name:sub(1, #prefix) == prefix then
 					local kind = COMPLETION_KIND.field
 					local item = { label = name, kind = kind, detail = types.display(field) }
@@ -1782,7 +1888,9 @@ function Lye:onDocumentChanged(params, atOnce)
 	self:forget(uri)
 
 	if atOnce then
-		local result = self:analyze(uri, params)
+		-- The document is newly opened, so there is no earlier text to read the change against:
+		-- `forget` above has just dropped what was held for it.
+		local result = self:analyze(uri)
 		if result then self:publishDiagnostics(uri, result) end
 		return
 	end
@@ -1810,7 +1918,6 @@ function Lye:forget(uri)
 	for index = #self.order, 1, -1 do
 		if self.order[index] == uri then table.remove(self.order, index) end
 	end
-	self.declared = nil
 end
 
 --- The byte a change starts at, against the text the held analysis was for: the statement to
@@ -1942,7 +2049,9 @@ end
 function Lye:onTypeDefinition(params)
 	local uri, text, index, names, offset = self:resolvePosition(params)
 	local result = names and names.parser
-	if not names or not result then return nil end
+	-- The text is there whenever an analysis is: the one is read from the other. Saying so keeps
+	-- the position resolvers below from taking a nil source.
+	if not uri or not names or not result or not text then return nil end
 
 	-- A type named in an annotation is already a type; what it needs is where it is declared.
 	local target = self:targetAt(uri, text, names, offset)
@@ -2683,16 +2792,17 @@ function Lye:workspaceSymbols()
 		self.workspace = out
 		return out
 	end
-	local pipe = io.popen(string.format("find %q -name '*.lua' -not -path '*/target/*' -not -path '*/.git/*' | head -2000", root))
+	local pipe = io.popen(string.format("find %q -type f -name '*.lua' -not -path '*/target/*' -not -path '*/.*/*' | head -2000", root))
 	if not pipe then
 		self.workspace = out
 		return out
 	end
 	for file in pipe:lines() do
 		local handle = io.open(file, "rb")
-		if handle then
-			local source = handle:read("*a")
-			handle:close()
+		-- A directory named like a file opens and then reads as nil, which is not a document.
+		local source = handle and handle:read("*a")
+		if handle then handle:close() end
+		if type(source) == "string" then
 			-- A symbol is a name the file declares, so the tree is all that is needed: analysing
 			-- every file of a project to list them typed and checked a workspace nobody asked
 			-- about, and one request over 126 files took the process from 17 MiB to 44.
@@ -2832,8 +2942,7 @@ function Lye:register()
 	server:on(method.workspaceDidChangeWatchedFiles, function()
 		self.workspace = nil
 		self.known = nil
-		self.declared = nil
-	end)
+		end)
 end
 
 ---@return lye.Server

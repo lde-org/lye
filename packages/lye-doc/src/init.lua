@@ -29,7 +29,6 @@ local doc = {}
 
 ---@class lye.doc.File
 ---@field annotations lye.doc.Annotation[]
----@field byOffset table<integer, lye.doc.Annotation[]> annotations whose stop is below a key
 
 -- Tags this reader understands, and whether they name an identifier.
 local TAGS = {
@@ -110,8 +109,16 @@ local function parse(comment, start, stop)
 		annotation.name = name
 		annotation.type = trim(remaining or "")
 		annotation.typeText = annotation.type
-		-- The marker belongs to the type, not the name: an optional parameter can be nil.
-		if marker == "?" then annotation.type = (annotation.type or "") .. "?" end
+		-- The marker belongs to the type, not the name: an optional parameter can be nil. A
+		-- signature is bracketed first, because `fun(s: string): string?` is a function that returns
+		-- something which may be absent, where `(fun(s: string): string)?` is the parameter itself —
+		-- a function, or nothing. Appending it loose made every optional callback a callback that
+		-- returns nil, which then disagreed with the field it was handed to.
+		if marker == "?" then
+			local written = annotation.type or ""
+			local signature = written:match("^fun%s*%(") or written:match("^fn%s*%(")
+			annotation.type = signature and ("(" .. written .. ")?") or (written .. "?")
+		end
 	elseif tag == "field" or tag == "alias" or tag == "generic" or tag == "class" then
 		local name, remaining = rest:match("^([%w_%.]+)(.*)$")
 		annotation.name = name
@@ -164,7 +171,9 @@ function doc.parse(source, tokens)
 	local continued = nil
 	-- The parser lexes the same text on its way to a tree, and a caller that has done so already
 	-- hands the tokens over rather than paying for a second pass over every byte.
-	tokens = tokens or lexer.tokenize(source)
+	-- Only the comments are wanted, and asking the full lexer for them means scanning every name,
+	-- number and operator on the way to the ones this reads.
+	tokens = tokens or lexer.comments(source)
 	for at = 1, tokens.count do
 		local token = tokens.arena[at]
 		if token.kind == lexer.KIND.comment then

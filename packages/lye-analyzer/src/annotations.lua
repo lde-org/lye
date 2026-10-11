@@ -54,16 +54,31 @@ local function kindToType(kind, returns)
 end
 
 --- Every assignment, as `name`, the offset it happened at, and the arena index of the value.
---- The tree supplies all three, so nothing is recovered by scanning spans.
+--- The tree supplies all three, so nothing is recovered by scanning spans. A name past the last
+--- expression of the statement records which value of it the name takes.
 ---@param parsed lye.parser.Result
----@return { name: string, at: integer, valueIdx: integer }[]
+---@return { name: string, at: integer, valueIdx: integer, valuePosition: integer? }[]
 local function collectAssignments(parsed)
 	local found = {}
 	for _, node in ipairs(parsed.nodes) do
-		if node.kind == "assignment" then
-			local name = targetName(parsed, node.target)
-			if name and node.value then
-				found[#found + 1] = { name = name, at = node.start, valueIdx = node.value }
+		if node.kind == "assignment" and node.value then
+			local names = node.targets
+			if names then
+				for index, target in ipairs(names) do
+					local name = targetName(parsed, target)
+					if name then
+						found[#found + 1] = {
+							name = name, at = node.start,
+							valueIdx = node.targetValues and node.targetValues[index] or node.value,
+							valuePosition = node.targetPositions and node.targetPositions[index] or 1,
+						}
+					end
+				end
+			else
+				local name = targetName(parsed, node.target)
+				if name then
+					found[#found + 1] = { name = name, at = node.start, valueIdx = node.value }
+				end
 			end
 		end
 	end
@@ -124,6 +139,11 @@ local function annotationSpan(parsed, declaration)
 		index -= 1
 	end
 	if not first then return nil end
+	-- And the block has to reach the declaration: what is written above a blank line describes
+	-- nothing, and a declaration taking it anyway is how a class left behind by an edit became the
+	-- type of whatever was written next. Only the last line of the block is checked, because the
+	-- lines above it are the same block.
+	if blankBetween(source, tokens[anchorIdx - 1].stop, tokens[anchorIdx].start) then return nil end
 	return tokens[first].start, tokens[anchorIdx - 1].stop
 end
 

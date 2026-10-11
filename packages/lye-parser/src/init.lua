@@ -307,7 +307,13 @@ function Parser:advance()
 end
 
 ---@return boolean
+--- Whether the next token worth reading is `text`. A comment is not worth reading: it is content
+--- the annotation pass wants, but it is written between any two tokens — `f(a --[[t]], b)` and
+--- `if x --[[ why ]] then` are both ordinary — so asking what comes next means asking past them.
+---@param text string
+---@return boolean
 function Parser:check(text)
+	self:skipComments()
 	local token = self:peek()
 	return token.kind ~= lexer.KIND.eof and self.texts[token.index] == text
 end
@@ -323,6 +329,7 @@ end
 
 ---@return boolean
 function Parser:checkAny(candidates)
+	self:skipComments()
 	local text = self:text(self:peek())
 	for _, candidate in ipairs(candidates) do
 		if text == candidate then return true end

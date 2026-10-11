@@ -56,7 +56,6 @@ end
 ---@param text string
 ---@return string name
 ---@return string? args
-
 local function splitGeneric(text)
 	local openAt = text:find("<", 1, true)
 	if not openAt then return text, nil end

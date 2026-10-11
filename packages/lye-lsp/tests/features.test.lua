@@ -749,4 +749,111 @@ test.it("jumps to a class from an annotation and to a builtin from code", functi
 	test.truthy(target.uri:match("lye/defs/math%.lua"), target.uri)
 end)
 
+test.it("reads a method written on a grouped value", function()
+	-- `(s or ""):lower()` is how a value that may be absent is called on, and the walk back from
+	-- the `:` has to reach through the group. Two things were missing for it: the group was read
+	-- from `result.nodes`, which an analysis does not carry, and a value written as an expression
+	-- was not typed at all — so the whole answer came back empty rather than wrong.
+	local source = table.concat({
+		"---@param query string # already lowercased\n",
+		"---@param s string?\n",
+		"---@return boolean\n",
+		"local function matches(query, s)\n",
+		"\treturn (s or \"\"):lower():find(query, 1, true) ~= nil\n",
+		"end\n",
+		"print(matches)\n",
+	}, "")
+
+	-- The cursor just after the first `:`, which is where an editor asks what can come next.
+	local line = "(\treturn (s or \"\"):"
+	local at = { line = 4, character = #line }
+	local results = run({ request(2, "textDocument/completion", at) }, source)
+	local labels = {}
+	for _, item in ipairs(results["2"] and results["2"].items or {}) do
+		labels[#labels + 1] = item.label
+	end
+	local found = {}
+	for _, label in ipairs(labels) do found[label] = true end
+	test.truthy(found["lower"], "`lower` is offered on the group: " .. table.concat(labels, " "))
+	test.truthy(found["len"], "and the rest of the string library with it")
+
+	-- And the same on a plain receiver, which always worked: the two must not disagree.
+	local same = run({ request(2, "textDocument/completion", { line = 1, character = #"\treturn s:" }) },
+		"---@param s string\nlocal function f(s)\n\treturn s:lower()\nend\nprint(f)\n")
+	test.truthy(same["2"] and #(same["2"].items or {}) > 5,
+		"a method on a plain receiver is offered too")
+end)
+
+
+test.it("reads an access a guard is written before", function()
+	-- `?.` guards whatever suffix follows it, and it is two bytes where a plain access writes one:
+	-- `a?.:m()` puts three between the value and the name, where `a:m()` puts one. A reader that
+	-- measured that gap as one byte named the field a byte early — the name was there and what was
+	-- read was the byte before it, so a guarded method call went uncoloured, and its completion
+	-- came back as the globals rather than the fields of the value.
+	local source = table.concat({
+		"local s = \"Hello\"\n",
+		"local t = { alpha = 1 }\n",
+		"print(s?.:upper())\n",
+		"print(t?.al)\n",
+		"print(t?.)\n",
+	}, "")
+
+	-- The cursor just after the `:`, which is where an editor asks what can come next.
+	local results = run({ request(2, "textDocument/completion", { line = 2, character = #"print(s?.:" }) }, source)
+	local labels = {}
+	for _, item in ipairs(results["2"] and results["2"].items or {}) do labels[item.label] = true end
+	test.truthy(labels["upper"] and labels["lower"], "the string library is offered after `?.:`")
+
+	-- Nothing written after the guard yet, which is the state a reader types it in: the guard read
+	-- no field there and the node it should have named was never emitted.
+	local half = run({ request(2, "textDocument/completion", { line = 4, character = #"print(t?." }) }, source)
+	local names = {}
+	for _, item in ipairs(half["2"] and half["2"].items or {}) do names[#names + 1] = item.label end
+	test.equal(#names, 1, "the fields of the value are offered: " .. table.concat(names, " "))
+	test.equal(names[1], "alpha")
+
+	local tokens = run({ request(2, "textDocument/semanticTokens/full", {}) }, source)
+	local data = tokens["2"] and tokens["2"].data or {}
+	local line, start, seen = 0, 0, {}
+	for at = 1, #data, 5 do
+		local deltaLine, deltaStart = data[at], data[at + 1]
+		line += deltaLine
+		start = deltaLine == 0 and (start + deltaStart) or deltaStart
+		seen[string.format("%d:%d", line, start)] = TYPES[data[at + 3] + 1]
+	end
+	test.equal(seen["2:10"], "method", "the name after `?.:` is the method it is")
+	test.equal(seen["3:9"], "property", "and a guarded field is the property it is")
+end)
+
+test.it("reads a field on a value that may be absent", function()
+	-- `string?` is what a value that may be missing is typed as, and a missing value is what a `?.`
+	-- is written for — so a receiver that may be nil lost every field it had, with the guard or
+	-- without one. A string reads the `string` table's fields, and the nil member of the union reads
+	-- none of them; asking whether the value *is* a string answered for the whole union at once.
+	local source = table.concat({
+		"---@param s string?\n",
+		"local function f(s)\n",
+		"  return s?.lower()\n",
+		"end\n",
+		"print(f)\n",
+	}, "")
+
+	local at = { line = 2, character = #"  return s?.l" }
+	local results = run({
+		request(2, "textDocument/hover", at),
+		request(3, "textDocument/definition", at),
+		request(4, "textDocument/completion", { line = 2, character = #"  return s?." }),
+	}, source)
+
+	local hover = results["2"]
+	test.truthy(hover and hover.contents.value:match("lower"), "the method is described")
+	local target = results["3"]
+	test.truthy(target and target.uri:match("lye/defs/string%.lua"),
+		"and found in the string library: " .. tostring(target and target.uri))
+	local labels = {}
+	for _, item in ipairs(results["4"] and results["4"].items or {}) do labels[item.label] = true end
+	test.truthy(labels["lower"] and labels["upper"], "and the library is offered after the guard")
+end)
+
 return true

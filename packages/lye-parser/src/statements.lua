@@ -276,18 +276,48 @@ function statements.parseExpressionStatement(self)
 	local text = self:text(token)
 
 	if text == "=" or text == "," then
+		local firstTarget = target
+		local targets
 		while self:accept(",") do
+			if not targets then targets = { firstTarget } end
 			target = self:parsePrefix(true)
+			targets[#targets + 1] = target
 		end
 		self:expect("=")
-		local valueIdx
-		repeat
-			-- The last value is the one the tree links; several targets with several values
-			-- is not modelled yet.
-			valueIdx = self:parseExpression()
-		until not self:accept(",")
+		local firstValue = self:parseExpression()
+		local valueIdxs
+		while self:accept(",") do
+			if not valueIdxs then valueIdxs = { firstValue } end
+			valueIdxs[#valueIdxs + 1] = self:parseExpression()
+		end
+		-- The last value is the one the tree links. One name and one value is what almost every
+		-- assignment is, and it carries nothing more than that: the lists below are for the rest.
+		local lastTarget, lastValue = target, valueIdxs and valueIdxs[#valueIdxs] or firstValue
+		if targets == nil and valueIdxs == nil then
+			self:emit("assignment", start, self.arena[self.index - 1].stop,
+				{ target = lastTarget, value = lastValue }, lastTarget, lastValue)
+			return
+		end
+		-- A name past the last expression takes its value at that position in it, the way a name
+		-- in a declaration does: `ok, err = pcall(f)` gives `err` the second value of the call.
+		-- Every other name takes the expression written for it.
+		local allTargets = targets or { firstTarget }
+		local allValues = valueIdxs or { firstValue }
+		local values, positions = {}, {}
+		for index = 1, #allTargets do
+			if index <= #allValues then
+				values[index], positions[index] = allValues[index], 1
+			else
+				values[index] = allValues[#allValues]
+				positions[index] = index - #allValues + 1
+			end
+		end
 		self:emit("assignment", start, self.arena[self.index - 1].stop,
-			{ target = target, value = valueIdx }, target, valueIdx)
+			{
+				target = lastTarget, targets = allTargets, targetValues = values,
+				targetPositions = positions, value = lastValue,
+			},
+			lastTarget, lastValue)
 		return
 	end
 

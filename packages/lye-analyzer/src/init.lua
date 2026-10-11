@@ -46,6 +46,10 @@ local analyzer = {}
 ---@field variables table<string, lye.analyzer.Variable[]> the declarations of each name
 ---@field children lye.analyzer.Scope[]
 ---@field facts table<string, lye.analyzer.Narrowing[]> conditions that hold over this scope
+---@field lastLookupName string?
+---@field lastLookupOffset integer?
+---@field lastLookupResult lye.analyzer.Variable?
+---@field hasLastLookup boolean?
 
 --- What a condition says about its subject, read from the expression node guarding a block.
 ---@class lye.analyzer.Condition
@@ -123,6 +127,9 @@ local analyzer = {}
 ---@field parser lye.parser.Result
 ---@field doc lye.doc.File the annotations the analysis read
 ---@field root lye.analyzer.Scope
+---@field scopes lye.analyzer.Scope[] sorted by start offset for lexical lookup
+---@field lastScope lye.analyzer.Scope?
+---@field lastScopeOffset integer?
 ---@field variables lye.analyzer.Variable[]
 ---@field byStart table<integer, lye.analyzer.Variable>
 ---@field diagnostics lye.analyzer.Diagnostic[]
@@ -130,6 +137,7 @@ local analyzer = {}
 ---@field returns table<string, lye.doc.Type>
 ---@field callTypes table<integer, lye.doc.Type> what each call was bound to, by node index
 ---@field module lye.doc.Type? what `require` of this file means, when it returns a table
+---@field ffiC lye.doc.Type? the functions `ffi.C` reaches, when this file declared any
 
 ---@param result lye.parser.Result
 ---@return lye.analyzer.Scope
@@ -142,9 +150,9 @@ local ARITHMETIC = {
 local function buildScopes(result)
 	local root = { start = 1, stop = math.huge, depth = 0, variables = {}, children = {}, facts = {} }
 	local byRecord = {}
-	local scopes = {}
-	for _, node in ipairs(result.scopes) do scopes[#scopes + 1] = node end
-	table.sort(scopes, function(a, b)
+	local records = {}
+	for _, node in ipairs(result.scopes) do records[#records + 1] = node end
+	table.sort(records, function(a, b)
 		if a.start ~= b.start then return a.start < b.start end
 		return a.stop > b.stop
 	end)
@@ -166,7 +174,8 @@ local function buildScopes(result)
 		return scope
 	end
 
-	for _, node in ipairs(scopes) do
+	local scopes = {}
+	for _, node in ipairs(records) do
 		local parent = innermost(root, node.start, node.stop)
 		local scope = {
 			start = node.start, stop = node.stop, parent = parent, depth = parent.depth + 1,
@@ -174,25 +183,27 @@ local function buildScopes(result)
 		}
 		parent.children[#parent.children + 1] = scope
 		byRecord[node] = scope
+		scopes[#scopes + 1] = scope
 	end
-	return root, byRecord
+	return root, byRecord, scopes
 end
 
 ---@param self lye.analyzer.Result
 ---@param offset integer
 local function scopeAt(self, offset)
-	local scope = self.root
-	while true do
-		local children = scope.children
-		local low, high = 1, #children
-		while low <= high do
-			local mid = math.floor((low + high) / 2)
-			if children[mid].start <= offset then low = mid + 1 else high = mid - 1 end
-		end
-		local candidate = children[high]
-		if not candidate or offset > candidate.stop then return scope end
-		scope = candidate
+	if self.lastScope and self.lastScopeOffset == offset then return self.lastScope end
+	local scopes = self.scopes
+	local low, high = 1, #scopes
+	while low <= high do
+		local mid = math.floor((low + high) / 2)
+		if scopes[mid].start <= offset then low = mid + 1 else high = mid - 1 end
 	end
+	local scope = scopes[high]
+	while scope and offset > scope.stop do scope = scope.parent end
+	scope = scope or self.root
+	self.lastScopeOffset = offset
+	self.lastScope = scope
+	return scope
 end
 
 --- Resolve a name where it is read: an inner declaration of the same name only takes over
@@ -202,19 +213,31 @@ end
 ---@param offset integer
 ---@return lye.analyzer.Variable?
 local function lookupIn(scope, name, offset)
-	local current = scope
+	if scope.hasLastLookup and scope.lastLookupName == name and scope.lastLookupOffset == offset then
+		return scope.lastLookupResult
+	end
+	local current, result = scope
 	while current do
-		-- A name declared twice in one scope shadows itself, and the variables are in declaration order,
-		-- so the last one starting at or before the read is the one the name means there.
 		local declared = current.variables[name]
 		if declared then
 			for index = #declared, 1, -1 do
-				local found = declared[index]
-				if found.start <= offset then return found end
+				local candidate = declared[index]
+				-- A local is visible after its initializer, but its own name stays a declaration target.
+				if offset >= (candidate.visibleFrom or candidate.start)
+					or (offset >= candidate.start and offset <= candidate.stop) then
+					result = candidate
+					break
+				end
 			end
 		end
+		if result then break end
 		current = current.parent
 	end
+	scope.lastLookupName = name
+	scope.lastLookupOffset = offset
+	scope.lastLookupResult = result
+	scope.hasLastLookup = true
+	return result
 end
 
 
@@ -391,7 +414,13 @@ function analyzer.fieldTypeAt(self, base, baseName, field, offset)
 	-- A string reads the `string` table's fields, because Lua points the string metatable's `__index`
 	-- at it. That is how the environment is arranged, so this layer owns the rule.
 	local held
-	if base.variant == "string" then
+	-- `ffi.C` reaches the functions the file's own cdef declared, and the name is what says so: the
+	-- far side is read the way `ffi.cdef`, `ffi.new` and `ffi.load` are, since a file that requires
+	-- `ffi` has that name for it whether or not the definitions were reached to type the table.
+	if field == "C" and baseName == "ffi" and self.ffiC then
+		return self.ffiC
+	end
+	if types.mayBe(base, "string") then
 		local library = analyzer.lookupAt(self, "string", offset)
 		local declared = library and analyzer.typeAt(self, library, offset)
 		held = declared and types.fieldOf(declared, field) or nil
@@ -401,8 +430,9 @@ function analyzer.fieldTypeAt(self, base, baseName, field, offset)
 
 	-- The same name has to be the same thing here as it was in the condition: an inner `local`
 	-- of the same name ends the fact rather than inheriting it.
-	local here = lookupIn(scopeAt(self, offset), baseName, offset)
-	local scope, guarding = scopeAt(self, offset), {}
+	local scope = scopeAt(self, offset)
+	local here = lookupIn(scope, baseName, offset)
+	local guarding = {}
 	while scope do
 		if scope.facts[baseName] then guarding[#guarding + 1] = scope end
 		scope = scope.parent
@@ -436,14 +466,30 @@ function analyzer.typeAt(self, variable, offset)
 	-- mutable unknown says so: it can still be refined by what is assigned below.
 	local base = variable.declared or variable.initializer or types.mutable()
 
-	if not variable.declared then
-		for _, assignment in ipairs(variable.assignments) do
-			-- An assignment the typing rounds did not reach has no type to combine. Left out rather than
-			-- combined, so asking about a name can never raise.
-			if assignment.type and assignment.at <= offset then
-				base = types.combine(base, assignment.type)
-			end
+	local latest
+	for _, assignment in ipairs(variable.assignments) do
+		-- An assignment the typing rounds did not reach has no type to combine. Left out rather than
+		-- combined, so asking about a name can never raise.
+		if assignment.type and assignment.at <= offset then
+			latest = assignment
+			-- With no annotation the name may still be the value it started as, so every write is
+			-- combined with it. A declared type is what the name is *where it is written* and not a
+			-- promise about the rest of its life, which is the other half of this below.
+			if not variable.declared then base = types.combine(base, assignment.type) end
 		end
+	end
+	-- The last write before a read is what that read gets: `x = x or default` narrows a declared
+	-- `x?` to `x`, and a name reused for another type is read as the new one. Leaving the declared
+	-- type in place instead made every assignment below an annotation invisible to the type
+	-- checker, which is why `local dest = x or fallback` had to be written out as its own name.
+	-- A write that has not settled is read as the declared type while the write itself is being
+	-- worked out — `current = current.parent` asks about `current` mid-write — but anywhere else
+	-- the read is the placeholder the write will become, so the promotion that fills it in reaches
+	-- this read as well rather than the declared type staying here for good.
+	if latest and variable.declared then
+		local value = latest.valueIdx and self.parser.nodes[latest.valueIdx]
+		local midWrite = value and offset >= value.start and offset <= value.stop
+		if not types.isMutable(latest.type) or not midWrite then base = latest.type end
 	end
 
 	-- Every enclosing scope may hold a condition on the name, outermost first so a nested one narrows
@@ -544,33 +590,29 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	---@return lye.doc.Type? wanted
 	---@return lye.doc.Type? actual
 	local function firstMismatch(node, params, receiver)
-		---@param shift integer how many parameters the receiver already fills
-		local function walk(shift)
-			if shift == 1 then
-				local wanted = params[1]
-				if wanted and types.mismatch(wanted, receiver, "argument 1") then
-					return node.target, wanted, receiver
-				end
-			end
-			for index, argIdx in ipairs(node.args or {}) do
-				local wanted = params[index + shift]
-				if wanted and parsed.nodes[argIdx] then
-					local actual = argumentAt(argIdx)
-					if types.mismatch(wanted, actual, "argument " .. (index + shift)) then
-						return argIdx, wanted, actual
-					end
-				end
-			end
-		end
-
-		-- A `:` call passes the receiver as its first argument, and a signature may or may not write that
-		-- parameter down. Whichever reading the receiver fits is the reading the call is judged by.
+		-- A `:` call passes the receiver as its first argument. Its type decides whether that argument
+		-- occupies a parameter, while a mismatch leaves the written arguments unshifted.
+		local shift = 0
 		if receiver then
 			local wanted = params[1]
-			if wanted ~= nil and types.mismatch(wanted, receiver, "argument 1") then return walk(0) end
-			return walk(1)
+			if wanted == nil then
+				shift = 1
+			elseif not types.mismatch(wanted, receiver, "argument 1") then
+				if types.mismatch(wanted, receiver, "argument 1") then
+					return node.target, wanted, receiver
+				end
+				shift = 1
+			end
 		end
-		return walk(0)
+		for index, argIdx in ipairs(node.args or {}) do
+			local wanted = params[index + shift]
+			if wanted and parsed.nodes[argIdx] then
+				local actual = argumentAt(argIdx)
+				if types.mismatch(wanted, actual, "argument " .. (index + shift)) then
+					return argIdx, wanted, actual
+				end
+			end
+		end
 	end
 
 	--- Report the arguments that cannot be what the parameters say they are. A call that fits one of
@@ -849,11 +891,12 @@ end
 ---@return lye.analyzer.Result
 ---@param resume lye.parser.Resume? what the previous parse of this document kept, when the
 --- text before the change is unchanged — a keystroke then re-reads one statement, not the file
-function analyzer.analyze(source, prepared, elsewhere, modules, resume)
+---@param cachedAnnotations lye.doc.File? annotations already parsed for a batch check
+function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAnnotations)
 	assert(type(source) == "string", "analyzer.analyze expects a string")
 
 	local parsed = Parser.new(source, resume):parse()
-	local annotations = doc.parse(source, parsed.tokens)
+	local annotations = cachedAnnotations or doc.parse(source, parsed.tokens)
 	
 	-- What this file declares, so a class name or an alias in an annotation means what it says. Read
 	-- before anything parses a type, with the definitions folded in first.
@@ -903,7 +946,14 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume)
 				local declared = cdef.parse(argument.value)
 				local written = doc.parse(cdef.annotations(declared))
 				local from = doc.classes.read(written)
-				for name, class in pairs(from.classes) do namespace.classes[name] = class end
+				for name, class in pairs(from.classes) do
+					-- A block that only referred to a name writes a class for it with no members — the
+					-- layout belongs to the block that defined it, and the reference landing on top
+					-- threw that away: `struct termios` mentioned by a function declaration in a third
+					-- cdef read as having no fields at all.
+					local held = namespace.classes[name]
+					if not held or #class.fields > 0 then namespace.classes[name] = class end
+				end
 				for name, alias in pairs(from.aliases) do namespace.aliases[name] = alias end
 				cdefs = cdefs or {}
 				cdefs[#cdefs + 1] = declared
@@ -1085,6 +1135,10 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume)
 	-- `self` is declared before the closure that reads it, so the closure captures this
 	-- table rather than an outer name.
 	local self = { parser = parsed, variables = {}, byStart = {}, diagnostics = {}, doc = annotations }
+	-- `ffi.C` names the same functions `ffi.load` hands back: one C namespace, and the file that
+	-- wrote the cdef is the one that knows what is in it. Built once rather than per read, since
+	-- every `ffi.C` in the file is that same namespace — and not at all when there is no cdef.
+	self.ffiC = cdefs and loadedSymbols() or nil
 	-- The problems were collected with their offsets already mapped into the document, so they are
 	-- added to this list here rather than where they were found.
 	for _, problem in ipairs(cdefProblems or {}) do
@@ -1432,9 +1486,12 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume)
 			-- Written after code on its line, so it is inside a statement rather than above one.
 			if before:find("[^%s%-]") then
 				local _, rest = (annotation.type or ""):match("^([%w_%.]+)%s*(.*)$")
-				local wanted = annotation.tag == "as" and annotation.type
-					or (rest and (rest:gsub("^%s*[%+%-!%?]%s*", "")))
-				local held = wanted and types.parse(wanted, resolve)
+				local written = annotation.tag == "as" and annotation.type or rest
+				-- The marker is the whole difference between saying what a value is and saying what
+				-- it is not. Dropping it made `raw ---@cast raw -nil` mean the value *is* nil, which
+				-- is how a read that had already ruled nil out was reported as still possibly nil.
+				local marker, wanted = (written or ""):match("^%s*([%+%-]?)%s*(.*)$")
+				local held = wanted ~= "" and types.parse(wanted, resolve)
 				if held then
 					local best
 					for _, node in ipairs(parsed.nodes) do
@@ -1444,14 +1501,22 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume)
 							best = node
 						end
 					end
-					if best then inlineCasts[best.index] = held end
+					-- A negative cast says what the expression is not, so what it is has to be read
+					-- from the expression itself: it is kept to be applied against that.
+					-- The expression it follows has to be on the same line: a `---@cast` written at the
+					-- end of `else ---@cast source string` has no expression of its own, and the node
+					-- that happens to end just before it belongs to the branch above.
+					if best and sameLine(parsed, best.stop, annotation.start) then
+						inlineCasts[best.index] = marker == "-" and { exclude = held } or held
+					end
 				end
 			end
 		end
 	end
 
-	local root, byRecord = buildScopes(parsed)
+	local root, byRecord, scopes = buildScopes(parsed)
 	self.root = root
+	self.scopes = scopes
 	-- The list itself, not the file it was parsed into: a `---@cast` is read from there.
 	narrow.collect(parsed, byRecord, signatures, resolve, annotations.annotations)
 	inferCtx = infer.context(parsed, typeOfName, returns, function(base, baseName, field, offset)
@@ -1463,34 +1528,94 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume)
 			local declaration = bodyOwner[index]
 			if declaration then
 				local signature = signatureOfDecl[declaration]
-				-- A declaration that says what it returns hands that to the function's type: the body implements
-				-- the signature rather than replacing it.
-				local annotated = signature and signature.returns and signature.returns.type
-				local returned = annotated
-					and types.parse(annotated, withGenerics(signature.generics, signature.constraints, resolve))
-					or types.mutable()
-				inferCtx.fnTypes[index] = types.fn(
-					paramsFor(declaration, signature, resolve),
-					returned,
-					(parsed.nodes[index].isVariadic == true)
-				)
+				-- A declaration that says what it returns hands that to the function's type: the body
+				-- implements the signature rather than replacing it. The signature is read through the
+				-- same helper the declared type uses, so `---@return A, B` gives the function both
+				-- values — read here as one text it gave a return nothing could compare against.
+				if signature then
+					inferCtx.fnTypes[index] = signatureTypeOf(declaration, signature)
+				else
+					inferCtx.fnTypes[index] = types.fn(
+						paramsFor(declaration, nil, resolve),
+						types.mutable(),
+						(parsed.nodes[index].isVariadic == true)
+					)
+				end
 			end
 		end
 	end
 
-	-- A method declared on a class is part of it: `function Foo:bar()` gives every `Foo` a `bar`
+	-- The class a table declaration gives its name to. A class is often spelled longer than the
+	-- table that holds it — `---@class lde.Package` over `local Package = {}` — and the method
+	-- written on `Package` belongs to `lde.Package`. Only a class annotation counts: a `---@type`
+	-- says what the table holds rather than that the table declares the class.
+	local classOfTable = {}
+	local written = annotations.annotations or {}
+	for _, declaration in ipairs(parsed.declarations) do
+		local spanStart = declaration.name and not declaration.name:find("[%.:]")
+			and declaration.initializer == "table" and annotationSpan(parsed, declaration)
+		if spanStart then
+			local low, high = 1, #written
+			while low <= high do
+				local mid = math.floor((low + high) / 2)
+				if written[mid].start < declaration.start then low = mid + 1 else high = mid - 1 end
+			end
+			-- The class has to be the declaration's own: a `---@type App` in the block belongs to the
+			-- declaration and stops the walk, while the fields of a class annotation are part of it.
+			-- Prose describes whatever follows, so it is walked over rather than read as a decision.
+			for index = high, 1, -1 do
+				local annotation = written[index]
+				if annotation.start < spanStart then break end
+				local tag = annotation.tag
+				if tag == "class" then
+					local name = annotation.name or (annotation.text or ""):match("^([%w_%.]+)")
+					if name and namespace.classes[name] then classOfTable[declaration.name] = name end
+					break
+				end
+				if tag ~= "field" and tag ~= "private" and tag ~= "protected" and tag ~= "public"
+					and tag ~= "unknown" and tag ~= "meta" and tag ~= "version" and tag ~= "see" then
+					break
+				end
+			end
+		end
+	end
+
+	-- A method written on a class is part of it: `function Foo:bar()` gives every `Foo` a `bar`
 	-- that returns what the body returns. Done before typing so a call reads the finished class.
+	-- The assignment form is the same method — `Foo.bar = function(...)` and `Table.__index =
+	-- function(self, key)` are how a class's metamethods are written — so both are read here.
+	---@param methodName string
+	---@param owner string
+	---@param valueIdx integer
+	local function evolveMethod(owner, methodName, valueIdx)
+		-- The definitions are the signatures a document reads, including a document that *is* one
+		-- of them — its text is what a client opens to show the definitions. The prelude's own
+		-- field type is the one its annotations were kept beside, so it stays.
+		local fromPrelude = prepared and prepared.evolved and prepared.evolved[owner]
+		if fromPrelude and fromPrelude[methodName] then return end
+		local methodType = inferCtx.fnTypes[valueIdx] or infer.at(inferCtx, valueIdx)
+		if methodType and types.isFn(methodType) then
+			doc.classes.evolve(namespace, owner, methodName, methodType)
+		end
+	end
+
 	for _, declaration in ipairs(parsed.declarations) do
 		if declaration.valueIdx then
 			local className, methodName = declaration.name:match("^([%w_%.]+)%s*[%.:]([%w_]+)$")
 			-- Only the last segment names the method: `A.B.c` is a method of `A.B`.
-			if className and methodName and namespace.classes[className] then
-				local methodType = inferCtx.fnTypes[declaration.valueIdx]
-					or (declaration.valueIdx and infer.at(inferCtx, declaration.valueIdx))
-				if methodType and types.isFn(methodType) then
-					doc.classes.evolve(namespace, className, methodName, methodType)
-				end
-			end
+			local owner = className and (namespace.classes[className] and className or classOfTable[className])
+			if owner and methodName then evolveMethod(owner, methodName, declaration.valueIdx) end
+		end
+	end
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "assignment" and node.value and parsed.nodes[node.value].kind == "function" then
+			local written = writtenNameOf(parsed, node.target)
+			-- A name that is not there leaves both unset; `written and written:match(...)` would take
+			-- only the first capture, since a value written with `and` is one value.
+			local className, methodName
+			if written then className, methodName = written:match("^([%w_%.]+)%s*[%.:]([%w_]+)$") end
+			local owner = className and (namespace.classes[className] and className or classOfTable[className])
+			if owner and methodName then evolveMethod(owner, methodName, node.value) end
 		end
 	end
 	-- Declaration first, typing second. Every name is in scope before any initializer is
@@ -1532,11 +1657,17 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume)
 					end
 				end
 			end
+			local initializer = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
 			local variable = {
 				declaration = declaration,
 				name = declaration.name,
 				qualifier = declaration.qualifier,
 				start = declaration.start,
+				-- Where the name comes into scope. `local function f` is sugar for declaring `f`
+				-- and then assigning it, so its body reads the `f` being made; every other
+				-- initializer is read in the scope above, where the name does not exist yet.
+				visibleFrom = declaration.isFunction and declaration.start
+					or (initializer and initializer.stop or declaration.stop),
 				stop = declaration.stop,
 				scope = scopeAt(self, declaration.start),
 				declared = declared,
@@ -1667,7 +1798,10 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume)
 						end
 					end
 					local previous = held.indexed
-					if word and value then
+					-- A write of nil removes the key rather than storing a nil under it: `t[#t] = nil`
+					-- pops, and widening the element type to `T?` would make every read of a list
+					-- optional for the sake of one pop.
+					if word and value and value.variant ~= "nil" then
 						held.indexed = {
 							key = word,
 							type = previous and types.combine(previous.type, value) or value,
@@ -1823,6 +1957,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume)
 			-- writes: `current = current.parent` asks for `current` while its own type is still being worked out.
 			list[#list + 1] = {
 				at = assignment.at, valueIdx = assignment.valueIdx, type = types.mutable(),
+				valuePosition = assignment.valuePosition,
 			}
 		end
 	end
@@ -1883,7 +2018,20 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume)
 	end
 
 	typing.typeAll(typingCtx)
-	typing.typeAll(typingCtx)
+	-- A second walk settles what the first could not: a value read before its type was known is
+	-- left a placeholder, and the pass that typed it has to read it again. Only the names holding
+	-- one are read again — everything else settled, and walking it finds nothing.
+	if typingCtx.pending then
+		local only = {}
+		for _, variable in ipairs(self.variables) do
+			if variable.pending then
+				variable.pending = nil
+				only[variable] = true
+			end
+		end
+		typingCtx.pending = nil
+		typing.typeAll(typingCtx, only)
+	end
 	recordIndexedWrites()
 
 	-- What each function's own body gives back, beside what its annotation promised. Nothing is

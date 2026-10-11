@@ -13,6 +13,30 @@ local function annotation(source, tag)
 	return doc.first(doc.parse(source), tag)
 end
 
+test.it("reads the same annotations with or without the tokens of a full lex", function()
+	-- `doc.parse` scans the comments itself when it is not handed tokens, and that scan has to see
+	-- the comments a full lex sees: a `--` inside a string is text, and a long bracket that opens a
+	-- string is not a comment.
+	local lexer = require("lye-lexer")
+	local cases = {
+		"---@class Point\nlocal x = 1",
+		"local s = \"-- not a comment\" ---@type string\nlocal y = 1",
+		"local s = [[\n---@type number\n]] ---@type boolean\nlocal z = true",
+		"---@alias X\n--- | \"a\"\n--- | \"b\"\nlocal a = 1",
+		"local f = function() return 1 end --[[@as number]]",
+		"---@param a Vec ---@param b Vec\nlocal function g(a, b) end",
+	}
+	for _, source in ipairs(cases) do
+		local scanned, full = doc.parse(source), doc.parse(source, lexer.tokenize(source))
+		test.equal(#scanned.annotations, #full.annotations, "count for " .. string.format("%q", source))
+		for index, one in ipairs(scanned.annotations) do
+			test.equal(one.tag, full.annotations[index].tag, "tag " .. index)
+			test.equal(one.typeText or "", full.annotations[index].typeText or "", "type " .. index)
+			test.equal(one.start, full.annotations[index].start, "offset " .. index)
+		end
+	end
+end)
+
 test.it("reads an annotation with a space before the tag", function()
 	-- `--- @class` is how a writer who thinks of the annotation as prose writes it, and LuaLS reads
 	-- it: insisting on the tight form would silently ignore half of someone's file.
@@ -171,7 +195,10 @@ test.it("compares two signatures by parameters and return", function()
 		"a parameter is contravariant: it has to accept what the constraint passes")
 	test.equal(doctype.satisfies(doctype.parse("fn(a: number) -> number"), wants), false,
 		"a return is covariant")
-	test.equal(doctype.satisfies(doctype.parse("fn() -> string"), wants), false, "arity counts")
+	test.equal(doctype.satisfies(doctype.parse("fn(a: number, b: string) -> string"), wants), false,
+		"a parameter the constraint does not pass has to be optional")
+	test.equal(doctype.satisfies(doctype.parse("fn() -> string"), wants), true,
+		"and a callable that ignores the argument still takes it")
 	test.equal(doctype.satisfies(doctype.parse("fn(a: number, ...) -> string"), wants), true,
 		"a variadic accepts the constraint's arguments")
 end)
@@ -182,6 +209,17 @@ test.it("claims a number only when both operands are numbers", function()
 	test.equal(doctype.display(doctype.binaryResult("*", any, number)), "unknown",
 		"an `any` could be a table with a metamethod, so the result is not a number")
 	test.equal(doctype.display(doctype.binaryResult("*", doctype.parse("string"), number)), "unknown")
+end)
+
+test.it("treats C numeric types and their single pointer marker as numbers", function()
+	local cNumber = doctype.classType("ffi.cnum")
+	local pointer = doctype.classType("ffi.cnum*")
+	local child = doctype.classType("pkg.Int", {}, {}, { cNumber })
+	test.equal(doctype.satisfies(cNumber, doctype.NUMBER), true)
+	test.equal(doctype.satisfies(pointer, doctype.NUMBER), true)
+	test.equal(doctype.satisfies(child, doctype.NUMBER), true)
+	test.equal(doctype.satisfies(doctype.NUMBER, pointer), true)
+	test.equal(doctype.satisfies(doctype.classType("ffi.cnum**"), doctype.NUMBER), false)
 end)
 
 test.it("never reports against a wildcard or an unresolved type", function()
@@ -245,6 +283,67 @@ test.it("narrows to a class or an alias by the parsed type", function()
 		"Point")
 	test.equal(doctype.display(doctype.excludeType(doctype.union({ point, doctype.NIL_TYPE }), point)),
 		"nil")
+end)
+
+test.it("reads a field marked optional on its own name", function()
+	-- `kind?: string` and `kind: string?` say the same thing, and LuaLS's own definitions write
+	-- both. The marker used to end up inside the type — the field printed as `kind: ?: string` and
+	-- stayed required — so every call passing a table without it was reported as a disagreement.
+	local function field(text, name)
+		local parsed = doctype.parse(text, function(called)
+			if called == "string" then return doctype.STRING end
+		end)
+		return (parsed.fields or {})[name]
+	end
+
+	test.equal(doctype.display(field("{ kind?: string }", "kind")), "string?")
+	test.equal(doctype.display(field("{ kind: string? }", "kind")), "string?",
+		"the marker on the type says the same thing")
+	test.equal(doctype.display(field("{ name: string }", "name")), "string",
+		"a field with no marker keeps its type")
+	test.equal(doctype.display(field("{ name: string, age?: number }", "age")), "number?",
+		"and a later field in the list is read the same way")
+end)
+
+test.it("takes a bare table for any shape it could hold", function()
+	-- `table` is the `any` of tables: nothing was said about what is in one, so it fits a shape, a
+	-- list or a map. It fits nothing that is not a table, which is the whole difference from `any`.
+	test.equal(doctype.satisfies(doctype.TABLE, doctype.parse("{ a: number }")), true)
+	test.equal(doctype.satisfies(doctype.TABLE, doctype.parse("table<string, number>")), true)
+	test.equal(doctype.satisfies(doctype.TABLE, doctype.parse("string[]")), true)
+	test.equal(doctype.satisfies(doctype.TABLE, doctype.parse("string")), false)
+	test.equal(doctype.satisfies(doctype.TABLE, doctype.parse("number")), false)
+end)
+
+test.it("reads a method written without its receiver as one written with it", function()
+	-- A class field spells the receiver out — `fun(self: P, label: string): boolean` — while the
+	-- body declared `function p:set(label)` takes it from the caller, so a table holding that body
+	-- is a P.
+	local P = doctype.classType("P", {}, {
+		set = doctype.parse("fun(self: P, label: string): boolean", function(name)
+			if name == "P" then return P end
+		end),
+	})
+	local value = doctype.object({ set = doctype.parse("fn(label: string) -> boolean") })
+	test.equal(doctype.satisfies(value, P), true)
+	local wrong = doctype.object({ set = doctype.parse("fn(label: number) -> boolean") })
+	test.equal(doctype.satisfies(wrong, P), false, "the parameters still have to fit")
+end)
+
+test.it("narrows every member of a union to the value the branch holds", function()
+	local optional = doctype.union({ doctype.BOOLEAN, doctype.NIL_TYPE })
+	test.equal(doctype.display(doctype.narrowTruthiness(optional, false)), "false?",
+		"a whole boolean in a union becomes the value that side holds")
+	test.equal(doctype.display(doctype.narrowTruthiness(optional, true)), "true",
+		"and the truthy side is the other one")
+	test.equal(doctype.display(doctype.narrowTruthiness(doctype.BOOLEAN, false)), "false")
+end)
+
+test.it("brackets a union an array display holds", function()
+	local element = doctype.union({ doctype.parse("{ a: number }"), doctype.parse("{ b: string }") })
+	test.equal(doctype.display(doctype.array(element)), "({ a: number }|{ b: string })[]")
+	test.equal(doctype.display(doctype.object({}, { key = "integer", type = element })),
+		"({ a: number }|{ b: string })[]", "a table of elements reads as the list it is")
 end)
 
 return true

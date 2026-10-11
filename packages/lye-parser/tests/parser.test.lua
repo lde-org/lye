@@ -50,6 +50,14 @@ local VALID = {
 	-- LuaJIT 3.0 syntax, all verified present on this build.
 	"local a = c ? 1 : 2",
 	"local a = t?.x?.y",
+	-- The guard is written before whatever it guards, not only before a field: `?.[k]`, `?.:m()`
+	-- and `?.()` are all accepted, and only the field form was read.
+	"local s = 'a' return s?.lower()",
+	"local s = 'a' return s?.:lower()",
+	"local s = 'a' return s?.[1]",
+	"local s = 'a' return s?.()",
+	"local s = 'a' return s?.(1)",
+	"return t?.x.a?.[1]:m()",
 	"local a = x ?? 1",
 	"local a = 1 ~>> 2",
 	"local a = 1 << 2 | 3 & 4 ~ 5",
@@ -79,6 +87,12 @@ local INVALID = {
 	"end",
 	"local x = {",
 	"f(",
+	-- A guard owns its dot, and guards only what follows it: `s?..lower` writes two, and a `:`
+	-- directly on the `?` is not the guard at all.
+	"local s = 'a' return s?..lower",
+	"local s = 'a' return s?:lower()",
+	"local s = 'a' return s?.?.b",
+	"local s = 'a' return s?.1",
 }
 
 test.it("parses every valid program without a diagnostic", function()

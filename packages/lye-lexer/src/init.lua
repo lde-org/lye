@@ -85,6 +85,7 @@ end
 ---@field texts string[]
 ---@field capacity integer
 ---@field count integer
+---@field problems lye.lexer.Problem[] what a scan could not finish, empty for a whole source
 local Lexer = {}
 Lexer.__index = Lexer
 
@@ -393,7 +394,13 @@ function Lexer:tokenize()
 				self.pos = stop + 1
 				emit(self, KIND.string, start, stop, 0)
 			else
-				assert(scanSymbol(self), string.format("lex error at byte %d: unexpected '['", start))
+				-- A byte the scanner cannot place is reported and stepped over rather than raised:
+				-- a file with one stray byte in it is still a file an editor has open, and refusing
+				-- to tokenize it is how one such file took a whole workspace's analysis down.
+				if not scanSymbol(self) then
+					fail(self, start, start, "unexpected '['")
+					self.pos = start + 1
+				end
 			end
 		elseif byteAt == 34 or byteAt == 39 then
 			scanString(self, byteAt)
@@ -407,10 +414,10 @@ function Lexer:tokenize()
 				emit(self, KEYWORDS[word] and KIND.keyword or KIND.name, self.pos,
 					self.pos + #word - 1, nil, word)
 				self.pos += #word
-			else
-				assert(scanSymbol(self), string.format(
-					"lex error at byte %d: unexpected byte 0x%02x", self.pos, byteAt
-				))
+			elseif not scanSymbol(self) then
+				fail(self, self.pos, self.pos,
+					string.format("unexpected byte 0x%02x", byteAt))
+				self.pos += 1
 			end
 		end
 	end
@@ -446,6 +453,77 @@ end
 function lexer.tokenize(source)
 	assert(type(source) == "string", "lexer.tokenize expects a string")
 	return Lexer.new(source):tokenize()
+end
+
+--- The comments a source holds, in the order they are written.
+---
+--- A reader that wants the `---@` annotations wants the comments and nothing else, and a lexer
+--- that hands back every token pays for every name, number and operator on the way — a file's
+--- annotations are read from its comments alone, and reading them is the larger half of what a
+--- check lexes. This walks the bytes once and steps over everything that is not a comment: a
+--- short string, a long bracket, and the code between, so a `--` written inside a string stays
+--- the text it is.
+---@param source string
+---@return lye.lexer.Tokens
+function lexer.comments(source)
+	assert(type(source) == "string", "lexer.comments expects a string")
+
+	local len = #source
+	local arena, texts = {}, {}
+	local count, pos = 0, 1
+
+	while pos <= len do
+		local byteAt = source:byte(pos)
+		if byteAt == 45 and source:byte(pos + 1) == 45 then
+			-- A comment runs to the end of its line, or to the close of the long bracket it
+			-- opened — `--[[@as Vec]]` is written inside an expression and ends where it says.
+			local start = pos
+			local level = source:match("^%[(=*)%[", pos + 2)
+			local stop
+			if level then
+				local close = "]" .. level .. "]"
+				local found = source:find(close, pos + 2 + #level, true)
+				stop = found and (found + #close - 1) or len
+				pos = stop + 1
+			else
+				local newline = source:find("\n", pos + 2, true)
+				stop = newline and (newline - 1) or len
+				pos = newline or (len + 1)
+			end
+			count = count + 1
+			arena[count] = { index = count, kind = KIND.comment, start = start, stop = stop, extra = 0 }
+			texts[count] = source:sub(start, stop)
+		elseif byteAt == 34 or byteAt == 39 then
+			-- A short string: what is inside it is text, and a `--` there is not a comment.
+			local quote = byteAt
+			pos = pos + 1
+			while pos <= len do
+				local inner = source:byte(pos)
+				if inner == 92 then
+					pos = pos + 2
+				elseif inner == quote then
+					pos = pos + 1
+					break
+				else
+					pos = pos + 1
+				end
+			end
+		elseif byteAt == 91 then
+			-- A long bracket that opens a string, which runs to its own close.
+			local level = source:match("^%[(=*)%[", pos)
+			if level then
+				local close = "]" .. level .. "]"
+				local found = source:find(close, pos + 2 + #level, true)
+				pos = found and (found + #close) or (len + 1)
+			else
+				pos = pos + 1
+			end
+		else
+			pos = pos + 1
+		end
+	end
+
+	return { count = count, arena = arena, texts = texts }
 end
 
 return lexer

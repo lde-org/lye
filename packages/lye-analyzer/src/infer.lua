@@ -53,7 +53,7 @@ end
 ---@param start integer
 ---@return lye.doc.Type?
 local function stringFieldOf(ctx, base, field, start)
-	if base.variant ~= "string" or not field or not ctx.typeOfName then return nil end
+	if not field or not ctx.typeOfName or not types.mayBe(base, "string") then return nil end
 	local library = ctx.typeOfName("string", start)
 	return library and types.fieldOf(library, field) or nil
 end
@@ -70,6 +70,15 @@ local function of(ctx, idx)
 	-- which is the only way to say what a value is where nothing declares it.
 	local cast = ctx.casts and ctx.casts[idx]
 	if cast then
+		if cast.exclude then
+			-- `x ---@cast x -T` keeps what the expression already was, without T. Read by asking
+			-- for the expression's own type with the cast set aside, which is why it is removed
+			-- for the call and put back after: asking again would find the cast and not end.
+			ctx.casts[idx] = nil
+			local held = of(ctx, idx)
+			ctx.casts[idx] = cast
+			cast = types.excludeType(held, cast.exclude) or held
+		end
 		ctx.cache[idx] = cast
 		return cast
 	end
@@ -86,7 +95,14 @@ local function of(ctx, idx)
 	elseif kind == "literal" then
 		-- A boolean literal is the value it spells, the way a number literal is its number: that is
 		-- what a discriminant is compared against when a tagged union is built in code.
-		result = node.text == "nil" and types.NIL_TYPE or types.booleanValue(node.text == "true")
+		-- `...` is emitted as a literal too, and reading it as a boolean made every vararg the
+		-- value `false`: `{ ... }` held `false`, the second name of `for _, v in ipairs({ ... })`
+		-- was declared `false`, and every use of it was reported as a value that was not one.
+		if node.text == "..." then
+			result = types.ANY_TYPE
+		else
+			result = node.text == "nil" and types.NIL_TYPE or types.booleanValue(node.text == "true")
+		end
 	elseif kind == "table" then
 		-- A literal can hold itself, directly or through a name, and the field being typed is then
 		-- the literal being built. Nothing is known about it yet, which is what a mutable unknown
@@ -416,8 +432,29 @@ function infer.refine(ctx, returns)
 				-- it reads have settled. Children come first in the arena, so a parent sees them.
 				ctx.cache[node.index] = nil
 				local fresh = of(ctx, node.index)
-				if fresh.variant ~= "unknown" then types.promote(cached, fresh) end
-				ctx.cache[node.index] = cached
+				if types.isMutable(cached) then
+					if fresh.variant ~= "unknown" then types.promote(cached, fresh) end
+					ctx.cache[node.index] = cached
+				else
+					-- The placeholder settled while the pass ran, from another reader of the same
+					-- value: this read is the one just worked out, which may be narrower — a
+					-- `dir` under `if dir then` is a string, and keeping the settled placeholder
+					-- here would throw that narrowing away.
+					ctx.cache[node.index] = fresh
+				end
+			end
+		elseif cached and node.kind == "table" and cached.variant == "object" then
+			-- A field read while the value it read was unsettled was cached without the narrowing
+			-- the conditions around it ask for: `{ archive = dir }` under `if dir then` kept a
+			-- `string?` even after `dir` settled. Each field is read again, into the same table so
+			-- everything else written to it stays.
+			local values = ctx.parser.tableFieldValues and ctx.parser.tableFieldValues[node.index]
+			if values then
+				for name, valueIdx in pairs(values) do
+					ctx.cache[valueIdx] = nil
+					local fresh = of(ctx, valueIdx)
+					if fresh and fresh.variant ~= "unknown" then cached.fields[name] = fresh end
+				end
 			end
 		end
 	end

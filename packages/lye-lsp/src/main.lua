@@ -6,6 +6,7 @@
 ]]
 
 local check = require("lye-lsp.check")
+local report = require("lye-lsp.report")
 
 local USAGE = [[
 usage: lye [options] [files...]
@@ -14,6 +15,8 @@ usage: lye [options] [files...]
   --stdio          the same, and what editors pass
   check [paths...] check every Lua file under the paths, or the working directory
   --check <file>   the same for the files named, kept for scripts that pass it
+  --no-color       report without colour, as a pipe or a log file wants
+  --color          report with it, for a log that will render it
   --version        print the version
   --help           print this message
 ]]
@@ -21,6 +24,7 @@ usage: lye [options] [files...]
 local args = arg or {}
 local paths = {}
 local isCheck = false
+local reporter = report.new()
 
 --- Options an editor adds on its own account. `vscode-languageclient` appends these to whatever
 --- arguments it was given, so a server that accepts only silence treats them as files to check
@@ -47,15 +51,27 @@ while args[index] do
 	elseif value == "--help" or value == "-h" then
 		io.stdout:write(USAGE)
 		return
+	elseif value == "--no-color" then
+		report.plain(reporter)
+	elseif value == "--color" then
+		report.plain(reporter, true)
 	elseif isClientOption(value) then
 		-- Nothing to do: serving stdio is already the default.
 	elseif value:sub(1, 1) == "-" then
 		-- An unknown option is a mistake, not a file named after it.
-		io.stderr:write(string.format("lye: unknown option '%s'\n%s", value, USAGE))
+		io.stderr:write(string.format("lye: unknown option '%s'\n", value) .. USAGE)
 		os.exit(2)
 	else
 		paths[#paths + 1] = value
 	end
+end
+
+-- A server is driven over a pipe, never by hand: with nothing named and a terminal watching, what
+-- is wanted is the usage rather than a prompt that never comes back. This is also what `lye` with
+-- no arguments looked like before — a hang.
+if not isCheck and #paths == 0 and report.terminal() then
+	io.stdout:write(USAGE)
+	os.exit(0)
 end
 
 -- Files with no other instruction means a check: running the server would make no sense.
@@ -67,9 +83,14 @@ if isCheck or #paths > 0 then
 		io.stderr:write("lye: no Lua files to check\n")
 		os.exit(1)
 	end
-	local isOk = check.files(named)
-	io.stderr:write(string.format("lye: %d file%s checked, %s\n", #named, #named == 1 and "" or "s",
-		isOk and "no errors" or "errors found"))
+	-- A check is a process that exits when it is done, where the collector's defaults are those of
+	-- one that runs on: it stops the world to walk a live set that is a document's tables and will
+	-- not be read again, several times per file. Collecting less often hands back about a tenth of
+	-- the run on a project this size, and the memory it costs goes away with the process. Set
+	-- before the batch is split, so the workers are given it too.
+	collectgarbage("setpause", 1200)
+	local isOk = check.files(named, reporter)
+	report.summary(reporter, #named)
 	os.exit(isOk and 0 or 1)
 end
 
