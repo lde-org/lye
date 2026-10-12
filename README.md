@@ -109,11 +109,29 @@ what keeps the numbers above honest about the code that produced them.
 
 ## Editors
 
-| Editor | Where | Install |
-|---|---|---|
-| Zed | `editors/zed/` | install that directory as a dev extension |
-| VS Code | `editors/vscode/` | `npm install && npm run package` |
-| anything else | — | speak LSP to `lye --stdio` |
+### Zed
+
+Install `editors/zed/` as a dev extension.
+
+### VS Code
+
+Run `npm install && npm run package` in `editors/vscode`.
+
+### Neovim
+
+A minimal configuration would look like this:
+```lua
+vim.lsp.config("lye", {
+  cmd = { "lye", "--stdio" },
+  root_markers = { "lde.json", "lye.json" },
+  filetypes = { "lua" }
+})
+vim.lsp.enable("lye")
+```
+
+### Anything else
+
+Speak LSP to `lye --stdio`.
 
 ## lde projects
 
