@@ -9,6 +9,7 @@ local fs = require("fs")
 local rapidhash = require("rapidhash")
 local env = require("env")
 local parallel = require("lye-lsp.parallel")
+local cache = require("lye-lsp.cache")
 
 local check = {}
 
@@ -25,6 +26,11 @@ local PRELUDE = analyzer.prelude(require("lye-defs"))
 -- asked for a dozen times here.
 local analysesByText = {}
 local docsByText = {}
+
+-- What a module came to for a `require`, by its text: a module-only analysis, which is a different
+-- thing from `analysesByText` — that one carries the diagnostics of a file being checked, and a
+-- file reached as a dependency first must not be handed those away as its answer.
+local interfacesByText = {}
 
 --- The key a piece of source is cached under.
 ---@param source string
@@ -101,6 +107,149 @@ local function linkedDeclarations(root, cache)
 	return found
 end
 
+--- Directories that never hold source to check: a build output and a fetched dependency tree.
+--- Anything whose name begins with a dot is refused too — version control, editor state, and the
+--- like — because walking those is most of the cost on a project that has been built.
+local SKIPPED = { ["target"] = true, ["node_modules"] = true }
+
+---@param name string
+---@return boolean
+local function ignored(name)
+	return SKIPPED[name] or name:sub(1, 1) == "."
+end
+
+--- What a file's checking needs to be part of a run that keeps its answers: the store to read and
+--- write, and the modules the file turns out to require, recorded as it is read.
+---@class lye.check.Cache
+---@field store lye.check.Store what the run keeps between runs
+---@field deps table<string, string> the module files read, by path, and the text they had
+
+--- What a run keeps for the next one: the digest of everything a file is read against, and the
+--- text of the files read on the way. `check.files` builds one; `check.file` and a run with the
+--- cache off have none, and every file is then checked the way it always was.
+---@class lye.check.Store
+---@field annotations string the digest of every annotation in the batch, which `declared` is built from
+---@field keys table<string, string> the text key of each file of the batch, by path
+---@field hashes table<string, string|false> the text key of a file read on demand, by path
+---@field farms table<string, string> each package's `target/` digest, by package root
+---@field farmFiles table<string, string[]> the files each digest was taken over
+local Store = {}
+Store.__index = Store
+
+---@param paths string[]
+---@param keysByPath table<string, string>
+---@param docsByText table<string, lye.doc.File|false>
+function Store.new(paths, keysByPath, docsByText)
+	local parts = {}
+	for _, path in ipairs(paths) do
+		local key = keysByPath[path]
+		local parsed = key and docsByText[key]
+		parts[#parts + 1] = path
+		if parsed then
+			for _, annotation in ipairs(parsed.annotations) do
+				-- Everything `classes.declare` reads from an annotation, and nothing that moves
+				-- with it: a run whose annotations hash the same declares the same names.
+				parts[#parts + 1] = (annotation.tag or "") .. "\0" .. (annotation.name or "") .. "\0"
+					.. (annotation.text or "") .. "\0" .. (annotation.type or "") .. "\0"
+					.. (annotation.typeText or "")
+			end
+		end
+	end
+	return setmetatable({
+		annotations = rapidhash.hex(table.concat(parts, "\1")),
+		keys = keysByPath, hashes = {}, farms = {}, farmFiles = {},
+	}, Store)
+end
+
+--- The text key of a file, read and hashed once: what a dependency's text is says whether an
+--- answer that depended on it still holds.
+---@param path string
+---@return string|false
+function Store:keyOf(path)
+	local held = self.hashes[path]
+	if held ~= nil then return held end
+	local text = readSource(path)
+	held = type(text) == "string" and textKey(text) or false
+	self.hashes[path] = held
+	return held
+end
+
+--- Everything linked into a package's `target/`, and the digest of their texts: a change to any
+--- of them changes what a file of that package is read against.
+---@param owner string
+---@return string
+function Store:farm(owner)
+	local held = self.farms[owner]
+	if held then return held end
+	local files = {}
+	local target = absolute(owner) .. "/target"
+	if fs.isdir(target) then
+		for file in fs.scan(target, "**/*.lua", { absolute = true, followSymlinks = true, ignore = ignored }) do
+			files[#files + 1] = file
+		end
+		table.sort(files)
+	end
+	local parts = {}
+	for _, path in ipairs(files) do parts[#parts + 1] = path .. "=" .. tostring(self:keyOf(path)) end
+	self.farmFiles[owner] = files
+	self.farms[owner] = rapidhash.hex(table.concat(parts, "\1"))
+	return self.farms[owner]
+end
+
+--- The entry a previous run left for this file, when the file, the batch's annotations and the
+--- package's links are all what they were, and every module file its analysis read still has the
+--- text it had. Anything else is nil, and the file is checked as it always was.
+---@param path string
+---@param key string
+---@param owner string?
+---@return table?
+function Store:hit(path, key, owner)
+	local farm = owner and self:farm(owner) or ""
+	local entry = cache.load(cache.key(key, self.annotations, farm, path))
+	if not entry or entry.text ~= key or entry.key ~= cache.codeVersion() then return nil end
+	for file, expected in pairs(entry.deps or {}) do
+		if self:keyOf(file) ~= expected then return nil end
+	end
+	return entry
+end
+
+--- Keep what this file came to, against the same digest the next run will ask its questions with.
+---@param path string
+---@param key string
+---@param owner string?
+---@param deps table<string, string>?
+---@param entries table[]
+function Store:keep(path, key, owner, deps, entries)
+	local stored = {}
+	for index, entry in ipairs(entries) do
+		stored[index] = {
+			start = entry.start, stop = entry.stop or entry.start,
+			severity = entry.severity, message = entry.message,
+		}
+	end
+	local farm = owner and self:farm(owner) or ""
+	cache.save(cache.key(key, self.annotations, farm, path), {
+		text = key, key = cache.codeVersion(), deps = deps, diagnostics = stored,
+	})
+end
+
+--- The file a module name resolves to inside a package's `target/`, without reading it: lde
+--- links every module a package can reach under that directory, so one rule answers a dependency
+--- and a sibling alike.
+---@param owner string the package root
+---@param name string
+---@return string?
+local function modulePath(owner, name)
+	local base = absolute(owner)
+	local tail = (name:gsub("%.", "/"))
+	for _, candidate in ipairs({
+		base .. "/target/" .. tail .. ".lua",
+		base .. "/target/" .. tail .. "/init.lua",
+	}) do
+		if fs.exists(candidate) then return candidate end
+	end
+end
+
 --- The type `require("name")` has in `path`: lde links every module a package can reach under its
 --- `target/`, so one rule answers a dependency and a sibling alike. `ffi` and the rest of the
 --- engine's modules are named in the definitions rather than in a file, and come from there.
@@ -109,22 +258,12 @@ end
 ---@param modules table<string, { type: lye.doc.Type? }> what each module came to, by the text it was read from
 ---@param analysing table<string, boolean> the modules being read, so a cycle ends
 ---@param elsewhere table<string, boolean|lye.doc.Type>? what the batch declares
+---@param deps table<string, string>? where the module files this reads are recorded, by path
 ---@return lye.doc.Type?
-local function moduleOf(path, name, modules, analysing, elsewhere)
+local function moduleOf(path, name, modules, analysing, elsewhere, deps)
 	local owner = packageOf(path)
 	if not owner then return nil end
-	local base = absolute(owner)
-	local tail = (name:gsub("%.", "/"))
-	local found
-	for _, candidate in ipairs({
-		base .. "/target/" .. tail .. ".lua",
-		base .. "/target/" .. tail .. "/init.lua",
-	}) do
-		if fs.exists(candidate) then
-			found = candidate
-			break
-		end
-	end
+	local found = modulePath(owner, name)
 	if not found then
 		return nil
 	end
@@ -134,12 +273,15 @@ local function moduleOf(path, name, modules, analysing, elsewhere)
 		return nil
 	end
 	local key = textKey(written)
+	-- Every module file this analysis read, and the text it read: a later run can tell whether an
+	-- answer it kept is still the answer these files give. The closure is recorded, not only the
+	-- names this file wrote, because a module's own requires change what it comes to.
+	if deps then deps[found] = key end
 
 	-- What the module came to is kept, including when it came to nothing: a package that requires
 	-- another is read once for the whole run rather than once per file that names it — and the
-	-- same file reached through another package's link, or as one of the files being checked, is
-	-- the same module and is not read again either.
-	local cached = modules[key]
+	-- same file reached through another package's link is the same module and is not read again.
+	local cached = modules[key] or interfacesByText[key]
 	if cached then return cached.type end
 	-- A module that requires its way back here says nothing rather than being read again.
 	if analysing[key] then return nil end
@@ -147,21 +289,41 @@ local function moduleOf(path, name, modules, analysing, elsewhere)
 	-- The module's own `require`s resolve within its package, so it is read with a resolver of its
 	-- own — and the analysis is the one the editor would do, definitions and all.
 	analysing[key] = true
-	local names = analysesByText[key]
-	if names == nil then
-		-- Read against what the batch declares as well: a signature written with a class or an
-		-- alias another file declares is otherwise an unresolved name, and every caller is then
-		-- refused against a type that has no meaning outside the file it was written in.
-		-- A module reached through `require` is read for its type: its own diagnostics are not
-		-- this run's to report, so the passes that only build them are left out.
-		names = analyzer.analyze(written, PRELUDE, elsewhere, function(inner)
-			return moduleOf(found, inner, modules, analysing, elsewhere)
-		end, nil, docsByText[key], true)
-		analysesByText[key] = names
-	end
+	-- Read against what the batch declares as well: a signature written with a class or an alias
+	-- another file declares is otherwise an unresolved name, and every caller is then refused
+	-- against a type that has no meaning outside the file it was written in.
+	-- A module reached through `require` is read for its type: its own diagnostics are not this
+	-- run's to report, so the passes that only build them are left out.
+	local names = analyzer.analyze(written, PRELUDE, elsewhere, function(inner)
+		return moduleOf(found, inner, modules, analysing, elsewhere, deps)
+	end, nil, docsByText[key], true)
 	analysing[key] = nil
-	modules[key] = { type = names.module }
+	local held = { type = names.module }
+	modules[key] = held
+	interfacesByText[key] = held
 	return names.module
+end
+
+--- Report what a file's analysis found, from the entries' byte offsets: this is the one place
+--- that wants 1-based line and column, which is what a reader sees.
+---@param reporter lye.Report
+---@param path string
+---@param source string
+---@param entries { start: integer, stop: integer?, severity: integer?, message: string }[]
+---@return boolean isOk
+local function reportEntries(reporter, path, source, entries)
+	local index
+	local isOk = true
+	for _, entry in ipairs(entries) do
+		index = index or position.buildLineIndex(source)
+		local line, character = position.toPosition(source, index, entry.start, position.UTF8)
+		report.diagnostic(reporter, path, line + 1, character + 1, entry.severity, entry.message)
+		-- An unused local is a hint, and a build step that fails on one is a build step nobody
+		-- keeps: it is printed and it does not decide the exit code.
+		-- A parser diagnostic carries no severity: a syntax error is the loudest thing there is.
+		if entry.severity == nil or entry.severity <= 2 then isOk = false end
+	end
+	return isOk
 end
 
 ---@return boolean? isOk
@@ -174,8 +336,10 @@ end
 ---@param source string?
 ---@param key string?
 ---@param isRead boolean
-local function checkSource(path, elsewhere, modules, reporter, scopes, source, key, isRead)
+---@param cached lye.check.Cache? what this run keeps between runs, when it keeps anything
+local function checkSource(path, elsewhere, modules, reporter, scopes, source, key, isRead, cached)
 	reporter = reporter or report.new()
+	local store = cached and cached.store
 	-- A name the package's linked modules declare is not a typo, so the file is read against them
 	-- as well as against the batch. Merged once per package rather than once per file.
 	local owner = packageOf(path)
@@ -202,7 +366,12 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	end
 	key = key or textKey(source)
 
-	local index
+	-- What a previous run found for this file, when nothing it was read against has changed:
+	-- reported as it stands, with no analysis at all.
+	if store then
+		local held = store:hit(path, key, owner)
+		if held then return reportEntries(reporter, path, source, held.diagnostics) end
+	end
 
 	-- Annotation type errors belong in the same report as syntax errors, so a declaration
 	-- contradicting its `---@type` fails the check.
@@ -212,9 +381,13 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	local names = analysesByText[key]
 	if names == nil then
 		names = analyzer.analyze(source, PRELUDE, elsewhere, function(name)
-			return moduleOf(path, name, modules or {}, analysing, elsewhere)
+			return moduleOf(path, name, modules or {}, analysing, elsewhere, cached and cached.deps)
 		end, nil, docsByText[key])
 		analysesByText[key] = names
+		-- The full analysis says what `require` of this file gives back as well, and it is the
+		-- richer answer: a module another file reaches afterwards takes it rather than being
+		-- analysed a second time.
+		interfacesByText[key] = { type = names.module }
 	end
 	-- The analysis parsed the file already: its own parse carries the syntax errors, so a file is
 	-- read by the parser once per check rather than twice.
@@ -224,19 +397,9 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	for _, entry in ipairs(names.diagnostics) do all[#all + 1] = entry end
 	table.sort(all, function(a, b) return a.start < b.start end)
 
-	local failed = false
-	for _, entry in ipairs(all) do
-		-- Byte offsets mean nothing to a human reading a terminal, so report 1-based
-		-- line and column here. This is the one place that wants them.
-		index = index or position.buildLineIndex(source)
-		local line, character = position.toPosition(source, index, entry.start, position.UTF8)
-		report.diagnostic(reporter, path, line + 1, character + 1, entry.severity, entry.message)
-		-- An unused local is a hint, and a build step that fails on one is a build step nobody
-		-- keeps: it is printed and it does not decide the exit code.
-		-- A parser diagnostic carries no severity: a syntax error is the loudest thing there is.
-		if entry.severity == nil or entry.severity <= 2 then failed = true end
-	end
-	return not failed
+	local isOk = reportEntries(reporter, path, source, all)
+	if store then store:keep(path, key, owner, cached.deps, all) end
+	return isOk
 end
 
 ---@param path string
@@ -246,17 +409,6 @@ end
 ---@param scopes table<string, table<string, boolean|lye.doc.Type>>?
 function check.file(path, elsewhere, modules, reporter, scopes)
 	return checkSource(path, elsewhere, modules, reporter, scopes, nil, nil, false)
-end
-
---- Directories that never hold source to check: a build output and a fetched dependency tree.
---- Anything whose name begins with a dot is refused too — version control, editor state, and the
---- like — because walking those is most of the cost on a project that has been built.
-local SKIPPED = { ["target"] = true, ["node_modules"] = true }
-
----@param name string
----@return boolean
-local function ignored(name)
-	return SKIPPED[name] or name:sub(1, 1) == "."
 end
 
 --- Every Lua file under `root`, which is what a check with no paths named checks.
@@ -334,12 +486,44 @@ function check.files(paths, reporter)
 			if parsed then parsedFiles[#parsedFiles + 1] = parsed end
 		end
 	end
+
+	reporter = reporter or report.new()
+	-- What an earlier run kept, when this one can read it: everything a file is read against,
+	-- hashed, so an answer that is still the answer is reported without working it out again.
+	local store = cache.enabled() and Store.new(paths, keysByPath, docsByText) or nil
+	if store then
+		local held, missing = {}, false
+		for _, path in ipairs(paths) do
+			local key = keysByPath[path]
+			local source = sourcesByPath[path]
+			-- A file that could not be read, or could not be parsed, is not one a run kept an
+			-- answer for: it is checked, and the check reports what is wrong with it.
+			local entry = type(source) == "string" and key and docsByText[key]
+				and store:hit(path, key, packageOf(path))
+			if not entry then
+				missing = true
+				break
+			end
+			held[path] = entry
+		end
+		-- Every file is what a previous run read: report what it found and analyse nothing. A
+		-- single file that is not is enough to make this an ordinary run.
+		if not missing then
+			local isOk = true
+			for _, path in ipairs(paths) do
+				local source = sourcesByPath[path] or ""
+				if not reportEntries(reporter, path, source, held[path].diagnostics) then
+					isOk = false
+				end
+			end
+			return isOk
+		end
+	end
+
 	-- What each name stands for, not only that it exists: a parameter declared with an alias
 	-- another file writes is checked against what the alias means, and a name on its own refuses
 	-- every argument handed to it.
 	local declared = classes.declare(parsedFiles)
-
-	reporter = reporter or report.new()
 
 	-- The work, in the units one process has to hold together: a package's files, which read the
 	-- same linked names and resolve one another in the order they are written.
@@ -366,8 +550,9 @@ function check.files(paths, reporter)
 	local function checkSlice(files, collector)
 		local modules, scopes = {}, {}
 		for _, path in ipairs(files) do
+			local cached = store and { store = store, deps = {} } or nil
 			local passed, err = checkSource(path, declared, modules, collector, scopes,
-				sourcesByPath[path], keysByPath[path], true)
+				sourcesByPath[path], keysByPath[path], true, cached)
 			if passed ~= true and err then
 				-- A file that cannot be read reports to whoever asked, and the name of the file is
 				-- what that report is about, so it travels with the rest and is said where it is
