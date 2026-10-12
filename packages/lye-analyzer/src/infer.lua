@@ -15,6 +15,7 @@ local infer = {}
 ---@field typeOfField fun(base: lye.doc.Type, baseName: string?, field: string, offset: integer): lye.doc.Type?
 ---@field returns table<string, lye.doc.Type>
 ---@field cache table<integer, lye.doc.Type> what each node was typed as, by arena index
+---@field mutables integer[] the nodes whose cached type is a placeholder still, in cache order
 ---@field fnTypes table<integer, lye.doc.Type> one callable per function node, filled from its body
 ---@field callTypes table<integer, lye.doc.Type> what a generic call was bound to, by node
 ---@field callValues table<integer, lye.doc.Type[]>? every value a call gives, when more than its signature says
@@ -58,6 +59,21 @@ local function stringFieldOf(ctx, base, field, start)
 	return library and types.fieldOf(library, field) or nil
 end
 
+--- Remember where a placeholder was cached: refinement reads those nodes again, and a walk of
+--- every node to find them costs more than the list does.
+---@param ctx lye.infer.Context
+---@param idx integer
+---@param value lye.doc.Type
+---@return lye.doc.Type
+local function cache(ctx, idx, value)
+	ctx.cache[idx] = value
+	if value.isMutable then
+		local list = ctx.mutables
+		list[#list + 1] = idx
+	end
+	return value
+end
+
 local function of(ctx, idx)
 	if not idx then return types.mutable() end
 	local cached = ctx.cache[idx]
@@ -79,8 +95,7 @@ local function of(ctx, idx)
 			ctx.casts[idx] = cast
 			cast = types.excludeType(held, cast.exclude) or held
 		end
-		ctx.cache[idx] = cast
-		return cast
+		return cache(ctx, idx, cast)
 	end
 
 	local result
@@ -180,8 +195,7 @@ local function of(ctx, idx)
 		if ctx.ctypes then
 			local held = ctx.ctypes(node)
 			if held then
-				ctx.cache[idx] = held
-				return held
+				return cache(ctx, idx, held)
 			end
 		end
 		if node.callee == "require" and ctx.modules then
@@ -189,8 +203,7 @@ local function of(ctx, idx)
 			if argument and argument.kind == "string" and type(argument.value) == "string" then
 				local held = ctx.modules(argument.value)
 				if held then
-					ctx.cache[idx] = held
-					return held
+					return cache(ctx, idx, held)
 				end
 			end
 		end
@@ -201,8 +214,7 @@ local function of(ctx, idx)
 		if node.callee == "assert" and node.args and node.args[1] then
 			local held = of(ctx, node.args[1])
 			result = types.narrowTruthiness(held, true) or held
-			ctx.cache[idx] = result
-			return result
+			return cache(ctx, idx, result)
 		end
 
 		-- A call yields what its callee returns, whether that came from an annotation or from the
@@ -241,8 +253,7 @@ local function of(ctx, idx)
 		result = types.mutable()
 	end
 
-	ctx.cache[idx] = result
-	return result
+	return cache(ctx, idx, result)
 end
 
 ---@param parser lye.parser.Result
@@ -251,7 +262,7 @@ end
 ---@return lye.infer.Context
 function infer.context(parser, typeOfName, returns, typeOfField, modules, ctypes)
 	return {
-		parser = parser, typeOfName = typeOfName, returns = returns or {}, typeOfField = typeOfField, cache = {}, fnTypes = {},
+		parser = parser, typeOfName = typeOfName, returns = returns or {}, typeOfField = typeOfField, cache = {}, mutables = {}, fnTypes = {},
 		callTypes = {},
 		callValues = {},
 		building = {},
@@ -413,7 +424,14 @@ end
 ---@param ctx lye.infer.Context
 ---@param returns table<string, lye.doc.Type>
 function infer.refine(ctx, returns)
-	for _, node in ipairs(ctx.parser.nodes) do
+	local parser = ctx.parser
+	local mutables = ctx.mutables
+	-- Only the nodes holding a placeholder are read again; every other node has an answer that
+	-- cannot change. A table literal whose fields were read before the value settled is the other
+	-- case, and table literals are a fraction of the nodes.
+	local count = #mutables
+	for at = 1, count do
+		local node = parser.nodes[mutables[at]]
 		local cached = ctx.cache[node.index]
 		if cached and types.isMutable(cached) then
 			-- Every call, not only the ones that name their callee: a method call is filled in the
@@ -443,12 +461,18 @@ function infer.refine(ctx, returns)
 					ctx.cache[node.index] = fresh
 				end
 			end
-		elseif cached and node.kind == "table" and cached.variant == "object" then
-			-- A field read while the value it read was unsettled was cached without the narrowing
-			-- the conditions around it ask for: `{ archive = dir }` under `if dir then` kept a
-			-- `string?` even after `dir` settled. Each field is read again, into the same table so
-			-- everything else written to it stays.
-			local values = ctx.parser.tableFieldValues and ctx.parser.tableFieldValues[node.index]
+		end
+	end
+
+	-- A field read while the value it read was unsettled was cached without the narrowing the
+	-- conditions around it ask for: `{ archive = dir }` under `if dir then` kept a `string?` even
+	-- after `dir` settled. Each field is read again, into the same table so everything else
+	-- written to it stays.
+	local tableFieldValues = parser.tableFieldValues
+	for _, node in ipairs(parser.byKind and parser.byKind.table or {}) do
+		local cached = ctx.cache[node.index]
+		if cached and not types.isMutable(cached) and cached.variant == "object" then
+			local values = tableFieldValues and tableFieldValues[node.index]
 			if values then
 				for name, valueIdx in pairs(values) do
 					ctx.cache[valueIdx] = nil

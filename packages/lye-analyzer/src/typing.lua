@@ -32,6 +32,21 @@ local withGenerics = annotations.withGenerics
 
 local typing = {}
 
+-- TEMPORARY: section timers inside `typeAll`, enabled with LYE_ANALYZE_PHASE=1.
+local PHASE = os.getenv("LYE_ANALYZE_PHASE") == "1"
+local phaseTotals, phaseCounts = {}, {}
+local function spend(name, started)
+	if not PHASE or started == 0 then return end
+	phaseTotals[name] = (phaseTotals[name] or 0) + (os.clock() - started)
+	phaseCounts[name] = (phaseCounts[name] or 0) + 1
+end
+function typing.phaseReport()
+	if not PHASE then return end
+	for name, total in pairs(phaseTotals) do
+		io.stderr:write(string.format("typing %-10s %8.1f ms  x%d\n", name, total * 1000, phaseCounts[name] or 0))
+	end
+end
+
 	--- What a function's body gives back, value by value: the first is the union of the first value
 	--- of each of its `return`s, the second of their second values, and so on. `return found, args`
 	--- gives two, and a caller writing `local a, b = find(x)` gets both — reading only the first left
@@ -127,6 +142,7 @@ local typing = {}
 	local checkMetatable = ctx.checkMetatable
 		-- A loop declares its own control variables: a numeric `for` counts, and a generic `for` takes its
 		-- first name from what the iterator yields. The pass runs twice, so the slot is claimed either way.
+		local claimedT = PHASE and os.clock() or 0
 		local claimed = {}
 		for _, variable in ipairs(self.variables) do
 			local node = variable.qualifier == "loop" and loopOf(variable)
@@ -149,6 +165,8 @@ local typing = {}
 			end
 		end
 
+		spend("claimed", claimedT)
+		local varsT = PHASE and os.clock() or 0
 		-- Assignments are typed before initializers, and both re-run to the fixpoint, so
 		-- `local y = x` sees what `x` was assigned above it rather than what it started as.
 		for _, variable in ipairs(self.variables) do
@@ -213,6 +231,8 @@ local typing = {}
 				end
 			end
 		end
+		spend("vars", varsT)
+		local fnT = PHASE and os.clock() or 0
 		-- What a function returns is read off its body: the union of every value it returns, or nil when it
 		-- returns nothing. Annotations are left alone, so a `@return` can be compared later.
 		for index, fnType in pairs(inferCtx.fnTypes) do
@@ -267,6 +287,8 @@ local typing = {}
 				}
 			end
 		end
+		spend("fnReturns", fnT)
+		local nodeT = PHASE and os.clock() or 0
 		-- Generic names are bound from the arguments before the results are read, so `id(5)` is
 		-- number and `unpack(t)` is whatever `t` holds.
 		for _, node in ipairs(parsed.nodes) do
@@ -333,6 +355,8 @@ local typing = {}
 				end
 			end
 		end
+		spend("callNodes", nodeT)
+		local spreadT = PHASE and os.clock() or 0
 		-- `local a, b = unpack(list)` gives every name the spread's type. The model links one
 		-- value to a statement, so the names after the first would otherwise have none.
 		local spreads = {}
@@ -349,7 +373,10 @@ local typing = {}
 			local spread = declaration.anchorIdx and spreads[declaration.anchorIdx]
 			if spread and not declaration.valueIdx then variable.initializer = spread end
 		end
+		spend("spreads", spreadT)
+		local refineT = PHASE and os.clock() or 0
 		infer.refine(inferCtx, returns)
+		spend("refine", refineT)
 	end
 
 return typing

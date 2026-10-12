@@ -332,50 +332,64 @@ end
 ---@return boolean whether the token started a statement
 function statements.parseStatement(self)
 	local token = self:peek()
-	local text = self:text(token)
+	local kind = token.kind
+	-- The kind of the first token decides which words can matter, so a statement costs a handful
+	-- of comparisons rather than every keyword the grammar knows.
+	if kind == KIND.keyword then
+		local text = self.texts[token.index]
+		if text == "if" then self:parseIf() return true end
+		if text == "while" then self:parseWhile() return true end
+		if text == "repeat" then self:parseRepeat() return true end
+		if text == "for" then self:parseFor() return true end
+		if text == "do" then self:parseDoBlock() return true end
+		if text == "function" then self:parseFunctionStatement() return true end
+		if text == "local" then self:parseLocal(token.start) return true end
+		if text == "return" then self:parseReturn() return true end
+		if text == "const" then self:parseConst(token.start) return true end
+		if text == "break" or text == "continue" then
+			self:advance()
+			self:emit("break", token.start, token.stop)
+			return true
+		end
+		return false
+	end
 
-	-- A semicolon is a statement separator and may also stand alone.
-	if text == ";" then
-		self:advance()
+	if kind == KIND.name then
+		local text = self.texts[token.index]
+		-- A soft keyword starts a goto statement only when a name follows it.
+		if text == "goto" and self:isName(self:peekAt(2)) then
+			self:advance()
+			self:advance()
+			self:emit("goto", token.start, self.arena[self.index - 1].stop)
+			return true
+		end
+		self:parseExpressionStatement()
 		return true
 	end
-	if text == "if" then self:parseIf() return true end
-	if text == "while" then self:parseWhile() return true end
-	if text == "repeat" then self:parseRepeat() return true end
-	if text == "for" then self:parseFor() return true end
-	if text == "do" then self:parseDoBlock() return true end
-	if text == "function" then self:parseFunctionStatement() return true end
-	if text == "local" then self:parseLocal(token.start) return true end
-	if text == "return" then self:parseReturn() return true end
-	if text == "const" then self:parseConst(token.start) return true end
 
-	if text == "break" or text == "continue" then
-		self:advance()
-		self:emit("break", token.start, token.stop)
-		return true
+	if kind == KIND.symbol then
+		local text = self.texts[token.index]
+		-- A semicolon is a statement separator and may also stand alone.
+		if text == ";" then
+			self:advance()
+			return true
+		end
+		if text == "(" then
+			self:parseExpressionStatement()
+			return true
+		end
+		return false
 	end
 
-	if token.kind == KIND.label then
+	if kind == KIND.label then
+		local text = self.texts[token.index]
 		self:advance()
-			local name = text:match("^::%s*([_%a][_%w]*)")
+		local name = text:match("^::%s*([_%a][_%w]*)")
 		if name then
 			local offset = text:find(name, 1, true)
 			self:declare(name, "label", { start = token.start + offset - 1, stop = token.start + offset + #name - 2 })
 		end
 		self:emit("label", token.start, token.stop)
-		return true
-	end
-
-	-- A soft keyword starts a goto statement only when a name follows it.
-	if text == "goto" and self:isName(self:peekAt(2)) then
-		self:advance()
-		self:advance()
-		self:emit("goto", token.start, self.arena[self.index - 1].stop)
-		return true
-	end
-
-	if self:isName(token) or text == "(" then
-		self:parseExpressionStatement()
 		return true
 	end
 	return false

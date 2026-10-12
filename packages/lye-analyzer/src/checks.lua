@@ -272,15 +272,17 @@ local function deadCode(ctx)
 	local inferCtx = ctx.inferCtx
 	local scopeAt = ctx.scopeAt
 	local dead = {}
-	for _, node in ipairs(parsed.nodes) do
-		if node.parent == parsed.root then
-			local list = dead[scopeAt(self, node.start)]
-			if not list then
-				list = {}
-				dead[scopeAt(self, node.start)] = list
-			end
-			list[#list + 1] = node
+	-- The chunk's statements are listed by the parser, so the walk is over statements rather than
+	-- over every node in the document, and the scope is asked once per statement.
+	for _, index in ipairs(parsed.topLevel) do
+		local node = parsed.nodes[index]
+		local scope = scopeAt(self, node.start)
+		local list = dead[scope]
+		if not list then
+			list = {}
+			dead[scope] = list
 		end
+		list[#list + 1] = node
 	end
 	--- The call a statement ends on, when that call never comes back: `error("x")`, and also
 	--- `local value = error("x")`, whose declaration never finishes either.
@@ -399,15 +401,15 @@ local function globalNames(ctx)
 	for name in pairs(signatures) do
 		if not name:find("[%.:]") then globals[name] = true end
 	end
-	for name in pairs(prepared and prepared.globalNames or {}) do globals[name] = true end
 	for _, variable in ipairs(self.variables) do
 		if variable.qualifier == "global" or variable.qualifier == "field" then
 			globals[variable.name] = true
 		end
 	end
 	-- A name a statement assigns is a global the file makes: `_ = x` and `M = {}` both define
-	-- one, and neither is a declaration the parser records.
-	for _, assignment in ipairs(collectAssignments(parsed)) do globals[assignment.name] = true end
+	-- one, and neither is a declaration the parser records. The list is the one the analysis
+	-- built its variables from, not a second walk of the document.
+	for _, assignment in ipairs(ctx.assignments) do globals[assignment.name] = true end
 	-- The definitions declare globals of their own: `arg`, `_VERSION`, and whatever else the
 	-- standard library puts in the environment.
 	for name in pairs(prepared and prepared.globalNames or {}) do globals[name] = true end

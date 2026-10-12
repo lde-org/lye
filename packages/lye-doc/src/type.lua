@@ -1044,7 +1044,7 @@ local CONTINUES = {
 --- which then disagrees with every argument.
 ---@param text string
 ---@return integer? stop
-local function typeEnd(text)
+local function typeEndScan(text)
 	local depth = 0
 	for at = 1, #text do
 		local char = text:sub(at, at)
@@ -1063,6 +1063,26 @@ local function typeEnd(text)
 			if not (CONTINUES[before] or (after and CONTINUES[after])) then return at - 1 end
 		end
 	end
+end
+
+--- Text read over and over — a signature's parameters at every call site, an annotation at every
+--- analysis — costs its scan each time, and the scans answer with plain text and numbers that
+--- nothing writes to. The first answer is kept for the same text; the keys are weak, so the text
+--- of an annotation that left the document is collected rather than kept for the life of the
+--- process. `false` records an answer that was nil, which a table cannot hold.
+local typeEnds = setmetatable({}, { __mode = "k" })
+
+---@param text string
+---@return integer? stop
+local function typeEnd(text)
+	local held = typeEnds[text]
+	if held ~= nil then
+		if held == false then return nil end
+		return held
+	end
+	local stop = typeEndScan(text)
+	typeEnds[text] = stop or false
+	return stop
 end
 
 --- The values a multi-value type text names, split where the commas are not inside brackets.
@@ -1109,7 +1129,7 @@ end
 ---@param text string
 ---@return integer? closeAt
 ---@return string? declared the names between the angle brackets, when it declares any
-local function fnParams(text)
+local function fnParamsScan(text)
 	local head = text:match("^fu?n%s*%(")
 	local declared
 	if not head then
@@ -1152,6 +1172,24 @@ local function fnParams(text)
 		end
 	end
 	if not closeAt then return nil end
+	return openAt, closeAt, declared
+end
+
+local fnShapes = setmetatable({}, { __mode = "k" })
+
+--- The parentheses and declared names of a signature, scanned once per text.
+---@param text string
+---@return integer? openAt
+---@return integer? closeAt
+---@return string? declared
+local function fnParams(text)
+	local held = fnShapes[text]
+	if held ~= nil then
+		if held == false then return nil end
+		return held[1], held[2], held[3]
+	end
+	local openAt, closeAt, declared = fnParamsScan(text)
+	fnShapes[text] = openAt and { openAt, closeAt, declared } or false
 	return openAt, closeAt, declared
 end
 
@@ -1223,7 +1261,7 @@ end
 --- engine would make a cdata of, a description after the type — because a type that cannot be
 --- worked out is left as the expression that was written.
 ---@param text string
-local function foldExpression(text)
+local function foldExpressionScan(text)
 	local rest = (text:gsub("^%s+", ""):gsub("%s+$", ""))
 
 	---@return number|string? value
@@ -1274,6 +1312,24 @@ local function foldExpression(text)
 		end
 	end
 	if not rest:match("^%s*$") then return nil end
+	return kind, value
+end
+
+local foldedExpressions = setmetatable({}, { __mode = "k" })
+
+--- An expression of literals, worked out once per text: the same type text is read at every call
+--- site of the function it belongs to.
+---@param text string
+---@return string? kind
+---@return number|string? value
+local function foldExpression(text)
+	local held = foldedExpressions[text]
+	if held ~= nil then
+		if held == false then return nil end
+		return held[1], held[2]
+	end
+	local kind, value = foldExpressionScan(text)
+	foldedExpressions[text] = kind and { kind, value } or false
 	return kind, value
 end
 

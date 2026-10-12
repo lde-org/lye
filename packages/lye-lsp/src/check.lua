@@ -12,6 +12,29 @@ local parallel = require("lye-lsp.parallel")
 
 local check = {}
 
+-- TEMPORARY: phase attribution, enabled with LYE_PHASE=1.
+local PHASE = os.getenv("LYE_PHASE") == "1"
+local phaseTotals, phaseCounts, phaseDepth = {}, {}, {}
+local function phaseStart(name)
+	if not PHASE then return 0 end
+	phaseDepth[name] = (phaseDepth[name] or 0) + 1
+	return os.clock()
+end
+local function spend(name, started)
+	if not PHASE or started == 0 then return end
+	phaseDepth[name] = phaseDepth[name] - 1
+	if phaseDepth[name] == 0 then
+		phaseTotals[name] = (phaseTotals[name] or 0) + (os.clock() - started)
+		phaseCounts[name] = (phaseCounts[name] or 0) + 1
+	end
+end
+local function phaseReport()
+	if not PHASE then return end
+	for name, total in pairs(phaseTotals) do
+		io.stderr:write(string.format("phase %-9s %8.1f ms  x%d\n", name, total * 1000, phaseCounts[name] or 0))
+	end
+end
+
 --- The LuaJIT definitions, prepared once, so a headless check sees the same standard library an
 --- editor session does.
 local PRELUDE = analyzer.prelude(require("lye-defs"))
@@ -114,6 +137,7 @@ local function moduleOf(path, name, modules, analysing, elsewhere)
 	local owner = packageOf(path)
 	if not owner then return nil end
 	local base = absolute(owner)
+	local resolveStarted = phaseStart("resolve")
 	local tail = (name:gsub("%.", "/"))
 	local found
 	for _, candidate in ipairs({
@@ -125,11 +149,18 @@ local function moduleOf(path, name, modules, analysing, elsewhere)
 			break
 		end
 	end
-	if not found then return nil end
+	if not found then
+		spend("resolve", resolveStarted)
+		return nil
+	end
 
 	local written = readSource(found)
-	if type(written) ~= "string" then return nil end
+	if type(written) ~= "string" then
+		spend("resolve", resolveStarted)
+		return nil
+	end
 	local key = textKey(written)
+	spend("resolve", resolveStarted)
 
 	-- What the module came to is kept, including when it came to nothing: a package that requires
 	-- another is read once for the whole run rather than once per file that names it — and the
@@ -148,6 +179,9 @@ local function moduleOf(path, name, modules, analysing, elsewhere)
 		-- Read against what the batch declares as well: a signature written with a class or an
 		-- alias another file declares is otherwise an unresolved name, and every caller is then
 		-- refused against a type that has no meaning outside the file it was written in.
+		if os.getenv("LYE_ANALYZE_LOG") == "1" then
+			io.stderr:write(string.format("analyze module %s bytes=%d\n", found, #written))
+		end
 		names = analyzer.analyze(written, PRELUDE, elsewhere, function(inner)
 			return moduleOf(found, inner, modules, analysing, elsewhere)
 		end, nil, docsByText[key])
@@ -180,9 +214,12 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 			-- What each name means, not only that it exists: an alias is carried as the type it
 			-- stands for, and copying the keys alone left every one of them a bare name again —
 			-- which is what made `pairs(depInfo)` refuse a dependency's own dependency union.
+			local linkedStarted = phaseStart("linked")
+			local linked = linkedDeclarations(owner, known)
+			spend("linked", linkedStarted)
 			scope = {}
 			for name, held in pairs(elsewhere or {}) do scope[name] = held end
-			for name, held in pairs(linkedDeclarations(owner, known)) do scope[name] = held end
+			for name, held in pairs(linked) do scope[name] = held end
 			known[owner] = scope
 		end
 		elsewhere = scope
@@ -204,9 +241,14 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	local analysing = { [key] = true }
 	local names = analysesByText[key]
 	if names == nil then
+		local analyzeStarted = phaseStart("analyze")
+		if os.getenv("LYE_ANALYZE_LOG") == "1" then
+			io.stderr:write(string.format("analyze batch %s bytes=%d\n", path, #source))
+		end
 		names = analyzer.analyze(source, PRELUDE, elsewhere, function(name)
 			return moduleOf(path, name, modules or {}, analysing, elsewhere)
 		end, nil, docsByText[key])
+		spend("analyze", analyzeStarted)
 		analysesByText[key] = names
 	end
 	-- The analysis parsed the file already: its own parse carries the syntax errors, so a file is
@@ -312,6 +354,7 @@ function check.files(paths, reporter)
 	-- another: annotations are workspace-wide even though a document is analysed on its own.
 	local parsedFiles = {}
 	local sourcesByPath, keysByPath = {}, {}
+	local docStarted = phaseStart("docParse")
 	for _, path in ipairs(paths) do
 		local source = readSource(path)
 		sourcesByPath[path] = source
@@ -327,10 +370,13 @@ function check.files(paths, reporter)
 			if parsed then parsedFiles[#parsedFiles + 1] = parsed end
 		end
 	end
+	spend("docParse", docStarted)
 	-- What each name stands for, not only that it exists: a parameter declared with an alias
 	-- another file writes is checked against what the alias means, and a name on its own refuses
 	-- every argument handed to it.
+	local declareStarted = phaseStart("declare")
 	local declared = classes.declare(parsedFiles)
+	spend("declare", declareStarted)
 
 	reporter = reporter or report.new()
 
@@ -344,17 +390,20 @@ function check.files(paths, reporter)
 		if not current or at ~= owner then
 			owner = at
 			---@type lye.parallel.Group
-			local group = { files = {}, bytes = 0 }
+			local group = { files = {}, sizes = {}, bytes = 0 }
 			groups[#groups + 1] = group
 			current = group
 		end
+		local size = #(sourcesByPath[path] or "")
 		current.files[#current.files + 1] = path
-		current.bytes += #(sourcesByPath[path] or "")
+		current.sizes[#current.sizes + 1] = size
+		current.bytes += size
 	end
 
 	---@param files string[]
 	---@param collector lye.Collector
 	local function checkSlice(files, collector)
+		local sliceStarted = os.getenv("LYE_SLICES") == "1" and os.clock() or nil
 		local modules, scopes = {}, {}
 		for _, path in ipairs(files) do
 			local passed, err = checkSource(path, declared, modules, collector, scopes,
@@ -365,6 +414,12 @@ function check.files(paths, reporter)
 				-- named.
 				collector.collect[#collector.collect + 1] = { path = path, err = err }
 			end
+		end
+		if sliceStarted then
+			local analyzed = 0
+			for _ in pairs(analysesByText) do analyzed += 1 end
+			io.stderr:write(string.format("slice files=%d analyzed=%d seconds=%.3f\n",
+				#files, analyzed, os.clock() - sliceStarted))
 		end
 	end
 
@@ -384,6 +439,7 @@ function check.files(paths, reporter)
 			end
 		end
 	end
+	phaseReport()
 	return isOk
 end
 

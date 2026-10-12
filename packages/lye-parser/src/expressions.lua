@@ -152,8 +152,10 @@ end
 ---@return integer
 local function parseTable(self)
 	local start = self:peek().start
-	local fieldKinds, fieldValues, elementIdxs = {}, {}, {}
-	local keyIdxs = {}
+	-- The lists are made when there is something to put in them: `{}` and `{ "x", "y" }` are
+	-- most literals in a project, and a table per kind of member per literal is most of what the
+	-- parser allocates.
+	local fieldKinds, fieldValues, elementIdxs, keyIdxs
 	self:expect("{")
 	while not self:check("}") and not self:isEof(self:peek()) do
 		self:skipComments()
@@ -161,6 +163,7 @@ local function parseTable(self)
 		if self:check("[") then
 			self:advance()
 			local keyIdx = self:parseExpression()
+			keyIdxs = keyIdxs or {}
 			keyIdxs[#keyIdxs + 1] = keyIdx
 			self:expect("]")
 			self:expect("=")
@@ -170,6 +173,7 @@ local function parseTable(self)
 			-- for — `{ end = 2 }` read as an object with no `end` at all.
 			local keyNode = self.nodes[keyIdx]
 			if keyNode and keyNode.kind == "string" and type(keyNode.value) == "string" then
+				fieldValues, fieldKinds = fieldValues or {}, fieldKinds or {}
 				fieldValues[keyNode.value] = valueIdx
 				fieldKinds[keyNode.value] = self.lastKind or "unknown"
 			end
@@ -177,12 +181,14 @@ local function parseTable(self)
 			local key = self:text(self:advance())
 			self:advance()
 			local from = self.index
+			fieldValues, fieldKinds = fieldValues or {}, fieldKinds or {}
 			fieldValues[key] = self:parseExpression()
 			fieldKinds[key] = self.lastKind or "unknown"
 			if self.index == from then self:advance() end
 		else
 			-- A positional element. Its node is kept, so the literal's element type comes from
 			-- what the elements actually are rather than from a kind name.
+			elementIdxs = elementIdxs or {}
 			elementIdxs[#elementIdxs + 1] = self:parseExpression()
 		end
 		if not self:accept(",") and not self:accept(";") then break end
@@ -193,15 +199,24 @@ local function parseTable(self)
 	-- they stayed unparented and were taken for statements of the chunk, which is what a guard's
 	-- `fallsThrough` reads when it asks whether the clause ends in a `return` — `if not x then
 	-- return { y = "z" } end` looked like it fell through, so nothing after it was narrowed.
-	local members = {}
-	for _, valueIdx in pairs(fieldValues) do members[#members + 1] = valueIdx end
-	for _, elementIdx in ipairs(elementIdxs) do members[#members + 1] = elementIdx end
-	for _, keyIdx in ipairs(keyIdxs) do members[#members + 1] = keyIdx end
-	if next(members) then self:adopt(index, members) end
+	local members
+	for _, valueIdx in pairs(fieldValues or {}) do
+		members = members or {}
+		members[#members + 1] = valueIdx
+	end
+	for _, elementIdx in ipairs(elementIdxs or {}) do
+		members = members or {}
+		members[#members + 1] = elementIdx
+	end
+	for _, keyIdx in ipairs(keyIdxs or {}) do
+		members = members or {}
+		members[#members + 1] = keyIdx
+	end
+	if members then self:adopt(index, members) end
 	-- Keyed by the node, which turns `local x = { foo = 1 }` into an object type without a
 	-- reader having to find the literal again by position.
-	if next(elementIdxs) then self.tableIndexes[index] = elementIdxs end
-	if next(fieldKinds) then
+	if elementIdxs then self.tableIndexes[index] = elementIdxs end
+	if fieldKinds then
 		self.tableFields[index] = fieldKinds
 		-- The node each value was read from, so a field of a literal is typed by what is written
 		-- there rather than by the kind of thing it looked like: `{ __add = add }` holds a
@@ -256,12 +271,26 @@ end
 
 local function parsePrimary(self, allowTernaryColon)
 	local token = self:peek()
-	local text = self:text(token)
+	local kind = token.kind
 
-	if text == "function" then
-		local start = token.start
-		self:advance()
-		return parseFunctionBody(self, start, false)
+	-- A name is an expression on its own and the commonest one there is, so it is answered
+	-- before the token's text is read: the rest of the questions are about what a token spells.
+	if kind == KIND.name then return parsePrefix(self, allowTernaryColon) end
+	local text = self.texts[token.index]
+
+	if kind == KIND.keyword then
+		if text == "function" then
+			local start = token.start
+			self:advance()
+			return parseFunctionBody(self, start, false)
+		end
+		if text == "nil" or text == "true" or text == "false" then
+			self:advance()
+			local index = self:emit("literal", token.start, token.stop, { text = text })
+			-- The literal itself is the kind: nil and true are different types.
+			self.lastKind = text
+			return index
+		end
 	end
 
 	-- A complete parameter list here is `|a, b| -> expr`, or `|| -> expr` for one that takes
@@ -298,23 +327,20 @@ local function parsePrimary(self, allowTernaryColon)
 
 	if text == "{" then return parseTable(self) end
 
-	local variant = self:variant(token)
-	if variant == "number" or variant == "string" then
+	if kind == KIND.number or kind == KIND.string then
 		self:advance()
-		local written = self:text(token)
 		-- A literal is the value it spells, which is what lets `local n = 2149` be 2149 rather
 		-- than the whole of `number`, and `5 + 6912` be worked out where it is written.
-		local fields = variant == "string" and { value = stringValue(written) }
-			or { value = tonumber(written), text = written }
-		local index = self:emit(variant, token.start, token.stop, fields)
-		self.lastKind = variant
+		local fields = kind == KIND.string and { value = stringValue(text) }
+			or { value = tonumber(text), text = text }
+		local index = self:emit(kind == KIND.string and "string" or "number", token.start, token.stop, fields)
+		self.lastKind = kind == KIND.string and "string" or "number"
 		return index
 	end
 
-	if text == "nil" or text == "true" or text == "false" or text == "..." then
+	if text == "..." then
 		self:advance()
 		local index = self:emit("literal", token.start, token.stop, { text = text })
-		-- The literal itself is the kind: nil and true are different types.
 		self.lastKind = text
 		return index
 	end
@@ -324,14 +350,22 @@ end
 
 local function parseUnary(self, allowTernaryColon)
 	local token = self:peek()
-	for _, symbol in ipairs(Parser.UNARY) do
-		if self:text(token) == symbol then
-			local startOffset = token.start
-			self:advance()
-			local operandIdx = parseUnary(self, allowTernaryColon)
-			return self:emit("unary", startOffset, self.nodes[operandIdx].stop,
-				{ op = symbol, operand = operandIdx }, operandIdx)
-		end
+	local kind = token.kind
+	-- The unary operators are three symbols and the word `not`, and asking a token's text five
+	-- times per operand is most of what this function does. The kind prunes it to one question.
+	local symbol
+	if kind == KIND.symbol then
+		local text = self.texts[token.index]
+		if text == "-" or text == "#" or text == "~" or text == "!" then symbol = text end
+	elseif kind == KIND.keyword and self.texts[token.index] == "not" then
+		symbol = "not"
+	end
+	if symbol then
+		local startOffset = token.start
+		self:advance()
+		local operandIdx = parseUnary(self, allowTernaryColon)
+		return self:emit("unary", startOffset, self.nodes[operandIdx].stop,
+			{ op = symbol, operand = operandIdx }, operandIdx)
 	end
 
 	local idx = parsePrimary(self, allowTernaryColon)

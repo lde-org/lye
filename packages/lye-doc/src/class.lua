@@ -331,6 +331,7 @@ function classes.resolver(namespace, elsewhere)
 		aliasName = (aliasName:gsub("%s+$", ""))
 		local alias = namespace.aliases[bareName(aliasName)]
 		if alias and not active[aliasName] then
+			if built[text] then return built[text] end
 			active[aliasName] = true
 			local body = alias.body
 			if #alias.params > 0 then
@@ -343,6 +344,10 @@ function classes.resolver(namespace, elsewhere)
 			active[aliasName] = "self"
 			local resolved = types.parse(body, resolve)
 			active[aliasName] = nil
+			-- The body is built once per spelling, the way a class is: an alias named by a hundred
+			-- signatures is one type, and reading it again is a tree per read. `Foo<number>` and
+			-- `Foo<string>` are two spellings and two types, which is what the arguments say.
+			built[text] = resolved
 			return resolved
 		end
 		-- Reading the body of an alias that names itself: `any` says the same thing a class's own

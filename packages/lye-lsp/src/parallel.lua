@@ -103,6 +103,7 @@ end
 --- linked names and resolve one another in the order they are written.
 ---@class lye.parallel.Group
 ---@field files string[]
+---@field sizes integer[] how many bytes each file is, parallel to `files`
 ---@field bytes integer
 
 --- What one process was handed.
@@ -171,29 +172,49 @@ local function waitFor(pid)
 	end
 end
 
---- Hand the groups out to as many slices as there are workers: a group whole — it is the unit a
---- worker's module cache works in — and the largest first onto the lightest slice, since one group
---- holding most of the batch is what leaves the other workers waiting for it.
+--- Hand the groups out to as many slices as there are workers. A group is the unit a worker's
+--- module cache works in — a package's files resolve one another and read the same linked names —
+--- so it stays whole when it fits; a group larger than one worker's share of the batch is split
+--- into pieces in the order its files were written, because one package holding most of the batch
+--- is what leaves every other worker waiting for it. The largest piece goes onto the lightest
+--- slice, so no worker is handed twice what another was.
 ---@param groups lye.parallel.Group[]
 ---@param workers integer
 ---@return lye.parallel.Slice[]
 local function splitWork(groups, workers)
+	local total = 0
+	for _, group in ipairs(groups) do total += group.bytes end
+	local share = math.max(math.floor(total / workers), 1)
+
+	local pieces = {}
+	for _, group in ipairs(groups) do
+		local files, bytes = {}, 0
+		for index, path in ipairs(group.files) do
+			local size = group.sizes and group.sizes[index] or 0
+			if #files > 0 and bytes + size > share then
+				pieces[#pieces + 1] = { files = files, bytes = bytes }
+				files, bytes = {}, 0
+			end
+			files[#files + 1] = path
+			bytes += size
+		end
+		if #files > 0 then pieces[#pieces + 1] = { files = files, bytes = bytes } end
+	end
+
 	local slices = {}
 	for index = 1, workers do
 		slices[index] = { files = {}, bytes = 0, out = outPath(index) }
 		-- A file left over from a run this pid happens to repeat would read as this run's result.
 		os.remove(slices[index].out)
 	end
-	local ranked = {}
-	for _, group in ipairs(groups) do ranked[#ranked + 1] = group end
-	table.sort(ranked, function(a, b) return a.bytes > b.bytes end)
-	for _, group in ipairs(ranked) do
+	table.sort(pieces, function(a, b) return a.bytes > b.bytes end)
+	for _, piece in ipairs(pieces) do
 		local lightest = slices[1]
 		for index = 2, workers do
 			if slices[index].bytes < lightest.bytes then lightest = slices[index] end
 		end
-		for _, path in ipairs(group.files) do lightest.files[#lightest.files + 1] = path end
-		lightest.bytes += group.bytes
+		for _, path in ipairs(piece.files) do lightest.files[#lightest.files + 1] = path end
+		lightest.bytes += piece.bytes
 	end
 	for _, slice in ipairs(slices) do table.sort(slice.files) end
 	return slices

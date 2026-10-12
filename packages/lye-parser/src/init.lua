@@ -2,6 +2,7 @@
 --- lexes and parses once and returns tokens, nodes, scopes and declarations together.
 
 local lexer = require("lye-lexer")
+local newTable = require("table.new")
 
 ---@alias lye.parser.Qualifier "local"|"global"|"field"|"param"|"loop"|"label"
 
@@ -55,6 +56,8 @@ local lexer = require("lye-lexer")
 ---@field root integer index of the chunk node, which contains everything
 ---@field scopes lye.parser.Scope[]
 ---@field tableFields table<integer, table<string, string>> field kinds, keyed by table node
+---@field byKind table<string, lye.parser.Node[]> every node, listed under its kind, in emission order
+---@field topLevel integer[] the statements of the chunk, by node index
 ---@field tokens lye.lexer.Tokens
 ---@field nodes lye.parser.Node[]
 ---@field declarations lye.parser.Declaration[]
@@ -92,8 +95,12 @@ local lexer = require("lye-lexer")
 ---@field scopes_ lye.parser.Scope[]
 ---@field tableFields table<integer, table<string, string>> field kinds per table literal
 ---@field tableIndexes table<integer, integer[]> positional element indices per table literal
+---@field byKind table<string, lye.parser.Node[]> every node, listed under its kind, in emission order
 local Parser = {}
 Parser.KIND = lexer.KIND
+
+--- What a kind with no nodes of its own answers with, so callers never test for nil.
+local EMPTY_NODES = {}
 
 --- The tokens that close a block. One list, not a table built per question.
 local BLOCK_END = { "end", "else", "elseif", "until" }
@@ -168,8 +175,10 @@ function Parser.new(source, resume)
 		-- A literal the scanner could not finish is a syntax error like any other, and the
 		-- tokens the scan recovered from are what the tree is built on.
 		diagnostics = tokens.problems,
-		nodes = {},
-		declarations = {},
+		-- Nodes and declarations run to a fraction of the source: sizing the arrays from it saves
+		-- the rehashes and copies of growing a table one node at a time.
+		nodes = newTable(math.floor(#source / 12) + 16, 0),
+		declarations = newTable(16, 0),
 		depth = 0,
 		scopes = { {} },
 		scopeStarts = {},
@@ -177,6 +186,7 @@ function Parser.new(source, resume)
 		tableFields = {},
 		tableFieldValues = {},
 		tableIndexes = {},
+		byKind = newTable(0, 16),
 		count_ = 0,
 		building = {},
 		lastKind = nil,
@@ -199,6 +209,20 @@ function Parser.new(source, resume)
 	self.tableFields = resume.tableFields
 	self.tableFieldValues = resume.tableFieldValues
 	self.tableIndexes = resume.tableIndexes
+	-- The lists are rebuilt from the nodes that were kept: a reader looks a kind up to walk fewer
+	-- than every node, and one holding only the new nodes would leave the kept statements out of
+	-- every pass over the tree.
+	for index = 1, keep do
+		local held = nodes[index]
+		if held then
+			local list = self.byKind[held.kind]
+			if list then
+				list[#list + 1] = held
+			else
+				self.byKind[held.kind] = { held }
+			end
+		end
+	end
 	return self
 end
 
@@ -310,29 +334,56 @@ end
 --- Whether the next token worth reading is `text`. A comment is not worth reading: it is content
 --- the annotation pass wants, but it is written between any two tokens — `f(a --[[t]], b)` and
 --- `if x --[[ why ]] then` are both ordinary — so asking what comes next means asking past them.
+---
+--- The scan is written out here rather than going through `peek` and `skipComments`: this is the
+--- question the parser asks more than any other, once or twice per token, and the call is most
+--- of what it costs.
 ---@param text string
 ---@return boolean
 function Parser:check(text)
-	self:skipComments()
-	local token = self:peek()
-	return token.kind ~= lexer.KIND.eof and self.texts[token.index] == text
+	local arena, texts = self.arena, self.texts
+	local index = self.index
+	local token = arena[index]
+	while token and token.kind == lexer.KIND.comment do
+		index += 1
+		token = arena[index]
+	end
+	self.index = index
+	return token ~= nil and token.kind ~= lexer.KIND.eof and texts[token.index] == text
 end
 
 ---@return boolean
 function Parser:accept(text)
-	if self:check(text) then
-		self:advance()
+	local arena, texts = self.arena, self.texts
+	local index = self.index
+	local token = arena[index]
+	while token and token.kind == lexer.KIND.comment do
+		index += 1
+		token = arena[index]
+	end
+	if token and token.kind ~= lexer.KIND.eof and texts[token.index] == text then
+		self.index = index + 1
 		return true
 	end
+	-- The comments stepped over are kept stepped over, as `skipComments` leaves them.
+	self.index = index
 	return false
 end
 
 ---@return boolean
 function Parser:checkAny(candidates)
-	self:skipComments()
-	local text = self:text(self:peek())
-	for _, candidate in ipairs(candidates) do
-		if text == candidate then return true end
+	local arena, texts = self.arena, self.texts
+	local index = self.index
+	local token = arena[index]
+	while token and token.kind == lexer.KIND.comment do
+		index += 1
+		token = arena[index]
+	end
+	self.index = index
+	if not token or token.kind == lexer.KIND.eof then return false end
+	local text = texts[token.index]
+	for at = 1, #candidates do
+		if text == candidates[at] then return true end
 	end
 	return false
 end
@@ -361,36 +412,43 @@ end
 ---@param kind lye.parser.NodeKind
 ---@param start integer
 ---@param stop integer
----@param fields table?
----@param ... integer idx the nodes this one contains, which are re-parented to it
+---@param node table? the fields the node is emitted with, which become the node itself
+---@param child1 integer? idx of a node this one contains, which is re-parented to it
+---@param child2 integer?
+---@param child3 integer?
 ---@return integer idx
-function Parser:emit(kind, start, stop, fields, ...)
+function Parser:emit(kind, start, stop, node, child1, child2, child3)
 	self.count_ = self.count_ + 1
+	local index = self.count_
 	local parent = self.building[#self.building]
-	local node = {
-		kind = kind, start = start, stop = stop, depth = self.depth,
-		index = self.count_, parent = parent,
-	}
-	if fields then
-		for key, value in pairs(fields) do
-			node[key] = value
-		end
-	end
-	self.nodes[self.count_] = node
+	-- The caller's table *is* the node: a field table merged into a second one is an allocation
+	-- and a walk per node, and the caller wrote the fields it has. Callers pass a fresh table.
+	node = node or {}
+	node.kind = kind
+	node.start = start
+	node.stop = stop
+	node.depth = self.depth
+	node.index = index
+	node.parent = parent
+	local nodes = self.nodes
+	nodes[index] = node
 	-- The operands were emitted before the node that contains them, so each one is re-parented
 	-- here. Nothing reads a node's own child list, and a list per node is a table per node, so
-	-- the indices arrive as arguments and only the parent link is kept.
-	for index = 1, select("#", ...) do
-		local childIdx = select(index, ...)
-		local child = childIdx and self.nodes[childIdx]
-		if child and childIdx ~= self.count_ then child.parent = self.count_ end
-	end
+	-- the indices arrive as arguments and only the parent link is kept. Three at most: a ternary
+	-- has three operands, and a list of any length is adopted by `adopt`.
+	if child1 and nodes[child1] then nodes[child1].parent = index end
+	if child2 and nodes[child2] then nodes[child2].parent = index end
+	if child3 and nodes[child3] then nodes[child3].parent = index end
 	if parent then
-		local owner = self.nodes[parent]
-		owner.children = owner.children or {}
-		owner.children[#owner.children + 1] = self.count_
+		local owner = nodes[parent]
+		local children = owner.children
+		if children then
+			children[#children + 1] = index
+		else
+			owner.children = { index }
+		end
 	end
-	return self.count_
+	return index
 end
 
 --- Re-parent a list of already-emitted nodes onto one that contains them. `unpack` is not
@@ -415,11 +473,14 @@ end
 --- definitions write `---@type Proto[]` between two fields. Expressions and fields step over one;
 --- annotations are read from their own offsets, so nothing depends on the parser stopping at them.
 function Parser:skipComments()
-	while true do
-		local token = self:peek()
-		if not token or token.kind ~= lexer.KIND.comment then return end
-		self:advance()
+	local arena = self.arena
+	local index = self.index
+	local token = arena[index]
+	while token and token.kind == lexer.KIND.comment do
+		index += 1
+		token = arena[index]
 	end
+	self.index = index
 end
 
 --- Open a node that expressions emitted before it closes become children of.
@@ -524,6 +585,16 @@ function Parser:isBlockEnd()
 end
 
 ---@return lye.parser.Result
+--- The nodes of one kind in a parse, in emission order. A pass that only wants the calls or the
+--- index reads walks those rather than every node in the document.
+---@param parsed lye.parser.Result
+---@param kind lye.parser.NodeKind
+---@return lye.parser.Node[]
+function Parser.nodesOf(parsed, kind)
+	return parsed.byKind[kind] or EMPTY_NODES
+end
+
+---@return lye.parser.Result
 function Parser:parse()
 	self:parseBlock()
 
@@ -533,10 +604,20 @@ function Parser:parse()
 	end
 
 	local eof = self.arena[self.tokenCount]
-	-- The chunk's children are the statements, which are the nodes still without a parent.
+	-- The chunk's children are the statements, which are the nodes still without a parent; the
+	-- same walk lists every node under its kind, so a pass that only wants the calls or the index
+	-- reads walks those and not every node in the document.
 	local topLevel = {}
+	local byKind = self.byKind
 	for _, node in ipairs(self.nodes) do
 		if not node.parent and node.kind ~= "chunk" then topLevel[#topLevel + 1] = node.index end
+		local kind = node.kind
+		local list = byKind[kind]
+		if list then
+			list[#list + 1] = node
+		else
+			byKind[kind] = { node }
+		end
 	end
 	local chunkIdx = self:emit("chunk", 1, eof.stop, nil)
 	-- The chunk is emitted last, so its statements are adopted afterwards rather than appended
@@ -554,6 +635,8 @@ function Parser:parse()
 		tableFields = self.tableFields,
 		tableFieldValues = self.tableFieldValues,
 		tableIndexes = self.tableIndexes,
+		byKind = self.byKind,
+		topLevel = topLevel,
 		tokens = self.tokens,
 		nodes = self.nodes,
 		declarations = self.declarations,
