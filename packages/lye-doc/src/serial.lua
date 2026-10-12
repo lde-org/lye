@@ -1,16 +1,34 @@
 --[[
-	Writing a type graph out as a Lua chunk and reading it back.
+	Writing a type graph out as bytes and reading it back.
 
 	A type is plain data — variants, strings, numbers, nested tables — and two types may share a
 	table or reach each other in a cycle, so a graph is written as a *flat* list of tables with
 	references between them: every table is made first, then the fields that point at other tables
-	are assigned. The chunk takes the builtin singletons as its argument, so a cached `string` or
-	`nil` comes back as the same table the type system uses rather than a copy of it.
+	are filled in. The builtin singletons and the tables a caller names — the definitions' own
+	types, which the analysis reaches by identity — are written by name and read back as the very
+	tables the caller holds.
+
+	Nothing read from a file is ever loaded as code. The bytes are read by this module alone, so an
+	entry somebody else wrote can be a wrong answer but not a running one.
 ]]
 
 local types = require("lye-doc.type")
+local buffer = require("string.buffer")
 
 local serial = {}
+
+-- The format this writes. A reader of another one refuses rather than guesses.
+local MAGIC = "LYE1"
+
+-- A scalar field is one of these, and nothing else: a table is written as a reference to the
+-- table's own entry, so a cycle is a number rather than a walk that never ends.
+local FALSE, TRUE, INTEGER, NUMBER, TEXT = 1, 2, 3, 4, 5
+
+-- A table's entry: plain, one of the singletons, or a table the caller named.
+local PLAIN, SINGLETON, KNOWN = 0, 1, 2
+
+-- A field's key: a name, or a position in an array — `params` of a function type is one.
+local BY_NAME, BY_INDEX = 0, 1
 
 --- The singletons a written graph is rebuilt with, by the name the writer gives them. A type
 --- compared by identity — `returns == types.VOID` — has to come back as the very table it was.
@@ -22,34 +40,6 @@ local SINGLETONS = {
 local SINGLETON_BY_TABLE = {}
 for name, held in pairs(SINGLETONS) do
 	if held ~= nil then SINGLETON_BY_TABLE[held] = name end
-end
-
----@param text string
-local function quoted(text)
-	local out = text:gsub("[%c\\\"']", function(char)
-		if char == "\\" then return "\\\\" end
-		if char == "\n" then return "\\n" end
-		if char == "\r" then return "\\r" end
-		if char == "\t" then return "\\t" end
-		if char == '"' or char == "'" then return "\\" .. char end
-		return string.format("\\%d", char:byte())
-	end)
-	return '"' .. out .. '"'
-end
-
----@param value unknown
----@return string
-local function scalar(value)
-	local kind = type(value)
-	if kind == "string" then return quoted(value) end
-	if kind == "number" then
-		if value == math.floor(value) and math.abs(value) < 2 ^ 53 then
-			return string.format("%d", value)
-		end
-		return string.format("%.17g", value)
-	end
-	if kind == "boolean" then return value and "true" or "false" end
-	return "nil"
 end
 
 --- The index of each table in the graph, in the order they were met, and the list itself.
@@ -72,10 +62,76 @@ local function index(root)
 	return at, order
 end
 
---- Write a value as a Lua chunk that takes the singleton table and rebuilds it. `known` names the
---- tables that must come back as the very tables they were — the definitions' own types, which the
---- analysis reaches by identity — and they are written as `K[name]` and read back as the caller's
---- own tables. Returns nil and an explanation for a graph this cannot write: a table used as a key,
+---@param out string.buffer
+---@param value integer
+local function putVarint(out, value)
+	while true do
+		local byte = value % 128
+		value = math.floor(value / 128)
+		if value == 0 then
+			out:put(string.char(byte))
+			return
+		end
+		out:put(string.char(byte + 128))
+	end
+end
+
+---@param out string.buffer
+---@param key string|number
+---@param strings table<string, integer>
+local function putKey(out, key, strings)
+	if type(key) == "number" then
+		out:put(string.char(BY_INDEX))
+		putVarint(out, key)
+	else
+		out:put(string.char(BY_NAME))
+		putVarint(out, assert(strings[key], "serial: a key was not written"))
+	end
+end
+
+--- The name of a table this writes by name, or nil for one it writes out.
+---@param value table
+---@param named table<unknown, string>?
+---@return integer?
+---@return string?
+local function kindOf(value, named)
+	local singleton = SINGLETON_BY_TABLE[value]
+	if singleton then return SINGLETON, singleton end
+	if named and named[value] then return KNOWN, named[value] end
+	return PLAIN
+end
+
+--- Every string the graph writes, each once, with the index a field refers to it by. The strings
+--- repeat — `variant` is a key of nearly every table — so they are written once and pointed at.
+---@param order table[]
+---@param named table<unknown, string>?
+---@return table<string, integer>
+---@return string[]
+local function stringsOf(order, named)
+	local at, list = {}, {}
+	---@param text string
+	local function add(text)
+		if at[text] then return end
+		at[text] = #list + 1
+		list[#list + 1] = text
+	end
+	for _, value in ipairs(order) do
+		local _, name = kindOf(value, named)
+		if name then
+			add(name)
+		else
+			for key, held in pairs(value) do
+				if type(key) == "string" then add(key) end
+				if type(held) == "string" then add(held) end
+			end
+		end
+	end
+	return at, list
+end
+
+--- Write a value as bytes that `serial.read` rebuilds. `known` names the tables that must come
+--- back as the very tables they were — the definitions' own types, which the analysis reaches by
+--- identity. Returns nil and an explanation for a graph this cannot write: a table used as a key,
 --- which a type never has.
 ---@param root unknown
 ---@param known { names: table<unknown, string> }? the caller's own tables, by the name to write each as
@@ -84,47 +140,112 @@ end
 function serial.write(root, known)
 	local named = known and known.names
 	local at, order = index(root)
-	local out = { "return function(S, K)\n", "local t = {}\n" }
-	for position, value in ipairs(order) do
-		local name = SINGLETON_BY_TABLE[value]
-		if name then
-			out[#out + 1] = string.format("t[%d] = S[%s]\n", position, quoted(name))
-		elseif named and named[value] then
-			-- A table the caller holds itself: naming it is what keeps a signature reachable from
-			-- the type it was built for, which is how the definitions' fields are looked up.
-			out[#out + 1] = string.format("t[%d] = assert(K[%s], \"a known type is missing\")\n",
-				position, quoted(named[value]))
+	local strings, list = stringsOf(order, named)
+
+	local out = buffer.new()
+	out:put(MAGIC)
+	putVarint(out, #order)
+	putVarint(out, #list)
+	for _, text in ipairs(list) do
+		putVarint(out, #text)
+		out:put(text)
+	end
+
+	for _, value in ipairs(order) do
+		local kind, name = kindOf(value, named)
+		out:put(string.char(kind))
+		if kind ~= PLAIN then
+			putVarint(out, assert(strings[name], "serial: a name was not written"))
 		else
-			local fields = {}
+			-- A field of another table is counted apart from the scalars, so every table is made
+			-- before any of them points at another: a class with a field of its own type needs it.
+			local scalars, references = {}, {}
 			for key, held in pairs(value) do
-				if type(key) == "string" and type(held) ~= "table" and held ~= nil then
-					fields[#fields + 1] = string.format("[%s] = %s", quoted(key), scalar(held))
+				if type(key) ~= "string" and type(key) ~= "number" then
+					return nil, "a table is used as a key"
 				end
-			end
-			out[#out + 1] = string.format("t[%d] = { %s }\n", position, table.concat(fields, ", "))
-		end
-	end
-	-- The entries that point at another table, written once every table is there: a field that
-	-- holds its own table — a class with a field of its own type — needs the assignment form.
-	for position, value in ipairs(order) do
-		-- A singleton and a named table are the caller's own: assigning to one would write into it.
-		if not SINGLETON_BY_TABLE[value] and not (named and named[value]) then
-			for key, held in pairs(value) do
 				if type(held) == "table" then
-					local target = at[held]
-					if type(key) == "number" then
-						out[#out + 1] = string.format("t[%d][%d] = t[%d]\n", position, key, target)
-					elseif type(key) == "string" then
-						out[#out + 1] = string.format("t[%d][%s] = t[%d]\n", position, quoted(key), target)
-					else
-						return nil, "a table is used as a key"
-					end
+					references[#references + 1] = { key, at[held] }
+				elseif held ~= nil then
+					scalars[#scalars + 1] = { key, held }
 				end
+			end
+			putVarint(out, #scalars)
+			for _, field in ipairs(scalars) do
+				putKey(out, field[1], strings)
+				local held = field[2]
+				local heldKind = type(held)
+				if heldKind == "boolean" then
+					out:put(string.char(held and TRUE or FALSE))
+				elseif heldKind == "number" and held >= 0 and held == math.floor(held)
+					and held < 2 ^ 53 then
+					out:put(string.char(INTEGER))
+					putVarint(out, held)
+				elseif heldKind == "number" then
+					-- Exact, and rare: a literal value that is not a whole, positive number.
+					out:put(string.char(NUMBER))
+					local text = string.format("%.17g", held)
+					putVarint(out, #text)
+					out:put(text)
+				elseif heldKind == "string" then
+					out:put(string.char(TEXT))
+					putVarint(out, strings[held])
+				else
+					return nil, "a field holds " .. heldKind
+				end
+			end
+			putVarint(out, #references)
+			for _, field in ipairs(references) do
+				putKey(out, field[1], strings)
+				putVarint(out, field[2])
 			end
 		end
 	end
-	out[#out + 1] = string.format("return t[%d]\nend\n", at[root] or 0)
-	return table.concat(out)
+	return out:tostring()
+end
+
+---@param read table
+---@param strings string[]
+---@return string|number
+local function readKey(read, strings)
+	if read:byte() == BY_INDEX then return read:varint() end
+	local key = strings[read:varint()]
+	if key == nil then error("serial: a key to nothing", 0) end
+	return key
+end
+
+--- A cursor over the bytes, which fails rather than reads past the end: an entry is a file
+--- somebody else may have written, and a wrong one is an answer to ignore.
+---@param text string
+---@return table
+local function cursor(bytes)
+	local state = { bytes = bytes, at = 1, count = #bytes }
+	return setmetatable(state, { __index = {
+		byte = function(self)
+			if self.at > self.count then error("serial: ended early", 0) end
+			local byte = string.byte(self.bytes, self.at)
+			self.at = self.at + 1
+			return byte
+		end,
+		varint = function(self)
+			local value, shift = 0, 1
+			while true do
+				local byte = self:byte()
+				value = value + (byte % 128) * shift
+				if byte < 128 then return value end
+				shift = shift * 128
+			end
+		end,
+		take = function(self, length)
+			if self.at + length - 1 > self.count then error("serial: ended early", 0) end
+			local part = string.sub(self.bytes, self.at, self.at + length - 1)
+			self.at = self.at + length
+			return part
+		end,
+		text = function(self)
+			return self:take(self:varint())
+		end,
+	} })
 end
 
 --- Read a graph written by `serial.write`, with the caller's own tables for the names it was given.
@@ -133,12 +254,66 @@ end
 ---@return unknown? value
 ---@return string? err
 function serial.read(text, known)
-	local chunk, err = loadstring(text)
-	if not chunk then return nil, err end
-	local ok, builder = pcall(chunk)
-	if not ok then return nil, builder end
-	if type(builder) ~= "function" then return nil, "not a builder" end
-	local called, value = pcall(builder, SINGLETONS, (known and known.tables) or {})
+	if type(text) ~= "string" or string.sub(text, 1, #MAGIC) ~= MAGIC then
+		return nil, "serial: not an entry this reads"
+	end
+	local tables = (known and known.tables) or {}
+	local read = cursor(text)
+	local called, value = pcall(function()
+		read.at = #MAGIC + 1
+		local count = read:varint()
+		local strings = {}
+		for position = 1, read:varint() do
+			strings[position] = read:text()
+		end
+
+		local order, pending = {}, {}
+		for position = 1, count do
+			local kind = read:byte()
+			if kind == SINGLETON then
+				local name = strings[read:varint()]
+				local held = SINGLETONS[name]
+				if held == nil then error("serial: unknown singleton " .. tostring(name), 0) end
+				order[position] = held
+			elseif kind == KNOWN then
+				local name = strings[read:varint()]
+				local held = tables[name]
+				if held == nil then error("serial: unknown table " .. tostring(name), 0) end
+				order[position] = held
+			else
+				local held = {}
+				order[position] = held
+				for _ = 1, read:varint() do
+					local key = readKey(read, strings)
+					local field = read:byte()
+					if field == FALSE then
+						held[key] = false
+					elseif field == TRUE then
+						held[key] = true
+					elseif field == INTEGER then
+						held[key] = read:varint()
+					elseif field == NUMBER then
+						held[key] = tonumber(read:text())
+					elseif field == TEXT then
+						held[key] = strings[read:varint()]
+					else
+						error("serial: unknown field kind " .. tostring(field), 0)
+					end
+				end
+				for _ = 1, read:varint() do
+					pending[#pending + 1] = { held, readKey(read, strings), read:varint() }
+				end
+			end
+		end
+
+		-- Every table is there now, so a field can point at one that was written after it.
+		for _, field in ipairs(pending) do
+			local target = order[field[3]]
+			if target == nil then error("serial: a reference to nothing", 0) end
+			field[1][field[2]] = target
+		end
+		return order[1]
+	end)
 	if not called then return nil, value end
 	return value
 end
