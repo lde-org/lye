@@ -36,14 +36,17 @@ local SIMPLE = {
 }
 
 ---@param variant string
----@param fields table?
+---@param fields table? the fields the type carries, which become the type itself
 ---@return lye.doc.Type
 local function make(variant, fields)
-	local out = { variant = variant }
+	-- The caller's table *is* the type: every call site writes a fresh literal, and copying it
+	-- into a second table was an allocation and a walk per type. It also kept this loop from
+	-- compiling, and types are made more than anything else in a document.
 	if fields then
-		for key, value in pairs(fields) do out[key] = value end
+		fields.variant = variant
+		return fields
 	end
-	return out
+	return { variant = variant }
 end
 
 --- An `unknown` that can still be promoted: a later assignment may tell us what it is.
