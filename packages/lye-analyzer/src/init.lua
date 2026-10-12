@@ -963,7 +963,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	isDefinition)
 	assert(type(source) == "string", "analyzer.analyze expects a string")
 
-	local parsed = Parser.new(source, resume):parse()
+	local parsed = Parser.new(source, resume, isDefinition):parse()
 	local annotations = cachedAnnotations or doc.parse(source, parsed.tokens)
 	
 	-- What this file declares, so a class name or an alias in an annotation means what it says. Read
@@ -1416,9 +1416,54 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	-- The parameters a function declares, in order. A signature built from them has the arity the
 	-- function has, so a call with the wrong number of arguments can be seen.
 	local declaredParams = {}
+
+	--- The types a definition file wrote inline — `function f(n: number): string` — folded into
+	--- the signature its annotations gave it. A parameter the annotations already typed keeps that
+	--- type: the annotation is the older, louder spelling, and two of them disagreeing is not this
+	--- reader's to settle.
+	---@return lye.doc.Annotation[]
+	---@return lye.doc.Annotation?
+	local function withInline(params, returned, generics, constraints, body)
+		for _, param in ipairs(body.params or {}) do
+			if param.inlineType and param.inlineType ~= "" then
+				local found
+				for _, annotation in ipairs(params) do
+					if annotation.name == param.name then found = annotation end
+				end
+				if found then
+					found.type = found.type or param.inlineType
+				else
+					params[#params + 1] = { tag = "param", name = param.name, type = param.inlineType }
+				end
+			end
+		end
+		local written = body.inlineGenerics
+		if written then
+			local inner = written:match("^%s*<(.+)>%s*$")
+			for _, part in ipairs(doc.classes.splitList(inner or "")) do
+				local name, constraint = part:match("^%s*([%a_][%w_]*)%s*:%s*(.*)$")
+				if name then
+					generics[name] = false
+					constraints[name] = constraint
+				else
+					name = part:match("^%s*([%a_][%w_]*)%s*$")
+					if name then generics[name] = false end
+				end
+			end
+		end
+		if body.inlineReturns and not returned then
+			returned = { tag = "return", type = body.inlineReturns }
+		end
+		return params, returned
+	end
+
 	for _, declaration in ipairs(parsed.declarations) do
 		local params, returned, generics, constraints, predicates, overloads =
 			signatureOf(parsed, annotations, declaration)
+		local inlineBody = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
+		if isDefinition and inlineBody and inlineBody.isFunction then
+			params, returned = withInline(params, returned, generics, constraints, inlineBody)
+		end
 		if #params > 0 or returned or #predicates > 0 or #overloads > 0 then
 			signatures[declaration.name] = {
 				params = params, returns = returned, generics = generics, constraints = constraints,

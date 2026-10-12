@@ -352,4 +352,33 @@ test.it("reads a parameter list a comment is written inside", function()
 	end
 end)
 
+test.it("reads the types a definition file writes inline", function()
+	-- A definition file has no bodies to carry the types, so it writes them where they are read:
+	-- `function f(n: number)`, `function f<T: number>(x: T): string`, `local held: number = 1`.
+	local source = table.concat({
+		"local function test(n: number) return n end\n",
+		"function generic<T: number>(f: T): string return \"x\" end\n",
+		"local held: number = 1\n",
+		"return test, generic, held\n",
+	}, "")
+	local parsed = Parser.new(source, nil, true):parse()
+	test.equal(#parsed.diagnostics, 0, "a definition file parses its own spelling")
+
+	local bodies = {}
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "function" then bodies[#bodies + 1] = node end
+	end
+	test.equal(bodies[1].params[1].inlineType, "number")
+	test.equal(bodies[1].inlineReturns, nil)
+	test.equal(bodies[2].params[1].inlineType, "T")
+	test.equal(bodies[2].inlineGenerics, "<T: number>")
+	test.equal(bodies[2].inlineReturns, "string")
+end)
+
+test.it("does not read that spelling in a file that runs", function()
+	-- The engine is the ground truth for the dialect, and it rejects the inline spelling: a file
+	-- that is not a definition must keep reporting it.
+	test.equal(#Parser.new("local function test(n: number) end"):parse().diagnostics > 0, true)
+end)
+
 return true

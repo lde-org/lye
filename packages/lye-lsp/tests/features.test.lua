@@ -210,6 +210,29 @@ test.it("colours an index signature as the two types it names", function()
 	test.equal(counts[11] or 0, 0, "and neither is read as a field name")
 end)
 
+test.it("reads the signature a definition file writes inline", function()
+	-- `local function test(n: number): string` writes its types where a reader sees them, and a
+	-- `.d.lua` name says the file is a definition without a `---@meta` marker.
+	local source = table.concat({
+		"local function test(n: number): string\n",
+		"\treturn \"x\"\n",
+		"end\n",
+		"return test\n",
+	}, "")
+	-- The request names the document itself: the helper's default is `f.lua`, and this file is a
+	-- definition because of its name.
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/hover",
+		params = {
+			textDocument = { uri = "file:///f.d.lua" },
+			position = { line = 3, character = 8 },
+		},
+	} }, source, nil, "file:///f.d.lua")
+	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(shown:find("fn(number)", 1, true), "the signature is read from the source: " .. shown)
+	test.truthy(shown:find("string", 1, true), "and so is what it gives back: " .. shown)
+end)
+
 test.it("says nothing where an inlay hint would repeat the name", function()
 	-- `local ffi: ffi = require("ffi")` written out as a hint is the name twice.
 	local source = "---@class held\nlocal held = {}\nreturn held\n"

@@ -163,7 +163,26 @@ end
 
 ---@param source string
 ---@param resume lye.parser.Resume? a parse to carry on from, when the text before it is unchanged
-function Parser.new(source, resume)
+--- Whether a source marks itself a definition file. `---@meta` says the file describes a library
+--- rather than running, and such a file writes its types where a reader sees them:
+--- `function f(n: number)`, `function f<T: number>(x: T): string`.
+---@param source string
+---@param tokens lye.lexer.Tokens
+---@return boolean
+local function marksDefinition(source, tokens)
+	-- A plain search first: nearly every file has no marker, and the scan below is per token.
+	if not source:find("@meta", 1, true) then return false end
+	for at = 1, tokens.count do
+		local token = tokens.arena[at]
+		if token.kind == lexer.KIND.comment
+			and tokens.texts[token.index]:match("^%-%-%-?%s*@meta%f[%A]") then
+			return true
+		end
+	end
+	return false
+end
+
+function Parser.new(source, resume, definition)
 	local tokens = resume and lexer.resume(source, resume.from, resume.tokens) or lexer.tokenize(source)
 	local self = setmetatable({
 		source = source,
@@ -190,6 +209,9 @@ function Parser.new(source, resume)
 		count_ = 0,
 		building = {},
 		lastKind = nil,
+		-- A definition file may write its types inline. A `.d.lua` name says so, and a `---@meta`
+		-- marker says it for any name.
+		definition = definition == true or marksDefinition(source, tokens),
 	}, Parser)
 	if not resume then return self end
 

@@ -14,7 +14,7 @@ local types = {}
 ---| { variant: "boolean" }
 ---| { variant: "nil" }
 ---| { variant: "table" }
----| { variant: "fn", params: lye.doc.Type[], returns: lye.doc.Type, isVariadic: boolean?, values: lye.doc.Type[]? }
+---| { variant: "fn", params: lye.doc.Type[], returns: lye.doc.Type, isVariadic: boolean?, variadic: lye.doc.Type?, values: lye.doc.Type[]? }
 ---| { variant: "any" }
 ---| { variant: "unknown" }
 ---| { variant: "extern", name: string }
@@ -131,9 +131,11 @@ end
 ---@param returns lye.doc.Type
 ---@param isVariadic boolean? accepts any number of arguments
 ---@param isSpread boolean? returns a sequence, so every call result is that type
-function types.fn(params, returns, isVariadic, isSpread)
+---@param variadic lye.doc.Type? what the extra arguments have to be, from `---@param ... string`
+function types.fn(params, returns, isVariadic, isSpread, variadic)
 	return make("fn", {
 		params = params, returns = returns, isVariadic = isVariadic, isSpread = isSpread,
+		variadic = variadic,
 	})
 end
 
@@ -277,7 +279,8 @@ local function methodFits(have, wanted, owner, depth)
 	if not fits(wanted.params[1], owner, depth + 1) then return false end
 	local rest = {}
 	for index = 2, #wanted.params do rest[#rest + 1] = wanted.params[index] end
-	return fits(have, types.fn(rest, wanted.returns, wanted.isVariadic, wanted.isSpread), depth + 1)
+	return fits(have, types.fn(rest, wanted.returns, wanted.isVariadic, wanted.isSpread, wanted.variadic),
+		depth + 1)
 end
 
 ---@param type lye.doc.Type

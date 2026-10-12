@@ -11,8 +11,8 @@ local types = require("lye-doc.type")
 -- types and about names that do not resolve; the unused-local rule is dropped by name, and tested
 -- on its own below.
 local analyzer = {
-	analyze = function(source, prepared)
-		local result = lye.analyze(source, prepared)
+	analyze = function(source, ...)
+		local result = lye.analyze(source, ...)
 		local kept = {}
 		for _, entry in ipairs(result.diagnostics) do
 			if not entry.message:match("^unused local") then kept[#kept + 1] = entry end
@@ -1284,6 +1284,26 @@ test.it("holds a definition file to its annotations, not to bodies it does not h
 	local same = source:gsub("^%-%-%-@meta\n", "")
 	test.equal(#analyzer.analyze(same).diagnostics, 1,
 		"and without the marker what is written is checked against what it says")
+end)
+
+test.it("checks against the types a definition file writes inline", function()
+	-- `local function test(n: number)` and `function generic<T: number>(f: T)` carry their types in
+	-- the source rather than in annotations, and they are the signature all the same.
+	local source = table.concat({
+		"local function test(n: number) return n end\n",
+		"function generic<T: number>(f: T) return f end\n",
+		"test(\"not a number\")\n",
+		"generic({})\n",
+		"test(1)\n",
+		"return test, generic\n",
+	}, "")
+	local result = analyzer.analyze(source, nil, nil, nil, nil, nil, nil, true)
+
+	test.equal(#result.diagnostics, 2, "the string and the table are refused, the number is not")
+	test.truthy(result.diagnostics[1].message:find("test expects number, got", 1, true),
+		result.diagnostics[1].message)
+	test.truthy(result.diagnostics[2].message:match("generic expects number, got table"),
+		result.diagnostics[2].message)
 end)
 
 test.it("checks each argument against its own parameter", function()

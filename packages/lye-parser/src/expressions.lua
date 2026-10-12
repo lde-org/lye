@@ -236,6 +236,81 @@ local function parseTable(self)
 end
 
 ---@return integer
+--- Whether a token can be part of a type written inline, the way a definition file writes
+--- `n: number`. Types hold no statement, so the reader only has to know where one ends.
+---@param self lye.parser.Parser
+---@param token lye.lexer.ffi.token
+---@return boolean
+local function isTypeToken(self, token)
+	local kind = token.kind
+	if kind == KIND.name or kind == KIND.number or kind == KIND.string then return true end
+	local text = self.texts[token.index]
+	if kind == KIND.keyword then
+		return text == "nil" or text == "true" or text == "false" or text == "function"
+			or text == "table"
+	end
+	return text == "|" or text == "." or text == "?" or text == "*" or text == "[" or text == "]"
+		or text == "<" or text == ">" or text == "(" or text == ")" or text == "{" or text == "}"
+		or text == ":" or text == "," or text == "-" or text == "..." or text == "fun"
+end
+
+--- Read a type written inline in a definition file — `n: number` — and give back its text. The
+--- tokens are consumed, so what the caller sees next is what follows the type.
+---@param self lye.parser.Parser
+---@return string? text
+local function skipInlineType(self)
+	local depth, from, to, arrow = 0, nil, nil, false
+	while true do
+		local token = self:peek()
+		if self:isEof(token) then break end
+		local text = self.texts[token.index]
+		if text == "(" or text == "{" or text == "[" or text == "<" then
+			depth = depth + 1
+		elseif text == ")" or text == "}" or text == "]" then
+			if depth == 0 then break end
+			depth = depth - 1
+		elseif text == ">" then
+			-- `->` is the arrow a function type is written with, not the end of a parameter list.
+			if depth == 0 and not arrow then break end
+			if depth > 0 then depth = depth - 1 end
+		elseif depth == 0
+			and (text == "," or text == ":" or text == "=" or text == "end" or text == "do") then
+			break
+		elseif not isTypeToken(self, token) then
+			break
+		end
+		arrow = text == "-"
+		if not from then from = token.start end
+		to = token.stop
+		self:advance()
+	end
+	if not from then return nil end
+	return self.source:sub(from, to)
+end
+
+--- Read the `<T: number, V>` a definition file writes after a function's name, and give back its
+--- text. The list is balanced, so the reader stops at the `>` that closes it.
+---@param self lye.parser.Parser
+---@return string? text
+local function skipGenerics(self)
+	if not self:check("<") then return nil end
+	local from, depth, to = self:peek().start, 0, nil
+	while true do
+		local token = self:peek()
+		if self:isEof(token) then break end
+		local text = self.texts[token.index]
+		to = token.stop
+		self:advance()
+		if text == "<" then
+			depth = depth + 1
+		elseif text == ">" then
+			depth = depth - 1
+			if depth == 0 then break end
+		end
+	end
+	return to and self.source:sub(from, to) or nil
+end
+
 local function parseFunctionBody(self, start, isMethod)
 	-- The body's scope opens at the parameter list, not at the statement: a `local function f`
 	-- declares its name outside the scope that holds its parameters and body, so the name stays
@@ -257,18 +332,38 @@ local function parseFunctionBody(self, start, isMethod)
 			break
 		end
 		local name, token = self:parseName()
-		if name then params[#params + 1] = self:declare(name, "param", token) end
+		if name then
+			local param = self:declare(name, "param", token)
+			params[#params + 1] = param
+			-- A definition file writes the type where a caller reads it: `function f(n: number)`.
+			if self.definition then
+				self:skipComments()
+				if self:accept(":") then
+					param.inlineType = skipInlineType(self)
+				end
+			end
+		end
 		self:skipComments()
 		if not self:accept(",") then break end
 	end
 	self:skipComments()
 	self:expect(")")
 
+	-- `function f(): string` writes the type of what the body gives back.
+	local inlineReturns
+	if self.definition then
+		self:skipComments()
+		if self:accept(":") then inlineReturns = skipInlineType(self) end
+	end
+
 	self:parseBlock()
 	self:popScope(self:peek().start - 1)
 	self:expect("end")
 	local index = self:emit("function", start, self.arena[self.index - 1].stop,
-		{ isFunction = true, isVariadic = isVariadic, params = params })
+		{
+			isFunction = true, isVariadic = isVariadic, params = params,
+			inlineReturns = inlineReturns,
+		})
 	-- Set last, since parsing the body overwrites it.
 	self.lastKind = "function"
 	return index
@@ -448,6 +543,8 @@ Parser.parsePrefix = parsePrefix
 Parser.parseArguments = parseArguments
 Parser.parseTable = parseTable
 Parser.parseFunctionBody = parseFunctionBody
+Parser.skipInlineType = skipInlineType
+Parser.skipGenerics = skipGenerics
 Parser.parsePrimary = parsePrimary
 Parser.parseUnary = parseUnary
 Parser.parseBinary = parseBinary

@@ -143,7 +143,10 @@ function statements.parseFunctionStatement(self)
 	end
 	local declarationIdx = self.lastDeclaration
 	if declarationIdx then self.declarations[declarationIdx].anchorIdx = startIdx end
+	-- `function f<T: number>(x: T)` names the types the signature works for.
+	local generics = self.definition and self:skipGenerics() or nil
 	local bodyIdx = self:parseFunctionBody(start, isMethod)
+	if generics and bodyIdx then self.nodes[bodyIdx].inlineGenerics = generics end
 	if declarationIdx then self:setInitializer(declarationIdx, "function", bodyIdx) end
 end
 
@@ -157,7 +160,9 @@ function statements.parseLocal(self, start)
 		if declarationIdx then self.declarations[declarationIdx].anchorIdx = startIdx end
 		-- The declaration has to be remembered before the body is parsed: parsing it declares the
 		-- parameters, and `lastDeclaration` moves to the last of them.
+		local generics = self.definition and self:skipGenerics() or nil
 		local bodyIdx = self:parseFunctionBody(start, false)
+		if generics and bodyIdx then self.nodes[bodyIdx].inlineGenerics = generics end
 		if declarationIdx then self:setInitializer(declarationIdx, "function", bodyIdx) end
 		return
 	end
@@ -168,7 +173,12 @@ function statements.parseLocal(self, start)
 		local name, token = self:parseName()
 		lastToken = token
 		if name then
-			self:declare(name, "local", token, nil, count + 1)
+			local declaration = self:declare(name, "local", token, nil, count + 1)
+			-- `local held: number = 1` writes the type where the name is.
+			if self.definition then
+				self:skipComments()
+				if self:accept(":") then declaration.inlineType = self:skipInlineType() end
+			end
 			first = first or self.lastDeclaration
 			count += 1
 		else
