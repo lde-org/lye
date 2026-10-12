@@ -577,6 +577,21 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	-- by every call in every document, it is parsed once per process.
 	---@type table<lye.analyzer.Signature, { params: (lye.doc.Type?)[], returns: lye.doc.Type? }>
 	local parsedSignatures = {}
+
+	-- The type a written text came to, parsed once per document. A generic signature is read at
+	-- every call site of the function, and parsing `T` or `T[]` again at each of them is a tree
+	-- per read; one resolution context covers the whole analysis, so one text is one type here.
+	---@type table<string, lye.doc.Type|false>
+	local parsedTypes = {}
+	---@param text string
+	---@return lye.doc.Type?
+	local function typeOfText(text)
+		local held = parsedTypes[text]
+		if held ~= nil then return held or nil end
+		local parsed = types.parse(text, resolve)
+		parsedTypes[text] = parsed or false
+		return parsed
+	end
 	---@param signature lye.analyzer.Signature
 	---@return (lye.doc.Type?)[]
 	---@return lye.doc.Type?
@@ -588,10 +603,10 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 		local params = positionalParams(signature, local_)
 		local written = signature.returns and signature.returns.type
 		local returned = written and types.parse(written, local_) or nil
-		-- A generic signature reads differently at each call, so only the fixed ones are kept.
-		if next(signature.generics) == nil then
-			parsedSignatures[signature] = { params = params, returns = returned }
-		end
+		-- Kept for a generic signature too: what a name of its own stands for is read the same at
+		-- every call — the call's own binding is applied by `types.substitute` on the answer, not
+		-- by reading the signature again, and re-reading it per call was a tree per call.
+		parsedSignatures[signature] = { params = params, returns = returned }
 		return params, returned
 	end
 
@@ -695,7 +710,7 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 					local bindings = {}
 					for name in pairs(calleeType.generics) do
 						local limit = calleeType.constraints and calleeType.constraints[name]
-						bindings[name] = (limit and types.parse(limit, resolve)) or types.UNKNOWN_TYPE
+						bindings[name] = (limit and typeOfText(limit)) or types.UNKNOWN_TYPE
 					end
 					local replaced = {}
 					for index, param in ipairs(params) do
@@ -2043,7 +2058,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 
 	local typingCtx = {
 		parsed = parsed, self = self, inferCtx = inferCtx, signatures = signatures,
-		returns = returns, resolve = resolve, fieldReturns = fieldReturns,
+		returns = returns, resolve = resolve, typeOfText = typeOfText, fieldReturns = fieldReturns,
 		loopOf = loopOf, signatureOfCall = signatureOfCall, returnsOf = returnsOf,
 		bodyOwner = bodyOwner, annotatedBodies = annotatedBodies, checkMetatable = checkMetatable, signatureOfDecl = signatureOfDecl,
 	}

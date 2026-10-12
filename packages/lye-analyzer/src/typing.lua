@@ -20,6 +20,7 @@ local withGenerics = annotations.withGenerics
 ---@field signatures table<string, lye.analyzer.Signature>
 ---@field returns table<string, lye.doc.Type>
 ---@field resolve fun(text: string): lye.doc.Type?
+---@field typeOfText fun(text: string): lye.doc.Type? a written type, parsed once per document
 ---@field fieldReturns table<lye.doc.Type, lye.doc.Type>
 ---@field loopOf fun(variable: lye.analyzer.Variable): lye.parser.Node?
 ---@field signatureOfCall fun(node: lye.parser.Node): lye.doc.Type?
@@ -124,6 +125,9 @@ local typing = {}
 	local bodyOwner, annotatedBodies = ctx.bodyOwner, ctx.annotatedBodies
 	local signatureOfDecl = ctx.signatureOfDecl
 	local checkMetatable = ctx.checkMetatable
+	-- A written type, read once per document where the analysis gave a cache for it: a context
+	-- built by hand — a test's — has none, and parses as it always did.
+	local parseType = ctx.typeOfText or function(text) return types.parse(text, resolve) end
 		-- A loop declares its own control variables: a numeric `for` counts, and a generic `for` takes its
 		-- first name from what the iterator yields. The pass runs twice, so the slot is claimed either way.
 			local claimed = {}
@@ -311,7 +315,7 @@ local typing = {}
 				for index, argIdx in ipairs(node.args or {}) do
 					local wanted = signature.params[index]
 					if wanted and wanted.type then
-						infer.bind(types.parse(wanted.type, resolve), infer.at(inferCtx, argIdx),
+						infer.bind(parseType(wanted.type), infer.at(inferCtx, argIdx),
 							signature.generics, bindings)
 					end
 				end
