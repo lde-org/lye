@@ -116,6 +116,31 @@ test.it("a change to a module invalidates what required it", function()
 		"and is not refused once the module gives a number: " .. second)
 end)
 
+test.it("what a reused analysis read is remembered too", function()
+	-- `a_user` is checked first and pulls `z_file` in as a module: that analysis is the one
+	-- `z_file`'s own check then uses. Its entry still has to know what `z_file` read — the module
+	-- whose body changes here — or the change would go unnoticed.
+	local user = "local z = require('z_file')\nreturn z\n"
+	local file = table.concat({
+		"local dep = require('z_dep')\n",
+		"local total = dep() + 1\n",
+		"return total\n",
+	}, "")
+	fixture({
+		["src/a_user.lua"] = user,
+		["src/z_file.lua"] = file,
+		["target/z_file.lua"] = file,
+		["target/z_dep.lua"] = "local function value() return \"x\" end\nreturn value\n",
+	})
+	local first = check({ "src" }, true)
+	test.truthy(first:find("needs numbers", 1, true), "a string is refused where a number is: " .. first)
+
+	write(ROOT .. "/target/z_dep.lua", "local function value() return 1 end\nreturn value\n")
+	local second = check({ "src" }, true)
+	test.equal(second:find("needs numbers", 1, true), nil,
+		"the change reaches the file that read it through another: " .. second)
+end)
+
 test.it("an entry that cannot be read is checked as it always was", function()
 	fixture({ ["src/one.lua"] = "local unused = 1\nreturn 2\n" })
 	local first = check({ "src" }, true)
