@@ -12,6 +12,13 @@ local json = require("lye-json")
 local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local FIXTURE = TESTS_DIR .. "/fixtures/server.lua"
+local CACHE = PACKAGE_DIR .. "/target/session-cache"
+
+-- Every session of the suite reads and writes under one directory of its own, wiped first: the
+-- definitions are written there rather than into the user's cache, and the first test that reaches a
+-- module reads it while the ones after it read the answer, so the whole file runs the same way
+-- every time rather than depending on what an earlier run — or another session — left behind.
+os.execute("rm -rf " .. string.format("%q", CACHE))
 local INPUT = PACKAGE_DIR .. "/target/lsp-test-input.bin"
 
 local URI = "file:///tmp/lye-session.lua"
@@ -49,7 +56,8 @@ local function run(messages, root)
 	-- close reports the shell's status rather than the child's, so the child prints its
 	-- own exit code as the final line.
 	local pipe = assert(io.popen(string.format(
-		"cd %q && cat %q | lde run %q 2>/dev/null; echo \"EXIT:$?\"", PACKAGE_DIR, INPUT, FIXTURE
+		"cd %q && XDG_CACHE_HOME=%q cat %q | lde run %q 2>/dev/null; echo \"EXIT:$?\"",
+		PACKAGE_DIR, CACHE, INPUT, FIXTURE
 	)))
 	local output = pipe:read("*a")
 	pipe:close()
@@ -67,6 +75,19 @@ local function run(messages, root)
 		i = stop + 1 + length
 	end
 	return frames, code
+end
+
+--- Write a file a test needs. `target/` is where lde links a package's dependencies, so the
+--- repository's `.gitignore` leaves it out: a fixture's linked module is written when the suite
+--- runs, not kept in the tree.
+---@param path string
+---@param content string
+local function writeFile(path, content)
+	local dir = path:match("^(.*)/[^/]+$")
+	os.execute("mkdir -p " .. string.format("%q", dir))
+	local handle = assert(io.open(path, "wb"))
+	handle:write(content)
+	handle:close()
 end
 
 --- A real session ends with `shutdown` then `exit`, and the exit code proves both arrived.
@@ -240,6 +261,53 @@ test.it("resolves a class the document's package has linked into target", functi
 	test.equal(#published[1].diagnostics, 0,
 		"a table built for the linked class fits it: "
 			.. (published[1].diagnostics[1] and published[1].diagnostics[1].message or "none"))
+end)
+
+test.it("keeps what a module came to for the session after it", function()
+	-- The first session analyses `dep` to answer `require`; the second reads that answer instead
+	-- of the file. Both must report the same thing about the caller.
+	local project = TESTS_DIR .. "/fixtures/interface"
+	local uri = "file://" .. project .. "/src/use.lua"
+	local source = table.concat({
+		"local dep = require(\"dep\")\n",
+		"local total = dep() + 1\n",
+		"return total\n",
+	}, "")
+	writeFile(project .. "/target/dep.lua", "local function value() return \"x\" end\nreturn value\n")
+
+	local cold = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project))
+	local warm = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project))
+
+	test.equal(#cold, 1, "the first session publishes on open")
+	test.equal(#cold[1].diagnostics, 1, "a string is refused where a number is")
+	test.truthy(cold[1].diagnostics[1].message:find("needs numbers", 1, true))
+	test.equal(#warm, 1, "so does the second")
+	test.equal(warm[1].diagnostics[1].message, cold[1].diagnostics[1].message,
+		"and the answer it kept says the same thing")
+end)
+
+test.it("reads a module again when the file it names has changed", function()
+	-- What a session keeps for a module is only the answer for the links it read it against, so a
+	-- dependency that changed on disk is read again rather than answered for.
+	local project = TESTS_DIR .. "/fixtures/interface"
+	local uri = "file://" .. project .. "/src/use.lua"
+	local module = project .. "/target/dep.lua"
+	local source = table.concat({
+		"local dep = require(\"dep\")\n",
+		"local total = dep() + 1\n",
+		"return total\n",
+	}, "")
+
+	local text = "local function value() return \"x\" end\nreturn value\n"
+	writeFile(module, text)
+	local cold = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project))
+
+	writeFile(module, "local function value() return 7 end\nreturn value\n")
+	local changed = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project))
+	writeFile(module, text)
+
+	test.equal(#cold[1].diagnostics, 1, "a string is refused where a number is")
+	test.equal(#changed[1].diagnostics, 0, "and the module that now gives a number is read again")
 end)
 
 test.it("exits 0 when exit follows shutdown", function()

@@ -49,6 +49,26 @@ test.it("keeps a shared table shared", function()
 	test.equal(written.fields.left, written.fields.right, "one table, not two")
 end)
 
+test.it("gives a named table back as the caller's own", function()
+	-- The definitions' methods are looked up by the type they were built for, so a graph holding
+	-- one has to come back holding the very table the caller named, not a copy of it.
+	local held = types.fn({ types.STRING }, types.VOID, false, false)
+	local known = { names = { [held] = "field:ffi.cdef" }, tables = { ["field:ffi.cdef"] = held } }
+	local holder = types.classType("Holder", {}, { cdef = held }, {}, {})
+	local written = assert(sequel.read(assert(sequel.write(holder, known)), known))
+	test.equal(written.fields.cdef, held, "the caller's own table")
+	test.equal(sequel.SINGLETONS.void, written.fields.cdef.returns, "beside the singletons it knows")
+end)
+
+test.it("reads nothing when a named table is gone", function()
+	local held = types.fn({}, types.VOID, false, false)
+	local holder = types.classType("Holder", {}, { cdef = held }, {}, {})
+	local text = assert(sequel.write(holder, { names = { [held] = "field:gone" } }))
+	local value, err = sequel.read(text, { tables = {} })
+	test.equal(value, nil, "an answer naming a type the reader does not have")
+	test.truthy(err, "is not an answer")
+end)
+
 test.it("keeps text as text", function()
 	local fn = types.fn({}, types.extern("a\\\"b\nc"), false, false)
 	local written = roundTrip(fn)

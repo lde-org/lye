@@ -72,18 +72,28 @@ local function index(root)
 	return at, order
 end
 
---- Write a value as a Lua chunk that takes the singleton table and rebuilds it. Returns nil and
---- an explanation for a graph this cannot write: a table used as a key, which a type never has.
+--- Write a value as a Lua chunk that takes the singleton table and rebuilds it. `known` names the
+--- tables that must come back as the very tables they were — the definitions' own types, which the
+--- analysis reaches by identity — and they are written as `K[name]` and read back as the caller's
+--- own tables. Returns nil and an explanation for a graph this cannot write: a table used as a key,
+--- which a type never has.
 ---@param root unknown
+---@param known { names: table<unknown, string> }? the caller's own tables, by the name to write each as
 ---@return string? text
 ---@return string? err
-function serial.write(root)
+function serial.write(root, known)
+	local named = known and known.names
 	local at, order = index(root)
-	local out = { "return function(S)\n", "local t = {}\n" }
+	local out = { "return function(S, K)\n", "local t = {}\n" }
 	for position, value in ipairs(order) do
 		local name = SINGLETON_BY_TABLE[value]
 		if name then
 			out[#out + 1] = string.format("t[%d] = S[%s]\n", position, quoted(name))
+		elseif named and named[value] then
+			-- A table the caller holds itself: naming it is what keeps a signature reachable from
+			-- the type it was built for, which is how the definitions' fields are looked up.
+			out[#out + 1] = string.format("t[%d] = assert(K[%s], \"a known type is missing\")\n",
+				position, quoted(named[value]))
 		else
 			local fields = {}
 			for key, held in pairs(value) do
@@ -97,7 +107,8 @@ function serial.write(root)
 	-- The entries that point at another table, written once every table is there: a field that
 	-- holds its own table — a class with a field of its own type — needs the assignment form.
 	for position, value in ipairs(order) do
-		if not SINGLETON_BY_TABLE[value] then
+		-- A singleton and a named table are the caller's own: assigning to one would write into it.
+		if not SINGLETON_BY_TABLE[value] and not (named and named[value]) then
 			for key, held in pairs(value) do
 				if type(held) == "table" then
 					local target = at[held]
@@ -116,17 +127,18 @@ function serial.write(root)
 	return table.concat(out)
 end
 
---- Read a graph written by `serial.write`.
+--- Read a graph written by `serial.write`, with the caller's own tables for the names it was given.
 ---@param text string
+---@param known { tables: table<string, unknown> }?
 ---@return unknown? value
 ---@return string? err
-function serial.read(text)
+function serial.read(text, known)
 	local chunk, err = loadstring(text)
 	if not chunk then return nil, err end
 	local ok, builder = pcall(chunk)
 	if not ok then return nil, builder end
 	if type(builder) ~= "function" then return nil, "not a builder" end
-	local called, value = pcall(builder, SINGLETONS)
+	local called, value = pcall(builder, SINGLETONS, (known and known.tables) or {})
 	if not called then return nil, value end
 	return value
 end

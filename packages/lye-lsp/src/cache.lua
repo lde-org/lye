@@ -90,16 +90,19 @@ local function pathOf(key)
 	return dir and (dir .. "/" .. key .. ".entry")
 end
 
---- The entry written under `key`, or nil when there is none (or it cannot be read).
+--- The entry written under `key`, or nil when there is none (or it cannot be read). `known` is the
+--- caller's own tables for the names an entry was written with: a type the analysis reaches by
+--- identity has to come back as the very table it was.
 ---@param key string
+---@param known { tables: table<string, unknown> }?
 ---@return table?
-function cache.load(key)
+function cache.load(key, known)
 	if not cache.enabled() then return nil end
 	local path = pathOf(key)
 	if not path then return nil end
 	local text = fs.read(path)
 	if type(text) ~= "string" then return nil end
-	local value = serial.read(text)
+	local value = serial.read(text, known)
 	if type(value) ~= "table" then return nil end
 	return value
 end
@@ -108,12 +111,13 @@ end
 --- without one. The write lands whole or not at all, so a reader never sees half an entry.
 ---@param key string
 ---@param value table
+---@param known { names: table<unknown, string> }? the caller's own tables, written by name
 ---@return boolean
-function cache.save(key, value)
+function cache.save(key, value, known)
 	if not cache.enabled() then return false end
 	local path = pathOf(key)
 	if not path then return false end
-	local text = serial.write(value)
+	local text = serial.write(value, known)
 	if not text then return false end
 	local temporary = path .. ".tmp." .. tostring(math.floor(math.random(1, 1e9)))
 	if not fs.write(temporary, text) then return false end

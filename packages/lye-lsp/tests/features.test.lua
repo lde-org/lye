@@ -10,6 +10,13 @@ local json = require("lye-json")
 
 local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
+local CACHE = PACKAGE_DIR .. "/target/features-cache"
+
+-- Every session of the suite reads and writes under one directory of its own, wiped first: the
+-- definitions are written there rather than into the user's cache, and the first test that reaches a
+-- module reads it while the ones after it read the answer, so the whole file runs the same way
+-- every time rather than depending on what an earlier run — or another session — left behind.
+os.execute("rm -rf " .. string.format("%q", CACHE))
 local INPUT = PACKAGE_DIR .. "/target/features-input.bin"
 local FIXTURE = TESTS_DIR .. "/fixtures/server.lua"
 
@@ -56,7 +63,8 @@ local function run(requests, source, root, uri)
 	handle:write(frame({ jsonrpc = "2.0", method = "exit" }))
 	handle:close()
 
-	local pipe = assert(io.popen(string.format("cat %q | lde run %q 2>/dev/null", INPUT, FIXTURE)))
+	local pipe = assert(io.popen(string.format("XDG_CACHE_HOME=%q cat %q | lde run %q 2>/dev/null",
+		CACHE, INPUT, FIXTURE)))
 	local output = pipe:read("*a")
 	pipe:close()
 
@@ -93,20 +101,31 @@ test.it("reads a module the engine ships from the definitions", function()
 	-- `require("ffi")` names no file in any workspace: the module is a definition, and its text is
 	-- written where a client can open it. `jit` is both that and a global.
 	local source = 'local ffi = require("ffi")\nffi.cdef("int x;")\nffi.\n'
-	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/completion",
-		params = {
-			textDocument = { uri = "file:///f.lua" },
-			position = { line = 2, character = 4 },
-		},
-	} }, source)
+	---@return table<string, any>
+	local function labels()
+		local results = run({ {
+			jsonrpc = "2.0", id = 2, method = "textDocument/completion",
+			params = {
+				textDocument = { uri = "file:///f.lua" },
+				position = { line = 2, character = 4 },
+			},
+		} }, source)
+		local found = {}
+		for _, item in ipairs(results["2"].items or {}) do found[item.label] = item end
+		return found
+	end
 
-	local labels = {}
-	for _, item in ipairs(results["2"].items or {}) do labels[item.label] = item end
-	test.truthy(labels["cdef"], "a field of the ffi library")
-	test.truthy(labels["new"], "and another")
-	test.truthy(labels["cdef"].detail:match("def: string"), "with the signature it was declared with")
-	test.equal(labels["arch"] ~= nil, true, "and the rest of it")
+	local cold = labels()
+	test.truthy(cold["cdef"], "a field of the ffi library")
+	test.truthy(cold["new"], "and another")
+	test.truthy(cold["cdef"].detail:match("def: string"), "with the signature it was declared with")
+	test.equal(cold["arch"] ~= nil, true, "and the rest of it")
+
+	-- The second session reads the definitions' answer from what the first one kept, and the
+	-- signature has to be reached through the very type the definitions built for it.
+	local warm = labels()
+	test.equal(warm["cdef"].detail, cold["cdef"].detail, "the kept answer says the same thing")
+	test.equal(warm["cdef"].documentation, cold["cdef"].documentation, "down to the documentation")
 end)
 
 test.it("offers the definitions' globals beside the names in scope", function()

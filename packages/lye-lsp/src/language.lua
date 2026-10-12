@@ -15,12 +15,44 @@ local cdef = require("lye-cdef")
 local editorconfig = require("lye-lsp.editorconfig")
 local KIND = require("lye-lexer").KIND
 local types = require("lye-doc.type")
+local cache = require("lye-lsp.cache")
+local rapidhash = require("rapidhash")
 
 local SYMBOL_KIND = { ["function"] = 12, variable = 13 }
 
 --- The LuaJIT definitions, prepared once: they are the same for every document, and parsing
 --- them per keystroke would be absurd.
 local PRELUDE = analyzer.prelude(require("lye-defs"))
+
+--- The definitions' own types, by a name a session can say them with. A module's answer holds
+--- them — `ffi.cdecl` is a function the definitions declared — and a session that reads that answer
+--- back has to reach the very tables the definitions built, because a signature is looked up by the
+--- type it was built for. Built once, from the maps the definitions are already keyed by.
+---@type { names: table<unknown, string>, tables: table<string, unknown> }?
+local preludeTypes
+
+---@return { names: table<unknown, string>, tables: table<string, unknown> }
+local function namedPreludeTypes()
+	if preludeTypes then return preludeTypes end
+	local names, tables = {}, {}
+	---@param held unknown
+	---@param name string
+	local function add(held, name)
+		if type(held) ~= "table" or names[held] then return end
+		names[held] = name
+		tables[name] = held
+	end
+	-- A field's type is what the completion looks a signature up by, so it needs its name most:
+	-- `evolved` is where the definitions' methods were put as they were declared.
+	for className, fields in pairs(PRELUDE.evolved or {}) do
+		for field, held in pairs(fields) do add(held, "field:" .. className .. "." .. field) end
+	end
+	for name, alias in pairs(PRELUDE.aliases) do add(alias, "alias:" .. name) end
+	for name, held in pairs(PRELUDE.returns) do add(held, "return:" .. name) end
+	for text, held in pairs(PRELUDE.built or {}) do add(held, "built:" .. text) end
+	preludeTypes = { names = names, tables = tables }
+	return preludeTypes
+end
 
 local TOKEN_LEGEND = {
 	tokenTypes = {
@@ -377,6 +409,26 @@ function Lye:moduleType(name, from)
 		return open.module
 	end
 
+	-- What an earlier session worked out for this module. It is read against the workspace's
+	-- declarations, this package's links and the documents that were open, so the key says all
+	-- three: a session that has the same ones reads the same answer, and one that does not reads
+	-- nothing. The first module of a session pays for the scan it needs anyway to say so.
+	local textKey = rapidhash.hex(written)
+	self:workspaceDeclarations()
+	local owner = self:packageRoot(uri)
+	if owner then self:packageDeclarations(owner) end
+	local key = cache.key("module", textKey, self.annotationsDigest or "",
+		(self.packageDigests or {})[owner] or "", self:documentsDigest())
+	local known = namedPreludeTypes()
+	local entry = cache.load(key, known)
+	if entry and entry.key == cache.codeVersion() and entry.text == textKey then
+		-- `false` is the answer a module that returns nothing came to: it is kept too, so a run
+		-- after this one is not made to read the file again to learn nothing.
+		local held = entry.module ~= false and entry.module or nil
+		self.modules[path] = { text = written, type = held }
+		return held
+	end
+
 	self.requiring[path] = true
 	-- The module's own `require`s resolve within *its* package: a dependency's file is a document
 	-- of that package, and what it can reach is what lde linked into that package's `target/`.
@@ -387,7 +439,30 @@ function Lye:moduleType(name, from)
 	end, nil, nil, true)
 	self.requiring[path] = nil
 	self.modules[path] = { text = written, type = names.module }
+	-- Kept for the sessions after this one. The graph is written as it stands: a placeholder in
+	-- it is a placeholder in the answer, which is what a session that analysed the file would have
+	-- had. A module that returns nothing is kept too, as `false`.
+	cache.save(key, { text = textKey, key = cache.codeVersion(), module = names.module or false }, known)
 	return names.module
+end
+
+--- A digest of the documents an editor has open. A module is analysed against what they declare —
+--- a class written in an unsaved buffer is as real to it as one on disk — so an answer kept for a
+--- session is only the answer for a session with the same ones open. Kept until one of them
+--- changes, which is the only thing that can make it say something else.
+---@param self lye.Server
+---@return string
+function Lye:documentsDigest()
+	if self.openDigest then return self.openDigest end
+	local byUri = self.server.documents and self.server.documents.byUri
+	if not byUri then return "" end
+	local parts = {}
+	for uri, document in pairs(byUri) do
+		parts[#parts + 1] = uri .. "\0" .. rapidhash.hex(document.text or "")
+	end
+	table.sort(parts)
+	self.openDigest = rapidhash.hex(table.concat(parts, "\1"))
+	return self.openDigest
 end
 
 --- What one document declares, which `declaredBy` keeps after its analysis is dropped.
@@ -412,7 +487,7 @@ function Lye:workspaceDeclarations()
 		local pipe = io.popen(string.format(
 			"find %q -type f -name '*.lua' -not -path '*/target/*' -not -path '*/.*/*' | head -2000", root))
 		if pipe then
-			local parsedFiles = {}
+			local parsedFiles, parts = {}, {}
 			for file in pipe:lines() do
 				local handle = io.open(file, "rb")
 				-- A read that comes back with nothing is not a file this can read — a directory
@@ -423,10 +498,19 @@ function Lye:workspaceDeclarations()
 				if type(source) == "string" then
 					local isOk, parsed = pcall(doc.parse, source)
 					if isOk then parsedFiles[#parsedFiles + 1] = parsed end
+					-- What a file declares, for the digest: a module's answer read against this
+					-- workspace is only the answer for a workspace that declares the same things.
+					if isOk then
+						for _, annotation in ipairs(parsed.annotations) do
+							parts[#parts + 1] = annotation.tag .. "\0" .. (annotation.name or "") .. "\0"
+								.. (annotation.text or "") .. "\0" .. (annotation.type or "")
+						end
+					end
 				end
 			end
 			pipe:close()
 			known = classes.declare(parsedFiles)
+			self.annotationsDigest = rapidhash.hex(table.concat(parts, "\1"))
 		end
 	end
 	self.known = known
@@ -446,9 +530,11 @@ end
 ---@return table<string, boolean|lye.doc.Type>
 function Lye:packageDeclarations(root)
 	self.packageNames = self.packageNames or {}
+	self.packageDigests = self.packageDigests or {}
 	local held = self.packageNames[root]
 	if held ~= nil then return held end
 	local found = {}
+	local parts = {}
 	local pipe = io.popen(string.format(
 		"find -L %q -type f -name '*.lua' -not -path '*/.*/*' 2>/dev/null | head -2000", root .. "/target"))
 	if pipe then
@@ -460,12 +546,16 @@ function Lye:packageDeclarations(root)
 			if type(source) == "string" then
 				local isOk, parsed = pcall(doc.parse, source)
 				if isOk then parsedFiles[#parsedFiles + 1] = parsed end
+				-- The file and what it says: a module read against a package's links is only the
+				-- answer for links that are the same.
+				parts[#parts + 1] = file .. "\0" .. rapidhash.hex(source)
 			end
 		end
 		pipe:close()
 		found = classes.declare(parsedFiles)
 	end
 	self.packageNames[root] = found
+	self.packageDigests[root] = rapidhash.hex(table.concat(parts, "\1"))
 	return found
 end
 
@@ -1916,6 +2006,8 @@ function Lye:forget(uri)
 	self.analysis[uri] = nil
 	self.names[uri] = nil
 	self.declaredBy[uri] = nil
+	-- What the documents say has changed with it, and `documentsDigest` reads them again for it.
+	self.openDigest = nil
 	for index = #self.order, 1, -1 do
 		if self.order[index] == uri then table.remove(self.order, index) end
 	end

@@ -27,6 +27,7 @@ It is written in the language it serves, compiles to one standalone executable, 
 - **Callbacks are typed** — a function cast to a C callback keeps the header's parameter types
 - **`require`, the lde way** — `<package>/target/?.lua`, plus `ffi`, `jit`, `string.buffer` and friends
 - **The standard library** — LuaJIT's and Lua 5.1's, from eighteen definition files
+- **The workspace, resolved** — on startup the whole workspace is read for what it declares, so a type named in a file nothing requires yet is already known, and what a `require` came to is kept between sessions, keyed by the file, the workspace's annotations, the package's links and the documents that were open. A session that agrees on all of those reports on an open file in a fraction of the time the first one took; `LYE_CACHE=off` turns the keeping off
 - **Headless too** — the same binary checks files for CI: `lye --check src/**.lua`, handing each package to a worker process so the batch runs on the machine's cores (`LYE_WORKERS=1` checks in one)
 - **Checked once, remembered** — what a check finds for a file is kept between runs, keyed by the file's own text and by everything it was read against (the batch's annotations, the package's `target/`, and the modules it requires). A tree that has not changed since the last run reports in about a tenth of a second; a file that changed is checked again only where that change can reach. `LYE_CACHE=off` turns this off
 
