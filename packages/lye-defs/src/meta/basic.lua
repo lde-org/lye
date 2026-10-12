@@ -33,6 +33,12 @@ function assert(v, message, ...) end
 ---@overload fun(opt: "setstepmul", arg: integer): integer
 function collectgarbage(...) end
 
+---How much memory the collector has taken, in kilobytes. Lua 5.1 and LuaJIT only, and the same
+---number `collectgarbage("count")` gives.
+---@return number kilobytes
+---@nodiscard
+function gcinfo() end
+
 
 
 

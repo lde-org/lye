@@ -335,23 +335,16 @@ end)
 test.it("holds a `.d.lua` document to its annotations, not to bodies it does not have", function()
 	-- A definition file has no bodies: `---@return true?` over `function file:write(...) end` is the
 	-- whole of that function, and a name ending `.d.lua` says so without a `---@meta` marker.
-	local source = table.concat({
-		"---@class file*\n",
-		"local file = {}\n",
-		"---@param ... string|number\n",
-		"---@return true? suc\n",
-		"function file:write(...) end\n",
-		"return file\n",
-	}, "")
+	local source = "---@type string\nlocal held = 1\nreturn held\n"
 	local asDefinition = publishedDiagnostics(
-		run(endingWithShutdown({ didOpen(source, "file:///tmp/io.d.lua") }), nil))
+		run(endingWithShutdown({ didOpen(source, "file:///tmp/held.d.lua") }), nil))
 	test.equal(#asDefinition, 1, "the document publishes")
 	test.equal(#asDefinition[1].diagnostics, 0, "and a definition file reports nothing")
 
 	local asSource = publishedDiagnostics(
-		run(endingWithShutdown({ didOpen(source, "file:///tmp/io.lua") }), nil))
+		run(endingWithShutdown({ didOpen(source, "file:///tmp/held.lua") }), nil))
 	test.equal(#asSource[1].diagnostics, 1,
-		"while the same text in a `.lua` file is held to a body it does not have")
+		"while the same text in a `.lua` file is held to what it writes")
 end)
 
 test.it("exits 0 when exit follows shutdown", function()

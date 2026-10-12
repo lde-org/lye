@@ -1,5 +1,11 @@
 ---@meta ffi
 
+---@class ffilib
+---@field C    ffi.namespace* the C namespace: what a `cdef` declared, reached by name
+---@field arch 'x86'|'x64'|'arm'|'arm64'|'arm64be'|'ppc'|'ppc64'|'ppc64le'|'mips'|'mipsel'|'mips64'|'mips64el'|string
+---@field os   'Windows'|'Linux'|'OSX'|'BSD'|'POSIX'|'Other'|string
+ffi = {}
+
 ---@class ffi.namespace*: table
 ---@field [string] function
 
@@ -172,6 +178,14 @@ function ffi.fill(dst, len, c) end
 ---@param param string
 ---@return boolean status
 function ffi.abi(param) end
+
+---A table describing a C type: how large it is, how it is aligned, what it is an array or a
+---pointer of, and the names and offsets of its fields.
+---@param ct ffi.ct*
+---@param ... any
+---@return table info
+---@nodiscard
+function ffi.typeinfo(ct, ...) end
 
 function cb:free() end
 
