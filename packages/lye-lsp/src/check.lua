@@ -76,27 +76,40 @@ end
 --- reading the same `target/`, does not.
 ---@param root string the package root
 ---@param cache table<string, table<string, boolean|lye.doc.Type>>
-local function linkedDeclarations(root, cache)
+---@param paths string[]? the files under `target/`, when a run has already listed them
+local function linkedDeclarations(root, cache, paths)
 	local held = cache[root]
 	if held then return held end
 	local found = {}
 	local target = absolute(root) .. "/target"
 	if fs.isdir(target) then
-		-- A link farm holds the same file under every package that depends on it, so the walk
-		-- stops at the cap rather than reading the closure of every closure.
+		-- Every file's names are read into one namespace before any is resolved: a class of one
+		-- file holds a field whose type is an alias of another — `lde.Package.Config.features` is
+		-- `lde.Package.Config.FeatureDefinitions` — and resolving the class with the file it is
+		-- written in alone left that field a name nothing stands for. A link farm holds the same
+		-- file under every package that depends on it, so the walk stops at the cap rather than
+		-- reading the closure of every closure; a run whose cache has already listed the farm —
+		-- its digest is taken over the same files — hands the list over instead of walking again.
 		local parsedFiles = {}
-		for file in fs.scan(target, "**/*.lua", { absolute = true, followSymlinks = true, ignore = ignored }) do
-			if #parsedFiles >= 2000 then break end
+		---@param file string
+		local function read(file)
+			if #parsedFiles >= 2000 then return end
 			local source = readSource(file)
-			if type(source) == "string" then
-				local key = textKey(source)
-				local parsed = docsByText[key]
-				if parsed == nil then
-					local isOk, one = pcall(doc.parse, source)
-					if isOk then docsByText[key] = one end
-					parsed = isOk and one or nil
-				end
-				if parsed then parsedFiles[#parsedFiles + 1] = parsed end
+			if type(source) ~= "string" then return end
+			local key = textKey(source)
+			local parsed = docsByText[key]
+			if parsed == nil then
+				local isOk, one = pcall(doc.parse, source)
+				if isOk then docsByText[key] = one end
+				parsed = isOk and one or nil
+			end
+			if parsed then parsedFiles[#parsedFiles + 1] = parsed end
+		end
+		if paths then
+			for _, file in ipairs(paths) do read(file) end
+		else
+			for file in fs.scan(target, "**/*.lua", { absolute = true, followSymlinks = true, ignore = ignored }) do
+				read(file)
 			end
 		end
 		-- What each name means, resolved once for the whole package: a dependency's alias is as
@@ -230,12 +243,14 @@ end
 ---@param scopes table<string, table<string, boolean|lye.doc.Type>>
 ---@param elsewhere table<string, boolean|lye.doc.Type>?
 ---@return table<string, boolean|lye.doc.Type>
-local function scopeFor(owner, scopes, elsewhere)
+local function scopeFor(owner, scopes, elsewhere, store)
 	local held = scopes[owner]
 	if held then return held end
 	local scope = {}
 	for name, value in pairs(elsewhere or {}) do scope[name] = value end
-	for name, value in pairs(linkedDeclarations(owner, scopes)) do scope[name] = value end
+	for name, value in pairs(linkedDeclarations(owner, scopes, store and store.farmFiles[owner])) do
+		scope[name] = value
+	end
 	scopes[owner] = scope
 	return scope
 end
@@ -267,8 +282,9 @@ end
 ---@param elsewhere table<string, boolean|lye.doc.Type>? what the batch declares
 ---@param scopes table<string, table<string, boolean|lye.doc.Type>>? the scope of each package
 ---@param batch table<string, string>? the files being checked, by their text
+---@param store lye.check.Store? what the run keeps between runs, whose farm list is reused here
 ---@return lye.doc.Type?
-local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch)
+local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch, store)
 	local owner = packageOf(path)
 	if not owner then return nil end
 	local found = modulePath(owner, name)
@@ -301,11 +317,13 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 	-- in two contexts. Anything else is read for its type alone: its diagnostics are not this
 	-- run's to report, so the passes that only build them are left out.
 	local batchPath = batch and batch[key]
-	local own = batchPath and scopeFor(packageOf(batchPath) or path, scopes or {}, elsewhere) or elsewhere
+	local own = batchPath
+		and scopeFor(packageOf(batchPath) or path, scopes or {}, elsewhere, store)
+		or elsewhere
 	local names = analysesByText[key]
 	if names == nil then
 		names = analyzer.analyze(written, PRELUDE, own, function(inner)
-			return moduleOf(found, inner, modules, analysing, own, scopes, batch)
+			return moduleOf(found, inner, modules, analysing, own, scopes, batch, store)
 		end, nil, docsByText[key], batchPath == nil)
 		analysesByText[key] = names
 	end
@@ -355,7 +373,7 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	-- A name the package's linked modules declare is not a typo, so the file is read against them
 	-- as well as against the batch. Merged once per package rather than once per file.
 	local owner = packageOf(path)
-	if owner then elsewhere = scopeFor(owner, scopes or {}, elsewhere) end
+	if owner then elsewhere = scopeFor(owner, scopes or {}, elsewhere, store) end
 	if not isRead then source = readSource(path) end
 	-- A directory reads as nothing and `--check` is pointed at folders all the time: say so
 	-- instead of handing the parser nothing to work with.
@@ -379,7 +397,7 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	local names = analysesByText[key]
 	if names == nil then
 		names = analyzer.analyze(source, PRELUDE, elsewhere, function(name)
-			return moduleOf(path, name, modules or {}, analysing, elsewhere, scopes, batch)
+			return moduleOf(path, name, modules or {}, analysing, elsewhere, scopes, batch, store)
 		end, nil, docsByText[key])
 		analysesByText[key] = names
 		-- The full analysis says what `require` of this file gives back as well, and it is the
