@@ -7,6 +7,7 @@
 ]]
 
 local test = require("lde-test")
+local fs = require("fs")
 
 local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
@@ -34,18 +35,35 @@ local function fixture(files)
 end
 
 ---@param paths string[] what to check, relative to the fixture
----@param withCache boolean? read and write the cache, rather than turning it off
+---@param cache boolean|string? read and write the cache — `true` for the suite's own directory, a
+--- string for that one — rather than turning it off
+---@param extra string? further options for the command line
 ---@return string output
-local function check(paths, withCache)
+local function check(paths, cache, extra)
 	local named = {}
 	for _, relative in ipairs(paths) do named[#named + 1] = string.format("%q", ROOT .. "/" .. relative) end
-	local cache = withCache and ("XDG_CACHE_HOME=" .. string.format("%q", CACHE)) or "LYE_CACHE=off"
-	local command = string.format("%s lde run %q -- check %s 2>&1",
-		cache, MAIN, table.concat(named, " "))
+	local env = ""
+	if cache == false then
+		env = "LYE_CACHE=off "
+	elseif cache then
+		env = "LYE_CACHE_DIR=" .. string.format("%q", cache == true and CACHE or cache) .. " "
+	end
+	local command = string.format("cd %q && %s lde run %q -- check %s%s 2>&1",
+		PACKAGE_DIR, env, MAIN, table.concat(named, " "), extra and (" " .. extra) or "")
 	local pipe = assert(io.popen(command))
 	local output = pipe:read("*a")
 	pipe:close()
 	return output
+end
+
+--- How many entries a directory holds, wherever the version directory under it is.
+---@param dir string
+---@return integer
+local function entries(dir)
+	local pipe = assert(io.popen(string.format("find %q -name '*.entry' 2>/dev/null | wc -l", dir)))
+	local count = tonumber(pipe:read("*a")) or 0
+	pipe:close()
+	return count
 end
 
 ---@param output string
@@ -139,6 +157,43 @@ test.it("what a reused analysis read is remembered too", function()
 	local second = check({ "src" }, true)
 	test.equal(second:find("needs numbers", 1, true), nil,
 		"the change reaches the file that read it through another: " .. second)
+end)
+
+test.it("keeps what it worked out in .lye beside the project, by default", function()
+	-- A check is called from the project it checks, so that is where its answers belong: nothing
+	-- about the project is written outside it, and the next run in the same tree reads them back.
+	local beside = PACKAGE_DIR .. "/.lye"
+	os.execute("rm -rf " .. string.format("%q", beside))
+	fixture({ ["src/one.lua"] = "local x = 1\nreturn x\n" })
+
+	local output = check({ "src" })
+
+	test.equal(entries(beside) > 0, true, "the run kept its answers in .lye: " .. output)
+	os.execute("rm -rf " .. string.format("%q", beside))
+end)
+
+test.it("keeps them where the command line says instead", function()
+	local told = PACKAGE_DIR .. "/target/cache-told"
+	local beside = PACKAGE_DIR .. "/.lye"
+	os.execute("rm -rf " .. string.format("%q", told) .. " " .. string.format("%q", beside))
+	fixture({ ["src/one.lua"] = "local x = 1\nreturn x\n" })
+
+	local output = check({ "src" }, nil, "--cache " .. string.format("%q", told))
+
+	test.equal(entries(told) > 0, true, "--cache is where the answers went: " .. output)
+	test.equal(fs.isdir(beside), false, "and nothing was kept beside the project")
+end)
+
+test.it("--cold checks again and keeps nothing", function()
+	local told = PACKAGE_DIR .. "/target/cache-cold"
+	os.execute("rm -rf " .. string.format("%q", told))
+	fixture({ ["src/one.lua"] = "local x = 1\nreturn x\n" })
+
+	local cold = check({ "src" }, nil, "--cold --cache " .. string.format("%q", told))
+	local warm = check({ "src" }, true)
+
+	test.equal(findings(cold), findings(warm), "a cold run finds what a warm one does: " .. cold)
+	test.equal(entries(told), 0, "and keeps nothing of its own")
 end)
 
 test.it("an entry that cannot be read is checked as it always was", function()

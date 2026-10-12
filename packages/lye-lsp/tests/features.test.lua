@@ -13,9 +13,10 @@ local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local CACHE = PACKAGE_DIR .. "/target/features-cache"
 
 -- Every session of the suite reads and writes under one directory of its own, wiped first: the
--- definitions are written there rather than into the user's cache, and the first test that reaches a
--- module reads it while the ones after it read the answer, so the whole file runs the same way
--- every time rather than depending on what an earlier run — or another session — left behind.
+-- entries and the definitions are written there rather than beside the workspace the session was
+-- handed, and the first test that reaches a module reads it while the ones after it read the
+-- answer, so the whole file runs the same way every time rather than depending on what an earlier
+-- run — or another session — left behind.
 os.execute("rm -rf " .. string.format("%q", CACHE))
 local INPUT = PACKAGE_DIR .. "/target/features-input.bin"
 local FIXTURE = TESTS_DIR .. "/fixtures/server.lua"
@@ -63,7 +64,7 @@ local function run(requests, source, root, uri)
 	handle:write(frame({ jsonrpc = "2.0", method = "exit" }))
 	handle:close()
 
-	local pipe = assert(io.popen(string.format("XDG_CACHE_HOME=%q cat %q | lde run %q 2>/dev/null",
+	local pipe = assert(io.popen(string.format("LYE_CACHE_DIR=%q cat %q | lde run %q 2>/dev/null",
 		CACHE, INPUT, FIXTURE)))
 	local output = pipe:read("*a")
 	pipe:close()

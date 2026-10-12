@@ -7,6 +7,7 @@
 
 local check = require("lye-lsp.check")
 local report = require("lye-lsp.report")
+local cache = require("lye-lsp.cache")
 
 local USAGE = [[
 usage: lye [options] [files...]
@@ -15,6 +16,8 @@ usage: lye [options] [files...]
   --stdio          the same, and what editors pass
   check [paths...] check every Lua file under the paths, or the working directory
   --check <file>   the same for the files named, kept for scripts that pass it
+  --cache <dir>    keep what a run worked out there, instead of ./.lye
+  --cold           check everything again, keeping nothing (as LYE_CACHE=off does)
   --no-color       report without colour, as a pipe or a log file wants
   --color          report with it, for a log that will render it
   --version        print the version
@@ -45,6 +48,20 @@ while args[index] do
 	index += 1
 	if value == "--check" then
 		isCheck = true
+	elseif value == "--cache" then
+		-- Where this run keeps what it works out. A build that wants its own directory, or one
+		-- that has a shared cache for a whole tree, says so here.
+		local dir = args[index]
+		if not dir then
+			io.stderr:write("lye: --cache needs a directory\n" .. USAGE)
+			os.exit(2)
+		end
+		index += 1
+		cache.setRoot(dir)
+	elseif value == "--cold" then
+		-- Everything again, as a first run does it, and nothing kept: what a run that wants to
+		-- measure itself, or to distrust what was kept, asks for.
+		cache.setEnabled(false)
 	elseif value == "--version" or value == "-v" then
 		print("lye " .. "0.1.0")
 		return

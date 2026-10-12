@@ -465,6 +465,16 @@ function Lye:documentsDigest()
 	return self.openDigest
 end
 
+--- Where this session keeps what it works out: the workspace the editor opened, so a second
+--- editor on the same project reads what the first one worked out. A run that named a directory —
+--- `LYE_CACHE_DIR`, or the command line — has said where it wants everything, and this leaves it
+--- there.
+---@param self lye.Server
+function Lye:useWorkspaceCache()
+	local root = self.server.rootPath
+	if root and root ~= "" and not cache.named() then cache.setRoot(root .. "/.lye") end
+end
+
 --- What one document declares, which `declaredBy` keeps after its analysis is dropped.
 ---@param file lye.doc.File
 ---@return table<string, boolean|lye.doc.Type>
@@ -480,6 +490,7 @@ end
 --- batch, so a type built from another file's annotations still resolves.
 ---@param self lye.Server
 function Lye:workspaceDeclarations()
+	self:useWorkspaceCache()
 	if self.known then return self.known end
 	local root = self.server.rootPath
 	local known = {}
@@ -1127,6 +1138,7 @@ end
 --- The names the definitions declare, indexed once and written where a client can open them.
 ---@return table
 function Lye:definitionIndex()
+	self:useWorkspaceCache()
 	if not self.definitions then
 		self.definitions = definitionsIndex.prepare(require("lye-defs"))
 	end

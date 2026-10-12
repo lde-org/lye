@@ -4,18 +4,33 @@
 	An entry is stored under a key its caller chooses — a hash of the text it is about and of what
 	it was read against — and holds a plain Lua table, written and read by `lye-doc.serial`. Every
 	entry carries the version of the code that wrote it: the sources of the packages that do the
-	analysing, hashed, so a run of other code never reads this code's answers as its own. A run
-	with no cache directory to write to, or with `LYE_CACHE=off`, simply does not cache.
+	analysing, hashed, so a run of other code never reads this code's answers as its own.
+
+	Everything a run keeps lives under one directory: `.lye` beside the project a check was called
+	in, or wherever `cache.setRoot` or `LYE_CACHE_DIR` names — a build that wants its own, or an
+	editor that wants the cache in the workspace it opened. `LYE_CACHE=off` turns the keeping off.
 ]]
 
 local fs = require("fs")
 local rapidhash = require("rapidhash")
 local serial = require("lye-doc.serial")
+local ffi = require("ffi")
 
 local cache = {}
 
+-- A name no other session's write shares, so two of them can write the same file at once without
+-- one moving the other's half-written text into place.
+pcall(ffi.cdef, [[int getpid(void);]])
+local PID = 0
+do
+	local ok, value = pcall(function() return ffi.C.getpid() end)
+	if ok then PID = tonumber(value) or 0 end
+end
+
 local version
 local rootDir
+local enabled
+local named
 
 --- The version an entry was written by: every source file of the packages whose code decides what
 --- an analysis finds, hashed together, with the definitions they are read through.
@@ -61,10 +76,44 @@ local function codeVersion()
 	return version
 end
 
---- Whether this run keeps a cache at all.
+--- Whether this run keeps a cache at all. `LYE_CACHE=off` says no, and so does a caller that
+--- wants a cold run out of a cache that is already there.
+---@return boolean
 function cache.enabled()
+	if enabled ~= nil then return enabled end
 	local set = os.getenv("LYE_CACHE")
 	return set ~= "off" and set ~= "0"
+end
+
+---@param value boolean
+function cache.setEnabled(value)
+	enabled = value
+end
+
+--- Where this run keeps what it worked out. A caller that names a directory — the command line,
+--- or a build that has its own idea — writes there instead of beside the project.
+---@param dir string
+function cache.setRoot(dir)
+	rootDir = nil
+	named = dir
+end
+
+--- Whether a directory has already been named, by a caller or by `LYE_CACHE_DIR`. The language
+--- server asks before it points the cache at the workspace it was handed: a run that named one has
+--- said where it wants everything, and the server is not the one to overrule it.
+---@return boolean
+function cache.named()
+	return named ~= nil or (os.getenv("LYE_CACHE_DIR") or "") ~= ""
+end
+
+--- The directory everything this run keeps goes under: what a caller named, else `LYE_CACHE_DIR`,
+--- else `.lye` in the working directory — the project a check was called in.
+---@return string
+function cache.root()
+	if named then return named end
+	local set = os.getenv("LYE_CACHE_DIR")
+	if set and set ~= "" then return set end
+	return "./.lye"
 end
 
 --- The directory this version's entries live in, made when it is first asked for. Nil when there
@@ -72,12 +121,7 @@ end
 local function directory()
 	if rootDir then return rootDir end
 	if not cache.enabled() then return nil end
-	local base = os.getenv("XDG_CACHE_HOME")
-	if not base or base == "" then
-		local home = os.getenv("HOME")
-		base = home and home ~= "" and (home .. "/.cache") or "/tmp"
-	end
-	local dir = base .. "/lye/" .. codeVersion()
+	local dir = cache.root() .. "/" .. codeVersion()
 	fs.mkdirAll(dir)
 	rootDir = fs.isdir(dir) and dir or nil
 	return rootDir
@@ -107,8 +151,23 @@ function cache.load(key, known)
 	return value
 end
 
+--- Write `text` at `path`, unless the file already holds exactly that. A write that cannot happen
+--- is not an error: the run goes on without one. The text lands whole or not at all — it goes to a
+--- temporary name beside the file and is moved over it — so a reader never finds half of it.
+---@param path string
+---@param text string
+---@return boolean
+function cache.writeWhole(path, text)
+	if fs.read(path) == text then return true end
+	local temporary = string.format("%s.tmp.%d-%d", path, PID, math.floor(math.random(1, 1e9)))
+	if not fs.write(temporary, text) then return false end
+	if fs.move(temporary, path) then return true end
+	os.remove(temporary)
+	return false
+end
+
 --- Write `value` under `key`. A cache that cannot be written is not an error: the run goes on
---- without one. The write lands whole or not at all, so a reader never sees half an entry.
+--- without one.
 ---@param key string
 ---@param value table
 ---@param known { names: table<unknown, string> }? the caller's own tables, written by name
@@ -119,11 +178,7 @@ function cache.save(key, value, known)
 	if not path then return false end
 	local text = serial.write(value, known)
 	if not text then return false end
-	local temporary = path .. ".tmp." .. tostring(math.floor(math.random(1, 1e9)))
-	if not fs.write(temporary, text) then return false end
-	if fs.move(temporary, path) then return true end
-	os.remove(temporary)
-	return false
+	return cache.writeWhole(path, text)
 end
 
 --- A key from the parts that make an entry what it is: the text it is about, and what it was read

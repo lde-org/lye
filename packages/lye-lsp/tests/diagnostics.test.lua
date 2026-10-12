@@ -8,6 +8,7 @@
 
 local test = require("lde-test")
 local json = require("lye-json")
+local fs = require("fs")
 
 local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
@@ -15,9 +16,10 @@ local FIXTURE = TESTS_DIR .. "/fixtures/server.lua"
 local CACHE = PACKAGE_DIR .. "/target/session-cache"
 
 -- Every session of the suite reads and writes under one directory of its own, wiped first: the
--- definitions are written there rather than into the user's cache, and the first test that reaches a
--- module reads it while the ones after it read the answer, so the whole file runs the same way
--- every time rather than depending on what an earlier run — or another session — left behind.
+-- entries and the definitions are written there rather than beside the workspace the session was
+-- handed, and the first test that reaches a module reads it while the ones after it read the
+-- answer, so the whole file runs the same way every time rather than depending on what an earlier
+-- run — or another session — left behind.
 os.execute("rm -rf " .. string.format("%q", CACHE))
 local INPUT = PACKAGE_DIR .. "/target/lsp-test-input.bin"
 
@@ -37,9 +39,11 @@ end
 --- handshake is dropped, so a session that forgot it would assert on silence.
 ---@param messages table[]
 ---@param root string? a workspace to open, for what a document names without requiring it
+---@param cache boolean|string? where the session keeps what it works out — the suite's own
+--- directory, one it names, or `false` for none named at all, which leaves the workspace's own
 ---@return table[] frames
 ---@return integer exitCode
-local function run(messages, root)
+local function run(messages, root, cache)
 	local handle = assert(io.open(INPUT, "wb"))
 	handle:write(frame({
 		jsonrpc = "2.0",
@@ -55,9 +59,10 @@ local function run(messages, root)
 	-- `lde run` resolves package dependencies from the working directory, and `io.popen`
 	-- close reports the shell's status rather than the child's, so the child prints its
 	-- own exit code as the final line.
+	local env = cache == false and "" or ("LYE_CACHE_DIR=" .. string.format("%q", cache or CACHE))
 	local pipe = assert(io.popen(string.format(
-		"cd %q && XDG_CACHE_HOME=%q cat %q | lde run %q 2>/dev/null; echo \"EXIT:$?\"",
-		PACKAGE_DIR, CACHE, INPUT, FIXTURE
+		"cd %q && %s cat %q | lde run %q 2>/dev/null; echo \"EXIT:$?\"",
+		PACKAGE_DIR, env, INPUT, FIXTURE
 	)))
 	local output = pipe:read("*a")
 	pipe:close()
@@ -308,6 +313,23 @@ test.it("reads a module again when the file it names has changed", function()
 
 	test.equal(#cold[1].diagnostics, 1, "a string is refused where a number is")
 	test.equal(#changed[1].diagnostics, 0, "and the module that now gives a number is read again")
+end)
+
+test.it("keeps what it works out beside the workspace it was handed", function()
+	-- No directory named: an editor session writes beside the project it opened, so a session
+	-- after it on the same project reads what this one worked out, definitions and all.
+	local project = TESTS_DIR .. "/fixtures/interface"
+	local uri = "file://" .. project .. "/src/use.lua"
+	local source = "local ffi = require(\"ffi\")\nreturn ffi\n"
+	local beside = project .. "/.lye"
+	os.execute("rm -rf " .. string.format("%q", beside))
+
+	local published = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project, false))
+
+	test.equal(#published, 1, "opening the document publishes its diagnostics")
+	test.equal(fs.isdir(beside), true, "the session kept its answers beside the workspace")
+	test.equal(fs.isdir(beside .. "/defs"), true, "and the definitions a client opens are there too")
+	os.execute("rm -rf " .. string.format("%q", beside))
 end)
 
 test.it("exits 0 when exit follows shutdown", function()

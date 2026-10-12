@@ -13,6 +13,7 @@ local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local INPUT = PACKAGE_DIR .. "/target/check-input.lua"
 local MAIN = PACKAGE_DIR .. "/src/main.lua"
+local CACHE = PACKAGE_DIR .. "/target/check-entries"
 
 ---@param source string
 local function writeInput(source)
@@ -21,10 +22,12 @@ local function writeInput(source)
 	handle:close()
 end
 
+--- Every command runs with the cache of this suite, so a test never reads or writes the one a
+--- developer's own runs leave beside their project.
 ---@param command string
 ---@return string output
 local function run(command)
-	local pipe = assert(io.popen(command))
+	local pipe = assert(io.popen("LYE_CACHE_DIR=" .. string.format("%q", CACHE) .. " " .. command))
 	local output = pipe:read("*a")
 	pipe:close()
 	return output
@@ -104,6 +107,13 @@ test.it("rejects an unknown option instead of checking a file named after it", f
 	local message = run(string.format("lde run %q -- --bogus 2>&1 >/dev/null", MAIN))
 	test.truthy(message:match("unknown option '%-%-bogus'"), "got: " .. message)
 	test.truthy(message:match("usage: lye"), "the usage line belongs in the message")
+end)
+
+test.it("refuses --cache without a directory", function()
+	local out = run(string.format("lde run %q -- --cache >/dev/null 2>&1; echo $?", MAIN))
+	test.equal(tonumber(out), 2)
+	local message = run(string.format("lde run %q -- --cache 2>&1 >/dev/null", MAIN))
+	test.truthy(message:match("%-%-cache needs a directory"), "got: " .. message)
 end)
 
 test.it("serves the protocol when an editor passes its own flags", function()

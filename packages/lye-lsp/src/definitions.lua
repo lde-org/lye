@@ -7,6 +7,8 @@
 
 local Parser = require("lye-parser")
 local doc = require("lye-doc")
+local fs = require("fs")
+local cache = require("lye-lsp.cache")
 
 local definitions = {}
 
@@ -15,11 +17,12 @@ local definitions = {}
 ---@field start integer
 ---@field stop integer
 
+--- Where the definitions are written: beside the entries, under the directory this run keeps
+--- everything in. A client opens them from here, so they are real files, written whole.
+---@return string
 local function cacheDir()
-	local root = os.getenv("XDG_CACHE_HOME")
-	if not root or root == "" then root = (os.getenv("HOME") or ".") .. "/.cache" end
-	local path = root .. "/lye/defs"
-	os.execute("mkdir -p '" .. path .. "'")
+	local path = cache.root() .. "/defs"
+	fs.mkdirAll(path)
 	return path
 end
 
@@ -34,11 +37,9 @@ function definitions.prepare(sources)
 
 	for name, text in pairs(sources) do
 		local path = dir .. "/" .. name .. ".lua"
-		local handle = io.open(path, "wb")
-		if handle then
-			handle:write(text)
-			handle:close()
-		end
+		-- Beside the entries and written the same way: a session that already has this text writes
+		-- nothing, and one that has to write cannot be read half way through.
+		cache.writeWhole(path, text)
 		local uri = "file://" .. path
 		index.text[uri] = text
 

@@ -1,4 +1,5 @@
 target
+.lye
 *.exe
 .scratch
 docs
