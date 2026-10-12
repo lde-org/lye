@@ -691,7 +691,6 @@ end
 ---@param member lye.doc.Type
 ---@param field string
 ---@param want boolean
----@return boolean
 local function survivesField(member, field, want)
 	if member.variant ~= "object" and member.variant ~= "class" then return false end
 	local held = member.fields[field]
@@ -723,7 +722,6 @@ end
 ---@param member lye.doc.Type
 ---@param field string
 ---@param wanted lye.doc.Type
----@return boolean
 local function couldBeDiscriminant(member, field, wanted)
 	local held = member.variant == "object" and member.fields[field] or nil
 	if not held then
