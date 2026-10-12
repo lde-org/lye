@@ -91,10 +91,12 @@ local TYPES = {
 ---@param id integer
 ---@param method string
 ---@param position table?
+---@param range table? for a request asked over a range rather than at a position
 ---@return table
-local function request(id, method, position)
+local function request(id, method, position, range)
 	local params = { textDocument = { uri = "file:///f.lua" } }
 	if position then params.position = position end
+	if range then params.range = range end
 	return { jsonrpc = "2.0", id = id, method = method, params = params }
 end
 
@@ -194,6 +196,73 @@ test.it("keeps every semantic token inside one line", function()
 	end
 end)
 
+test.it("answers a hover about the word it is on, not the whole access", function()
+	-- `t.field` is one expression, but a reader on `t` and a reader on `field` are asking about
+	-- two different things. The range is what tells a client which one it got: a range over both
+	-- makes an editor think that moving from one to the other is the same answer.
+	local source = 'local t = { field = function() return 1 end }\nreturn t.field()\n'
+	local results = run({
+		request(2, "textDocument/hover", { line = 1, character = 7 }),
+		request(3, "textDocument/hover", { line = 1, character = 9 }),
+	}, source)
+	local onTable = results["2"] and results["2"].range
+	local onField = results["3"] and results["3"].range
+	test.truthy(onTable, "hovering the table answers")
+	test.truthy(onField, "hovering the field answers")
+	test.equal(onTable["end"].character, 8, "the table's answer points at the table")
+	test.equal(onField.start.character, 9, "and the field's answer at the field")
+end)
+
+test.it("says nothing for the punctuation inside a call's arguments", function()
+	-- The expression around a `}` is a call nobody pointed at.
+	local source = 'local function f(a) return a end\nreturn f({ x = 1 })\n'
+	local results = run({ request(2, "textDocument/hover", { line = 1, character = 17 }) }, source)
+	test.equal(results["2"], json.null, "a hover on `}` is no hover")
+end)
+
+test.it("answers for a type named in an annotation, and jumps to it", function()
+	-- A class is not a name the parser sees: the whole annotation is one comment token. Hovering
+	-- the name should say where and how the type is declared, and a jump should land on it.
+	local source = table.concat({
+		"--- A dependency of the check.\n",
+		"---@class Dep\n",
+		"---@field amount number\n",
+		"\n",
+		"---@param d Dep\n",
+		"local function takes(d)\n",
+		"\treturn d.amount\n",
+		"end\n",
+		"\n",
+		"return takes\n",
+	}, "")
+	local results = run({
+		request(2, "textDocument/hover", { line = 4, character = 13 }),
+		request(3, "textDocument/definition", { line = 4, character = 13 }),
+	}, source)
+	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(shown:match("A dependency of the check"), "the documentation is shown: " .. shown)
+	test.truthy(shown:match("%-%-%-@class Dep"), "and the declaration: " .. shown)
+	test.truthy(shown:match("amount number"), "with the fields written under it: " .. shown)
+	local target = results["3"]
+	test.truthy(target and target.uri and target.uri:match("f%.lua"), "the jump is in this document")
+	test.equal(target.range.start.line, 1, "and lands on the class declaration")
+end)
+
+test.it("says nothing where a table shape cannot fit in a hint", function()
+	-- Half of a table shape reads as a smaller table, which is a worse answer than none. The
+	-- hover still has the whole type.
+	local source = table.concat({
+		"local held = { first = 1, second = 2, third = 3, fourth = 4, fifth = 5 }\n",
+		"return held\n",
+	}, "")
+	local results = run({
+		request(2, "textDocument/inlayHint", nil, {
+			start = { line = 0, character = 0 }, ["end"] = { line = 1, character = 0 },
+		}),
+	}, source)
+	test.equal(#(results["2"] or {}), 0, "a table shape that does not fit is not hinted")
+end)
+
 test.it("keeps an inlay hint short", function()
 	-- A table of six fields and a sentence-length string are both correct answers to "what is this",
 	-- and neither is readable beside a name. The hover still has the whole type.
@@ -204,7 +273,11 @@ test.it("keeps an inlay hint short", function()
 	}, "")
 	local results = run({ request(2, "textDocument/inlayHint", { line = 0, character = 0 }) }, source)
 	local hints = results["2"]
-	test.truthy(#hints >= 3, "a hint per name")
+	local labels = {}
+	for _, hint in ipairs(hints) do labels[#labels + 1] = hint.label end
+	-- The table's own shape is dropped rather than cut: see the test above. The other two are
+	-- shown, short.
+	test.truthy(#hints >= 2, "a hint for what can be shown: " .. table.concat(labels, " | "))
 	for _, hint in ipairs(hints) do
 		test.truthy(#hint.label <= 40, "a hint is short: " .. hint.label)
 	end

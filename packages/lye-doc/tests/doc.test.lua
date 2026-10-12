@@ -67,6 +67,29 @@ test.it("reads a parameter with its name and type", function()
 	test.equal(found.type, "number")
 end)
 
+test.it("cuts the prose written after a parameter's type", function()
+	-- A type is one expression, so the words a writer puts after it are a sentence, not part of
+	-- the type: the type ends at the first space that no operator binds, and the span follows.
+	local source = "---@param x string some prose here\nlocal function f(x) end"
+	local found = annotation(source, "param")
+	test.equal(found.typeText, "string")
+	test.equal(found.type, "string")
+	test.equal(found.typeStop, source:find("string", 1, true) + #"string" - 1,
+		"the span still ends on the `g` of `string`")
+	test.equal(source:sub(found.typeStart, found.typeStop), "string")
+end)
+
+test.it("keeps a spaced union whole", function()
+	local found = annotation("---@param x string | nil\nlocal function f(x) end", "param")
+	test.equal(found.typeText, "string | nil", "the bars are the type, not prose")
+end)
+
+test.it("keeps a function type with spaces whole", function()
+	local found = annotation("---@param x fun(a: string): boolean\nlocal function f(x) end", "param")
+	test.equal(found.typeText, "fun(a: string): boolean",
+		"the spaces inside the signature belong to the type")
+end)
+
 test.it("treats a trailing hash as a description, not part of the type", function()
 	local found = annotation("---@param a number # the first\nlocal function f(a) end", "param")
 	test.equal(found.type, "number")

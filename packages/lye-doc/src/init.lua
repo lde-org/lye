@@ -53,6 +53,70 @@ local function splitBody(body)
 	return body, nil
 end
 
+--- The characters a word written after a space must open with for the space to bind the two words
+--- into one type: `string | nil` is one type, and the space inside it is not prose. Brackets count
+--- for depth, so `table<string, number>` needs none of this.
+local CONTINUES = {
+	["|"] = true, [","] = true, ["."] = true, ["["] = true, ["]"] = true, ["?"] = true,
+	["*"] = true, ["("] = true, [")"] = true, ["<"] = true, [">"] = true, ["{"] = true,
+	["}"] = true, [":"] = true,
+}
+
+--- The same, for the word *before* the space. Only a character that still wants the word after it —
+--- an operator or an opener — keeps the type going; a closing bracket ends an expression, so a
+--- space after `)` or `]` begins prose.
+local BINDS = {
+	["|"] = true, [","] = true, ["."] = true, ["?"] = true, ["*"] = true, [":"] = true,
+	["("] = true, ["["] = true, ["{"] = true, ["<"] = true,
+}
+
+--- The type expression at the front of `text`, with any prose written after it dropped. Brackets
+--- `()` `{}` `<>` `[]` nest, and a quoted string holds anything, so a space inside one of those is
+--- part of the type. At the top level the first space that is neither bound to the word before it
+--- nor followed by a continuation ends the type; everything past it is prose, as in
+--- `---@param x string a sentence about it`.
+---@param text string
+---@return string
+local function cutType(text)
+	text = trim(text)
+	local depth, quote, at, length = 0, nil, 1, #text
+	while at <= length do
+		local char = text:sub(at, at)
+		if quote then
+			if char == "\\" then at = at + 2
+			else
+				if char == quote then quote = nil end
+				at = at + 1
+			end
+		elseif char == '"' or char == "'" then
+			quote = char
+			at = at + 1
+		elseif char == "(" or char == "{" or char == "[" or char == "<" then
+			depth = depth + 1
+			at = at + 1
+		elseif char == ")" or char == "}" or char == "]" or char == ">" then
+			if depth > 0 then depth = depth - 1 end
+			at = at + 1
+		elseif (char == " " or char == "\t") and depth == 0 then
+			local stop = at
+			while stop <= length and (text:sub(stop, stop) == " " or text:sub(stop, stop) == "\t") do
+				stop = stop + 1
+			end
+			if stop > length then break end
+			local arrowHere = text:sub(at - 2, at - 1) == "->"
+			local arrowNext = text:sub(stop, stop + 1) == "->"
+			if arrowHere or arrowNext or BINDS[text:sub(at - 1, at - 1)] or CONTINUES[text:sub(stop, stop)] then
+				at = stop
+			else
+				break
+			end
+		else
+			at = at + 1
+		end
+	end
+	return trim(text:sub(1, at - 1))
+end
+
 --- Where a tag begins on a line: `---@param`, and `--- @param` too. The space is what a writer
 --- puts there when they think of the annotation as prose, and LuaLS reads it, so a reader that
 --- insisted on the tight form would silently ignore half of someone's file.
@@ -107,7 +171,7 @@ local function parse(comment, start, stop)
 		-- is not a character class on this LuaJIT, so the marker is matched literally.
 		local name, marker, remaining = rest:match("^([%w_%.]+)(%??)(.*)$")
 		annotation.name = name
-		annotation.type = trim(remaining or "")
+		annotation.type = cutType(remaining or "")
 		annotation.typeText = annotation.type
 		-- The marker belongs to the type, not the name: an optional parameter can be nil. A
 		-- signature is bracketed first, because `fun(s: string): string?` is a function that returns
@@ -122,10 +186,22 @@ local function parse(comment, start, stop)
 	elseif tag == "field" or tag == "alias" or tag == "generic" or tag == "class" then
 		local name, remaining = rest:match("^([%w_%.]+)(.*)$")
 		annotation.name = name
-		annotation.type = trim((remaining or ""):gsub("^=", ""))
+		local written = trim((remaining or ""):gsub("^=", ""))
+		-- A class or an alias may write a parameter list before its body — `A<T: number> T[]` — and
+		-- that body is not prose, so a declaration that opens with `<` is kept whole.
+		annotation.type = written:sub(1, 1) == "<" and written or cutType(written)
 		annotation.typeText = annotation.type
-	elseif tag == "return" or tag == "type" or tag == "cast" or tag == "as"
-		or tag == "overload" then
+	elseif tag == "return" then
+		-- `---@return v is T` names a parameter and the type it proves rather than a type of its
+		-- own: its words are the annotation, not prose, so it is kept whole.
+		annotation.type = rest:match("^[%w_]+%s+is%s+") and rest or cutType(rest)
+		annotation.typeText = annotation.type
+	elseif tag == "type" or tag == "as" or tag == "overload" then
+		annotation.type = cutType(rest)
+		annotation.typeText = annotation.type
+	elseif tag == "cast" then
+		-- `---@cast name +type`: the name is part of what the analyzer reads, not prose, so the
+		-- body is kept whole.
 		annotation.type = rest
 		annotation.typeText = rest
 	elseif tag == "meta" or tag == "diagnostic" then
@@ -136,7 +212,7 @@ local function parse(comment, start, stop)
 		annotation.typeText = annotation.type
 	end
 
-	if annotation.type == "" then annotation.type = nil end
+	if annotation.type == "" then annotation.type, annotation.typeText = nil, nil end
 
 	-- Offsets for the parts an editor colours separately: the name of a parameter reads as a
 	-- parameter, and the type as a type. Searching starts after the tag, since a name as short as

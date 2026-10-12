@@ -29,11 +29,16 @@ local function parsePrefix(self, allowTernaryColon)
 	local token = self:peek()
 	local startOffset = token.start
 
-	local callee, groupIdx
+	-- The prefix spans the token it is written with. It was one byte before, so a diagnostic on a
+	-- bare name, and a highlight, covered one character instead of the name. A group spans its
+	-- opening parenthesis, which is the token the prefix is written with.
+	local callee, groupIdx, prefixStop
 	if self:isName(token) then
 		callee = self:text(token)
+		prefixStop = token.stop
 		self:advance()
 	elseif self:text(token) == "(" then
+		prefixStop = token.stop
 		self:advance()
 		groupIdx = self:parseExpression()
 		self:expect(")")
@@ -46,7 +51,7 @@ local function parsePrefix(self, allowTernaryColon)
 
 	-- The prefix is the expression's identity until a suffix wraps it. Nothing is
 	-- auto-parented: the child lists are explicit, so there is one mechanism, not two.
-	local expressionIdx = self:emit("prefix", startOffset, startOffset,
+	local expressionIdx = self:emit("prefix", startOffset, prefixStop,
 		{ callee = callee, group = groupIdx })
 	-- The wrapper is the expression's identity while a suffix has something to wrap. A group that
 	-- nothing wrapped is the expression it holds: Lua's parentheses cut a call down to one value,

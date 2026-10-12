@@ -475,6 +475,77 @@ function Lye:useWorkspaceCache()
 	if root and root ~= "" and not cache.named() then cache.setRoot(root .. "/.lye") end
 end
 
+--- The start of the line an offset is written on. The last run of characters that holds no
+--- newline is cut off the front of the text, and what is left is everything above it.
+---@param source string
+---@param offset integer
+---@return integer
+local function lineStart(source, offset)
+	local before = source:sub(1, offset - 1):gsub("[^\n]*$", "")
+	return #before + 1
+end
+
+--- The line at a start offset, without its indentation.
+---@param source string
+---@param at integer
+---@return string
+local function lineAt(source, at)
+	local to = source:find("\n", at, true) or (#source + 1)
+	return (source:sub(at, to - 1):gsub("^%s+", ""))
+end
+
+--- The lines that declare a class or an alias: the comment above it, which is its documentation,
+--- its own line, and the fields written under it. The annotation above the comment is another
+--- type's business, so the walk stops there.
+---@param source string
+---@param annotations lye.doc.Annotation[]
+---@param at integer the index of the class or alias annotation
+---@return string
+local function declarationLines(source, annotations, at)
+	local annotation = annotations[at]
+	local declaration = lineStart(source, annotation.start)
+	local lines = {}
+	local above = declaration
+	while #lines < 8 and above > 1 do
+		local previous = lineStart(source, above - 1)
+		local text = lineAt(source, previous)
+		if not text:match("^%-%-") or text:match("^%-%-%-@") then break end
+		table.insert(lines, 1, text)
+		above = previous
+	end
+	lines[#lines + 1] = lineAt(source, declaration)
+	for following = at + 1, #annotations do
+		local next_ = annotations[following]
+		if next_.tag ~= "field" or not next_.name then break end
+		lines[#lines + 1] = lineAt(source, lineStart(source, next_.start))
+	end
+	return table.concat(lines, "\n")
+end
+
+--- Remember where a class or an alias is written, with the lines that declare it. A type named in
+--- one file has to be answerable from another, and the workspace is read for these once rather
+--- than per request.
+---@param into table<string, { location: lye.DefinitionLocation, lines: string }>
+---@param path string
+---@param source string
+---@param parsed lye.doc.File
+local function collectTypes(into, path, source, parsed)
+	local annotations = parsed.annotations
+	for index, annotation in ipairs(annotations) do
+		local isType = annotation.tag == "class" or annotation.tag == "alias"
+		if isType and annotation.name and not into[annotation.name] then
+			into[annotation.name] = {
+				location = {
+					uri = "file://" .. path,
+					start = annotation.nameStart or annotation.start,
+					stop = annotation.nameStop or annotation.stop,
+				},
+				lines = declarationLines(source, annotations, index),
+			}
+		end
+	end
+end
+
 --- What one document declares, which `declaredBy` keeps after its analysis is dropped.
 ---@param file lye.doc.File
 ---@return table<string, boolean|lye.doc.Type>
@@ -499,6 +570,7 @@ function Lye:workspaceDeclarations()
 			"find %q -type f -name '*.lua' -not -path '*/target/*' -not -path '*/.*/*' | head -2000", root))
 		if pipe then
 			local parsedFiles, parts = {}, {}
+			self.typeLocations = self.typeLocations or {}
 			for file in pipe:lines() do
 				local handle = io.open(file, "rb")
 				-- A read that comes back with nothing is not a file this can read — a directory
@@ -508,7 +580,10 @@ function Lye:workspaceDeclarations()
 				if handle then handle:close() end
 				if type(source) == "string" then
 					local isOk, parsed = pcall(doc.parse, source)
-					if isOk then parsedFiles[#parsedFiles + 1] = parsed end
+					if isOk then
+						parsedFiles[#parsedFiles + 1] = parsed
+						collectTypes(self.typeLocations, file, source, parsed)
+					end
 					-- What a file declares, for the digest: a module's answer read against this
 					-- workspace is only the answer for a workspace that declares the same things.
 					if isOk then
@@ -556,7 +631,11 @@ function Lye:packageDeclarations(root)
 			if handle then handle:close() end
 			if type(source) == "string" then
 				local isOk, parsed = pcall(doc.parse, source)
-				if isOk then parsedFiles[#parsedFiles + 1] = parsed end
+				if isOk then
+					parsedFiles[#parsedFiles + 1] = parsed
+					self.typeLocations = self.typeLocations or {}
+					collectTypes(self.typeLocations, file, source, parsed)
+				end
 				-- The file and what it says: a module read against a package's links is only the
 				-- answer for links that are the same.
 				parts[#parts + 1] = file .. "\0" .. rapidhash.hex(source)
@@ -711,6 +790,16 @@ local function tokenAt(result, offset)
 			return token
 		end
 	end
+end
+
+--- Whether a token is something a hover can be about: a name or a literal. A `}` or a `,` is not,
+--- and answering about the expression around one is how a hover ends up describing a call nobody
+--- pointed at.
+---@param token lye.lexer.ffi.token
+---@return boolean
+local function isValueToken(token)
+	local kind = token.kind
+	return kind == KIND.name or kind == KIND.number or kind == KIND.string or kind == KIND.keyword
 end
 
 ---@return string? name
@@ -1050,6 +1139,41 @@ local function nodeAt(result, offset)
 	return found
 end
 
+--- The name written at an offset, read from the source: an identifier, dotted if it is one.
+---@param source string
+---@param offset integer
+local function writtenAt(source, offset)
+	local at = offset
+	if not source:sub(at, at):match("[%w_%.]") and source:sub(at - 1, at - 1):match("[%w_%.]") then
+		at = at - 1
+	end
+	if not source:sub(at, at):match("[%w_%.]") then return nil end
+	local from, to = at, at
+	while from > 1 and source:sub(from - 1, from - 1):match("[%w_%.]") do from = from - 1 end
+	while to < #source and source:sub(to + 1, to + 1):match("[%w_%.]") do to = to + 1 end
+	return source:sub(from, to)
+end
+
+--- The name an offset sits under, when it sits inside a doc annotation rather than in code.
+---@param names lye.analyzer.Result
+---@param source string
+---@param offset integer
+local function nameInAnnotation(names, source, offset)
+	for _, annotation in ipairs(names.doc and names.doc.annotations or {}) do
+		if annotation.nameStart and offset >= annotation.nameStart and offset <= annotation.nameStop then
+			-- The name the annotation declares is a declaration in its own right: `---@field call`
+			-- is where the field is, and `---@class App` where the class is.
+			return writtenAt(source, offset), annotation
+		end
+		local from, to = annotation.typeStart, annotation.typeStop
+		if not from or offset < from or offset > to then
+			from, to = annotation.start, annotation.stop
+			if offset < from or offset > to then from = nil end
+		end
+		if from then return writtenAt(source, offset), nil end
+	end
+end
+
 --- The string inside a `require(...)` that an offset sits in, and what has been typed in it.
 ---@param self lye.Server
 ---@param uri string
@@ -1106,11 +1230,29 @@ function Lye:onHover(params)
 		return {
 			contents = { kind = "markdown", value = table.concat(blocks, "\n\n") },
 			-- The word being hovered, not the declaration it resolves to: a client highlights what
-			-- the answer points at, and pointing at the declaration highlights another line.
+			-- the answer points at, and pointing at the declaration highlights another line. A
+			-- dotted name is several tokens, and the one the cursor is on is the answer.
 			range = (function()
+				local token = tokenAt(result.parser, offset)
+				if token and isValueToken(token) then
+					return self:toRange(text, index, token.start, token.stop)
+				end
 				local from, to = wordSpan(text, offset)
 				return self:toRange(text, index, from or declaration.start, to or declaration.stop)
 			end)(),
+		}
+	end
+
+	-- A type named in an annotation is not a name the parser sees: the whole annotation is one
+	-- comment token. What it stands for is the class or alias it names, and the answer is where
+	-- that is written.
+	local written = nameInAnnotation(result, text, offset)
+	local declared = written and self:typeDeclaration(written, uri)
+	if declared then
+		local from, to = wordSpan(text, offset)
+		return {
+			contents = { kind = "markdown", value = "```lua\n" .. declared.lines .. "\n```" },
+			range = self:toRange(text, index, from or offset, to or offset),
 		}
 	end
 
@@ -1118,6 +1260,18 @@ function Lye:onHover(params)
 	-- the standard library. A function is shown by the signature it was declared with.
 	local node = nodeAt(result, offset)
 	if not node then return nil end
+	-- The word the cursor is written on decides both answers. A reader moving from `t` to `t.field`
+	-- is asking about two different things, and a range over the whole access tells a client they
+	-- are the same one, so the answer points at the word itself.
+	local token = tokenAt(result.parser, offset)
+	local trace = io.open("/tmp/hover-trace.log", "a")
+	if trace then
+		trace:write(string.format("offset=%d token=%s kind=%s span=%s..%s node=%s %s..%s\n", offset,
+			tostring(token and token.index), tostring(token and token.kind), tostring(token and token.start),
+			tostring(token and token.stop), tostring(node.kind), tostring(node.start), tostring(node.stop)))
+		trace:close()
+	end
+	if not token or not isValueToken(token) then return nil end
 	local signature = signatureFor(self.names[uri], node, offset)
 	local held = typeOfExpression(result, node.index, offset)
 	if not signature and not held then return nil end
@@ -1129,7 +1283,7 @@ function Lye:onHover(params)
 	if signature and signature.doc then blocks[#blocks + 1] = signature.doc end
 	return {
 		contents = { kind = "markdown", value = table.concat(blocks, "\n\n") },
-		range = self:toRange(text, index, node.start, node.stop),
+		range = self:toRange(text, index, token.start, token.stop),
 	}
 end
 
@@ -1143,41 +1297,6 @@ function Lye:definitionIndex()
 		self.definitions = definitionsIndex.prepare(require("lye-defs"))
 	end
 	return self.definitions
-end
-
---- The name written at an offset, read from the source: an identifier, dotted if it is one.
----@param source string
----@param offset integer
-local function writtenAt(source, offset)
-	local at = offset
-	if not source:sub(at, at):match("[%w_%.]") and source:sub(at - 1, at - 1):match("[%w_%.]") then
-		at = at - 1
-	end
-	if not source:sub(at, at):match("[%w_%.]") then return nil end
-	local from, to = at, at
-	while from > 1 and source:sub(from - 1, from - 1):match("[%w_%.]") do from = from - 1 end
-	while to < #source and source:sub(to + 1, to + 1):match("[%w_%.]") do to = to + 1 end
-	return source:sub(from, to)
-end
-
---- The name an offset sits under, when it sits inside a doc annotation rather than in code.
----@param names lye.analyzer.Result
----@param source string
----@param offset integer
-local function nameInAnnotation(names, source, offset)
-	for _, annotation in ipairs(names.doc and names.doc.annotations or {}) do
-		if annotation.nameStart and offset >= annotation.nameStart and offset <= annotation.nameStop then
-			-- The name the annotation declares is a declaration in its own right: `---@field call`
-			-- is where the field is, and `---@class App` where the class is.
-			return writtenAt(source, offset), annotation
-		end
-		local from, to = annotation.typeStart, annotation.typeStop
-		if not from or offset < from or offset > to then
-			from, to = annotation.start, annotation.stop
-			if offset < from or offset > to then from = nil end
-		end
-		if from then return writtenAt(source, offset), nil end
-	end
 end
 
 --- A range in another file, resolved against that file's own text. A definition the server wrote
@@ -1200,6 +1319,57 @@ function Lye:rangeIn(target)
 	}
 end
 
+--- The class or alias a name stands for, with the lines that declare it: the comment above it,
+--- its own line, and the fields written under it. The workspace is read for these when it is read
+--- for anything else, so a type written in one file is answerable from another even when that
+--- file's own analysis is not held. A builtin is read out of the definitions the same way.
+---@param self lye.Server
+---@param name string
+---@param uri string? the document the question came from, which is read first
+---@return { location: lye.DefinitionLocation, lines: string }?
+function Lye:typeDeclaration(name, uri)
+	-- The document the cursor is in comes first: a class written in a buffer that was never saved
+	-- is as real as one on disk, and the workspace scan has only read the disk.
+	local names = uri and self.names[uri]
+	local annotations = names and names.doc and names.doc.annotations
+	local text = uri and self:textOf(uri)
+	if annotations and text then
+		for at, annotation in ipairs(annotations) do
+			local isType = annotation.tag == "class" or annotation.tag == "alias"
+			if isType and annotation.name == name then
+				return {
+					location = {
+						uri = uri,
+						start = annotation.nameStart or annotation.start,
+						stop = annotation.nameStop or annotation.stop,
+					},
+					lines = declarationLines(text, annotations, at),
+				}
+			end
+		end
+	end
+
+	local held = self.typeLocations and self.typeLocations[name]
+	if held then return held end
+
+	local index = self:definitionIndex()
+	local found = definitionsIndex.find(index, name)
+	if not found then return nil end
+	local text = definitionsIndex.sourceOf(index, found.uri)
+	if not text then return nil end
+
+	local lines = { lineAt(text, lineStart(text, found.start)) }
+	local fields = {}
+	for fieldName, where in pairs(index.fields) do
+		if fieldName:sub(1, #name + 1) == name .. "." then fields[#fields + 1] = where end
+	end
+	table.sort(fields, function(left, right) return left.start < right.start end)
+	for _, where in ipairs(fields) do
+		lines[#lines + 1] = lineAt(text, lineStart(text, where.start))
+	end
+	return { location = found, lines = table.concat(lines, "\n") }
+end
+
 --- The class or alias a name declares: in this document, in another the server has analysed, or in
 --- the definitions — which is where the builtin types live.
 ---@param self lye.Server
@@ -1219,6 +1389,9 @@ function Lye:targetOfType(name, uri)
 			end
 		end
 	end
+
+	local indexed = self.typeLocations and self.typeLocations[name]
+	if indexed then return indexed.location end
 
 	local mine = inDocument(uri, self.names[uri])
 	if mine then return mine end
@@ -2265,11 +2438,16 @@ local HINT_LIMIT = 32
 --- The type an inlay hint shows, cut to fit. The hover still has all of it, so a hint only has to
 --- say enough to be worth reading: what is kept is the beginning, cut back to a separator where
 --- there is one rather than through the middle of a word.
+---
+--- A table shape that does not fit is not shown at all: half of `{ collect: fn() -> ... }` reads as
+--- a table with one field, which is a worse answer than none. A name, a union or an array still
+--- says what it is when it is cut, and the hover has the rest.
 ---@param type lye.doc.Type
----@return string
+---@return string?
 local function hintText(type)
 	local shown = types.display(type)
 	if #shown <= HINT_LIMIT then return shown end
+	if shown:sub(1, 1) == "{" then return nil end
 	local cut = shown:sub(1, HINT_LIMIT)
 	-- A string value keeps its shape: `"a very long messa…"` still reads as a string.
 	if shown:sub(1, 1) == '"' then return cut .. '…"' end
@@ -2299,7 +2477,7 @@ function Lye:onInlayHint(params)
 		if not variable.declared and not isFunction and declaration.start >= from and declaration.stop <= to then
 			local held = analyzer.typeAt(names, variable, declaration.stop)
 			local shown = hintText(held)
-			if shown ~= "unknown" and shown ~= "any" then
+			if shown and shown ~= "unknown" and shown ~= "any" then
 				out[#out + 1] = {
 					position = select(2, position.toPosition(text, index, declaration.stop + 1, encoding)) and {
 						line = select(1, position.toPosition(text, index, declaration.stop + 1, encoding)),

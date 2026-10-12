@@ -1241,6 +1241,22 @@ test.it("checks an argument against its parameter type", function()
 	).diagnostics, 0)
 end)
 
+test.it("spans the whole name an argument is written with", function()
+	local source = table.concat({
+		"---@type string?\n",
+		"local maybe = nil\n",
+		"---@param a string\n",
+		"local function f(a) end\n",
+		"f(maybe)\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 1)
+	local entry = result.diagnostics[1]
+	test.truthy(entry.message:match("f expects string"))
+	test.equal(source:sub(entry.start, entry.stop), "maybe",
+		"the diagnostic covers the whole name, not its first character")
+end)
+
 test.it("checks each argument against its own parameter", function()
 	local result = analyzer.analyze(
 		"---@param a string\n---@param b number\nlocal function f(a, b) end\nf(\"s\", \"t\")\n"
