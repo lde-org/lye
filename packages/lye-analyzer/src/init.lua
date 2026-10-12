@@ -300,6 +300,15 @@ end
 ---@param resolve fun(text: string): lye.doc.Type?
 ---@return lye.doc.Type?
 function analyzer.declaredTypeFor(parsed, file, declaration, resolve)
+	-- A definition file writes the type where the name is — `local held: number = 1` — and that is
+	-- the type the declaration has. An annotation above it is the older, louder spelling of the
+	-- same thing, and it wins where both are written.
+	local inline = declaration.inlineType and declaration.inlineType ~= "" and declaration.inlineType
+	if inline then
+		local held = types.parse(inline, resolve)
+		if held then return held end
+	end
+
 	-- Annotations are in source order, so the candidate is the last one before the declaration.
 	local annotations = file.annotations
 	local low, high = 1, #annotations

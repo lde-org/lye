@@ -1306,6 +1306,17 @@ test.it("checks against the types a definition file writes inline", function()
 		result.diagnostics[2].message)
 end)
 
+test.it("applies the type a definition file writes on a local", function()
+	-- `local held: number = 1` carries the type in the source, and the name has it.
+	local result = analyzer.analyze("local held: number = 1\nreturn held\n", nil, nil, nil, nil, nil, nil, true)
+	local found
+	for _, variable in ipairs(result.variables) do
+		if variable.name == "held" then found = variable end
+	end
+	test.truthy(found and found.declared, "the name has a declared type")
+	test.equal(types.display(found.declared), "number", "and it is the one written inline")
+end)
+
 test.it("checks each argument against its own parameter", function()
 	local result = analyzer.analyze(
 		"---@param a string\n---@param b number\nlocal function f(a, b) end\nf(\"s\", \"t\")\n"
