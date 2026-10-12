@@ -588,7 +588,6 @@ end
 --- index reads walks those rather than every node in the document.
 ---@param parsed lye.parser.Result
 ---@param kind lye.parser.NodeKind
----@return lye.parser.Node[]
 function Parser.nodesOf(parsed, kind)
 	return parsed.byKind[kind] or EMPTY_NODES
 end

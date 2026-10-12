@@ -7,9 +7,7 @@
 
 local types = require("lye-doc.type")
 local infer = require("lye-analyzer.infer")
-local names = require("lye-analyzer.names")
 local annotations = require("lye-analyzer.annotations")
-local callName = names.callName
 local kindToType = annotations.kindToType
 local pattern = require("lye-doc.pattern")
 local withGenerics = annotations.withGenerics

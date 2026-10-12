@@ -10,8 +10,7 @@ local infer = require("lye-analyzer.infer")
 local names = require("lye-analyzer.names")
 local annotations = require("lye-analyzer.annotations")
 local writtenNameOf = names.writtenNameOf
-local collectAssignments, isNeverNumeric, callLabel =
-	annotations.collectAssignments, annotations.isNeverNumeric, annotations.callLabel
+local isNeverNumeric, callLabel = annotations.isNeverNumeric, annotations.callLabel
 
 --- Everything the checks share, all of it built by `analyzer.analyze` before it calls this.
 ---@class lye.analyzer.CheckContext

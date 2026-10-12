@@ -368,6 +368,15 @@ function Lye:moduleType(name, from)
 	local cached = self.modules[path]
 	if cached and cached.text == written then return cached.type end
 
+	-- A document that is open has been analysed in full, and that analysis already says what
+	-- `require` of it gives back: reading it again as a module is the same work for the same
+	-- answer, and a monorepo with several files of one package open pays it once per file.
+	local open = document and self.names[uri]
+	if open and open.module ~= nil then
+		self.modules[path] = { text = written, type = open.module }
+		return open.module
+	end
+
 	self.requiring[path] = true
 	-- The module's own `require`s resolve within *its* package: a dependency's file is a document
 	-- of that package, and what it can reach is what lde linked into that package's `target/`.

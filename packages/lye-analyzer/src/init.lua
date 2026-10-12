@@ -47,6 +47,7 @@ local analyzer = {}
 ---@field variables table<string, lye.analyzer.Variable[]> the declarations of each name
 ---@field children lye.analyzer.Scope[]
 ---@field facts table<string, lye.analyzer.Narrowing[]> conditions that hold over this scope
+---@field names table<string, lye.analyzer.Variable[]|boolean>? which scope each name was found in, remembered
 ---@field lastLookupName string?
 ---@field lastLookupOffset integer?
 ---@field lastLookupResult lye.analyzer.Variable?
@@ -131,6 +132,8 @@ local analyzer = {}
 ---@field scopes lye.analyzer.Scope[] sorted by start offset for lexical lookup
 ---@field lastScope lye.analyzer.Scope?
 ---@field lastScopeOffset integer?
+---@field scopeSlots integer[]? the offset each scope lookup slot was last asked about
+---@field scopeValues lye.analyzer.Scope[]? the scope that answered it
 ---@field variables lye.analyzer.Variable[]
 ---@field byStart table<integer, lye.analyzer.Variable>
 ---@field diagnostics lye.analyzer.Diagnostic[]
@@ -646,7 +649,7 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	--- `collectgarbage("count")` are calls to functions written with overloads, and checking them
 	--- against the first signature alone reports every one of them.
 	---@param node lye.parser.Node
-	---@param label string
+	---@param name string? what the call is written with, for the message a mismatch is reported in
 	---@param params (lye.doc.Type?)[]
 	---@param overloads string[]?
 	---@param receiver lye.doc.Type?
