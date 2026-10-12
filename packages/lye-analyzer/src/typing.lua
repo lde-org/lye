@@ -128,6 +128,17 @@ local typing = {}
 	-- A written type, read once per document where the analysis gave a cache for it: a context
 	-- built by hand — a test's — has none, and parses as it always did.
 	local parseType = ctx.typeOfText or function(text) return types.parse(text, resolve) end
+
+	-- The resolver a generic return is read with at a call: the bindings from that call's
+	-- arguments first, the signature's own limits behind them. The state is what the loop sets,
+	-- so the function is made once rather than per call site — a closure made in the loop stops
+	-- the loop from compiling.
+	local bindingsNow, fallbackNow
+	local function boundResolver(text)
+		local held = bindingsNow and bindingsNow[text]
+		if held then return held end
+		return fallbackNow and fallbackNow(text) or nil
+	end
 		-- A loop declares its own control variables: a numeric `for` counts, and a generic `for` takes its
 		-- first name from what the iterator yields. The pass runs twice, so the slot is claimed either way.
 			local claimed = {}
@@ -324,10 +335,9 @@ local typing = {}
 					-- A binding from the arguments beats the name's own limit, which is what is
 					-- left when nothing was bound: `math.max(1, 2)` is a number either way.
 					local fallback = withGenerics(signature.generics, signature.constraints, resolve)
-					local bound = types.parse(bare, function(text)
-						if bindings[text] then return bindings[text] end
-						return fallback(text)
-					end)
+					bindingsNow, fallbackNow = bindings, fallback
+					local bound = types.parse(bare, boundResolver)
+					bindingsNow, fallbackNow = nil, nil
 					-- What was cached before the binding was known has to be recomputed.
 					if bound then
 						local cached = inferCtx.cache[node.index]

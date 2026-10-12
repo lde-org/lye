@@ -682,34 +682,56 @@ function types.exclude(type, typeName)
 	return types.excludeType(type, types.parse(typeName))
 end
 
+--- Whether a member survives a condition on one of its fields. A field whose truth is written
+--- down decides it, which is what makes `{ ok: true, v: T } | { ok: false, e: string }` narrow on
+--- `parsed.ok`.
+---
+--- A function of its arguments rather than a closure over them: a closure written where this is
+--- asked is created inside the loops that ask it, and a function that makes one never compiles.
+---@param member lye.doc.Type
+---@param field string
+---@param want boolean
+---@return boolean
+local function survivesField(member, field, want)
+	if member.variant ~= "object" and member.variant ~= "class" then return false end
+	local held = member.fields[field]
+	if held == nil then return not want end
+	local known = types.truthiness(held)
+	if known == nil then return want end
+	return known == want
+end
+
 ---@param field string
 ---@param want boolean
 ---@return lye.doc.Type? narrowed
 function types.narrowField(type, field, want)
-	--- Whether a member survives the condition. A field whose truth is written down decides it,
-	--- which is what makes `{ ok: true, v: T } | { ok: false, e: string }` narrow on `parsed.ok`.
-	---@param member lye.doc.Type
-	---@return boolean
-	local function survives(member)
-		if member.variant ~= "object" and member.variant ~= "class" then return false end
-		local held = member.fields[field]
-		if held == nil then return not want end
-		local known = types.truthiness(held)
-		if known == nil then return want end
-		return known == want
-	end
-
 	if type.variant ~= "union" then
 		if type.variant ~= "object" and type.variant ~= "class" then return type end
-		return survives(type) and type or nil
+		return survivesField(type, field, want) and type or nil
 	end
 
 	local kept = {}
 	for _, member in ipairs(type.types) do
-		if survives(member) then kept[#kept + 1] = member end
+		if survivesField(member, field, want) then kept[#kept + 1] = member end
 	end
 	if #kept == 0 then return nil end
 	return types.union(kept)
+end
+
+--- Whether a member could hold what a condition compared its `field` against. A function of its
+--- arguments rather than a closure, for the reason `survivesField` is.
+---@param member lye.doc.Type
+---@param field string
+---@param wanted lye.doc.Type
+---@return boolean
+local function couldBeDiscriminant(member, field, wanted)
+	local held = member.variant == "object" and member.fields[field] or nil
+	if not held then
+		-- A class is built at runtime, so a field it does not name may still be there; an
+		-- object literal says what it holds and nothing else.
+		return member.variant == "class"
+	end
+	return types.satisfies(wanted, held)
 end
 
 --- Keep only the members whose own `field` could hold what a condition compared it against:
@@ -720,21 +742,10 @@ end
 ---@param wanted lye.doc.Type the value the condition compared against
 ---@param want boolean whether the condition was the equality
 function types.narrowDiscriminant(type, field, wanted, want)
-	---@param member lye.doc.Type
-	local function couldBe(member)
-		local held = member.variant == "object" and member.fields[field] or nil
-		if not held then
-			-- A class is built at runtime, so a field it does not name may still be there; an
-			-- object literal says what it holds and nothing else.
-			return member.variant == "class"
-		end
-		return types.satisfies(wanted, held)
-	end
-
-	if type.variant ~= "union" then return couldBe(type) == want and type or nil end
+	if type.variant ~= "union" then return couldBeDiscriminant(type, field, wanted) == want and type or nil end
 	local kept = {}
 	for _, member in ipairs(type.types) do
-		if couldBe(member) == want then kept[#kept + 1] = member end
+		if couldBeDiscriminant(member, field, wanted) == want then kept[#kept + 1] = member end
 	end
 	if #kept == 0 then return nil end
 	return types.union(kept)
