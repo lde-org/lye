@@ -196,6 +196,31 @@ test.it("keeps every semantic token inside one line", function()
 	end
 end)
 
+test.it("colours an index signature as the two types it names", function()
+	-- `---@field [integer] string` is an index signature: the bracket is the key's type and what
+	-- follows is the value's, so both read as types rather than one as a field name.
+	local source = "---@field [integer] string\n"
+	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
+	local counts = {}
+	for index = 1, #(results["2"].data), 5 do
+		local kind = results["2"].data[index + 3]
+		counts[kind] = (counts[kind] or 0) + 1
+	end
+	test.equal(counts[8] or 0, 2, "the key type and the value type are both types")
+	test.equal(counts[11] or 0, 0, "and neither is read as a field name")
+end)
+
+test.it("says nothing where an inlay hint would repeat the name", function()
+	-- `local ffi: ffi = require("ffi")` written out as a hint is the name twice.
+	local source = "---@class held\nlocal held = {}\nreturn held\n"
+	local results = run({
+		request(2, "textDocument/inlayHint", nil, {
+			start = { line = 0, character = 0 }, ["end"] = { line = 2, character = 0 },
+		}),
+	}, source)
+	test.equal(#(results["2"] or {}), 0, "a hint that repeats the name is not shown")
+end)
+
 test.it("answers a hover about the word it is on, not the whole access", function()
 	-- `t.field` is one expression, but a reader on `t` and a reader on `field` are asking about
 	-- two different things. The range is what tells a client which one it got: a range over both

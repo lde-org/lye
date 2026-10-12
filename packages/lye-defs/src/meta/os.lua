@@ -32,22 +32,20 @@ function os.clock() end
 ---Returns a string or a table containing date and time, formatted according to the given string `format`.
 ---@param format? string
 ---@param time?   integer
----@return string|osdate
+---@return string|osdate|nil
 ---@nodiscard
 function os.date(format, time) end
 
 ---Returns the difference, in seconds, from time `t1` to time `t2`.
 ---@param t2 integer
----@param t1 integer
+---@param t1? integer
 ---@return integer
 ---@nodiscard
 function os.difftime(t2, t1) end
 
 ---Passes `command` to be executed by an operating system shell.
 ---@param command? string
----@return true?     suc
----@return exitcode? exitcode
----@return integer?  code
+---@return integer status
 function os.execute(command) end
 
 ---Calls the ISO C function `exit` to terminate the host program.
@@ -85,9 +83,9 @@ function os.rename(oldname, newname) end
 ---| "time"
 
 ---Sets the current locale of the program.
----@param locale    string|nil
+---@param locale    string?
 ---@param category? localecategory
----@return string localecategory
+---@return string? locale
 function os.setlocale(locale, category) end
 
 ---@class osdateparam

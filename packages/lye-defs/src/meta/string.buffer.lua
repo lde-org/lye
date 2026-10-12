@@ -130,7 +130,7 @@ local buf = {}
 
 --- A string, number, or any object obj with a __tostring metamethod to the buffer.
 ---
----@alias string.buffer.data string|number|table
+---@alias string.buffer.data string|number|table|string.buffer
 
 
 --- Appends a string str, a number num or any object obj with a `__tostring` metamethod to the buffer. Multiple arguments are appended in the given order.
@@ -167,7 +167,7 @@ function buf:putcdata(cdata, len) end
 ---
 --- The stored reference is an anchor for the garbage collector and keeps the originally passed string or FFI cdata object alive.
 ---
----@param str string.buffer.data
+---@param str string
 ---@return string.buffer
 ---@overload fun(self:string.buffer, cdata:ffi.cdata*, len:integer):string.buffer
 function buf:set(str) end
@@ -180,6 +180,7 @@ function buf:reset() end
 --- The buffer space of the buffer object is freed. The object itself remains intact, empty and may be reused.
 ---
 --- Note: you normally don't need to use this method. The garbage collector automatically frees the buffer space, when the buffer object is collected. Use this method, if you need to free the associated memory immediately.
+---@return string.buffer
 function buf:free() end
 
 
@@ -309,6 +310,7 @@ function buffer.decode(str) end
 ---
 ---@param size? integer
 ---@param options? string.buffer.serialization.opts
+---@overload fun(options: string.buffer.serialization.opts):string.buffer
 ---@return string.buffer
 function buffer.new(size, options) end
 
@@ -344,8 +346,8 @@ function buffer.new(size, options) end
 --- end
 --- ```
 ---@class string.buffer.serialization.opts
----@field dict string[]
----@field metatable table[]
+---@field dict? string[]
+---@field metatable? table[]
 
 
 return buffer

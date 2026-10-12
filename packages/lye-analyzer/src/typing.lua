@@ -111,6 +111,30 @@ local typing = {}
 		return types.isMutable(held) or held.variant == "unknown" or held.variant == "any"
 	end
 
+	--- Whether a function was written with a body at all.
+	---
+	--- A definition file declares the library it describes as `function file:close() end`: the
+	--- annotations are the whole of the function, so there is no body that could contradict them.
+	--- The parser holds a body's statements as nodes of their own rather than as something the
+	--- function answers for, so what says a body was written is a node inside the function's own
+	--- span — a parameter is a token, not a node, which is what leaves an empty declaration with
+	--- nothing in it. The span is also how a `return` was placed in the function that owns it, and
+	--- what is asked here is the same question one step earlier.
+	---@param parsed lye.parser.Result
+	---@param index integer
+	---@return boolean
+	local function hasBody(parsed, index)
+		local fn = parsed.nodes[index]
+		for _, node in ipairs(parsed.nodes) do
+			-- A node inside the span is a statement of the body, a nested function, or the body
+			-- of an arrow, which is the expression itself.
+			if node.index ~= index and node.start >= fn.start and node.stop <= fn.stop then
+				return true
+			end
+		end
+		return false
+	end
+
 	--- Type every variable from the arena. Run until it settles: a call can be met before
 	--- its callee's `@return` is known, which leaves a mutable unknown for `refine` to
 	--- promote in place, so one pass is not enough on its own.
@@ -266,13 +290,16 @@ local typing = {}
 				fnType.returns = types.VOID
 			end
 			-- The field promised its callers a result, and a body that gives none at all is the
-			-- same contradiction as one that gives the wrong type.
+			-- same contradiction as one that gives the wrong type. A function written with no body
+			-- — a definition file's `function file:close() end` — promises nothing yet, the way
+			-- an annotated `local function g() end` is left alone above: there is nothing there to
+			-- contradict the annotation, and only a body that exists can be held to it.
 			local promised = fieldReturns[index]
 			-- A field that says nothing about a return promises nothing: only a written one can be
 			-- contradicted by a body that returns nothing.
 			local written = promised and promised ~= types.VOID and promised.variant ~= "unknown"
 				and promised.variant ~= "any"
-			if written and not inferred then
+			if written and not inferred and not self.isDefinition and hasBody(parsed, index) then
 				self.diagnostics[#self.diagnostics + 1] = {
 					message = string.format("the type says this returns %s, but nothing is returned",
 						types.display(promised)),

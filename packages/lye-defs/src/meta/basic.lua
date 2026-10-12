@@ -56,7 +56,7 @@ function error(message, level) end
 _G = {}
 
 ---Returns the current environment in use by the function. `f` can be a Lua function or a number that specifies the function at that stack level.
----@param f? integer|async fun(...):...
+---@param f? integer|fun(...):...
 ---@return table
 ---@nodiscard
 function getfenv(f) end
@@ -157,7 +157,7 @@ function pairs(t) end
 
 ---Calls the function `f` with the given arguments in *protected mode*. This means that any error inside `f` is not propagated; instead, `pcall` catches the error and returns a status code. Its first result is the status code (a boolean), which is true if the call succeeds without errors. In such case, `pcall` also returns all results from the call, after this first result. In case of any error, `pcall` returns `false` plus the error object.
 ---
----@param f     async fun(...):...
+---@param f     fun(...):...
 ---@param arg1? any
 ---@param ...   any
 ---@return boolean success
@@ -203,32 +203,12 @@ function rawset(table, index, value) end
 function select(index, ...) end
 
 ---Sets the environment to be used by the given function.
----@param f     (async fun(...):...)|integer
+---@param f     (fun(...):...)|integer
 ---@param table table
 ---@return function
 function setfenv(f, table) end
 
 
----@class metatable
----@field __mode 'v'|'k'|'kv'|nil
----@field __metatable any|nil
----@field __tostring (fun(t):string)|nil
----@field __gc fun(t)|nil
----@field __add (fun(t1,t2):any)|nil
----@field __sub (fun(t1,t2):any)|nil
----@field __mul (fun(t1,t2):any)|nil
----@field __div (fun(t1,t2):any)|nil
----@field __mod (fun(t1,t2):any)|nil
----@field __pow (fun(t1,t2):any)|nil
----@field __unm (fun(t):any)|nil
----@field __concat (fun(t1,t2):any)|nil
----@field __len (fun(t):integer)|nil
----@field __eq (fun(t1,t2):boolean)|nil
----@field __lt (fun(t1,t2):boolean)|nil
----@field __le (fun(t1,t2):boolean)|nil
----@field __index table|(fun(t,k):any)|nil
----@field __newindex table|fun(t,k,v)|nil
----@field __call (fun(t,...):...)|nil
 
 ---Sets the metatable for the given table. If `metatable` is `nil`, removes the metatable of the given table. If the original metatable has a `__metatable` field, raises an error.
 ---
@@ -285,7 +265,7 @@ _VERSION = "Lua 5.1"
 
 
 ---Calls function `f` with the given arguments in protected mode with a new message handler.
----@param f     async fun(...):...
+---@param f     fun(...):...
 ---@param msgh  function
 ---@param arg1? any
 ---@param ...   any

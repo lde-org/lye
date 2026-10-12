@@ -85,7 +85,7 @@ function math.fmod(x, y) end
 ---Returns two numbers `m` and `e` such that `x = m * (2 ^ e)`, where `e` is an integer. When `x` is zero, NaN, +inf, or -inf, `m` is equal to `x`; otherwise, the absolute value of `m` is in the range [0.5, 1).
 ---@param x number
 ---@return number m
----@return number e
+---@return integer e
 ---@nodiscard
 function math.frexp(x) end
 
@@ -151,7 +151,7 @@ function math.rad(x) end
 function math.random(m, n) end
 
 ---Sets `x` as the "seed" for the pseudo-random generator.
----@param x integer
+---@param x? integer
 function math.randomseed(x) end
 
 ---Returns the sine of `x` (assumed to be in radians).

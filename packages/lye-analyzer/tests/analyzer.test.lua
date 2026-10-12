@@ -1257,6 +1257,35 @@ test.it("spans the whole name an argument is written with", function()
 		"the diagnostic covers the whole name, not its first character")
 end)
 
+test.it("checks what an argument past the named ones has to be", function()
+	-- `---@param ... string|number` is a promise about every extra argument, so a table or a nil
+	-- written there is the same contradiction as one written for a named parameter.
+	local source = table.concat({
+		"---@param ... string|number\n",
+		"local function takes(...) end\n",
+		"takes(1, \"a\")\n",
+		"takes({})\n",
+		"takes(nil)\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 2, "the table and the nil are refused, the number and string are not")
+	test.truthy(result.diagnostics[1].message:match("takes expects number|string, got table"),
+		result.diagnostics[1].message)
+	test.truthy(result.diagnostics[2].message:match("got nil"), result.diagnostics[2].message)
+end)
+
+test.it("holds a definition file to its annotations, not to bodies it does not have", function()
+	-- `---@meta` says the file describes a library: `---@return true?` over an empty function is
+	-- the whole of that function, and there is no body to contradict the annotation.
+	local source = "---@meta\n---@type string\nlocal x = 1\nreturn x\n"
+	test.equal(#analyzer.analyze(source).diagnostics, 0,
+		"a definition file's annotations describe the library rather than a body")
+
+	local same = source:gsub("^%-%-%-@meta\n", "")
+	test.equal(#analyzer.analyze(same).diagnostics, 1,
+		"and without the marker what is written is checked against what it says")
+end)
+
 test.it("checks each argument against its own parameter", function()
 	local result = analyzer.analyze(
 		"---@param a string\n---@param b number\nlocal function f(a, b) end\nf(\"s\", \"t\")\n"

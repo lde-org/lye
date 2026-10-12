@@ -13,7 +13,6 @@ debug = {}
 ---@field lastlinedefined integer
 ---@field what            string
 ---@field currentline     integer
----@field istailcall      boolean
 ---@field nups            integer
 ---@field nparams         integer
 ---@field isvararg        boolean
@@ -25,13 +24,13 @@ function debug.debug() end
 
 ---Returns the environment of object `o` .
 ---@param o any
----@return table
+---@return table|nil
 ---@nodiscard
 function debug.getfenv(o) end
 
 ---Returns the current hook settings of the thread.
 ---@param co? thread
----@return function hook
+---@return function|nil hook
 ---@return string mask
 ---@return integer count
 ---@nodiscard
@@ -41,7 +40,6 @@ function debug.gethook(co) end
 ---|+"n"     # `name` and `namewhat`
 ---|+"S"     # `source`, `short_src`, `linedefined`, `lastlinedefined`, and `what`
 ---|+"l"     # `currentline`
----|+"t"     # `istailcall`
 ---|+"u" # `nups`, `nparams`, and `isvararg`
 ---|+"f"     # `func`
 ---|+"L"     # `activelines`
@@ -49,16 +47,16 @@ function debug.gethook(co) end
 ---Returns a table with information about a function.
 ---@overload fun(f: integer|function, what?: infowhat):debuginfo
 ---@param thread thread
----@param f      integer|async fun(...):...
+---@param f      integer|fun(...):...
 ---@param what?  infowhat
 ---@return debuginfo
 ---@nodiscard
 function debug.getinfo(thread, f, what) end
 
 ---Returns the name and the value of the local variable with index `local` of the function at level `f` of the stack.
----@overload fun(f: integer|async fun(...):..., index: integer):string, any
+---@overload fun(f: integer|fun(...):..., index: integer):string, any
 ---@param thread  thread
----@param f       integer|async fun(...):...
+---@param f       integer|fun(...):...
 ---@param index   integer
 ---@return string name
 ---@return any    value
@@ -67,7 +65,7 @@ function debug.getlocal(thread, f, index) end
 
 ---Returns the metatable of the given value.
 ---@param object any
----@return table metatable
+---@return table|nil metatable
 ---@nodiscard
 function debug.getmetatable(object) end
 
@@ -77,7 +75,7 @@ function debug.getmetatable(object) end
 function debug.getregistry() end
 
 ---Returns the name and the value of the upvalue with index `up` of the function.
----@param f  async fun(...):...
+---@param f  fun(...):...
 ---@param up integer
 ---@return string name
 ---@return any    value
@@ -99,11 +97,11 @@ function debug.setfenv(object, env) end
 ---|+"l" # Calls hook when Lua enters a new line of code.
 
 ---Sets the given function as a hook.
----@overload fun(hook: (async fun(...):...), mask: hookmask, count?: integer)
+---@overload fun(hook: (fun(...):...), mask: hookmask, count?: integer)
 ---@overload fun(thread: thread):...
 ---@overload fun(...):...
 ---@param thread thread
----@param hook   async fun(...):...
+---@param hook   fun(...):...
 ---@param mask   hookmask
 ---@param count? integer
 function debug.sethook(thread, hook, mask, count) end
@@ -118,14 +116,13 @@ function debug.sethook(thread, hook, mask, count) end
 function debug.setlocal(thread, level, index, value) end
 
 ---Sets the metatable for the given value to the given table (which can be `nil`).
----@generic T
----@param value T
+---@param value any
 ---@param meta? table
----@return T value
+---@return boolean
 function debug.setmetatable(value, meta) end
 
 ---Assigns the `value` to the upvalue with index `up` of the function.
----@param f     async fun(...):...
+---@param f     fun(...):...
 ---@param up    integer
 ---@param value any
 ---@return string name
@@ -142,16 +139,16 @@ function debug.setupvalue(f, up, value) end
 function debug.traceback(thread, message, level) end
 
 ---Returns a unique identifier (as a light userdata) for the upvalue numbered `n` from the given function.
----@param f async fun(...):...
+---@param f fun(...):...
 ---@param n integer
 ---@return lightuserdata id
 ---@nodiscard
 function debug.upvalueid(f, n) end
 
 ---Make the `n1`-th upvalue of the Lua closure `f1` refer to the `n2`-th upvalue of the Lua closure `f2`.
----@param f1 async fun(...):...
+---@param f1 fun(...):...
 ---@param n1 integer
----@param f2 async fun(...):...
+---@param f2 fun(...):...
 ---@param n2 integer
 function debug.upvaluejoin(f1, n1, f2, n2) end
 

@@ -13,6 +13,14 @@ local cache = require("lye-lsp.cache")
 
 local check = {}
 
+--- Whether a file is a definition file: `.d.lua` describes a library the way a `---@meta` file
+--- does, so a check holds it to its annotations rather than to bodies it does not have.
+---@param path string
+---@return boolean
+local function isDefinitionPath(path)
+	return path:match("%.d%.lua$") ~= nil
+end
+
 --- The LuaJIT definitions, prepared once, so a headless check sees the same standard library an
 --- editor session does.
 local PRELUDE = analyzer.prelude(require("lye-defs"))
@@ -324,7 +332,7 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 	if names == nil then
 		names = analyzer.analyze(written, PRELUDE, own, function(inner)
 			return moduleOf(found, inner, modules, analysing, own, scopes, batch, store)
-		end, nil, docsByText[key], batchPath == nil)
+		end, nil, docsByText[key], batchPath == nil, isDefinitionPath(path))
 		analysesByText[key] = names
 	end
 	analysing[key] = nil
@@ -398,7 +406,7 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	if names == nil then
 		names = analyzer.analyze(source, PRELUDE, elsewhere, function(name)
 			return moduleOf(path, name, modules or {}, analysing, elsewhere, scopes, batch, store)
-		end, nil, docsByText[key])
+		end, nil, docsByText[key], nil, isDefinitionPath(path))
 		analysesByText[key] = names
 		-- The full analysis says what `require` of this file gives back as well, and it is the
 		-- richer answer: a module another file reaches afterwards takes it rather than being

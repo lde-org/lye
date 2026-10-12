@@ -13,6 +13,33 @@ local function annotation(source, tag)
 	return doc.first(doc.parse(source), tag)
 end
 
+test.it("reads an index signature as a key type and a value type", function()
+	-- `---@field [integer] T` is what a value indexed with that kind of key gives: the bracket is
+	-- the key's type rather than a field name, and the type after it is the value's.
+	local source = "---@field [integer] string\n"
+	local found = annotation(source, "field")
+	test.equal(found.name, "[integer]")
+	test.equal(found.type, "string")
+	test.equal(source:sub(found.nameStart, found.nameStop), "[integer]", "the span is the key")
+end)
+
+test.it("says a file is a definition when it carries ---@meta", function()
+	test.equal(doc.parse("---@meta\nlocal x = 1\n").isDefinition, true)
+	test.equal(doc.parse("---@meta bit\n").isDefinition, true, "the name it may carry does not matter")
+	test.equal(doc.parse("local x = 1\n").isDefinition, false)
+end)
+
+test.it("keeps a class's parameters and drops the sentence after them", function()
+	-- `---@class Metatable<T: table> the fields Lua consults ...` writes its parameters and then a
+	-- sentence about them. The sentence is documentation; a parent type would follow a colon.
+	local found = annotation("---@class lye.Metatable<T: table> the fields Lua consults\n", "class")
+	test.equal(found.name, "lye.Metatable")
+	test.equal(found.type, "<T: table>", "the parameters are the body, and the sentence is not")
+
+	local withParent = annotation("---@class Box<T>: Container<T> a box\n", "class")
+	test.equal(withParent.type, "<T>: Container<T>", "a parent after the colon is the body")
+end)
+
 test.it("reads the same annotations with or without the tokens of a full lex", function()
 	-- `doc.parse` scans the comments itself when it is not handed tokens, and that scan has to see
 	-- the comments a full lex sees: a `--` inside a string is text, and a long bracket that opens a

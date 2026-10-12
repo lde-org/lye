@@ -117,6 +117,9 @@ end
 
 local function declaredMismatches(ctx)
 	local parsed, self = ctx.parsed, ctx.self
+	-- A definition file's annotations are the library it describes, not a promise about a body:
+	-- `---@return true?` over `function file:close() end` is the whole of the function.
+	if self.isDefinition then return end
 	for _, variable in ipairs(self.variables) do
 		-- A name starting with `_` is a discard: what is written to it is not meant to be read, so
 		-- the type it happens to have — often a loop's own index — is not a promise to check against.
@@ -469,7 +472,10 @@ local function unusedLocals(ctx)
 			and not variable.name:match("^_")
 		if unused then
 			local declaration = variable.declaration
-			diagnostic.add(ctx.self, string.format("unused local `%s`", variable.name), declaration.start, declaration.stop, 2)
+			if not ctx.self.isDefinition then
+				diagnostic.add(ctx.self, string.format("unused local `%s`", variable.name),
+					declaration.start, declaration.stop, 2)
+			end
 		end
 	end
 

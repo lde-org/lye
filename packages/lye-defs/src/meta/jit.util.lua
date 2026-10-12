@@ -66,12 +66,12 @@ local traceinfo = {
     linktype = ""
 }
 
----@param tr Trace
+---@param tr integer
 ---@return jit.traceinfo? info
 function util.traceinfo(tr)
 end
 
----@param tr Trace
+---@param tr integer
 ---@param ref integer
 ---@return integer? m
 ---@return integer? ot
@@ -81,7 +81,7 @@ end
 function util.traceir(tr, ref)
 end
 
----@param tr Trace
+---@param tr integer
 ---@param idx integer
 ---@return any? k
 ---@return integer? t
@@ -91,13 +91,14 @@ end
 
 ---@class jit.snap : integer[]
 
----@param tr Trace
+---@overload fun(tr: integer, sn: integer, getpos: boolean): jit.snap, integer
+---@param tr integer
 ---@param sn integer
 ---@return jit.snap? snap
 function util.tracesnap(tr, sn)
 end
 
----@param tr Trace
+---@param tr integer
 ---@return string? mcode
 ---@return integer? addr
 ---@return integer? loop
@@ -105,7 +106,7 @@ function util.tracemc(tr)
 end
 
 ---@overload fun(exitno: integer): integer
----@param tr Trace
+---@param tr integer
 ---@param exitno integer
 ---@return integer? addr
 function util.traceexitstub(tr, exitno)

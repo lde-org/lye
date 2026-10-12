@@ -597,17 +597,25 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	---@return lye.doc.Type?
 	local function typesOf(signature)
 		local held = parsedSignatures[signature]
-		if held then return held.params, held.returns end
+		if held then return held.params, held.returns, held.variadic end
 
 		local local_ = resolveFor(signature)
 		local params = positionalParams(signature, local_)
+		-- What the `...` a signature declares accepts, which is what an argument past the named
+		-- parameters is checked against.
+		local variadic
+		for _, annotation in ipairs(signature.params or {}) do
+			if annotation.name == "..." and annotation.type then
+				variadic = types.parse(annotation.type, local_) or nil
+			end
+		end
 		local written = signature.returns and signature.returns.type
 		local returned = written and types.parse(written, local_) or nil
 		-- Kept for a generic signature too: what a name of its own stands for is read the same at
 		-- every call — the call's own binding is applied by `types.substitute` on the answer, not
 		-- by reading the signature again, and re-reading it per call was a tree per call.
-		parsedSignatures[signature] = { params = params, returns = returned }
-		return params, returned
+		parsedSignatures[signature] = { params = params, returns = returned, variadic = variadic }
+		return params, returned, variadic
 	end
 
 	--- The type an argument has as it was written. A string literal is the one string it spells,
@@ -630,10 +638,11 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	---@param node lye.parser.Node
 	---@param params (lye.doc.Type?)[]
 	---@param receiver lye.doc.Type? the value a `:` call passes, which fills the first parameter
+	---@param variadic lye.doc.Type? what an argument past the named ones has to be
 	---@return integer? nodeIdx the argument, or the receiver, that cannot be what it is
 	---@return lye.doc.Type? wanted
 	---@return lye.doc.Type? actual
-	local function firstMismatch(node, params, receiver)
+	local function firstMismatch(node, params, receiver, variadic)
 		-- A `:` call passes the receiver as its first argument. Its type decides whether that argument
 		-- occupies a parameter, while a mismatch leaves the written arguments unshifted.
 		local shift = 0
@@ -649,7 +658,10 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 			end
 		end
 		for index, argIdx in ipairs(node.args or {}) do
+			-- An argument past the named parameters is one of the `...` a signature declares, and
+			-- what that accepts is what it says: `f(1, {})` is wrong for `---@param ... number`.
 			local wanted = params[index + shift]
+			if not wanted and variadic and index + shift > #params then wanted = variadic end
 			if wanted and parsed.nodes[argIdx] then
 				local actual = argumentAt(argIdx)
 				if types.mismatch(wanted, actual, "argument " .. (index + shift)) then
@@ -668,13 +680,14 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	---@param params (lye.doc.Type?)[]
 	---@param overloads string[]?
 	---@param receiver lye.doc.Type?
-	local function checkArgs(node, name, params, overloads, receiver)
-		local blame, wanted, actual = firstMismatch(node, params, receiver)
+	local function checkArgs(node, name, params, overloads, receiver, variadic)
+		local blame, wanted, actual = firstMismatch(node, params, receiver, variadic)
 		if not blame then return end
 
 		for _, written in ipairs(overloads or {}) do
 			local shape = types.parse(written, resolve)
-			if shape and shape.variant == "fn" and not firstMismatch(node, shape.params, receiver) then
+			if shape and shape.variant == "fn"
+				and not firstMismatch(node, shape.params, receiver, shape.variadic) then
 				return
 			end
 		end
@@ -699,13 +712,14 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 			local callable = target and types.metamethod(target, "__call")
 			local receiver = (node.isMethod or callable) and target or nil
 			if signature then
-				local params, returned = typesOf(signature)
+				local params, returned, variadic = typesOf(signature)
 				if byName and returned then returns[node.callee] = returned end
-				checkArgs(node, name, params, signature.overloads, receiver)
+				checkArgs(node, name, params, signature.overloads, receiver, variadic)
 			elseif calleeType and types.isFn(calleeType) and not types.isAnyFn(calleeType) then
 				-- A callable nothing annotated, such as a method declared in this document: its own type is all
 				-- there is to check against, and a parameter of the signature's own is bound by this very call.
 				local params = calleeType.params
+				local variadic = calleeType.variadic
 				if calleeType.generics and next(calleeType.generics) then
 					local bindings = {}
 					for name in pairs(calleeType.generics) do
@@ -717,8 +731,9 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 						replaced[index] = types.substitute(param, bindings)
 					end
 					params = replaced
+					if variadic then variadic = types.substitute(variadic, bindings) end
 				end
-				checkArgs(node, name, params, nil, receiver)
+				checkArgs(node, name, params, nil, receiver, variadic)
 			end
 		end
 	end
@@ -826,10 +841,11 @@ function analyzer.prelude(sources)
 				-- A generic in a stdlib signature is bound at the call site, so all this knows is
 				-- what the name was limited to.
 				local local_ = withGenerics(entry.generics, entry.constraints, resolveAll)
-				local params, isVariadic = {}, false
+				local params, isVariadic, variadic = {}, false, nil
 				for _, annotation in ipairs(entry.params) do
 					if annotation.name == "..." then
 						isVariadic = true
+						variadic = annotation.type and types.parse(annotation.type, local_) or nil
 					else
 						params[#params + 1] = annotation.type
 							and types.parse(annotation.type, local_) or types.UNKNOWN_TYPE
@@ -838,7 +854,7 @@ function analyzer.prelude(sources)
 				local returned = entry.returns and entry.returns.type
 				local bare = returned and (returned:gsub("%.%.%.$", "")) or nil
 				local fnType = types.fn(params,
-					(bare and types.parse(bare, local_)) or types.ANY_TYPE, isVariadic)
+					(bare and types.parse(bare, local_)) or types.ANY_TYPE, isVariadic, nil, variadic)
 				doc.classes.evolve(prepared, className, field, fnType)
 				-- The annotations stay reachable from the type they built, so a call through the field is checked
 				-- and bound exactly as a call to a named function is.
@@ -943,7 +959,8 @@ end
 ---@param cachedAnnotations lye.doc.File? annotations already parsed for a batch check
 ---@param isModuleOnly boolean? the document is read for what `require` gives back, so its own
 --- diagnostics are nobody's to report and the passes that only build them are left out
-function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAnnotations, isModuleOnly)
+function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAnnotations, isModuleOnly,
+	isDefinition)
 	assert(type(source) == "string", "analyzer.analyze expects a string")
 
 	local parsed = Parser.new(source, resume):parse()
@@ -1189,7 +1206,12 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 
 	-- `self` is declared before the closure that reads it, so the closure captures this
 	-- table rather than an outer name.
-	local self = { parser = parsed, variables = {}, byStart = {}, diagnostics = {}, doc = annotations }
+	local self = {
+		parser = parsed, variables = {}, byStart = {}, diagnostics = {}, doc = annotations,
+		-- A definition file — one marked `---@meta`, or named `.d.lua` — declares a library: what it
+		-- writes is the whole of a function, so the checks that read a body have nothing to read.
+		isDefinition = isDefinition or (type(annotations) == "table" and annotations.isDefinition) or false,
+	}
 	-- `ffi.C` names the same functions `ffi.load` hands back: one C namespace, and the file that
 	-- wrote the cdef is the one that knows what is in it. Built once rather than per read, since
 	-- every `ffi.C` in the file is that same namespace — and not at all when there is no cdef.
@@ -1477,8 +1499,12 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	local function signatureTypeOf(declaration, signature)
 		local local_ = withGenerics(signature.generics, signature.constraints, resolve)
 		local params, isVariadic = paramsFor(declaration, signature, local_)
+		local variadic
 		for _, annotation in ipairs(signature.params) do
-			if annotation.name == "..." then isVariadic = true end
+			if annotation.name == "..." then
+				isVariadic = true
+				variadic = annotation.type and types.parse(annotation.type, local_) or nil
+			end
 		end
 		local returned = signature.returns and signature.returns.type
 		-- `---@return T1, T2` and `---@return T...` spread: each returned value is that type.
@@ -1501,7 +1527,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		-- A signature that names its parameters but not its return promises nothing about one. A mutable
 		-- unknown says exactly that, and the body's own return is promoted into it in place.
 		local fnType = types.fn(params, (returned and types.parse(returned, local_)) or types.mutable(),
-			isVariadic, isSpread)
+			isVariadic, isSpread, variadic)
 		if values then fnType.values = values end
 		return fnType
 	end

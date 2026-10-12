@@ -5,7 +5,7 @@
 coroutine = {}
 
 ---Creates a new coroutine, with body `f`. `f` must be a function. Returns this new coroutine, an object with type `"thread"`.
----@param f async fun(...):...
+---@param f fun(...):...
 ---@return thread
 ---@nodiscard
 function coroutine.create(f) end
@@ -19,9 +19,8 @@ function coroutine.create(f) end
 ---@return any ...
 function coroutine.resume(co, val1, ...) end
 
----Returns the running coroutine plus a boolean, true when the running coroutine is the main one.
----@return thread running
----@return boolean ismain
+---Returns the running coroutine, or nil when called by the main thread.
+---@return thread|nil running
 ---@nodiscard
 function coroutine.running() end
 
@@ -36,13 +35,12 @@ function coroutine.running() end
 function coroutine.status(co) end
 
 ---Creates a new coroutine, with body `f`; `f` must be a function. Returns a function that resumes the coroutine each time it is called.
----@param f async fun(...):...
+---@param f fun(...):...
 ---@return fun(...):...
 ---@nodiscard
 function coroutine.wrap(f) end
 
 ---Suspends the execution of the calling coroutine.
----@async
 ---@return any ...
 function coroutine.yield(...) end
 

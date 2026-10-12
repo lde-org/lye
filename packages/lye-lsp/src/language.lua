@@ -370,6 +370,14 @@ function Lye:requirePaths(uri)
 	return out
 end
 
+--- Whether a document is a definition file: one named `.d.lua` describes a library the way a
+--- `---@meta` file does, and the analyzer holds it to its annotations rather than to a body.
+---@param uri string
+---@return boolean
+local function isDefinitionFile(uri)
+	return uri:match("%.d%.lua$") ~= nil
+end
+
 --- What `require("name")` is: the type the module file returns, analysed once and kept until its
 --- text changes. A module that requires the file being analysed comes back around, so a name
 --- already in progress answers nothing rather than recursing.
@@ -436,7 +444,7 @@ function Lye:moduleType(name, from)
 	-- document, which is analysed on its own account when it is open.
 	local names = analyzer.analyze(written, PRELUDE, self:declaredTypes("file://" .. path), function(inner)
 		return self:moduleType(inner, "file://" .. path)
-	end, nil, nil, true)
+	end, nil, nil, true, isDefinitionFile("file://" .. path))
 	self.requiring[path] = nil
 	self.modules[path] = { text = written, type = names.module }
 	-- Kept for the sessions after this one. The graph is written as it stands: a placeholder in
@@ -474,6 +482,7 @@ function Lye:useWorkspaceCache()
 	local root = self.server.rootPath
 	if root and root ~= "" and not cache.named() then cache.setRoot(root .. "/.lye") end
 end
+
 
 --- The start of the line an offset is written on. The last run of characters that holds no
 --- newline is cut off the front of the text, and what is left is everything above it.
@@ -707,7 +716,7 @@ function Lye:analyze(uri, from)
 	local previous = from and self.analysis[uri]
 	local names = analyzer.analyze(document.text, PRELUDE, self:declaredTypes(uri), function(name)
 		return self:moduleType(name, uri)
-	end, previous and Parser.resumeAt(previous, from) or nil)
+	end, previous and Parser.resumeAt(previous, from) or nil, nil, nil, isDefinitionFile(uri))
 	local result = names.parser
 	self.analysis[uri] = result
 	self.names[uri] = names
@@ -1718,7 +1727,9 @@ function Lye:onSemanticTokens(params)
 					elseif annotation.tag == "class" or annotation.tag == "alias" then
 						target = "type"
 					elseif annotation.tag == "field" then
-						target = "property"
+						-- `---@field [integer] T` names a key type rather than a field, and a key
+						-- type reads as a type.
+						target = annotation.name:sub(1, 1) == "[" and "type" or "property"
 					end
 					carve(annotation.nameStart, annotation.nameStop, target)
 				end
@@ -2477,6 +2488,9 @@ function Lye:onInlayHint(params)
 		if not variable.declared and not isFunction and declaration.start >= from and declaration.stop <= to then
 			local held = analyzer.typeAt(names, variable, declaration.stop)
 			local shown = hintText(held)
+			-- `local ffi = require("ffi")` with a type that reads `ffi` says nothing: the hint
+			-- would be the name written twice.
+			if shown == variable.name then shown = nil end
 			if shown and shown ~= "unknown" and shown ~= "any" then
 				out[#out + 1] = {
 					position = select(2, position.toPosition(text, index, declaration.stop + 1, encoding)) and {

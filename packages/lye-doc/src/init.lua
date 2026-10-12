@@ -77,6 +77,27 @@ local BINDS = {
 --- `---@param x string a sentence about it`.
 ---@param text string
 ---@return string
+--- Split a leading `<...>` parameter list from what follows it. A class or an alias writes its
+--- parameters first, and the body after them is read on its own. The two halves are the source's
+--- own slices, so the offsets a reader finds in them still point at the text.
+---@param text string
+---@return string params
+---@return string body
+local function splitParams(text)
+	if text:sub(1, 1) ~= "<" then return "", text end
+	local depth = 0
+	for at = 1, #text do
+		local char = text:sub(at, at)
+		if char == "<" then
+			depth = depth + 1
+		elseif char == ">" then
+			depth = depth - 1
+			if depth == 0 then return text:sub(1, at), text:sub(at + 1) end
+		end
+	end
+	return "", text
+end
+
 local function cutType(text)
 	text = trim(text)
 	local depth, quote, at, length = 0, nil, 1, #text
@@ -183,13 +204,41 @@ local function parse(comment, start, stop)
 			local signature = written:match("^fun%s*%(") or written:match("^fn%s*%(")
 			annotation.type = signature and ("(" .. written .. ")?") or (written .. "?")
 		end
-	elseif tag == "field" or tag == "alias" or tag == "generic" or tag == "class" then
+	elseif tag == "field" then
+		-- `---@field [integer] T` is an index signature rather than a field: what a value indexed
+		-- with that kind of key gives. The bracket is the name slot — a key type, not an
+		-- identifier — and the type after it is the value's.
+		local name, remaining = rest:match("^([%w_%.]+)(.*)$")
+		if not name then
+			local bracket, body = rest:match("^(%[[^%]]*%])(.*)$")
+			name, remaining = bracket, body
+		end
+		annotation.name = name
+		local written = trim((remaining or ""):gsub("^=", ""))
+		annotation.type = cutType(written)
+		annotation.typeText = annotation.type
+	elseif tag == "alias" or tag == "generic" or tag == "class" then
 		local name, remaining = rest:match("^([%w_%.]+)(.*)$")
 		annotation.name = name
 		local written = trim((remaining or ""):gsub("^=", ""))
-		-- A class or an alias may write a parameter list before its body — `A<T: number> T[]` — and
-		-- that body is not prose, so a declaration that opens with `<` is kept whole.
-		annotation.type = written:sub(1, 1) == "<" and written or cutType(written)
+		if tag == "class" or tag == "alias" then
+			-- A class or an alias writes its parameters first — `A<T: number> T[]`. An alias's
+			-- body is the type it stands for; a class's body is a parent after `:`, and a sentence
+			-- that follows the parameters is documentation rather than a type of its own.
+			local params, body = splitParams(written)
+			local colon = tag == "class" and body:find(":", 1, true) or nil
+			if colon then
+				local lead = body:match("^:%s*") or ":"
+				annotation.type = params .. lead .. cutType(trim(body:sub(colon + 1)))
+			elseif tag == "class" then
+				annotation.type = params
+			else
+				local cut = cutType(trim(body))
+				annotation.type = cut == "" and params or (params .. (body:match("^%s*") or "") .. cut)
+			end
+		else
+			annotation.type = cutType(written)
+		end
 		annotation.typeText = annotation.type
 	elseif tag == "return" then
 		-- `---@return v is T` names a parameter and the type it proves rather than a type of its
@@ -323,7 +372,18 @@ function doc.parse(source, tokens)
 	-- once and binary search later.
 	table.sort(annotations, function(a, b) return a.start < b.start end)
 
-	return { annotations = annotations }
+	-- A definition file describes a library rather than running: `---@meta` says so, the way LuaLS
+	-- spells it, and the analyzer holds such a file to its annotations instead of to bodies it does
+	-- not have. The name a `---@meta` line may carry — the global the file describes — is kept.
+	local isDefinition = false
+	for _, annotation in ipairs(annotations) do
+		if annotation.tag == "meta" then
+			isDefinition = true
+			break
+		end
+	end
+
+	return { annotations = annotations, isDefinition = isDefinition }
 end
 
 --- The annotations that describe a declaration at `offset`: those whose comment ends above

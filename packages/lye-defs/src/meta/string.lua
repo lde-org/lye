@@ -20,7 +20,7 @@ function string.byte(s, i, j) end
 function string.char(byte, ...) end
 
 ---Returns a string containing a binary representation (a *binary chunk*) of the given function.
----@param f      async fun(...):...
+---@param f      fun(...):...
 ---@param strip? boolean
 ---@return string
 ---@nodiscard
@@ -57,7 +57,7 @@ function string.format(s, ...) end
 ---
 ---@param s       string|number
 ---@param pattern string|number
----@return fun():string, ...
+---@return fun():string|number, ...
 ---@nodiscard
 function string.gmatch(s, pattern) end
 
