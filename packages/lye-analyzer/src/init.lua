@@ -885,7 +885,7 @@ end
 
 ---@param source string
 ---@param prepared lye.analyzer.Prelude? what the definitions declare
----@param elsewhere table<string, boolean>? type names other files declare, which are not typos
+---@param elsewhere table<string, boolean|lye.doc.Type>? what other files declare: the name alone as a typo guard, the type where a caller can build one
 ---@param modules fun(name: string): lye.doc.Type? ? what `require("name")` is, when the caller can
 --- find the file: the analyzer reads the document it is given, and a module lives elsewhere
 ---@return lye.analyzer.Result

@@ -16,13 +16,6 @@ local INPUT = PACKAGE_DIR .. "/target/lsp-test-input.bin"
 
 local URI = "file:///tmp/lye-session.lua"
 
-local INITIALIZE = {
-	jsonrpc = "2.0",
-	id = 1,
-	method = "initialize",
-	params = { capabilities = {} },
-}
-
 local BROKEN = "local x = 1\nlocal = 2\n"
 local VALID = "local x = 1\nlocal y = 2\n"
 
@@ -36,11 +29,17 @@ end
 --- Drive a session. `initialize` is always prepended: a notification sent before the
 --- handshake is dropped, so a session that forgot it would assert on silence.
 ---@param messages table[]
+---@param root string? a workspace to open, for what a document names without requiring it
 ---@return table[] frames
 ---@return integer exitCode
-local function run(messages)
+local function run(messages, root)
 	local handle = assert(io.open(INPUT, "wb"))
-	handle:write(frame(INITIALIZE))
+	handle:write(frame({
+		jsonrpc = "2.0",
+		id = 1,
+		method = "initialize",
+		params = { capabilities = {}, rootUri = root and ("file://" .. root) or nil },
+	}))
 	for _, message in ipairs(messages) do
 		handle:write(frame(message))
 	end
@@ -80,12 +79,13 @@ local function endingWithShutdown(messages)
 end
 
 ---@param text string
+---@param uri string? the document to open, for what its types resolve against
 ---@return table
-local function didOpen(text)
+local function didOpen(text, uri)
 	return {
 		jsonrpc = "2.0",
 		method = "textDocument/didOpen",
-		params = { textDocument = { uri = URI, languageId = "lua", version = 1, text = text } },
+		params = { textDocument = { uri = uri or URI, languageId = "lua", version = 1, text = text } },
 	}
 end
 
@@ -197,6 +197,49 @@ test.it("publishes a diagnostic after an incremental change introduces an error"
 	test.equal(#published[2].diagnostics, 1)
 	test.equal(published[2].diagnostics[1].range.start.line, 1)
 	test.equal(published[2].diagnostics[1].range.start.character, 6)
+end)
+
+test.it("resolves a class another workspace file declares for a document that never requires it", function()
+	-- The editor opens one document at startup and has read no other: a parameter typed as
+	-- another file's class has to mean that class all the same, or every table built for it is
+	-- refused. No document is opened here, so only the workspace scan can know it — which is what
+	-- `lye check` reads the pair of files as too.
+	local workspace = TESTS_DIR .. "/fixtures/workspace"
+	local uri = "file://" .. workspace .. "/use.lua"
+	local source = table.concat({
+		"---@param p Point\n",
+		"local function f(p)\n",
+		"\treturn p.x\n",
+		"end\n",
+		"f({ x = 1, y = 2 })\n",
+	}, "")
+	local published = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), workspace))
+
+	test.equal(#published, 1, "opening the document publishes its diagnostics")
+	test.equal(#published[1].diagnostics, 0,
+		"a table built for the class fits it: "
+			.. (published[1].diagnostics[1] and published[1].diagnostics[1].message or "none"))
+end)
+
+test.it("resolves a class the document's package has linked into target", function()
+	-- `target/` is left out of the workspace walk — it mirrors other packages — and what a
+	-- document can reach is what lde linked into its own package: the same resolution a check
+	-- does for the package's links.
+	local project = TESTS_DIR .. "/fixtures/package"
+	local uri = "file://" .. project .. "/src/use.lua"
+	local source = table.concat({
+		"---@param d Dep\n",
+		"local function f(d)\n",
+		"\treturn d.amount\n",
+		"end\n",
+		"f({ amount = 1 })\n",
+	}, "")
+	local published = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project))
+
+	test.equal(#published, 1, "opening the document publishes its diagnostics")
+	test.equal(#published[1].diagnostics, 0,
+		"a table built for the linked class fits it: "
+			.. (published[1].diagnostics[1] and published[1].diagnostics[1].message or "none"))
 end)
 
 test.it("exits 0 when exit follows shutdown", function()

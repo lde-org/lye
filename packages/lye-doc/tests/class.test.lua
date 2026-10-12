@@ -185,6 +185,20 @@ test.it("answers nothing for a class it does not know", function()
 	test.equal(next(classes.fieldsOf(namespace, "Missing")), nil)
 end)
 
+test.it("resolves every name a run of files declares against the whole run", function()
+	-- A class another file declares is what its fields are, not its name: a reader that merges the
+	-- run — `lye check` reads a batch this way and the LSP reads the workspace this way — hands an
+	-- analysis these types rather than the names alone, so a table built for one is checked
+	-- against what the class says.
+	local point = doc.parse("---@class Point\n---@field x number\nlocal Point = {}\n")
+	local aliases = doc.parse("---@alias Points Point[]\n")
+	local declared = classes.declare({ point, aliases })
+	test.equal(declared.Point.variant, "class", "the class is the class")
+	test.equal(doctype.display(declared.Point.fields.x), "number", "with the field it declares")
+	test.equal(declared.Points.type.variant, "class", "and the alias read the other file's class")
+	test.equal(declared.Points.type.name, "Point")
+end)
+
 test.it("keeps the name of a parameter that carries a limit", function()
 	local namespace = read("---@class Box<T: number>\n---@field item T\nlocal Box = {}\n")
 	test.equal(namespace.classes.Box.name, "Box")

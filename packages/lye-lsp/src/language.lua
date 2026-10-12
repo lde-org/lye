@@ -158,11 +158,11 @@ local DOC_TAG_NAME = "[%a_][%w_]*"
 ---@field analysis table<string, lye.parser.Result>
 ---@field names table<string, lye.analyzer.Result>
 ---@field packageRoots table<string, string|boolean>? which package each path belongs to, by `find`
----@field packageNames table<string, table<string, boolean>>? the names each package's `target/` declares
+---@field packageNames table<string, table<string, boolean|lye.doc.Type>>? what each package's `target/` declares
 ---@field modules table<string, { text: string, type: lye.doc.Type? }>? what each required file gives
 ---@field requiring table<string, boolean>? the files being required now, so a cycle ends
 ---@field declaredBy table<string, table<string, boolean|lye.doc.Type>> what each document declares, kept after its analysis is dropped
----@field known table<string, boolean>? the names every file in the workspace declares
+---@field known table<string, boolean|lye.doc.Type>? what every file in the workspace declares, resolved
 ---@field order string[] the documents whose analyses are held, least recently used first
 ---@field order string[] the documents whose analyses are held, least recently used first
 ---@field definitions table? the definitions, indexed by name, built once
@@ -379,35 +379,29 @@ function Lye:moduleType(name, from)
 	return names.module
 end
 
---- The type names the documents this server knows declare, by name: the class, or what an alias
---- stands for. The names alone keep `---@param t Point` from reading as a typo; the type itself
---- is handed over where one can be built, since a name resolving to nothing disagrees with every argument.
+--- What one document declares, which `declaredBy` keeps after its analysis is dropped.
 ---@param file lye.doc.File
 ---@return table<string, boolean|lye.doc.Type>
 local function declarationsOf(file)
-	local found = {}
-	local namespace = classes.read(file)
-	local resolve = classes.resolver(namespace)
-	for _, annotation in ipairs(file.annotations) do
-		if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name then
-			found[annotation.name] = resolve(annotation.name) or true
-		end
-	end
-	return found
+	return classes.declare({ file })
 end
 
---- The classes and aliases every file in the workspace declares, by name alone. A document is
---- analysed on its own, so a class another file declares is a name nothing here resolves — which
---- is not a mistake. Read by parsing each file, never by analysing one: a project holds hundreds.
+--- The classes and aliases every file in the workspace declares, each resolved to the type it
+--- stands for. A document is analysed on its own, so a class another file declares has to mean
+--- that class here: a name alone keeps `---@param p Point` from reading as a typo but disagrees
+--- with every table built for it. Read by parsing each file, never by analysing one — a project
+--- holds hundreds — and the whole run is read into one namespace the way `lye check` reads a
+--- batch, so a type built from another file's annotations still resolves.
 ---@param self lye.Server
 function Lye:workspaceDeclarations()
 	if self.known then return self.known end
-	local known = {}
 	local root = self.server.rootPath
+	local known = {}
 	if root then
 		local pipe = io.popen(string.format(
 			"find %q -type f -name '*.lua' -not -path '*/target/*' -not -path '*/.*/*' | head -2000", root))
 		if pipe then
+			local parsedFiles = {}
 			for file in pipe:lines() do
 				local handle = io.open(file, "rb")
 				-- A read that comes back with nothing is not a file this can read — a directory
@@ -416,14 +410,12 @@ function Lye:workspaceDeclarations()
 				local source = handle and handle:read("*a")
 				if handle then handle:close() end
 				if type(source) == "string" then
-					for _, annotation in ipairs(doc.parse(source).annotations) do
-						if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name then
-							known[annotation.name] = true
-						end
-					end
+					local isOk, parsed = pcall(doc.parse, source)
+					if isOk then parsedFiles[#parsedFiles + 1] = parsed end
 				end
 			end
 			pipe:close()
+			known = classes.declare(parsedFiles)
 		end
 	end
 	self.known = known
@@ -431,7 +423,7 @@ function Lye:workspaceDeclarations()
 end
 
 ---@param self lye.Server
---- The names the modules linked into a package's `target/` declare.
+--- The classes and aliases the modules linked into a package's `target/` declare, resolved.
 ---
 --- This is what a project laid out as several lde packages needs and a flat repository does not:
 --- the modules a document can `require` are exactly the ones lde linked beside it, and a
@@ -440,7 +432,7 @@ end
 --- package, and only for the package the document belongs to.
 ---@param self lye.Server
 ---@param root string the package root
----@return table<string, boolean>
+---@return table<string, boolean|lye.doc.Type>
 function Lye:packageDeclarations(root)
 	self.packageNames = self.packageNames or {}
 	local held = self.packageNames[root]
@@ -449,20 +441,18 @@ function Lye:packageDeclarations(root)
 	local pipe = io.popen(string.format(
 		"find -L %q -type f -name '*.lua' -not -path '*/.*/*' 2>/dev/null | head -2000", root .. "/target"))
 	if pipe then
+		local parsedFiles = {}
 		for file in pipe:lines() do
 			local handle = io.open(file, "rb")
 			local source = handle and handle:read("*a")
 			if handle then handle:close() end
 			if type(source) == "string" then
-				local isOk, file_ = pcall(doc.parse, source)
-				for _, annotation in ipairs(isOk and file_.annotations or {}) do
-					if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name then
-						found[annotation.name] = true
-					end
-				end
+				local isOk, parsed = pcall(doc.parse, source)
+				if isOk then parsedFiles[#parsedFiles + 1] = parsed end
 			end
 		end
 		pipe:close()
+		found = classes.declare(parsedFiles)
 	end
 	self.packageNames[root] = found
 	return found
@@ -473,14 +463,14 @@ end
 ---@return table<string, boolean|lye.doc.Type>
 function Lye:declaredTypes(uri)
 	local found = {}
-	-- The workspace first, so a name another file declares is known even when that file is closed;
+	-- The workspace first, so what another file declares is known even when that file is closed;
 	-- an open document's own answer then replaces it with the type itself where one can be built.
-	for name in pairs(self:workspaceDeclarations()) do found[name] = true end
+	for name, held in pairs(self:workspaceDeclarations()) do found[name] = held end
 	-- Then what the document's own package can reach: a monorepo is several packages, and each
 	-- resolves its `require`s through its own `target/`.
 	local root = uri and self:packageRoot(uri)
 	if root then
-		for name in pairs(self:packageDeclarations(root)) do found[name] = true end
+		for name, held in pairs(self:packageDeclarations(root)) do found[name] = held end
 	end
 	-- From what each document declared rather than from the analysis it had: a document whose
 	-- analysis was dropped to keep the process small still declares everything it did, so an
@@ -2942,6 +2932,7 @@ function Lye:register()
 	server:on(method.workspaceDidChangeWatchedFiles, function()
 		self.workspace = nil
 		self.known = nil
+		self.packageNames = nil
 		end)
 end
 

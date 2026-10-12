@@ -431,4 +431,32 @@ function classes.read(file)
 	return namespace
 end
 
+--- The names a run of files declares, each resolved to the type it stands for: a class with its
+--- fields, an alias as the body it writes. Every file's classes and aliases go into one namespace
+--- before any name is resolved, because a field of one file's class may name an alias another
+--- file writes — reading it against the file it was written in alone leaves that field a name
+--- nothing stands for. `lye check` reads a batch of files this way and the LSP reads the whole
+--- workspace this way, so both hand an analysis the same types.
+---@param files lye.doc.File[]
+---@return table<string, lye.doc.Type|boolean> the type where one can be built, `true` where not
+function classes.declare(files)
+	local merged = { classes = {}, aliases = {} }
+	for _, file in ipairs(files) do
+		local namespace = classes.read(file)
+		for name, class in pairs(namespace.classes) do merged.classes[name] = merged.classes[name] or class end
+		for name, alias in pairs(namespace.aliases) do merged.aliases[name] = merged.aliases[name] or alias end
+	end
+	local resolve = classes.resolver(merged)
+	local found = {}
+	for _, file in ipairs(files) do
+		for _, annotation in ipairs(file.annotations) do
+			if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name
+				and found[annotation.name] == nil then
+				found[annotation.name] = resolve(annotation.name) or true
+			end
+		end
+	end
+	return found
+end
+
 return classes

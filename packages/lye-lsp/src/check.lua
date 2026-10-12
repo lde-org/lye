@@ -69,20 +69,16 @@ end
 --- every `clap.Args` and `process.Child` as a type nothing declares — which is what the editor,
 --- reading the same `target/`, does not.
 ---@param root string the package root
----@param cache table<string, table<string, boolean>>
+---@param cache table<string, table<string, boolean|lye.doc.Type>>
 local function linkedDeclarations(root, cache)
 	local held = cache[root]
 	if held then return held end
 	local found = {}
 	local target = absolute(root) .. "/target"
 	if fs.isdir(target) then
-		-- Every file's names are read into one namespace before any is resolved: a class of one
-		-- file holds a field whose type is an alias of another — `lde.Package.Config.features` is
-		-- `lde.Package.Config.FeatureDefinitions` — and resolving the class with the file it is
-		-- written in alone left that field a name nothing stands for.
-		local parsedFiles, names = {}, {}
 		-- A link farm holds the same file under every package that depends on it, so the walk
 		-- stops at the cap rather than reading the closure of every closure.
+		local parsedFiles = {}
 		for file in fs.scan(target, "**/*.lua", { absolute = true, followSymlinks = true, ignore = ignored }) do
 			if #parsedFiles >= 2000 then break end
 			local source = readSource(file)
@@ -97,25 +93,9 @@ local function linkedDeclarations(root, cache)
 				if parsed then parsedFiles[#parsedFiles + 1] = parsed end
 			end
 		end
-		local merged = { classes = {}, aliases = {} }
-		for _, parsed in ipairs(parsedFiles) do
-			local namespace = classes.read(parsed)
-			for name, class in pairs(namespace.classes) do merged.classes[name] = merged.classes[name] or class end
-			for name, alias in pairs(namespace.aliases) do merged.aliases[name] = merged.aliases[name] or alias end
-			for _, annotation in ipairs(parsed.annotations) do
-				if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name then
-					names[annotation.name] = true
-				end
-			end
-		end
 		-- What each name means, resolved once for the whole package: a dependency's alias is as
-		-- real to a reader as its own, and a bare name refuses every argument made of it. The
-		-- namespace is every file's, so a class whose field names an alias of another file is
-		-- still that alias.
-		local resolve = classes.resolver(merged)
-		for name in pairs(names) do
-			if found[name] == nil then found[name] = resolve(name) or true end
-		end
+		-- real to a reader as its own, and a bare name refuses every argument made of it.
+		found = classes.declare(parsedFiles)
 	end
 	cache[root] = found
 	return found
@@ -181,10 +161,10 @@ end
 ---@return boolean? isOk
 ---@return string? err
 ---@param path string
----@param elsewhere table<string, boolean>? type names the other files in this batch declare
+---@param elsewhere table<string, boolean|lye.doc.Type>? what the other files in this batch declare
 ---@param modules table<string, { type: lye.doc.Type? }>? what each module came to, shared across the batch
 ---@param reporter lye.Report? where what is found is written
----@param scopes table<string, table<string, boolean>>? what each package's links declare, merged
+---@param scopes table<string, table<string, boolean|lye.doc.Type>>? what each package's links declare, merged
 ---@param source string?
 ---@param key string?
 ---@param isRead boolean
@@ -253,10 +233,10 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 end
 
 ---@param path string
----@param elsewhere table<string, boolean>?
+---@param elsewhere table<string, boolean|lye.doc.Type>?
 ---@param modules table<string, { type: lye.doc.Type? }>?
 ---@param reporter lye.Report?
----@param scopes table<string, table<string, boolean>>?
+---@param scopes table<string, table<string, boolean|lye.doc.Type>>?
 function check.file(path, elsewhere, modules, reporter, scopes)
 	return checkSource(path, elsewhere, modules, reporter, scopes, nil, nil, false)
 end
@@ -330,7 +310,6 @@ end
 function check.files(paths, reporter)
 	-- Every file in the batch is read first, so a name one of them declares is not a typo in
 	-- another: annotations are workspace-wide even though a document is analysed on its own.
-	local declared = {}
 	local parsedFiles = {}
 	local sourcesByPath, keysByPath = {}, {}
 	for _, path in ipairs(paths) do
@@ -348,26 +327,10 @@ function check.files(paths, reporter)
 			if parsed then parsedFiles[#parsedFiles + 1] = parsed end
 		end
 	end
-	-- One namespace for the batch, built before anything is resolved: a class here may hold a
-	-- field whose type is an alias another file writes, and resolving it with its own file alone
-	-- turned that field into a name nothing stands for.
-	local merged = { classes = {}, aliases = {} }
-	for _, parsed in ipairs(parsedFiles) do
-		local namespace = classes.read(parsed)
-		for name, class in pairs(namespace.classes) do merged.classes[name] = merged.classes[name] or class end
-		for name, alias in pairs(namespace.aliases) do merged.aliases[name] = merged.aliases[name] or alias end
-	end
 	-- What each name stands for, not only that it exists: a parameter declared with an alias
 	-- another file writes is checked against what the alias means, and a name on its own refuses
 	-- every argument handed to it.
-	local resolve = classes.resolver(merged)
-	for _, parsed in ipairs(parsedFiles) do
-		for _, annotation in ipairs(parsed.annotations) do
-			if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name then
-				declared[annotation.name] = resolve(annotation.name) or true
-			end
-		end
-	end
+	local declared = classes.declare(parsedFiles)
 
 	reporter = reporter or report.new()
 
