@@ -516,8 +516,10 @@ local function callbackReturns(ctx)
 	-- rounds, like every other read, so the names it is built from are settled.
 end
 
+--- What this file gives a caller: a top-level `return { ... }` is what a module is, and its type
+--- is what `require("this.file")` means elsewhere. Read after typing, so its names are settled.
 local function moduleExport(ctx)
-	for _, node in ipairs(ctx.parsed.nodes) do
+	for _, node in ipairs(ctx.parsed.byKind["return"] or {}) do
 		-- Top level means the scope it is written in is the file's own: `parent` says which node was
 		-- being built, which a statement inside a function body also answers with the root.
 		if node.kind == "return" and ctx.scopeAt(ctx.self, node.start) == ctx.self.root and not ctx.self.module then
@@ -527,6 +529,8 @@ local function moduleExport(ctx)
 end
 end
 
+
+checks.moduleExport = moduleExport
 
 function checks.report(ctx)
 	returnHints(ctx)

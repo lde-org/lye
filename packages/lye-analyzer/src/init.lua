@@ -27,27 +27,6 @@ local annotationValues, annotationSpan, documentationOf, trailsCode, sameLine, c
 
 local analyzer = {}
 
--- TEMPORARY: section attribution inside `analyzer.analyze`, enabled with LYE_ANALYZE_PHASE=1.
-local PHASE = os.getenv("LYE_ANALYZE_PHASE") == "1"
-local phaseTotals, phaseCounts, phaseDepth = {}, {}, 0
-local function phaseStart()
-	if not PHASE or phaseDepth > 0 then return 0 end
-	phaseDepth = 1
-	return os.clock()
-end
-local function spend(name, started)
-	if not PHASE or started == 0 then return end
-	phaseDepth = 0
-	phaseTotals[name] = (phaseTotals[name] or 0) + (os.clock() - started)
-	phaseCounts[name] = (phaseCounts[name] or 0) + 1
-end
-function analyzer.phaseReport()
-	if not PHASE then return end
-	for name, total in pairs(phaseTotals) do
-		io.stderr:write(string.format("analyze %-10s %8.1f ms  x%d\n", name, total * 1000, phaseCounts[name] or 0))
-	end
-end
-
 ---@class lye.analyzer.Variable
 ---@field declaration lye.parser.Declaration
 ---@field name string
@@ -210,10 +189,22 @@ local function buildScopes(result)
 	return root, byRecord, scopes
 end
 
+-- How many offsets the scope lookup remembers. The question is asked by offset, and a node's
+-- children are typed before the node itself, so the same offset rarely comes twice in a row:
+-- one remembered answer is almost always a miss. 256 slots answer nearly every repeat.
+local SCOPE_SLOTS = 256
+
 ---@param self lye.analyzer.Result
 ---@param offset integer
 local function scopeAt(self, offset)
-	if self.lastScope and self.lastScopeOffset == offset then return self.lastScope end
+	local slot = (offset % SCOPE_SLOTS) + 1
+	local offsets, scopes_ = self.scopeSlots, self.scopeValues
+	if not offsets then
+		offsets, scopes_ = {}, {}
+		self.scopeSlots, self.scopeValues = offsets, scopes_
+	end
+	local held = offsets[slot]
+	if held == offset then return scopes_[slot] end
 	local scopes = self.scopes
 	local low, high = 1, #scopes
 	while low <= high do
@@ -223,8 +214,8 @@ local function scopeAt(self, offset)
 	local scope = scopes[high]
 	while scope and offset > scope.stop do scope = scope.parent end
 	scope = scope or self.root
-	self.lastScopeOffset = offset
-	self.lastScope = scope
+	offsets[slot] = offset
+	scopes_[slot] = scope
 	return scope
 end
 
@@ -235,31 +226,44 @@ end
 ---@param offset integer
 ---@return lye.analyzer.Variable?
 local function lookupIn(scope, name, offset)
-	if scope.hasLastLookup and scope.lastLookupName == name and scope.lastLookupOffset == offset then
-		return scope.lastLookupResult
+	-- Which scope first declares the name does not depend on the offset, so that walk outwards is
+	-- done once per name and remembered. Whether each declaration is *visible* does depend on the
+	-- offset — a name read above its own `local` is the outer one — so the scan runs every time,
+	-- and a scope holding the name whose declarations are not in scope yet keeps walking outwards.
+	local names = scope.names
+	if not names then
+		names = {}
+		scope.names = names
 	end
-	local current, result = scope
-	while current do
-		local declared = current.variables[name]
+	local held = names[name]
+	local declared, owner
+	if held then
+		declared, owner = held[1], held[2]
+	else
+		owner = scope
+		while owner do
+			declared = owner.variables[name]
+			if declared then break end
+			owner = owner.parent
+		end
+		declared = declared or false
+		names[name] = { declared, owner }
+	end
+	while owner do
 		if declared then
 			for index = #declared, 1, -1 do
 				local candidate = declared[index]
 				-- A local is visible after its initializer, but its own name stays a declaration target.
 				if offset >= (candidate.visibleFrom or candidate.start)
 					or (offset >= candidate.start and offset <= candidate.stop) then
-					result = candidate
-					break
+					return candidate
 				end
 			end
 		end
-		if result then break end
-		current = current.parent
+		owner = owner.parent
+		declared = owner and owner.variables[name] or false
 	end
-	scope.lastLookupName = name
-	scope.lastLookupOffset = offset
-	scope.lastLookupResult = result
-	scope.hasLastLookup = true
-	return result
+	return nil
 end
 
 
@@ -646,7 +650,7 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	---@param params (lye.doc.Type?)[]
 	---@param overloads string[]?
 	---@param receiver lye.doc.Type?
-	local function checkArgs(node, label, params, overloads, receiver)
+	local function checkArgs(node, name, params, overloads, receiver)
 		local blame, wanted, actual = firstMismatch(node, params, receiver)
 		if not blame then return end
 
@@ -657,6 +661,9 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 			end
 		end
 
+		-- The label is a string built by walking the call's name, and a call that fits its
+		-- parameters never needs one: it is written where the diagnostic it belongs to is.
+		local label = name or callLabel(parsed, node)
 		local argument = parsed.nodes[blame]
 		diagnostic.add(self, string.format("%s expects %s, got %s", label,
 				types.display(wanted), types.display(actual)), argument.start, argument.stop, 1)
@@ -665,7 +672,9 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	for _, node in ipairs(nodesOf(parsed, "call")) do
 		do
 			local signature, calleeType, byName = signatureOfCall(node)
-			local label = byName and node.callee or callLabel(parsed, node)
+			-- The name the call is written with, when it is one: the label a mismatch is reported
+			-- under, built only where one is reported.
+			local name = byName and node.callee or nil
 			-- The value a method call is written on, which the callee receives first: a `:` call passes it, a
 			-- `__call` metamethod is handed it, and a `.` call passes nothing extra.
 			local target = node.target and infer.at(inferCtx, node.target)
@@ -674,7 +683,7 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 			if signature then
 				local params, returned = typesOf(signature)
 				if byName and returned then returns[node.callee] = returned end
-				checkArgs(node, label, params, signature.overloads, receiver)
+				checkArgs(node, name, params, signature.overloads, receiver)
 			elseif calleeType and types.isFn(calleeType) and not types.isAnyFn(calleeType) then
 				-- A callable nothing annotated, such as a method declared in this document: its own type is all
 				-- there is to check against, and a parameter of the signature's own is bound by this very call.
@@ -691,7 +700,7 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 					end
 					params = replaced
 				end
-				checkArgs(node, label, params, nil, receiver)
+				checkArgs(node, name, params, nil, receiver)
 			end
 		end
 	end
@@ -914,13 +923,12 @@ end
 ---@param resume lye.parser.Resume? what the previous parse of this document kept, when the
 --- text before the change is unchanged — a keystroke then re-reads one statement, not the file
 ---@param cachedAnnotations lye.doc.File? annotations already parsed for a batch check
-function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAnnotations)
+---@param isModuleOnly boolean? the document is read for what `require` gives back, so its own
+--- diagnostics are nobody's to report and the passes that only build them are left out
+function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAnnotations, isModuleOnly)
 	assert(type(source) == "string", "analyzer.analyze expects a string")
 
-	local phaseT = phaseStart()
 	local parsed = Parser.new(source, resume):parse()
-	spend("parse", phaseT)
-	phaseT = phaseStart()
 	local annotations = cachedAnnotations or doc.parse(source, parsed.tokens)
 	
 	-- What this file declares, so a class name or an alias in an annotation means what it says. Read
@@ -1000,8 +1008,6 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	end
 	end
 
-	spend("setup", phaseT)
-	phaseT = phaseStart()
 	local own = doc.classes.resolver(namespace, elsewhere)
 	-- A name this file does not declare may be one that another file does, and the caller is the
 	-- one that can say so. When it hands over what the name *is* — the alias body, the class — that
@@ -1066,7 +1072,10 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	--- it. An anonymous function has no declaration of its own to hang them on, so the parameter
 	--- itself is what is known: this is the third parameter of *that* signature.
 	---@type table<lye.parser.Declaration, { index: integer, type: lye.cdef.Type, namespace: lye.cdef.Namespace }>
+	-- Only a file that writes the word can be calling `ffi.cast`: the name a callback is read from
+	-- has to appear in the text, so a file without it has no callbacks to gather.
 	local callbackParams = {}
+	if source:find("ffi", 1, true) then
 	for _, node in ipairs(nodesOf(parsed, "call")) do
 		if node.args and node.args[2] then
 			local called = calledName(node)
@@ -1092,6 +1101,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 				end
 			end
 		end
+	end
 	end
 
 	--- The signatures a `ffi.cdef` in this file declared, as the fields a `ffi.load` gives back.
@@ -1509,6 +1519,21 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	-- `f --[[@as Vec]].x`: a cast inside an expression, which is how a value gets a type where no
 	-- declaration carries one. The node ending just before it is typed as what it names.
 	local inlineCasts = {}
+	-- Where each node ends, sorted once, so a cast finds the node it was written after without a
+	-- walk of every node: a document with a cast per line is otherwise its own nodes read once per
+	-- cast, which is the whole document squared.
+	local byEnd
+	for _, annotation in ipairs(annotations.annotations or {}) do
+		if annotation.tag == "as" or annotation.tag == "cast" then
+			byEnd = {}
+			for _, node in ipairs(parsed.nodes) do byEnd[#byEnd + 1] = node end
+			table.sort(byEnd, function(a, b)
+				if a.stop ~= b.stop then return a.stop < b.stop end
+				return a.start < b.start
+			end)
+			break
+		end
+	end
 	for _, annotation in ipairs(annotations.annotations or {}) do
 		if annotation.tag == "as" or annotation.tag == "cast" then
 			local lineStart = annotation.start
@@ -1524,14 +1549,13 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 				local marker, wanted = (written or ""):match("^%s*([%+%-]?)%s*(.*)$")
 				local held = wanted ~= "" and types.parse(wanted, resolve)
 				if held then
-					local best
-					for _, node in ipairs(parsed.nodes) do
-						if node.stop <= annotation.start
-							and (not best or node.stop > best.stop
-								or (node.stop == best.stop and node.start > best.start)) then
-							best = node
-						end
+					-- The last node ending at or before the cast: the one it was written after.
+					local low, high = 1, #byEnd
+					while low <= high do
+						local mid = math.floor((low + high) / 2)
+						if byEnd[mid].stop <= annotation.start then low = mid + 1 else high = mid - 1 end
 					end
+					local best = byEnd[high]
 					-- A negative cast says what the expression is not, so what it is has to be read
 					-- from the expression itself: it is kept to be applied against that.
 					-- The expression it follows has to be on the same line: a `---@cast` written at the
@@ -1545,8 +1569,6 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		end
 	end
 
-	spend("signatures", phaseT)
-	phaseT = phaseStart()
 	local root, byRecord, scopes = buildScopes(parsed)
 	self.root = root
 	self.scopes = scopes
@@ -1582,8 +1604,6 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	-- table that holds it — `---@class lde.Package` over `local Package = {}` — and the method
 	-- written on `Package` belongs to `lde.Package`. Only a class annotation counts: a `---@type`
 	-- says what the table holds rather than that the table declares the class.
-	spend("scopes", phaseT)
-	phaseT = phaseStart()
 	local classOfTable = {}
 	local written = annotations.annotations or {}
 	for _, declaration in ipairs(parsed.declarations) do
@@ -1983,8 +2003,6 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 
 	-- Collected now that names are in scope. The target belongs to the name as it resolves where the
 	-- assignment is written: a map from name to declaration hands `x = ...` to the last `x` declared.
-	spend("classes", phaseT)
-	phaseT = phaseStart()
 	local assignments = collectAssignments(parsed)
 	for _, assignment in ipairs(assignments) do
 		local variable = lookupIn(scopeAt(self, assignment.at), assignment.name, assignment.at)
@@ -2051,11 +2069,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		end
 	end
 
-	spend("variables", phaseT)
-	phaseT = phaseStart()
 	typing.typeAll(typingCtx)
-	spend("typeAll", phaseT)
-	phaseT = phaseStart()
 	-- A second walk settles what the first could not: a value read before its type was known is
 	-- left a placeholder, and the pass that typed it has to read it again. Only the names holding
 	-- one are read again — everything else settled, and walking it finds nothing.
@@ -2070,8 +2084,6 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		typingCtx.pending = nil
 		typing.typeAll(typingCtx, only)
 	end
-	spend("typeAll2", phaseT)
-	phaseT = phaseStart()
 	recordIndexedWrites()
 
 	-- What each function's own body gives back, beside what its annotation promised. Nothing is
@@ -2086,19 +2098,19 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		scopeAt = scopeAt, lookupIn = lookupIn, declaredField = declaredField,
 		arithmetic = ARITHMETIC,
 	}
-	spend("indexed", phaseT)
-	phaseT = phaseStart()
-	checks.report(ctx)
-
-	checkCalls(self, parsed, signatureOfCall, returns, resolve, inferCtx, source, positionalParams)
+	if isModuleOnly then
+		-- What `require("this.file")` is — the one thing a module analysis is read for.
+		checks.moduleExport(ctx)
+	else
+		checks.report(ctx)
+		checkCalls(self, parsed, signatureOfCall, returns, resolve, inferCtx, source, positionalParams)
+	end
 	-- What each call was bound to, by node: a generic result is settled per call, and a reader
 	-- asking what `f()` is — a completion after `f().` — has no other way to that answer.
 	self.callTypes = inferCtx.callTypes
 	self.signatures = signatures
 	self.returns = returns
 
-	spend("checks", phaseT)
-	phaseT = phaseStart()
 	-- Typing runs twice, so a check that reports while typing would see the same fault twice and a
 	-- reader should be told about it once.
 	local seen, unique = {}, {}
@@ -2111,7 +2123,6 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	end
 	self.diagnostics = unique
 
-	spend("dedupe", phaseT)
 	return self
 end
 

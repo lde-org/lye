@@ -371,9 +371,11 @@ function Lye:moduleType(name, from)
 	self.requiring[path] = true
 	-- The module's own `require`s resolve within *its* package: a dependency's file is a document
 	-- of that package, and what it can reach is what lde linked into that package's `target/`.
+	-- A module reached through `require` is read for its type: its diagnostics belong to its own
+	-- document, which is analysed on its own account when it is open.
 	local names = analyzer.analyze(written, PRELUDE, self:declaredTypes("file://" .. path), function(inner)
 		return self:moduleType(inner, "file://" .. path)
-	end)
+	end, nil, nil, true)
 	self.requiring[path] = nil
 	self.modules[path] = { text = written, type = names.module }
 	return names.module

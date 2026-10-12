@@ -32,20 +32,6 @@ local withGenerics = annotations.withGenerics
 
 local typing = {}
 
--- TEMPORARY: section timers inside `typeAll`, enabled with LYE_ANALYZE_PHASE=1.
-local PHASE = os.getenv("LYE_ANALYZE_PHASE") == "1"
-local phaseTotals, phaseCounts = {}, {}
-local function spend(name, started)
-	if not PHASE or started == 0 then return end
-	phaseTotals[name] = (phaseTotals[name] or 0) + (os.clock() - started)
-	phaseCounts[name] = (phaseCounts[name] or 0) + 1
-end
-function typing.phaseReport()
-	if not PHASE then return end
-	for name, total in pairs(phaseTotals) do
-		io.stderr:write(string.format("typing %-10s %8.1f ms  x%d\n", name, total * 1000, phaseCounts[name] or 0))
-	end
-end
 
 	--- What a function's body gives back, value by value: the first is the union of the first value
 	--- of each of its `return`s, the second of their second values, and so on. `return found, args`
@@ -142,8 +128,7 @@ end
 	local checkMetatable = ctx.checkMetatable
 		-- A loop declares its own control variables: a numeric `for` counts, and a generic `for` takes its
 		-- first name from what the iterator yields. The pass runs twice, so the slot is claimed either way.
-		local claimedT = PHASE and os.clock() or 0
-		local claimed = {}
+			local claimed = {}
 		for _, variable in ipairs(self.variables) do
 			local node = variable.qualifier == "loop" and loopOf(variable)
 			-- Two names are typed: the first takes the iterator's value, the second what the table it walks
@@ -165,9 +150,7 @@ end
 			end
 		end
 
-		spend("claimed", claimedT)
-		local varsT = PHASE and os.clock() or 0
-		-- Assignments are typed before initializers, and both re-run to the fixpoint, so
+			-- Assignments are typed before initializers, and both re-run to the fixpoint, so
 		-- `local y = x` sees what `x` was assigned above it rather than what it started as.
 		for _, variable in ipairs(self.variables) do
 			-- A standard library constant is not this document's to type, and a later pass reads
@@ -231,9 +214,7 @@ end
 				end
 			end
 		end
-		spend("vars", varsT)
-		local fnT = PHASE and os.clock() or 0
-		-- What a function returns is read off its body: the union of every value it returns, or nil when it
+			-- What a function returns is read off its body: the union of every value it returns, or nil when it
 		-- returns nothing. Annotations are left alone, so a `@return` can be compared later.
 		for index, fnType in pairs(inferCtx.fnTypes) do
 			local values = typing.inferredValuesOf(ctx, index)
@@ -287,9 +268,7 @@ end
 				}
 			end
 		end
-		spend("fnReturns", fnT)
-		local nodeT = PHASE and os.clock() or 0
-		-- Generic names are bound from the arguments before the results are read, so `id(5)` is
+			-- Generic names are bound from the arguments before the results are read, so `id(5)` is
 		-- number and `unpack(t)` is whatever `t` holds.
 		for _, node in ipairs(parsed.nodes) do
 			local signature = node.kind == "call" and signatureOfCall(node)
@@ -298,8 +277,10 @@ end
 			if node.kind == "call" and node.args then
 				-- `s:find("%d+")` gives positions and `s:match` gives captures, and a pattern anchored at both
 				-- ends cannot fail. The pattern is written at the call, which is what makes this knowable.
-				local written = callName(parsed, node)
-				local subject = written and written:match("([%w_]+)$")
+				-- The field the call reads is what `subject` was, taken straight rather than written out
+				-- with its owner: building `string.find` to throw the owner away was a string per call.
+				local target = node.target and parsed.nodes[node.target]
+				local subject = node.field or (target and target.field)
 				local argument = pattern.CALLS[subject or ""]
 				local patternIdx = argument and node.args[node.isMethod and 1 or 2]
 				local literal = patternIdx and parsed.nodes[patternIdx]
@@ -355,9 +336,7 @@ end
 				end
 			end
 		end
-		spend("callNodes", nodeT)
-		local spreadT = PHASE and os.clock() or 0
-		-- `local a, b = unpack(list)` gives every name the spread's type. The model links one
+			-- `local a, b = unpack(list)` gives every name the spread's type. The model links one
 		-- value to a statement, so the names after the first would otherwise have none.
 		local spreads = {}
 		for _, declaration in ipairs(parsed.declarations) do
@@ -373,10 +352,7 @@ end
 			local spread = declaration.anchorIdx and spreads[declaration.anchorIdx]
 			if spread and not declaration.valueIdx then variable.initializer = spread end
 		end
-		spend("spreads", spreadT)
-		local refineT = PHASE and os.clock() or 0
-		infer.refine(inferCtx, returns)
-		spend("refine", refineT)
+			infer.refine(inferCtx, returns)
 	end
 
 return typing

@@ -584,7 +584,6 @@ function Parser:isBlockEnd()
 	return self:checkAny(BLOCK_END)
 end
 
----@return lye.parser.Result
 --- The nodes of one kind in a parse, in emission order. A pass that only wants the calls or the
 --- index reads walks those rather than every node in the document.
 ---@param parsed lye.parser.Result
