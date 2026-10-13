@@ -118,7 +118,7 @@ function ffi.typeof(ct, params, ...) end
 ---@nodiscard
 function ffi.cast(ct, init) end
 
----@param ct        ffi.ct*
+---@param ct        ffi.ctype*|ffi.cdata* a type, not the name of one: `ffi.metatype("int", ...)` is refused
 ---@param metatable table
 ---@return ffi.ctype* ctype
 function ffi.metatype(ct, metatable) end
@@ -172,7 +172,7 @@ function ffi.copy(dst, src, len) end
 
 ---@param dst ffi.cdata*
 ---@param len integer
----@param c?  any
+---@param c?  integer
 function ffi.fill(dst, len, c) end
 
 ---@param param string

@@ -203,7 +203,7 @@ function buf:free() end
 ---
 --- The reserved write space is not initialized. At least the used bytes must be written to before calling the commit method. There's no need to call the commit method, if nothing is added to the buffer (e.g. on error).
 ---@param size integer
----@return ffi.cdata* ptr # an uint8_t * FFI cdata pointer that points to this space
+---@return ffi.ptr<ffi.uint8_t> ptr # an uint8_t * FFI cdata pointer that points to this space
 ---@return integer len    # available length (bytes)
 function buf:reserve(size) end
 
@@ -253,14 +253,14 @@ function buf:tostring() end
 ---
 --- Unlike Lua strings, buffer data is not implicitly zero-terminated. It's not safe to pass ptr to C functions that expect zero-terminated strings. If you're not using len, then you're doing something wrong.
 ---
----@return ffi.cdata* ptr # an uint8_t * FFI cdata pointer that points to the buffer data.
+---@return ffi.ptr<ffi.uint8_t> ptr # an uint8_t * FFI cdata pointer that points to the buffer data.
 ---@return integer len # length of the buffer data in bytes
 function buf:ref() end
 
 --- Serializes (encodes) the Lua object to the buffer
 ---
 --- This function may throw an error when attempting to serialize unsupported object types, circular references or deeply nested tables.
----@param obj any
+---@param obj nil|boolean|number|string|table
 ---@return string.buffer
 function buf:encode(obj) end
 
@@ -275,14 +275,14 @@ function buf:encode(obj) end
 ---
 --- Attempting to de-serialize an FFI type will throw an error, if the FFI library is not built-in or has not been loaded, yet.
 ---
----@return any obj
+---@return nil|boolean|number|string|table obj
 function buf:decode() end
 
 
 --- Serializes (encodes) the Lua object obj
 ---
 --- This function may throw an error when attempting to serialize unsupported object types, circular references or deeply nested tables.
----@param obj any
+---@param obj nil|boolean|number|string|table
 ---@return string
 function buffer.encode(obj) end
 
@@ -296,7 +296,7 @@ function buffer.encode(obj) end
 --- Attempting to de-serialize an FFI type will throw an error, if the FFI library is not built-in or has not been loaded, yet.
 ---
 ---@param str string
----@return any obj
+---@return nil|boolean|number|string|table obj
 function buffer.decode(str) end
 
 

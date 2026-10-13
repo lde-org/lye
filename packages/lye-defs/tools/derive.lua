@@ -549,7 +549,7 @@ local function main(argv)
 
 	local changes = 0
 	for name, text in pairs(derived) do
-		local target = PACKAGE .. "/src/meta/" .. name .. ".lua"
+		local target = PACKAGE .. "/src/meta/" .. name .. ".d.lua"
 		local handle = io.open(target, "rb")
 		local existing = handle and handle:read("*a")
 		if handle then handle:close() end

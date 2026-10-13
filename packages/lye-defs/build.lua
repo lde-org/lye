@@ -51,7 +51,7 @@ end
 local parts = {}
 for _, name in ipairs(FILES) do
 	-- Paths are relative to the output directory, which is `target/<package>`.
-	local text = build:read("meta/" .. name .. ".lua")
+	local text = build:read("meta/" .. name .. ".d.lua")
 	parts[#parts + 1] = string.format("defs[%q] = %s", name, embed(text))
 end
 
