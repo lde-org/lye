@@ -2284,9 +2284,58 @@ end
 
 ---@param self lye.Server
 ---@return table?
+--- Where a name written in an annotation is written again: the annotation that declares it and
+--- every type text that names it. The name is dotted — `jit.funcinfo.c` — so a match counts only
+--- where neither side of it runs on into another name.
+---@param self lye.Server
+---@param text string
+---@param lineIndex lye.framework.LineIndex
+---@param names lye.analyzer.Result
+---@param written string
+---@return table[] ranges
+function Lye:placesOfType(text, lineIndex, names, written)
+	local out = {}
+	---@param from integer
+	---@param to integer
+	local function add(from, to)
+		out[#out + 1] = self:toRange(text, lineIndex, from, to)
+	end
+	for _, annotation in ipairs(names.doc and names.doc.annotations or {}) do
+		if annotation.name == written and annotation.nameStart then
+			add(annotation.nameStart, annotation.nameStop)
+		end
+		if annotation.typeText then
+			local at = 1
+			while true do
+				local from, to = annotation.typeText:find(written, at, true)
+				if not from then break end
+				if not annotation.typeText:sub(from - 1, from - 1):match("[%w_%.]")
+					and not annotation.typeText:sub(to + 1, to + 1):match("[%w_%.]") then
+					add(annotation.typeStart + from - 1, annotation.typeStart + to - 1)
+				end
+				at = to + 1
+			end
+		end
+	end
+	return out
+end
+
 function Lye:onDocumentHighlight(params)
+	local uri, text, index, names, offset = self:resolvePosition(params)
+	-- A type named in an annotation is not a name the parser sees: the annotation is one comment
+	-- token. What is highlighted is the name written there, wherever it is written again — a
+	-- client that is given nothing falls back to its own idea of a word, and its idea splits on
+	-- the dots a type name is made of.
+	local written = names and text and nameInAnnotation(names, text, offset)
+	if written then
+		local out = json.array()
+		for _, range in ipairs(self:placesOfType(text, index, names, written)) do
+			out[#out + 1] = { range = range, kind = 2 }
+		end
+		if #out > 0 then return out end
+	end
+
 	local variable = targetAt(self, params)
-	local uri = params.textDocument?.uri
 	local document = uri and self.server.documents:get(uri)
 	if not variable or not document then return json.array() end
 
@@ -2342,9 +2391,16 @@ function Lye:onTypeDefinition(params)
 	-- the position resolvers below from taking a nil source.
 	if not uri or not names or not result or not text then return nil end
 
-	-- A type named in an annotation is already a type; what it needs is where it is declared.
+	-- A type named in an annotation is already a type; what it needs is where it is declared, in
+	-- this document or another. Asking only about the other one left a jump into a class written
+	-- in the same file with no answer at all.
 	local target = self:targetAt(uri, text, names, offset)
-	if target and target.uri ~= uri then return { uri = target.uri, range = self:rangeIn(target) } end
+	if target then
+		if target.uri == uri then
+			return { uri = uri, range = self:toRange(text, index, target.start, target.stop) }
+		end
+		return { uri = target.uri, range = self:rangeIn(target) }
+	end
 
 	local variable = analyzer.lookupAt(names, nameAt(result, offset) or "", offset)
 	local held = variable and analyzer.typeAt(names, variable, offset)

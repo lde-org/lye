@@ -233,6 +233,33 @@ test.it("reads the signature a definition file writes inline", function()
 	test.truthy(shown:find("string", 1, true), "and so is what it gives back: " .. shown)
 end)
 
+test.it("answers for a dotted type name as one name", function()
+	-- Dots are characters in a type name, so `jit.funcinfo.c` is one name: the jumps land on the
+	-- class, and the highlight covers the whole name rather than one segment of it.
+	local source = table.concat({
+		"---@param info jit.funcinfo.c|jit.funcinfo.lua\n",
+		"local function show(info) return info end\n",
+		"return show\n",
+	}, "")
+	local results = run({
+		request(2, "textDocument/definition", { line = 0, character = 15 }),
+		request(3, "textDocument/typeDefinition", { line = 0, character = 15 }),
+		request(4, "textDocument/documentHighlight", { line = 0, character = 15 }),
+	}, source)
+	local definition = results["2"]
+	test.truthy(definition and definition.uri and definition.uri:match("jit%.util%.lua"),
+		"the jump lands on the class: " .. json.encode(definition or {}))
+	test.equal(definition.range["end"].character - definition.range.start.character, 14,
+		"on the whole name it declares")
+	local typed = results["3"]
+	test.truthy(typed and typed.uri and typed.uri:match("jit%.util%.lua"),
+		"and so does the type jump: " .. json.encode(typed or {}))
+	local highlights = results["4"] or {}
+	test.truthy(#highlights > 0, "the highlight covers the name")
+	test.equal(highlights[1].range["end"].character - highlights[1].range.start.character, 14,
+		"the whole of `jit.funcinfo.c`, not one of its parts")
+end)
+
 test.it("says nothing where an inlay hint would repeat the name", function()
 	-- `local ffi: ffi = require("ffi")` written out as a hint is the name twice.
 	local source = "---@class held\nlocal held = {}\nreturn held\n"
