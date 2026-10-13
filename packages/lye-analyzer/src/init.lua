@@ -748,6 +748,52 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	end
 end
 
+--- The types a definition file wrote inline — `function f(n: number): string` — folded into
+--- the signature its annotations gave it. A parameter the annotations already typed keeps that
+--- type: the annotation is the older, louder spelling, and two of them disagreeing is not this
+--- reader's to settle.
+---@return lye.doc.Annotation[]
+---@return lye.doc.Annotation?
+local function withInline(params, returned, generics, constraints, body)
+	for _, param in ipairs(body.params or {}) do
+		if param.inlineType and param.inlineType ~= "" then
+			local found
+			for _, annotation in ipairs(params) do
+				if annotation.name == param.name then found = annotation end
+			end
+			if found then
+				found.type = found.type or param.inlineType
+			else
+				params[#params + 1] = { tag = "param", name = param.name, type = param.inlineType }
+			end
+		end
+	end
+	if body.inlineVariadic then
+		-- The `...` a signature declares is written the same way a named parameter is, and the
+		-- reader that builds the signature looks for it by that name.
+		params[#params + 1] = { tag = "param", name = "...", type = body.inlineVariadic }
+	end
+	local written = body.inlineGenerics
+	if written then
+		local inner = written:match("^%s*<(.+)>%s*$")
+		for _, part in ipairs(doc.classes.splitList(inner or "")) do
+			local name, constraint = part:match("^%s*([%a_][%w_]*)%s*:%s*(.*)$")
+			if name then
+				generics[name] = false
+				constraints[name] = constraint
+			else
+				name = part:match("^%s*([%a_][%w_]*)%s*$")
+				if name then generics[name] = false end
+			end
+		end
+	end
+	if body.inlineReturns and not returned then
+		returned = { tag = "return", type = body.inlineReturns }
+	end
+	return params, returned
+end
+
+
 --- Everything a set of definition files says, gathered once so a document can be analysed
 --- against it without reparsing them on every keystroke.
 ---@param sources table<string, string> definition text by name
@@ -763,7 +809,9 @@ function analyzer.prelude(sources)
 	-- document can read, and a local still names the receiver of `function file:close()`.
 	local backing = {}
 	for _, source in pairs(sources) do
-		local parsed = Parser.new(source):parse()
+		-- Every file here describes a library: the definitions a document is read through have no
+		-- bodies, and may write their types inline.
+		local parsed = Parser.new(source, nil, true):parse()
 		local file = doc.parse(source, parsed.tokens)
 		local namespace = doc.classes.read(file)
 
@@ -809,6 +857,12 @@ function analyzer.prelude(sources)
 			if owner and not classFields[owner] then classFields[owner] = {} end
 			local params, returned, generics, constraints, predicates, overloads =
 				signatureOf(parsed, file, declaration)
+			-- A definition file may write its types inline — `function f(x: number): string` — and
+			-- the definitions a document is read through are read the same way.
+			local inlineBody = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
+			if inlineBody and inlineBody.isFunction then
+				params, returned = withInline(params, returned, generics, constraints, inlineBody)
+			end
 			if owner then
 				local value = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
 				classFields[owner][field] = {
@@ -1425,51 +1479,6 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	-- The parameters a function declares, in order. A signature built from them has the arity the
 	-- function has, so a call with the wrong number of arguments can be seen.
 	local declaredParams = {}
-
-	--- The types a definition file wrote inline — `function f(n: number): string` — folded into
-	--- the signature its annotations gave it. A parameter the annotations already typed keeps that
-	--- type: the annotation is the older, louder spelling, and two of them disagreeing is not this
-	--- reader's to settle.
-	---@return lye.doc.Annotation[]
-	---@return lye.doc.Annotation?
-	local function withInline(params, returned, generics, constraints, body)
-		for _, param in ipairs(body.params or {}) do
-			if param.inlineType and param.inlineType ~= "" then
-				local found
-				for _, annotation in ipairs(params) do
-					if annotation.name == param.name then found = annotation end
-				end
-				if found then
-					found.type = found.type or param.inlineType
-				else
-					params[#params + 1] = { tag = "param", name = param.name, type = param.inlineType }
-				end
-			end
-		end
-		if body.inlineVariadic then
-			-- The `...` a signature declares is written the same way a named parameter is, and the
-			-- reader that builds the signature looks for it by that name.
-			params[#params + 1] = { tag = "param", name = "...", type = body.inlineVariadic }
-		end
-		local written = body.inlineGenerics
-		if written then
-			local inner = written:match("^%s*<(.+)>%s*$")
-			for _, part in ipairs(doc.classes.splitList(inner or "")) do
-				local name, constraint = part:match("^%s*([%a_][%w_]*)%s*:%s*(.*)$")
-				if name then
-					generics[name] = false
-					constraints[name] = constraint
-				else
-					name = part:match("^%s*([%a_][%w_]*)%s*$")
-					if name then generics[name] = false end
-				end
-			end
-		end
-		if body.inlineReturns and not returned then
-			returned = { tag = "return", type = body.inlineReturns }
-		end
-		return params, returned
-	end
 
 	for _, declaration in ipairs(parsed.declarations) do
 		local params, returned, generics, constraints, predicates, overloads =

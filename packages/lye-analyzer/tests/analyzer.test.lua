@@ -1327,6 +1327,23 @@ test.it("checks what a definition file writes for its varargs", function()
 		result.diagnostics[1].message)
 end)
 
+test.it("reads the types a definition file writes inline through a prepared prelude", function()
+	-- The definitions a document is read through are definition files too, so a function declared
+	-- with `function sized(x: integer): string` is that signature everywhere.
+	local prelude = analyzer.prelude({
+		basic = "function sized(x: integer): string return \"x\" end\n",
+	})
+	local source = "local a = sized(1)\nlocal b = sized(\"nope\")\nreturn a, b\n"
+	local result = analyzer.analyze(source, prelude)
+	test.equal(#result.diagnostics, 1, "the string is refused where an integer is wanted")
+	test.truthy(result.diagnostics[1].message:find("sized expects", 1, true),
+		result.diagnostics[1].message)
+	test.truthy(result.diagnostics[1].message:find("got \"nope\"", 1, true),
+		result.diagnostics[1].message)
+	test.equal(types.display(analyzer.typeAt(result, result.variables[1], #source)), "string",
+		"and what it gives back is read too")
+end)
+
 test.it("checks each argument against its own parameter", function()
 	local result = analyzer.analyze(
 		"---@param a string\n---@param b number\nlocal function f(a, b) end\nf(\"s\", \"t\")\n"
