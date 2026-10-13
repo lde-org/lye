@@ -1317,6 +1317,16 @@ test.it("applies the type a definition file writes on a local", function()
 	test.equal(types.display(found.declared), "number", "and it is the one written inline")
 end)
 
+test.it("checks what a definition file writes for its varargs", function()
+	-- `function takes(...: string|number)` says what every extra argument has to be.
+	local result = analyzer.analyze(
+		"function takes(...: string|number): nil end\ntakes(1, {})\nreturn takes\n",
+		nil, nil, nil, nil, nil, nil, true)
+	test.equal(#result.diagnostics, 1)
+	test.truthy(result.diagnostics[1].message:find("takes expects", 1, true),
+		result.diagnostics[1].message)
+end)
+
 test.it("checks each argument against its own parameter", function()
 	local result = analyzer.analyze(
 		"---@param a string\n---@param b number\nlocal function f(a, b) end\nf(\"s\", \"t\")\n"

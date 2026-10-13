@@ -1446,6 +1446,11 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 				end
 			end
 		end
+		if body.inlineVariadic then
+			-- The `...` a signature declares is written the same way a named parameter is, and the
+			-- reader that builds the signature looks for it by that name.
+			params[#params + 1] = { tag = "param", name = "...", type = body.inlineVariadic }
+		end
 		local written = body.inlineGenerics
 		if written then
 			local inner = written:match("^%s*<(.+)>%s*$")
@@ -1559,6 +1564,12 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 				isVariadic = true
 				variadic = annotation.type and types.parse(annotation.type, local_) or nil
 			end
+		end
+		-- A definition file writes it inline instead: `function f(...: string|number)`.
+		local inlineBody = not variadic and declaration.valueIdx and parsed.nodes[declaration.valueIdx]
+		if inlineBody and inlineBody.inlineVariadic then
+			isVariadic = true
+			variadic = types.parse(inlineBody.inlineVariadic, local_) or nil
 		end
 		local returned = signature.returns and signature.returns.type
 		-- `---@return T1, T2` and `---@return T...` spread: each returned value is that type.

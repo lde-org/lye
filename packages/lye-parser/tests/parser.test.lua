@@ -359,6 +359,7 @@ test.it("reads the types a definition file writes inline", function()
 		"local function test(n: number) return n end\n",
 		"function generic<T: number>(f: T): string return \"x\" end\n",
 		"local held: number = 1\n",
+		"function takes(...: string|number): nil return nil end\n",
 		"return test, generic, held\n",
 	}, "")
 	local parsed = Parser.new(source, nil, true):parse()
@@ -373,6 +374,8 @@ test.it("reads the types a definition file writes inline", function()
 	test.equal(bodies[2].params[1].inlineType, "T")
 	test.equal(bodies[2].inlineGenerics, "<T: number>")
 	test.equal(bodies[2].inlineReturns, "string")
+	test.equal(bodies[3].isVariadic, true)
+	test.equal(bodies[3].inlineVariadic, "string|number")
 end)
 
 test.it("does not read that spelling in a file that runs", function()

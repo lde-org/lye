@@ -323,12 +323,17 @@ local function parseFunctionBody(self, start, isMethod)
 
 	-- A comment may sit between any two of these: `f(a --[[string]], b)` is written that way. The
 	-- lexer emits comments as tokens, so each step past one is a step past a token.
-	local isVariadic = false
+	local isVariadic, inlineVariadic = false, nil
 	while true do
 		self:skipComments()
 		if self:check(")") or self:isEof(self:peek()) then break end
 		if self:accept("...") then
 			isVariadic = true
+			-- `function f(...: string|number)` writes what the extra arguments have to be.
+			if self.definition then
+				self:skipComments()
+				if self:accept(":") then inlineVariadic = skipInlineType(self) end
+			end
 			break
 		end
 		local name, token = self:parseName()
@@ -362,7 +367,7 @@ local function parseFunctionBody(self, start, isMethod)
 	local index = self:emit("function", start, self.arena[self.index - 1].stop,
 		{
 			isFunction = true, isVariadic = isVariadic, params = params,
-			inlineReturns = inlineReturns,
+			inlineReturns = inlineReturns, inlineVariadic = inlineVariadic,
 		})
 	-- Set last, since parsing the body overwrites it.
 	self.lastKind = "function"
