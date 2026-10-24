@@ -13,8 +13,8 @@
 		"lye-doc": {
 			"path": "../lye-doc"
 		},
-		"lye-cdef": {
-			"path": "../lye-cdef"
+		"lye-plugin": {
+			"path": "../lye-plugin"
 		}
 	}
 }

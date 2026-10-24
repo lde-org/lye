@@ -12,25 +12,45 @@ position.UTF16 = "utf-16"
 ---@class lye.framework.LineIndex
 ---@field starts integer[]
 ---@field length integer
+---@field wide table<integer, boolean>? the lines that hold a non-ASCII byte, by line number. A
+--- line that is not here has a UTF-16 position equal to its byte offset, which almost every line
+--- of code does; keeping only the exception is what makes the fast path free of a per-line table.
 
 ---@return lye.framework.LineIndex
 function position.buildLineIndex(text)
-	local starts, count = { 1 }, 1
+	local starts, wideLines, count = { 1 }, nil, 1
+	local wide = false
 	local i, len = 1, #text
 	while i <= len do
 		local byteAt = text:byte(i)
 		if byteAt == 10 then
+			if wide then
+				wideLines = wideLines or {}
+				wideLines[count] = true
+			end
 			count += 1
 			starts[count] = i + 1
+			wide = false
 		elseif byteAt == 13 then
 			-- \r\n is one terminator, not two.
 			if text:byte(i + 1) == 10 then i += 1 end
+			if wide then
+				wideLines = wideLines or {}
+				wideLines[count] = true
+			end
 			count += 1
 			starts[count] = i + 1
+			wide = false
+		elseif byteAt >= 0x80 then
+			wide = true
 		end
 		i += 1
 	end
-	return { starts = starts, length = len }
+	if wide then
+		wideLines = wideLines or {}
+		wideLines[count] = true
+	end
+	return { starts = starts, length = len, wide = wideLines }
 end
 
 --- Binary search, because a linear scan on every conversion is unusable in a large file.
@@ -136,6 +156,13 @@ function position.toPosition(text, index, offset, encoding)
 	if offset < 1 then return 0, 0 end
 	local line, start = lineAt(index, offset)
 	if encoding == position.UTF8 then return line, offset - start end
+	-- ASCII bytes and UTF-16 code units are the same count, and the line is not copied to find
+	-- that out. A document that is mostly code takes this path for almost every token.
+	if not (index.wide and index.wide[line + 1]) then
+		local stop = (index.starts[line + 2] or (index.length + 1)) - 1
+		while stop >= start and (text:byte(stop) == 10 or text:byte(stop) == 13) do stop -= 1 end
+		return line, math.min(offset - start, stop - start + 1)
+	end
 
 	local lineText = position.lineText(text, index, line)
 	local byteCount = math.min(offset - start, #lineText)

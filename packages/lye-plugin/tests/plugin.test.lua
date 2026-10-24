@@ -166,7 +166,7 @@ test.it("loads a plugin of the workspace's own, and turns a shipped one off by n
 
 	local specs = plugin.load({ "./mine.lua" }, WORK, resolve, report)
 	test.equal(#specs, 4, "the plugin the workspace named, and the shipped ones it did not turn off")
-	test.equal(namesOf(specs), "mine patterns formats cdef",
+	test.equal(namesOf(specs), "mine patterns formats ffi",
 		"in the order the workspace listed it, then lye's own")
 	test.equal(#said, 0, "and nothing was reported")
 
@@ -176,12 +176,12 @@ test.it("loads a plugin of the workspace's own, and turns a shipped one off by n
 	test.equal(context.text, "local lowered = 1", "and what the hooks were handed says so")
 
 	local shipped = plugin.load({}, WORK, resolve, report)
-	test.equal(namesOf(shipped), "patterns formats cdef",
+	test.equal(namesOf(shipped), "patterns formats ffi",
 		"the shipped plugins are on unless a workspace says otherwise")
 	for _, spec in ipairs(shipped) do
 		test.truthy(spec.tokens, "each colours tokens: " .. spec.name)
 	end
-	test.equal(#plugin.load({ "!patterns", "!formats", "!cdef" }, WORK, resolve, report), 0,
+	test.equal(#plugin.load({ "!patterns", "!formats", "!ffi" }, WORK, resolve, report), 0,
 		"and a `!` leaves one out")
 end)
 
@@ -209,7 +209,7 @@ test.it("reports a broken hook once, and asks it nothing after that", function()
 	-- The plugin counts its own calls in a global, which is the only thing a loaded chunk and the
 	-- test running it can share: declared here so that the count is a name the checker knows.
 	asked = 0
-	local specs = plugin.load({ "./broken.lua", "!patterns", "!formats", "!cdef" }, WORK, resolve, report)
+	local specs = plugin.load({ "./broken.lua", "!patterns", "!formats", "!ffi" }, WORK, resolve, report)
 	local context = { uri = "file:///f.lua", source = "x" }
 	plugin.lower(specs, context, report)
 	plugin.lower(specs, context, report)
@@ -229,7 +229,7 @@ test.it("reports a lowering that cannot be applied, and keeps the document", fun
 		"\tend,\n",
 		"}\n",
 	}, ""))
-	local specs = plugin.load({ "./greedy.lua", "!patterns", "!formats", "!cdef" }, WORK, resolve, report)
+	local specs = plugin.load({ "./greedy.lua", "!patterns", "!formats", "!ffi" }, WORK, resolve, report)
 	local context = { uri = "file:///f.lua", source = "short" }
 	local map = plugin.lower(specs, context, report)
 	test.equal(context.text, "short", "the document is left as it was")
@@ -239,7 +239,7 @@ test.it("reports a lowering that cannot be applied, and keeps the document", fun
 end)
 
 test.it("hands every plugin the text lye reads, and collects what they colour", function()
-	local specs = plugin.load({ "./mine.lua", "!patterns", "!formats", "!cdef" }, WORK, resolve,
+	local specs = plugin.load({ "./mine.lua", "!patterns", "!formats", "!ffi" }, WORK, resolve,
 		function() end)
 	local texts = {}
 	specs[1].tokens = function(context)
@@ -260,10 +260,36 @@ test.it("finds a plugin the package installed, and keeps what the workspace list
 	write(WORK .. "/moonscript.lua", "return { extensions = { \"moon\" } }\n")
 	local said, report = collecting()
 	local specs = plugin.load({ "moonscript", "./mine.lua" }, WORK, resolve, report)
-	test.equal(namesOf(specs), "moonscript mine patterns formats cdef",
+	test.equal(namesOf(specs), "moonscript mine patterns formats ffi",
 		"the two the workspace named, then lye's own")
 	test.equal(specs[1].extensions[1], "moon", "and the extension it claims comes with it")
 	test.equal(#said, 0, "nothing to report")
+end)
+
+test.it("asks a plugin for the types it contributes, and calls its providers", function()
+	write(WORK .. "/typed.lua", table.concat({
+		"local typed = {}\n",
+		"function typed.types(context)\n",
+		"\treturn {\n",
+		"\t\tannotations = { { annotations = {} } },\n",
+		"\t\tattach = function(resolve)\n",
+		"\t\t\treturn { call = function() return resolve(\"T\") end }\n",
+		"\t\tend,\n",
+		"\t}\n",
+		"end\n",
+		"return typed\n",
+	}, ""))
+	local specs = plugin.load({ "./typed.lua", "!patterns", "!formats", "!ffi" }, WORK, resolve,
+		function() end)
+	local contexts = {
+		source = "", text = "", parsed = { byKind = {} }, annotations = { annotations = {} },
+		callName = function() return nil end,
+	}
+	local got = plugin.types(specs, contexts, function() end)
+	test.equal(#got, 1, "one contribution")
+	test.equal(got[1].name, "typed", "named for the plugin that answered")
+	local providers = got[1].types.attach(function(name) return name end)
+	test.equal(providers.call({}), "T", "the provider is built with the document's resolver")
 end)
 
 test.it("colours a pattern's escapes and a format's conversion through the shipped plugins", function()
@@ -315,7 +341,7 @@ test.it("colours an ffi.cdef block from our own parse of it, through the shipped
 	-- grammar installed and would not know LuaJIT's dialect: the parse lye already makes is what
 	-- the colours come from. The brackets are lye's own string token, not the plugin's.
 	local Parser = require("lye-parser")
-	local cdefPlugin = require("lye-plugin.plugins.cdef")
+	local cdefPlugin = require("lye-plugin.plugins.ffi")
 
 	local written = table.concat({
 		"local ffi = require(\"ffi\")\n",
@@ -345,7 +371,7 @@ test.it("leaves a cdef block a lowering plugin wrote out of it", function()
 	-- The block is in text lye was handed by another plugin, so there is no place in the document
 	-- for its colours: a plugin colours the language it reads, and this is not the reader's.
 	local Parser = require("lye-parser")
-	local cdefPlugin = require("lye-plugin.plugins.cdef")
+	local cdefPlugin = require("lye-plugin.plugins.ffi")
 
 	local written = "ffi.cdef[[int x;]]\n"
 	local lowered = "local lowered = 1\n"

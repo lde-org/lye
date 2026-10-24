@@ -2,6 +2,8 @@
 	The lye language server: wires the protocol layer to the Lua tooling.
 ]]
 
+-- First, so the mark it writes for `initialize` covers everything this server loaded.
+local timing = require("lye-lsp.timing")
 local rpc = require("lye-rpc")
 local doc = require("lye-doc")
 local classes = require("lye-doc.class")
@@ -11,6 +13,7 @@ local json = require("lye-json")
 local definitionsIndex = require("lye-lsp.definitions")
 local Parser = require("lye-parser")
 local analyzer = require("lye-analyzer")
+local analyzerNames = require("lye-analyzer.names")
 local editorconfig = require("lye-lsp.editorconfig")
 local KIND = require("lye-lexer").KIND
 local types = require("lye-doc.type")
@@ -151,6 +154,7 @@ local DOC_TAG_NAME = "[%a_][%w_]*"
 ---@field definitions table? the definitions, indexed by name, built once
 ---@field plugins_ table<string, lye.plugin.Spec[]>? the plugins each package asked for, loaded once
 ---@field views table<string, lye.View>? what lye reads of each open document, and the way back
+---@field dirtyAt table<string, number>? when each dirty document's first change of a burst arrived
 ---@field tokens_ table<string, { text: string, answer: table }>? the token answer for a document
 --- that has not changed since it was worked out
 ---@field viewByIndex table<lye.framework.LineIndex, lye.View>? the same, found by a line index a
@@ -500,7 +504,8 @@ function Lye:moduleType(name, from)
 	local owner = self:packageRoot(uri)
 	if owner then self:packageDeclarations(owner) end
 	local key = cache.key("module", textKey, self.annotationsDigest or "",
-		(self.packageDigests or {})[owner] or "", self:documentsDigest())
+		(self.packageDigests or {})[owner] or "", self:documentsDigest(),
+		plugin.digest(self:plugins(uri)))
 	local known = namedPreludeTypes()
 	local entry = cache.load(key, known)
 	if entry and entry.key == cache.codeVersion() and entry.text == textKey then
@@ -518,7 +523,8 @@ function Lye:moduleType(name, from)
 	-- document, which is analysed on its own account when it is open.
 	local names = analyzer.analyze(written, PRELUDE, self:declaredTypes("file://" .. path), function(inner)
 		return self:moduleType(inner, "file://" .. path)
-	end, nil, nil, true, isDefinitionFile("file://" .. path))
+	end, nil, nil, true, isDefinitionFile("file://" .. path), self:plugins("file://" .. path),
+		function(message) self.server:log(message, framework.LOG.warning) end)
 	self.requiring[path] = nil
 	self.modules[path] = { text = written, type = names.module }
 	-- Kept for the sessions after this one. The graph is written as it stands: a placeholder in
@@ -558,14 +564,20 @@ function Lye:useWorkspaceCache()
 end
 
 
---- The start of the line an offset is written on. The last run of characters that holds no
---- newline is cut off the front of the text, and what is left is everything above it.
+--- The start of the line an offset is written on, found by walking back to the newline above it.
+--- Cutting the front of the text off and matching the last line removed is the same answer, but it
+--- copies and scans everything above the offset for every annotation of every file in the scan —
+--- which the profiler showed as most of a first open. A line is short; a file is not.
 ---@param source string
 ---@param offset integer
 ---@return integer
 local function lineStart(source, offset)
-	local before = source:sub(1, offset - 1):gsub("[^\n]*$", "")
-	return #before + 1
+	local at = offset - 1
+	while at >= 1 do
+		if source:byte(at) == 10 then return at + 1 end
+		at -= 1
+	end
+	return 1
 end
 
 --- The line at a start offset, without its indentation.
@@ -646,12 +658,15 @@ end
 function Lye:workspaceDeclarations()
 	self:useWorkspaceCache()
 	if self.known then return self.known end
+	local started = timing.now()
 	local root = self.server.rootPath
 	local known = {}
+	local files = 0
 	if root then
 		local pipe = io.popen(string.format(
 			"find %q -type f -name '*.lua' -not -path '*/target/*' -not -path '*/.*/*' | head -2000", root))
 		if pipe then
+			local parseStarted = timing.now()
 			local parsedFiles, parts = {}, {}
 			self.typeLocations = self.typeLocations or {}
 			for file in pipe:lines() do
@@ -662,6 +677,7 @@ function Lye:workspaceDeclarations()
 				local source = handle and handle:read("*a")
 				if handle then handle:close() end
 				if type(source) == "string" then
+					files += 1
 					local isOk, parsed = pcall(doc.parse, source)
 					if isOk then
 						parsedFiles[#parsedFiles + 1] = parsed
@@ -678,11 +694,16 @@ function Lye:workspaceDeclarations()
 				end
 			end
 			pipe:close()
+			timing.detail("scan-read-parse", parseStarted, "files=%d", files)
+			local declareStarted = timing.now()
 			known = classes.declare(parsedFiles)
+			timing.detail("scan-declare", declareStarted, "files=%d", #parsedFiles)
 			self.annotationsDigest = rapidhash.hex(table.concat(parts, "\1"))
 		end
 	end
 	self.known = known
+	timing.mark("workspace-scan", started,
+		string.format("files=%d elapsed=%.1fms", files, timing.elapsed()))
 	return known
 end
 
@@ -702,8 +723,10 @@ function Lye:packageDeclarations(root)
 	self.packageDigests = self.packageDigests or {}
 	local held = self.packageNames[root]
 	if held ~= nil then return held end
+	local started = timing.now()
 	local found = {}
 	local parts = {}
+	local files = 0
 	local pipe = io.popen(string.format(
 		"find -L %q -type f -name '*.lua' -not -path '*/.*/*' 2>/dev/null | head -2000", root .. "/target"))
 	if pipe then
@@ -713,6 +736,7 @@ function Lye:packageDeclarations(root)
 			local source = handle and handle:read("*a")
 			if handle then handle:close() end
 			if type(source) == "string" then
+				files += 1
 				local isOk, parsed = pcall(doc.parse, source)
 				if isOk then
 					parsedFiles[#parsedFiles + 1] = parsed
@@ -729,6 +753,7 @@ function Lye:packageDeclarations(root)
 	end
 	self.packageNames[root] = found
 	self.packageDigests[root] = rapidhash.hex(table.concat(parts, "\1"))
+	timing.detail("package-scan", started, "files=%d root=%s", files, root)
 	return found
 end
 
@@ -786,6 +811,7 @@ function Lye:analyze(uri, from)
 	if not document then return nil end
 	local view = self:view(uri)
 	if not view then return nil end
+	local started = timing.now()
 	-- The analyzer parses the document itself, so its result carries the tree, the scopes and the
 	-- comments this needs. Parsing the same text a second time is a third of the cost of a
 	-- keystroke on a large file, for the same tree.
@@ -795,7 +821,8 @@ function Lye:analyze(uri, from)
 	local previous = from and view.map:isEmpty() and self.analysis[uri]
 	local names = analyzer.analyze(view.text, PRELUDE, self:declaredTypes(uri), function(name)
 		return self:moduleType(name, uri)
-	end, previous and Parser.resumeAt(previous, from) or nil, nil, nil, isDefinitionFile(uri))
+	end, previous and Parser.resumeAt(previous, from) or nil, nil, nil, isDefinitionFile(uri), view.specs,
+		function(message) self.server:log(message, framework.LOG.warning) end)
 	local result = names.parser
 	self.analysis[uri] = result
 	self.names[uri] = names
@@ -808,6 +835,7 @@ function Lye:analyze(uri, from)
 	end
 	self:keepAnalysis(uri)
 	self.dirty[uri] = nil
+	timing.detail("analyze", started, "bytes=%d resumed=%s", #view.text, from and "1" or "0")
 	return result
 end
 
@@ -1384,13 +1412,6 @@ function Lye:onHover(params)
 	-- is asking about two different things, and a range over the whole access tells a client they
 	-- are the same one, so the answer points at the word itself.
 	local token = tokenAt(result.parser, offset)
-	local trace = io.open("/tmp/hover-trace.log", "a")
-	if trace then
-		trace:write(string.format("offset=%d token=%s kind=%s span=%s..%s node=%s %s..%s\n", offset,
-			tostring(token and token.index), tostring(token and token.kind), tostring(token and token.start),
-			tostring(token and token.stop), tostring(node.kind), tostring(node.start), tostring(node.stop)))
-		trace:close()
-	end
 	if not token or not isValueToken(token) then return nil end
 	local signature = signatureFor(self.names[uri], node, offset)
 	local held = typeOfExpression(result, node.index, offset)
@@ -1606,6 +1627,7 @@ end
 ---@param self lye.Server
 ---@return table
 function Lye:onSemanticTokens(params)
+	local started = timing.now()
 	local uri = params.textDocument?.uri
 	local document = uri and self.server.documents:get(uri)
 	local result = uri and (self.analysis[uri] or self:analyze(uri))
@@ -1616,7 +1638,10 @@ function Lye:onSemanticTokens(params)
 	-- moves and the view scrolls: the answer for a document that has not changed is the answer.
 	self.tokens_ = self.tokens_ or {}
 	local held = self.tokens_[uri]
-	if held and held.text == document.text then return held.answer end
+	if held and held.text == document.text then
+		timing.detail("tokens", started, "cached=1")
+		return held.answer
+	end
 
 	-- What lye reads is the lowered text, and what the editor colours is its own: every span is
 	-- carried back through the map before a token is written down.
@@ -1847,6 +1872,7 @@ function Lye:onSemanticTokens(params)
 	-- A kind the legend does not have is left out rather than advertised to an editor that cannot
 	-- know it.
 	local askedKind, askedMods = {}, {}
+	local pluginStarted = timing.now()
 	local asked = plugin.tokens(view.specs, {
 		uri = uri, source = view.source, text = view.text, root = self:packageRoot(uri),
 		map = view.map, parsed = result, analysis = self.names[uri] or {},
@@ -1855,7 +1881,9 @@ function Lye:onSemanticTokens(params)
 			return node and typeOfExpression(self.names[uri], nodeIdx, node.start) or nil
 		end,
 		ownerOf = types.ownerOf,
+		callName = function(node) return analyzerNames.callName(result, node) end,
 	})
+	timing.detail("plugin-tokens", pluginStarted, "plugins=%d spans=%d", #view.specs, #asked)
 	for _, span in ipairs(asked) do
 		local from, to, kind = span.from, span.to, span.type
 		if type(from) == "number" and type(to) == "number" and TOKEN_TYPE[kind] and to >= from then
@@ -1951,6 +1979,7 @@ function Lye:onSemanticTokens(params)
 
 	local answer = { data = data }
 	self.tokens_[uri] = { text = document.text, answer = answer }
+	timing.detail("tokens", started, "cached=0 tokens=%d spans=%d", count / 5, #pieces)
 	return answer
 end
 
@@ -2256,6 +2285,7 @@ end
 function Lye:onDocumentChanged(params, atOnce)
 	local uri = params.textDocument?.uri
 	if not uri then return end
+	local started = timing.now()
 
 	-- The text has moved on, so what was worked out for the old text is not an answer about this
 	-- one. It is dropped rather than analysed over: a burst of keystrokes arrives faster than a
@@ -2267,9 +2297,14 @@ function Lye:onDocumentChanged(params, atOnce)
 		-- `forget` above has just dropped what was held for it.
 		local result = self:analyze(uri)
 		if result then self:publishDiagnostics(uri, result) end
+		timing.detail("open", started, "bytes=%d", #self.server.documents:get(uri).text)
 		return
 	end
 	self.dirty[uri] = true
+	-- When the first of a burst arrived, which is what the user felt: the last one may be a
+	-- fraction of a millisecond later, and analyses that happened between them were thrown away.
+	self.dirtyAt = self.dirtyAt or {}
+	self.dirtyAt[uri] = started
 end
 
 --- Every document whose text has changed since it was last analysed, read once the editor has
@@ -2277,8 +2312,12 @@ end
 function Lye:onIdle()
 	for uri in pairs(self.dirty) do
 		self.dirty[uri] = nil
+		local started = self.dirtyAt and self.dirtyAt[uri] or timing.now()
+		if self.dirtyAt then self.dirtyAt[uri] = nil end
+		local analyzeStarted = timing.now()
 		local result = self:analyze(uri)
 		if result then self:publishDiagnostics(uri, result) end
+		timing.detail("keystroke", started, "analyze=%.1fms", timing.now() - analyzeStarted)
 	end
 end
 
@@ -3269,6 +3308,7 @@ end
 ---@param self lye.Server
 function Lye:workspaceSymbols()
 	if self.workspace then return self.workspace end
+	local started = timing.now()
 
 	local out = json.array()
 	local root = self.server.rootPath
@@ -3281,12 +3321,14 @@ function Lye:workspaceSymbols()
 		self.workspace = out
 		return out
 	end
+	local files = 0
 	for file in pipe:lines() do
 		local handle = io.open(file, "rb")
 		-- A directory named like a file opens and then reads as nil, which is not a document.
 		local source = handle and handle:read("*a")
 		if handle then handle:close() end
 		if type(source) == "string" then
+			files += 1
 			-- A symbol is a name the file declares, so the tree is all that is needed: analysing
 			-- every file of a project to list them typed and checked a workspace nobody asked
 			-- about, and one request over 126 files took the process from 17 MiB to 44.
@@ -3308,6 +3350,7 @@ function Lye:workspaceSymbols()
 	end
 	pipe:close()
 	self.workspace = out
+	timing.mark("workspace-symbols", started, string.format("files=%d symbols=%d", files, #out))
 	return out
 end
 
@@ -3365,6 +3408,9 @@ function Lye:register()
 	-- is reading what the burst described and has to find it done.
 	server.connection:setBeforeHandler(function(message)
 		local method = message.method
+		-- The first request an editor sends, after the runtime and the definitions are already
+		-- loaded: from here on the session is answering rather than starting.
+		if method == framework.METHOD.initialize then timing.fromStart("initialize") end
 		if method ~= framework.METHOD.didChange and method ~= framework.METHOD.didOpen then
 			self:onIdle()
 		end

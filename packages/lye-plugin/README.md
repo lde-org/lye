@@ -9,6 +9,7 @@ be read and where an editor has asked something about one:
 |---|---|---|
 | `lower(context)` | the edits that turn a document into Lua | a language that is not Lua: the plugin compiles what it can, lye reads the result |
 | `tokens(context)` | extra semantic tokens | colours for a language or a library lye does not know |
+| `types(context)` | classes, aliases and provider hooks | a dialect whose types the analyzer does not know: the shipped `ffi` plugin is one |
 | `extensions` | a list like `{ "moon" }` | the files a language is written in, so `lye check .` checks them |
 
 A plugin is handed a **context** and nothing else — the document, the text lye reads, and what the
@@ -122,7 +123,7 @@ A plugin that works from `context.parsed` is reading the *lowered* text, and its
 offsets; `context.map` carries them back, and `context.map:rangeIsWritten(from, to)` says whether a
 range has a place in the document at all. Ask the parse tree for what you want rather than walking
 every node — `context.parsed.byKind.call` is the index — because the hook is called again on every
-keystroke. Both shipped plugins do exactly that:
+keystroke. The shipped colour plugins do exactly that:
 
 ```lua
 local first, last = from + mark.start - 1, from + mark.stop - 1
@@ -132,6 +133,44 @@ if not map:rangeIsWritten(first, last) then
 end
 ```
 
+## `types`: types of your own
+
+`types` is asked once per analysis, before the analyzer resolves the document's names. It answers
+the classes and aliases the plugin's constructs declare, and a provider table the analyzer consults
+once the namespace exists:
+
+```lua
+local doc = require("lye-doc")
+
+function ffi.types(context)
+	return {
+		annotations = { doc.parse("---@class Vec\n---@field x number\n") },
+		diagnostics = { { message = "…", start = 10, stop = 12, severity = 1 } },
+		attach = function(resolve)
+			return {
+				call = function(node) … end,          -- what a call gives
+				field = function(base, baseName, field, offset) … end,
+				parameter = function(declaration) … end,
+				callbackReturns = { [nodeIndex] = type },
+			}
+		end,
+	}
+end
+```
+
+`annotations` is a list of `lye.doc.File`s, one per declaration block. They are merged into the
+document's namespace before the resolver exists, which is why provider hooks are behind `attach`:
+it is handed the resolver, so a type the plugin contributes and a class the writer declared mean the
+same thing to one another. Every provider hook is optional; the first plugin in workspace order
+that answers wins. `parameter` is asked only for a parameter whose own annotation says nothing, and
+`callbackReturns` promises what a function literal handed to C returns.
+
+The shipped `ffi` plugin is the worked example. It parses every `ffi.cdef` block once, contributes
+the classes, aliases and enum constants it declares, types `ffi.new`, `ffi.cast`, `ffi.typeof`,
+`ffi.load` and `ffi.C`, and colours the same block. Turn it off with `"!ffi"` and the file still
+reads, with `ffi.new("Vec")` typed as the plain `ffi.cdata` its definitions say — the analyzer has
+no ffi code in it at all.
+
 ## Context
 
 | Field | What it is |
@@ -140,7 +179,9 @@ end
 | `source` | the document as the editor holds it |
 | `text` | what lye reads: the lowered text, once a plugin has lowered it |
 | `root` | the package the document belongs to, for a plugin with files of its own |
-| `parsed` | the parse tree lye read (`tokens` only) |
+| `parsed` | the parse tree lye read (`tokens` and `types`) |
+| `annotations` | the `---@` annotations the document wrote (`types` only) |
+| `callName(node)` | the dotted name a call is written with (`tokens` and `types`) |
 | `analysis` | what the analyzer worked out: declarations, variables, classes (`tokens` only) |
 | `map` | the way from the text lye reads back to the document (`tokens` only) |
 | `typeOf(nodeIdx)` | the type the analyzer gave a node, or nil (`tokens` only) |
@@ -153,13 +194,15 @@ end
   `gsub`'s replacement.
 * `formats` — the same for a format string: the conversions of `string.format("%d/%s")`, and of
   `string.pack`, `string.unpack`, `string.packsize` and `os.date`.
-* `cdef` — the text handed to `ffi.cdef` is C, and it is coloured from lye's own parse of it: a
-  keyword, a builtin type, the name the block declared, a member, a constant an `enum` named. The
-  brackets stay the string token lye's walk writes, and the plugin's spans are cut out of it.
+* `ffi` — the whole `ffi.cdef` dialect. It colours the C (a keyword, a builtin type, the name the
+  block declared, a member, a constant an `enum` named) and contributes its types: the classes,
+  aliases and enum constants the blocks declare, `ffi.new`/`ffi.cast`/`ffi.typeof`, the functions
+  `ffi.load` and `ffi.C` give back, and the signature a callback cast to a C type has. The brackets
+  stay the string token lye's walk writes, and the plugin's spans are cut out of it.
 
-These three were part of the server before plugins existed. They are the worked examples of one —
-two of them read the parse tree and map what they find back through `context.map`, and the test
-that they still colour what they used to is in `lye-lsp`'s suite.
+These three started in the server. The `ffi` one is the proof that a plugin can carry a dialect
+all the way — parse, types and colours — and the tests that they still answer what they used to are
+in `lye-plugin`, `lye-analyzer` and `lye-lsp`.
 
 ## Layout
 

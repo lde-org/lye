@@ -3,6 +3,6 @@
 		"./toy.lua",
 		"!patterns",
 		"!formats",
-		"!cdef"
+		"!ffi"
 	]
 }

@@ -91,6 +91,36 @@ test.it("reads the types an ffi.cdef declares", function()
 		"a member the header never declared: " .. table.concat(messages, "; "))
 end)
 
+test.it("leaves the ffi dialect to the plugin that owns it", function()
+	-- The analyzer no longer parses `ffi.cdef` itself: the shipped ffi plugin contributes the
+	-- classes the block declares and the type of `ffi.new`. A workspace that turns it off gets the
+	-- plain declarations only, which is the proof that a plugin can carry a dialect this far.
+	local source = table.concat({
+		'---@class ffilib\n',
+		'---@field new fun(ct: string): ffi.cdata\n',
+		'---@class ffi.cdata\n',
+		'local ffi = {}\n',
+		'ffi.cdef[[\n',
+		'\ttypedef struct { double x, y; } Vec;\n',
+		']]\n',
+		'local made = ffi.new("Vec")\n',
+		'made.x = 1\n',
+		'made.nope = 1\n',
+	}, "")
+	test.equal(typeOf(source, "made"), "Vec", "the plugin read the block and typed the constructor")
+
+	local result = analyzer.analyze(source, nil, nil, nil, nil, nil, nil, nil, {})
+	local found
+	for _, variable in ipairs(result.variables) do
+		if variable.name == "made" then found = types.display(analyzer.typeAt(result, variable, #source)) end
+	end
+	test.truthy(found and found ~= "Vec", "without the plugin the block declares nothing: " .. tostring(found))
+	for _, entry in ipairs(result.diagnostics) do
+		test.falsy(entry.message:match("`nope` is not a field of Vec"),
+			"and the generated class does not report its members: " .. entry.message)
+	end
+end)
+
 test.it("types a callback from the C signature it was cast to", function()
 	-- A Lua function handed to `ffi.cast` is called by C, so the values it is given are the ones
 	-- the header declares rather than Lua's: `ptr` is a pointer (not a string) and `size` a

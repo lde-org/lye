@@ -11,7 +11,7 @@ jit.opt.start("maxtrace=8000", "maxmcode=8192", "hotexit=250")
 
 local Parser = require("lye-parser")
 local doc = require("lye-doc")
-local cdef = require("lye-cdef")
+local plugin = require("lye-plugin")
 local types = require("lye-doc.type")
 local diagnostic = require("lye-analyzer.diagnostic")
 local infer = require("lye-analyzer.infer")
@@ -26,6 +26,20 @@ local annotationValues, annotationSpan, documentationOf, trailsCode, sameLine, c
 	annotations.annotationValues, annotations.annotationSpan, annotations.documentationOf, annotations.trailsCode, annotations.sameLine, annotations.collectAssignments, annotations.factHolds, annotations.withGenerics, annotations.signatureOf, annotations.paramTypeOf, annotations.callLabel
 
 local analyzer = {}
+
+--- The plugins lye ships, for a caller that did not name the ones a document is read with: a
+--- library, a tool, or a test reads the same language an editor does unless it says otherwise.
+--- Loaded once — the loader protects and names each hook — and an empty list means no plugins.
+---@type lye.plugin.Spec[]?
+local shippedPlugins
+
+---@return lye.plugin.Spec[]
+local function defaultPlugins()
+	if not shippedPlugins then
+		shippedPlugins = plugin.load(nil, nil, nil, function() end)
+	end
+	return shippedPlugins
+end
 
 ---@class lye.analyzer.Variable
 ---@field declaration lye.parser.Declaration
@@ -141,7 +155,7 @@ local analyzer = {}
 ---@field returns table<string, lye.doc.Type>
 ---@field callTypes table<integer, lye.doc.Type> what each call was bound to, by node index
 ---@field module lye.doc.Type? what `require` of this file means, when it returns a table
----@field ffiC lye.doc.Type? the functions `ffi.C` reaches, when this file declared any
+---@field providers lye.plugin.TypeProviders[]? what the plugins of this document answer
 
 ---@param result lye.parser.Result
 ---@return lye.analyzer.Scope
@@ -449,15 +463,19 @@ end
 ---@param field string
 ---@param offset integer
 function analyzer.fieldTypeAt(self, base, baseName, field, offset)
+	-- A plugin that knows the construct answers first: `ffi.C` is the functions the file's own
+	-- blocks declared, and a workspace without the ffi plugin has no such answer.
+	if self.providers then
+		for _, provided in ipairs(self.providers) do
+			if provided.field then
+				local found = provided.field(base, baseName, field, offset)
+				if found then return found end
+			end
+		end
+	end
 	-- A string reads the `string` table's fields, because Lua points the string metatable's `__index`
 	-- at it. That is how the environment is arranged, so this layer owns the rule.
 	local held
-	-- `ffi.C` reaches the functions the file's own cdef declared, and the name is what says so: the
-	-- far side is read the way `ffi.cdef`, `ffi.new` and `ffi.load` are, since a file that requires
-	-- `ffi` has that name for it whether or not the definitions were reached to type the table.
-	if field == "C" and baseName == "ffi" and self.ffiC then
-		return self.ffiC
-	end
 	if types.mayBe(base, "string") then
 		local library = analyzer.lookupAt(self, "string", offset)
 		local declared = library and analyzer.typeAt(self, library, offset)
@@ -1035,8 +1053,12 @@ end
 ---@param cachedAnnotations lye.doc.File? annotations already parsed for a batch check
 ---@param isModuleOnly boolean? the document is read for what `require` gives back, so its own
 --- diagnostics are nobody's to report and the passes that only build them are left out
+---@param plugins lye.plugin.Spec[]? the plugins this document is read with; nil means the ones lye
+--- ships, and an empty list means none. A plugin contributes classes, aliases and the types of the
+--- calls and fields only it understands — the ffi dialect is one.
+---@param report fun(message: string)? where a plugin's fault is written, when the caller has a log
 function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAnnotations, isModuleOnly,
-	isDefinition)
+	isDefinition, plugins, report)
 	assert(type(source) == "string", "analyzer.analyze expects a string")
 
 	local parsed = Parser.new(source, resume, isDefinition):parse()
@@ -1063,60 +1085,34 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	---@param node lye.parser.Node
 	local function calledName(node) return callName(parsed, node) end
 
-	--- Where the text inside a `ffi.cdef` string begins in the document: past the quote, or past the
-	--- brackets and whatever `=` signs a long one was written with. The parser reports offsets into
-	--- the text it was handed, and a reader has to be told where in their file that is. A quoted
-	--- string with escapes in it would drift — a cdef is written as a long string in practice.
-	---@param written string the document
-	---@param argument lye.parser.Node the string the cdef was written as
-	---@param offset integer 1-based, into the text the parser read
-	local function cdefTextStart(written, argument, offset)
-		local source = written:sub(argument.start, argument.stop)
-		local level = source:match("^%[(=*)%[")
-		local opened = level and (2 + #level) or 1
-		return argument.start + opened + offset - 1
-	end
-
-	-- The C a `ffi.cdef` call declares. Its types belong to this file, and its declarations are
-	-- written back out as annotation text, so one reader builds every class rather than two.
-	local cdefs, cdefProblems
-	-- Only a file that writes the word can be declaring C, and the scan is per node: reading the
-	-- text first is what keeps a file that declares nothing from paying for the search.
-	if source:find("cdef", 1, true) then
-	for _, node in ipairs(nodesOf(parsed, "call")) do
-		if calledName(node) == "ffi.cdef" then
-			local argument = node.args and node.args[1] and parsed.nodes[node.args[1]]
-			if argument and argument.kind == "string" and type(argument.value) == "string" then
-				local declared = cdef.parse(argument.value)
-				local written = doc.parse(cdef.annotations(declared))
-				local from = doc.classes.read(written)
-				for name, class in pairs(from.classes) do
-					-- A block that only referred to a name writes a class for it with no members — the
-					-- layout belongs to the block that defined it, and the reference landing on top
-					-- threw that away: `struct termios` mentioned by a function declaration in a third
-					-- cdef read as having no fields at all.
-					local held = namespace.classes[name]
-					if not held or #class.fields > 0 then namespace.classes[name] = class end
-				end
-				for name, alias in pairs(from.aliases) do namespace.aliases[name] = alias end
-				cdefs = cdefs or {}
-				cdefs[#cdefs + 1] = declared
-
-				-- A declaration that could not be read is reported inside the string, so the offsets the parser
-				-- gives have to be mapped before they mean anything. What *was* readable is still used.
-				for _, problem in ipairs(declared.problems) do
-					local at = cdefTextStart(source, argument, problem.start)
-					cdefProblems = cdefProblems or {}
-					cdefProblems[#cdefProblems + 1] = {
-						message = "cdef: " .. problem.message,
-						severity = 1,
-						start = at,
-						stop = at + math.max(problem.stop - problem.start, 0),
-					}
-				end
+	-- What the plugins this document is read with contribute to its types. The ffi plugin is what
+	-- turns an `ffi.cdef` block into classes and aliases, so a workspace that turns it off reads
+	-- the same file without them. The annotations are merged before the namespace is resolved;
+	-- `attach` is called afterwards with the resolver, so a contributed type and a declared one
+	-- agree about what a name means.
+	local specs = plugins or defaultPlugins()
+	local contributions = plugin.types(specs, {
+		source = source, text = source, parsed = parsed, annotations = annotations,
+		callName = calledName,
+	}, report or function() end)
+	local pluginDiagnostics = {}
+	for _, contribution in ipairs(contributions) do
+		local contributed = contribution.types
+		for _, file in ipairs(contributed.annotations or {}) do
+			local from = doc.classes.read(file)
+			for name, class in pairs(from.classes) do
+				-- A block that only referred to a name writes a class for it with no members — the
+				-- layout belongs to the block that defined it, and the reference landing on top
+				-- threw that away: `struct termios` mentioned by a function declaration in a third
+				-- cdef read as having no fields at all.
+				local held = namespace.classes[name]
+				if not held or #class.fields > 0 then namespace.classes[name] = class end
 			end
+			for name, alias in pairs(from.aliases) do namespace.aliases[name] = alias end
 		end
-	end
+		for _, entry in ipairs(contributed.diagnostics or {}) do
+			pluginDiagnostics[#pluginDiagnostics + 1] = entry
+		end
 	end
 
 	local own = doc.classes.resolver(namespace, elsewhere)
@@ -1134,132 +1130,52 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		if type(foreign) == "table" then return foreign end
 	end
 
-	--- What a call that names a C type is worth. `ffi.new("Vec")` and `ffi.cast("Vec", v)` hand
-	--- back a Vec, and `ffi.typeof("Vec")` hands back the ctype — which is the class itself, since
-	--- what a reader does with a ctype is construct from it. Only the names the cdef introduced
-	--- resolve: `ffi.new("int")` is a number, which the definitions already say.
-	--- The C type a written name stands for, and the block that declared it: `ffi.cast("Node *")`
-	--- is the C type wherever a reader needs the type rather than the class a value of it is.
-	---@param written string
-	---@return lye.cdef.Type?
-	---@return lye.cdef.Namespace?
-	local function cTypeNamed(written)
-		for _, declared in ipairs(cdefs or {}) do
-			local found = cdef.typeOf(declared, written)
-			if found then return found, declared end
-		end
-	end
-
-	--- What a Lua function handed to `ffi.cast` has to be. The value really is a C function pointer
-	--- at runtime, so the callback's parameters are the C ones and its result is converted back
-	--- into the C type — which is what makes `buf:putcdata(ptr, len)` inside one the right thing to
-	--- do and `size * nmemb` a number.
-	---@param written string the type the cast names
-	---@return lye.cdef.Type?
-	---@return lye.cdef.Namespace?
-	local function cTypeOfCallback(written)
-		local found, declared = cTypeNamed(written)
-		if not found then return nil end
-		if found.kind == "function" then return found, declared end
-		if found.kind == "pointer" and found.target and found.target.kind == "function" then
-			return found.target, declared
-		end
-		-- A typedef of a callback: `curl_write_callback` is one.
-		local resolved = cdef.resolve(declared, found.name or written)
-		if resolved and resolved.kind == "pointer" and resolved.target
-			and resolved.target.kind == "function" then
-			return resolved.target, declared
-		end
-		if resolved and resolved.kind == "function" then return resolved, declared end
-	end
-
-	--- The C signature of each function literal written as a callback, by the node that is the
-	--- function. Read before the names are declared, because a parameter's type is one of them.
-	---@type table<integer, { type: lye.cdef.Type, namespace: lye.cdef.Namespace }>
-	local callbacks = {}
-	---@type table<integer, lye.doc.Type>
-	local callbackReturns = {}
-	--- Which C parameter each of a callback's parameters is, by the declaration the parser made for
-	--- it. An anonymous function has no declaration of its own to hang them on, so the parameter
-	--- itself is what is known: this is the third parameter of *that* signature.
-	---@type table<lye.parser.Declaration, { index: integer, type: lye.cdef.Type, namespace: lye.cdef.Namespace }>
-	-- Only a file that writes the word can be calling `ffi.cast`: the name a callback is read from
-	-- has to appear in the text, so a file without it has no callbacks to gather.
-	local callbackParams = {}
-	if source:find("ffi", 1, true) then
-	for _, node in ipairs(nodesOf(parsed, "call")) do
-		if node.args and node.args[2] then
-			local called = calledName(node)
-			if called == "ffi.cast" or called == "ffi.new" then
-				local written = parsed.nodes[node.args[1]]
-				local body = parsed.nodes[node.args[2]]
-				if written and written.kind == "string" and type(written.value) == "string"
-					and body and body.kind == "function" then
-					local signature, declared = cTypeOfCallback(written.value)
-					if signature then
-						callbacks[node.args[2]] = { type = signature, namespace = declared }
-						for index, param in ipairs(body.params or {}) do
-							callbackParams[param] = { index = index, type = signature, namespace = declared }
-						end
-						-- The engine converts what the callback returns into the C result type, so
-						-- the C says what the body has to give — a promise like a `@return`.
-						local returned = signature.returns
-						if returned then
-							callbackReturns[node.args[2]] = types.parse(
-								cdef.notation(declared, returned), resolve)
-						end
-					end
+	-- What each plugin answers about this document, now that the namespace is complete. The ffi
+	-- plugin's `ffi.new("Vec")`, `ffi.C` and callback signatures are all read here rather than by
+	-- the analyzer, and a workspace that turns it off reads none of them.
+	local providers, callbackReturns = {}, {}
+	for _, contribution in ipairs(contributions) do
+		local attach = contribution.types.attach
+		if attach then
+			local provided = attach(resolve)
+			if type(provided) == "table" then
+				providers[#providers + 1] = provided
+				for index, returned in pairs(provided.callbackReturns or {}) do
+					if callbackReturns[index] == nil then callbackReturns[index] = returned end
 				end
 			end
 		end
 	end
-	end
 
-	--- The signatures a `ffi.cdef` in this file declared, as the fields a `ffi.load` gives back.
-	--- A cdef declares the functions of one library, and the file that wrote it is the one that
-	--- knows them: taking every symbol the process has ever seen would be a list nobody can read.
+	--- What a declaration's own annotation did not say, as a plugin that knows the construct does.
+	---@param declaration lye.parser.Declaration
 	---@return lye.doc.Type?
-	local function loadedSymbols()
-		local fields = {}
-		for _, declared in ipairs(cdefs or {}) do
-			for _, name in ipairs(declared.order) do
-				local type = declared.types[name]
-				if type and type.kind == "function" then
-					local parts = {}
-					for _, param in ipairs(type.params or {}) do
-						parts[#parts + 1] = cdef.notation(declared, param, "parameter")
-					end
-					if type.variadic then parts[#parts + 1] = "..." end
-					local returned = type.returns and cdef.notation(declared, type.returns)
-					local written = "fun(" .. table.concat(parts, ", ") .. ")"
-					if returned and returned ~= "nil" then written = written .. ": " .. returned end
-					local held = types.parse(written, resolve)
-					if held then fields[name] = held end
-				end
+	local function providerParameter(declaration)
+		for _, provided in ipairs(providers) do
+			if provided.parameter then
+				local held = provided.parameter(declaration)
+				if held then return held end
 			end
 		end
-		if not next(fields) then return nil end
-		return types.object(fields)
 	end
 
-	local function cTypeOf(node)
-		if not cdefs then return nil end
-		local called = calledName(node)
-		if called == "ffi.load" then return loadedSymbols() end
-		if called ~= "ffi.new" and called ~= "ffi.cast" and called ~= "ffi.typeof" then return nil end
-		local argument = node.args and node.args[1] and parsed.nodes[node.args[1]]
-		if not argument or argument.kind ~= "string" or type(argument.value) ~= "string" then return nil end
-		local found, declared = cTypeNamed(argument.value)
-		if not found then return nil end
-		-- A struct, a union, an enum or a typedef of one is a class this file declares, and looking the
-		-- name up lets the document's own class win over the generated one. Everything else is mapped.
-		local className = cdef.className(found)
-		local named = className and resolve(className)
-		if named and (found.kind == "struct" or found.kind == "union" or found.kind == "enum"
-			or (found.kind == "typedef" and cdef.resolve(declared, found.name or "") ~= nil)) then
-			return named
+	local hasCallProvider = false
+	for _, provided in ipairs(providers) do
+		if provided.call then
+			hasCallProvider = true
+			break
 		end
-		return types.parse(cdef.notation(declared, found), resolve)
+	end
+	--- What a call to a construct a plugin knows is worth; the first answer wins.
+	---@param node lye.parser.Node
+	---@return lye.doc.Type?
+	local function providerCall(node)
+		for _, provided in ipairs(providers) do
+			if provided.call then
+				local held = provided.call(node)
+				if held then return held end
+			end
+		end
 	end
 
 		-- Declared returns are needed while typing declarations, and a `@return` belongs to the
@@ -1288,13 +1204,13 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		-- writes is the whole of a function, so the checks that read a body have nothing to read.
 		isDefinition = isDefinition or (type(annotations) == "table" and annotations.isDefinition) or false,
 	}
-	-- `ffi.C` names the same functions `ffi.load` hands back: one C namespace, and the file that
-	-- wrote the cdef is the one that knows what is in it. Built once rather than per read, since
-	-- every `ffi.C` in the file is that same namespace — and not at all when there is no cdef.
-	self.ffiC = cdefs and loadedSymbols() or nil
-	-- The problems were collected with their offsets already mapped into the document, so they are
-	-- added to this list here rather than where they were found.
-	for _, problem in ipairs(cdefProblems or {}) do
+	-- What plugins answer about this document after it is typed: `ffi.C`, a call that names a C
+	-- type, a callback's parameters. Kept on the result because a field read is asked long after
+	-- the analysis returns.
+	self.providers = providers
+	-- A contribution's problems were collected with their offsets already mapped into the
+	-- document, so they are added to this list here rather than where they were found.
+	for _, problem in ipairs(pluginDiagnostics) do
 		self.diagnostics[#self.diagnostics + 1] = problem
 	end
 
@@ -1715,7 +1631,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	narrow.collect(parsed, byRecord, signatures, resolve, annotations.annotations)
 	inferCtx = infer.context(parsed, typeOfName, returns, function(base, baseName, field, offset)
 		return analyzer.fieldTypeAt(self, base, baseName, field, offset)
-	end, modules, cTypeOf)
+	end, modules, hasCallProvider and providerCall or nil)
 	inferCtx.casts = inlineCasts
 	for index, node in ipairs(parsed.nodes) do
 		if node.kind == "function" then
@@ -1836,15 +1752,9 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 						if className then declared = resolve(className) end
 					end
 					-- A function literal handed to `ffi.cast` is called by C, so its parameters are the ones the
-					-- header declares: `ptr` is a pointer rather than a Lua string.
-					local asCallback = callbackParams[declaration]
-					if not declared and asCallback then
-						local wanted = asCallback.type.params and asCallback.type.params[asCallback.index]
-						if wanted then
-							declared = types.parse(
-								cdef.notation(asCallback.namespace, wanted, "parameter"), resolve)
-						end
-					end
+					-- header declares: `ptr` is a pointer rather than a Lua string. The plugin that knows
+					-- the construct answers; a declaration that has its own annotation keeps it.
+					if not declared then declared = providerParameter(declaration) end
 					-- A parameter with no `@param` is `any`: the arity is known, the type is not.
 					if not declared and declaration.qualifier == "param" then
 						declared = types.ANY_TYPE

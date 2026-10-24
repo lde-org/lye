@@ -11,8 +11,15 @@
 		},
 		"lye-parser": {
 			"path": "../lye-parser"
+		},
+		"lye-plugin": {
+			"path": "../lye-plugin"
+		},
+		"rapidhash": {
+			"commit": "937ef6654bd5c8afb0a3fe61593f8c2419627f89",
+			"git": "https://github.com/lde-org/rapidhash.git"
 		}
 	},
-	"manifestHash": "a8ad796bea069aff",
+	"manifestHash": "ae2163b5c77bada0",
 	"version": "1"
 }

@@ -29,6 +29,7 @@ local newTable = require("table.new")
 ---@field callee string? the name a call invokes
 ---@field args integer[]? the argument node indices of a call
 ---@field params lye.parser.Declaration[]? the parameters a function node declares, `self` first
+---@field value string|number|boolean? what a literal node stands for
 
 ---@class lye.parser.Declaration
 ---@field name string

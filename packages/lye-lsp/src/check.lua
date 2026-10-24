@@ -345,6 +345,16 @@ local function pluginsFor(path)
 	return specs
 end
 
+--- The key an analysis is kept under: what lye reads of the file, and the plugins that read it.
+--- The ffi plugin is what gives a cdef block its types, so a workspace that turned it off must not
+--- read the answer from when it was on.
+---@param path string
+---@param written string
+---@return string
+local function analysisKey(path, written)
+	return textKey(written .. "\0" .. plugin.digest(pluginsFor(path)))
+end
+
 --- What lye reads of a file: the text itself, lowered when the package it belongs to asked for a
 --- plugin that knows its language. The map is what carries a finding back to the file it was found
 --- in, so a report says where a reader would look for it.
@@ -362,7 +372,7 @@ local loweredBySource = {}
 local function lowered(path, source)
 	local specs = pluginsFor(path)
 	if #specs == 0 then return source, IDENTITY end
-	local cacheKey = path .. "\0" .. textKey(source)
+	local cacheKey = path .. "\0" .. textKey(source) .. "\0" .. plugin.digest(specs)
 	local held = loweredBySource[cacheKey]
 	if held then return held.text, held.map end
 	local context = { uri = path, source = source, text = source, root = packageOf(path) }
@@ -398,7 +408,7 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 		return nil
 	end
 	local written = lowered(found, source)
-	local key = textKey(written)
+	local key = analysisKey(found, written)
 
 	-- What the module came to is kept, including when it came to nothing: a package that requires
 	-- another is read once for the whole run rather than once per file that names it — and the
@@ -426,7 +436,8 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 	if names == nil then
 		names = analyzer.analyze(written, PRELUDE, own, function(inner)
 			return moduleOf(found, inner, modules, analysing, own, scopes, batch, store)
-		end, nil, docsByText[key], batchPath == nil, isDefinitionPath(path))
+		end, nil, docsByText[key], batchPath == nil, isDefinitionPath(path), pluginsFor(found),
+			function(message) io.stderr:write("check: " .. message .. "\n") end)
 		analysesByText[key] = names
 	end
 	analysing[key] = nil
@@ -486,7 +497,7 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	-- The plugins the file's package asked for: what lye reads is the lowered text, and every
 	-- finding is carried back to the file the reader wrote before it is reported or kept.
 	local written, map = lowered(path, source)
-	key = key or textKey(written)
+	key = key or analysisKey(path, written)
 
 	-- What a previous run found for this file, when nothing it was read against has changed:
 	-- reported as it stands, with no analysis at all.
@@ -504,7 +515,8 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	if names == nil then
 		names = analyzer.analyze(written, PRELUDE, elsewhere, function(name)
 			return moduleOf(path, name, modules or {}, analysing, elsewhere, scopes, batch, store)
-		end, nil, docsByText[key], nil, isDefinitionPath(path))
+		end, nil, docsByText[key], nil, isDefinitionPath(path), pluginsFor(path),
+			function(message) io.stderr:write("check: " .. message .. "\n") end)
 		analysesByText[key] = names
 		-- The full analysis says what `require` of this file gives back as well, and it is the
 		-- richer answer: a module another file reaches afterwards takes it rather than being
@@ -653,7 +665,7 @@ function check.files(paths, reporter)
 			-- A file a plugin reads is keyed by what lye reads of it: that is what an analysis is
 			-- about, and the annotations a batch hands over are the ones written in it.
 			local written = lowered(path, source)
-			local key = textKey(written)
+			local key = analysisKey(path, written)
 			keysByPath[path] = key
 			local parsed = docsByText[key]
 			if parsed == nil then

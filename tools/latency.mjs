@@ -10,7 +10,8 @@
 // keystroke, a hover, the semantic tokens. `tools/bench.lua` answers the same question about the
 // analyzer alone, which is cheap enough to measure inside one process.
 //
-// The file opened is the language server's own largest source file, and the phases are:
+// The file opened is the language server's own largest source file unless FILE names another, and
+// the phases are:
 //
 //   open       didOpen, then the first token request: parse, analyse, colour
 //   keystroke  an edit at the top of the file, then the tokens again
@@ -18,15 +19,27 @@
 //   tokens     ASKS/4 more token requests over the text as it now stands
 //
 // Each round is a fresh server, so a round includes the JIT warming up; the best round is reported
-// for that reason.
+// for that reason. A second line carries the server's own marks — initialize, the workspace scans,
+// each analysis, the token build and the plugin walk — so a phase that is the editor waiting can be
+// told from a phase that is the server working. LYE_TIMING=1 is set for the child; COLD=1 empties
+// the cache before every round and FILE=path opens another document, which is the usual way to
+// separate a first run from a typical one.
 import { spawn } from "node:child_process";
+import { rmSync } from "node:fs";
 
 const tree = process.argv[2] ?? "/home/once/Projects/Personal/lye";
-const file = `${tree}/packages/lye-lsp/src/language.lua`;
+// The largest source file is the worst case; `FILE` names another one, which is what a typical
+// keystroke looks like rather than the ceiling.
+const file = process.env.FILE ?? `${tree}/packages/lye-lsp/src/language.lua`;
 const text = await Bun.file(file).text();
 const uri = `file://${file}`;
 const rounds = Number(process.env.ROUNDS ?? 5);
 const asks = Number(process.env.ASKS ?? 40);
+// The server's own marks are the only place the workspace scan and the token walk are timed apart
+// from the request that carried them. `COLD=1` makes every round a first run, which is what the
+// scan and the cache are worth measuring on.
+const cold = process.env.COLD === "1";
+const cache = `/tmp/lye-latency-${tree.replace(/[^a-zA-Z0-9]/g, "_")}`;
 
 const frame = (value) => {
 	// The length is bytes, not characters: a document with an em dash in it declares four bytes for
@@ -38,16 +51,37 @@ const frame = (value) => {
 const request = (id, method, params) => ({ jsonrpc: "2.0", id, method, params });
 
 async function once() {
+	if (cold) rmSync(cache, { recursive: true, force: true });
 	const child = spawn("lde", ["run", "-C", `${tree}/packages/lye-lsp`, "tests/fixtures/server.lua"], {
 		cwd: tree,
-		env: { ...process.env, LYE_CACHE_DIR: `/tmp/lye-latency-${tree.replace(/[^a-zA-Z0-9]/g, "_")}` },
-		stdio: ["pipe", "pipe", "ignore"],
+		env: { ...process.env, LYE_CACHE_DIR: cache, LYE_TIMING: process.env.LYE_TIMING ?? "1" },
+		stdio: ["pipe", "pipe", "pipe"],
 	});
 
 	let out = "";
 	let settled = 0;
 	const phases = {};
 	const waiters = [];
+	const marks = {};
+	let trace = "";
+	child.stderr.on("data", (chunk) => {
+		trace += chunk.toString();
+		while (true) {
+			const newline = trace.indexOf("\n");
+			if (newline < 0) break;
+			const line = trace.slice(0, newline);
+			trace = trace.slice(newline + 1);
+			const found = line.match(/^lye timing: ([a-z-]+)=([\d.]+)ms(?: (.*))?$/);
+			if (found) {
+				const note = found[3] ?? "";
+				// A cached token answer is a different measurement from building one, and keeping
+				// only the last of them would report the cheap one.
+				const label = found[1] + (note.includes("cached=0") ? ":build" : note.includes("cached=1") ? ":cached" : "");
+				marks[label] = { ms: Number(found[2]), note };
+			}
+		}
+	});
+	const startedAt = performance.now();
 	child.stdout.on("data", (chunk) => {
 		out += chunk.toString();
 		while (true) {
@@ -82,6 +116,7 @@ async function once() {
 		capabilities: {}, rootUri: `file://${tree}`,
 	}));
 	await settle(id++);
+	phases.init = performance.now() - startedAt;
 
 	// The open: nothing is known yet, so this is a parse, an analysis and the first diagnostics.
 	let at = performance.now();
@@ -132,17 +167,28 @@ async function once() {
 	await settle(id - 1);
 	child.kill();
 	phases.shutdown = performance.now() - at;
-	return phases;
+	return { phases, marks };
 }
 
 const results = [];
 for (let round = 0; round < rounds; round += 1) results.push(await once());
 const best = {};
-for (const phase of Object.keys(results[0])) {
-	best[phase] = Math.min(...results.map((r) => r[phase]));
+for (const phase of Object.keys(results[0].phases)) {
+	best[phase] = Math.min(...results.map((r) => r.phases[phase]));
+}
+const marks = {};
+for (const result of results) {
+	for (const [label, mark] of Object.entries(result.marks)) {
+		if (!marks[label] || mark.ms < marks[label].ms) marks[label] = mark;
+	}
 }
 console.log(
 	Object.entries(best)
 		.map(([phase, ms]) => `${phase}=${ms.toFixed(1)}ms`)
-		.join(" ") + `  (${asks} asks, best of ${rounds})`,
+		.join(" ") + `  (${asks} asks, best of ${rounds}${cold ? ", cold" : ""})`,
+);
+console.log(
+	"server " + Object.entries(marks)
+		.map(([label, mark]) => `${label}=${mark.ms.toFixed(1)}ms${mark.note ? `(${mark.note})` : ""}`)
+		.join(" "),
 );

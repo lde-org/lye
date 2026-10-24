@@ -413,6 +413,42 @@ test.it("holds a `.d.lua` document to its annotations, not to bodies it does not
 		"while the same text in a `.lua` file is held to what it writes")
 end)
 
+test.it("reads ffi types only while the ffi plugin is on", function()
+	-- The analyzer has no cdef code left in it: the shipped ffi plugin contributes the classes a
+	-- block declares and the type of `ffi.new`. Turning it off in `lye.json` removes both, which is
+	-- the proof that a dialect can be a plugin rather than a branch in the analyzer.
+	local project = PACKAGE_DIR .. "/target/ffi-toggle"
+	os.execute("rm -rf " .. string.format("%q", project))
+	writeFile(project .. "/lye.json", "{\"plugins\":[\"!ffi\"]}\n")
+	local uri = "file://" .. project .. "/main.lua"
+	local source = table.concat({
+		"local ffi = require(\"ffi\")\n",
+		"ffi.cdef[[ typedef struct { int x; } Vec; ]]\n",
+		"local v = ffi.new(\"Vec\")\n",
+		"v.nope = 1\n",
+		"return v\n",
+	}, "")
+
+	---@param published table[]
+	---@return boolean
+	local function reportsVec(published)
+		for _, message in ipairs(published) do
+			for _, entry in ipairs(message.diagnostics) do
+				if entry.message:match("`nope` is not a field of Vec") then return true end
+			end
+		end
+		return false
+	end
+
+	local off = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project))
+	test.falsy(reportsVec(off), "without the plugin the generated class is not there")
+
+	writeFile(project .. "/lye.json", "{\"plugins\":[]}\n")
+	local on = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project))
+	test.truthy(reportsVec(on), "with it, the member the block never declared is reported")
+	os.execute("rm -rf " .. string.format("%q", project))
+end)
+
 test.it("exits 0 when exit follows shutdown", function()
 	local _, code = run(endingWithShutdown({}))
 	test.equal(code, 0)

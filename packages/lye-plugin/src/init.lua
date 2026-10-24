@@ -2,13 +2,16 @@
 	What a plugin is, and how one is found, loaded and asked.
 
 	A plugin is a Lua module that returns a table of hooks. lye calls them where a document is about
-	to be read, and where an editor has asked something about one:
+	to be read, where its types are worked out, and where an editor has asked something about one:
 
 	* `lower(context)` answers the edits that turn the document into Lua lye can read. A plugin for
 	  another language compiles what it can and says where each piece came from; lye works on the
 	  result and reports in the original, which is what an editor holding that other language needs.
 	* `tokens(context)` answers extra semantic tokens, in the offsets of the text lye read — the
 	  lowered one, when a plugin lowered it.
+	* `types(context)` answers the classes and aliases a dialect declares, and provider hooks for
+	  the calls, fields and callback signatures only it understands. The ffi plugin is what reads
+	  `ffi.cdef` now; nothing in the analyzer knows what a cdef is.
 
 	Only what a plugin has to be handed is handed: the document, the text lye reads, what the
 	analysis worked out, and the map it is working under. Nothing about the server is visible, so a
@@ -19,6 +22,7 @@
 ]]
 
 local source = require("lye-plugin.source")
+local rapidhash = require("rapidhash")
 
 local plugin = {}
 
@@ -28,13 +32,13 @@ local plugin = {}
 local SHIPPED = {
 	patterns = require("lye-plugin.plugins.patterns"),
 	formats = require("lye-plugin.plugins.formats"),
-	cdef = require("lye-plugin.plugins.cdef"),
+	ffi = require("lye-plugin.plugins.ffi"),
 }
 
 --- The order they are asked in when a workspace names none of them: a plugin's kind is looked up
 --- after the ones before it had their say, so the order is written down rather than left to the
 --- table's.
-local SHIPPED_ORDER = { "patterns", "formats", "cdef" }
+local SHIPPED_ORDER = { "patterns", "formats", "ffi" }
 
 --- A context a hook is handed: the document, and the text lye reads.
 ---@class lye.plugin.Context
@@ -43,6 +47,35 @@ local SHIPPED_ORDER = { "patterns", "formats", "cdef" }
 ---@field text string the text lye reads — the lowered text, once a plugin has lowered it
 ---@field root string? the directory `lye.json` was read from, for a plugin with files of its own
 
+--- What a plugin is handed when the analyzer is about to infer types: the parse tree, the
+--- annotations the document wrote, and a way to name a call the way the analyzer does. It is the
+--- same context for every plugin, in the order the workspace listed them.
+---@class lye.plugin.TypeContext
+---@field uri string? the document, when the caller knows one
+---@field source string the document as the editor holds it
+---@field text string the text lye reads
+---@field root string? the directory a package's `lye.json` was read from
+---@field parsed lye.parser.Result
+---@field annotations lye.doc.File
+---@field callName fun(node: lye.parser.Node): string? the dotted name a call is written with
+
+--- A plugin's answer to the type side of a document: the classes and aliases it declares, the
+--- problems it found, and the hooks that resolve what the rest of the analysis cannot. A hook
+--- table is built by `attach`, once the document's own namespace exists, so a contributed type
+--- and a class the writer declared resolve against each other.
+---@class lye.plugin.Types
+---@field annotations lye.doc.File[]? extra annotations, one file per declaration block
+---@field diagnostics { message: string, start: integer, stop: integer, severity: integer? }[]?
+---@field attach fun(resolve: fun(name: string): lye.doc.Type?): lye.plugin.TypeProviders?
+
+--- What a plugin can answer about a document after the namespace is complete. Each hook is
+--- optional; the first answer in plugin order wins.
+---@class lye.plugin.TypeProviders
+---@field call fun(node: lye.parser.Node): any what a call to a construct this plugin knows gives, as a `lye.doc.Type`
+---@field field fun(base: any, baseName: string?, field: string, offset: integer): any what a field read gives; `base` is a `lye.doc.Type`
+---@field parameter fun(declaration: lye.parser.Declaration): any what a declaration's annotation does not say, as a `lye.doc.Type`
+---@field callbackReturns table<integer, any>? what a function literal given to C returns, by node
+
 --- Extra tokens, over the text lye reads.
 ---@class lye.plugin.TokenContext : lye.plugin.Context
 ---@field parsed lye.parser.Result
@@ -50,6 +83,7 @@ local SHIPPED_ORDER = { "patterns", "formats", "cdef" }
 ---@field map lye.plugin.Map the map from the text lye reads back to the document
 ---@field typeOf fun(nodeIdx: integer): lye.doc.Type? what the analyzer worked out for a node
 ---@field ownerOf fun(held: lye.doc.Type?): string? the table a value's fields come from, as its name
+---@field callName fun(node: lye.parser.Node): string? the dotted name a call is written with
 
 --- One token a plugin wants an editor to colour, in the offsets of `context.source` — the document
 --- as the editor holds it, which is the text the colour lands on. A plugin that reads
@@ -68,6 +102,7 @@ local SHIPPED_ORDER = { "patterns", "formats", "cdef" }
 --- `{ "moon" }` says a `.moon` file is one lye should read through this plugin
 ---@field lower fun(context: lye.plugin.Context): lye.plugin.Edit[]?
 ---@field tokens fun(context: lye.plugin.TokenContext): lye.plugin.Span[]?
+---@field types fun(context: lye.plugin.TypeContext): lye.plugin.Types?
 
 --- A file of the workspace's own, loaded the way a plugin file is: a Lua chunk that returns the
 --- hooks. `require` is reachable from it under the name the server's runtime gives it, which is
@@ -115,7 +150,7 @@ local function protect(hooks, name, path, report)
 		end
 		if #list > 0 then spec.extensions = list end
 	end
-	for _, hook in ipairs({ "lower", "tokens" }) do
+	for _, hook in ipairs({ "lower", "tokens", "types" }) do
 		local asked = hooks[hook]
 		if type(asked) == "function" then
 			local broken = false
@@ -135,7 +170,6 @@ end
 --- Whether an entry names a file rather than a plugin: a path is written as one — `./tools/x.lua`,
 --- `/opt/x.lua` — and anything else is a name, resolved the way a `require` is.
 ---@param entry string
----@return boolean
 local function isPath(entry)
 	return entry:sub(1, 1) == "." or entry:sub(1, 1) == "/" or entry:sub(-4) == ".lua"
 end
@@ -265,6 +299,67 @@ function plugin.tokens(specs, context)
 		end
 	end
 	return spans
+end
+
+--- What each plugin contributes to the type side of a document, in the order it was asked. The
+--- analyzer merges the annotations and diagnostics before it builds the namespace; `attach` is
+--- called after, with the resolver, so a contributed class and a class the document declares mean
+--- the same thing to one another. A fault in one hook is reported and that plugin answers nothing,
+--- the same rule `lower` and `tokens` follow.
+---@param specs lye.plugin.Spec[]
+---@param context lye.plugin.TypeContext
+---@param report fun(message: string)
+---@return { name: string, types: lye.plugin.Types }[]
+function plugin.types(specs, context, report)
+	local out = {}
+	for _, spec in ipairs(specs) do
+		if spec.types then
+			local asked = spec.types(context)
+			if type(asked) == "table" then
+				local attach = asked.attach
+				if type(attach) == "function" then
+					local broken = false
+					asked.attach = function(resolve)
+						if broken then return nil end
+						local ok, providers = pcall(attach, resolve)
+						if ok then return providers end
+						broken = true
+						report(string.format("plugin `%s`: types.attach is broken: %s", spec.name, providers))
+						return nil
+					end
+				end
+				out[#out + 1] = { name = spec.name, types = asked }
+			end
+		end
+	end
+	return out
+end
+
+--- A key for what a set of plugins can say. The analyzer's answers are kept between runs, and a
+--- workspace that turned the ffi plugin off must not read what it said when it was on; the file a
+--- plugin of the workspace's own is read from is part of the key for the same reason. The answer is
+--- kept against the spec table itself, which is loaded once per package, so the file is read on
+--- the first analysis rather than on every keystroke.
+---@type table<lye.plugin.Spec[], string>
+local digests = setmetatable({}, { __mode = "k" })
+---@param specs lye.plugin.Spec[]?
+---@return string
+function plugin.digest(specs)
+	local held = specs and digests[specs]
+	if held then return held end
+	local parts = {}
+	for _, spec in ipairs(specs or {}) do
+		parts[#parts + 1] = spec.name
+		if spec.path then
+			local handle = io.open(spec.path, "rb")
+			local text = handle and handle:read("*a")
+			if handle then handle:close() end
+			parts[#parts + 1] = type(text) == "string" and text or ""
+		end
+	end
+	local value = rapidhash.hex(table.concat(parts, "\0"))
+	if specs then digests[specs] = value end
+	return value
 end
 
 return plugin

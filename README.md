@@ -109,6 +109,15 @@ it (1.20 of that the node tables, 316 bytes a node), 0.87 MiB for the definition
 analysis itself — and `tools/sweep.lua` type-checks this repository with the same analyzer, which is
 what keeps the numbers above honest about the code that produced them.
 
+A session reports its own startup on stderr: `lye timing: initialize=…` and
+`lye timing: workspace-scan=…ms files=…` are always written, and `LYE_TIMING=1` adds a mark per open,
+analysis, keystroke, token build and plugin walk. `tools/latency.mjs` drives the real server over
+stdio and prints those marks beside the editor's phases — `COLD=1` makes every round a first run, and
+`FILE=` opens a typical file rather than the largest. `tools/bench-plugins.lua` times the shipped
+token hooks against the same document with each one off: on the largest source file the three hooks
+answer in 3–4 ms of a 73–93 ms token build, and the spec tables a session keeps per package are a
+few KiB, so the plugin layer is not where a keystroke goes — the analyzer and the parser are.
+
 ## Editors
 
 | Editor | Where | Install |
@@ -127,18 +136,22 @@ with — a path for a file of the workspace's own, a name for a module the packa
 { "plugins": ["./tools/moonscript.lua", "lye-plugin-moonscript", "!patterns"] }
 ```
 
-A plugin answers one or both of two hooks, and names the files its language is written in. `lower`
+A plugin answers one or more of three hooks, and names the files its language is written in. `lower`
 turns a document into Lua — the plugin compiles what it can and says where each piece came from, lye
 reads the result and reports in the original, so a fault inside a synthesized line lands on the line
 the reader wrote, and something like MoonScript gets the analysis lye would give the Lua it compiles
 to. `tokens` adds colours of its own, for a language or a library lye does not know: a plugin's span
 wins over what lye's own walk found, so it can colour `%d` inside a literal without hiding the
-literal. `lye check` reads a package through the same plugins, and its walk reaches the files they
-claim — `extensions = { "moon" }` is what makes `lye check .` check a MoonScript project.
+literal. `types` contributes classes, aliases and the types of the calls and fields only it
+understands. `lye check` reads a package through the same plugins, and its walk reaches the files
+they claim — `extensions = { "moon" }` is what makes `lye check .` check a MoonScript project.
 
-lye's own pattern, format and `ffi.cdef` colouring are plugins now, and they are the worked
-examples: `packages/lye-plugin` documents the interface, the hooks a plugin answers, and what each
-context carries.
+lye's own pattern, format and ffi handling are plugins now. The ffi plugin owns the whole dialect:
+it reads every `ffi.cdef` block, contributes the C types it declares and the results of `ffi.new`,
+`ffi.cast`, `ffi.load` and `ffi.C`, and colours the same block. Turn it off with `"!ffi"` and the
+file still reads without that knowledge, which is the point: a plugin can carry a dialect all the
+way through types and colours. `packages/lye-plugin` documents the interface and what each context
+carries; the shipped plugins are the worked examples.
 
 ## lde projects
 

@@ -53,6 +53,7 @@ local function codeVersion()
 		require("lye-parser").parse,
 		require("lye-lexer").tokenize,
 		require("lye-cdef").parse,
+		require("lye-plugin").types,
 		require("lye-lsp.check").files,
 	}
 	for _, fn in ipairs(sources) do

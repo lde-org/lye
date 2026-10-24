@@ -5,6 +5,8 @@
 	works in a build step.
 ]]
 
+-- Loaded first so the `initialize` mark measures the command line's own startup too.
+require("lye-lsp.timing")
 local check = require("lye-lsp.check")
 local report = require("lye-lsp.report")
 local cache = require("lye-lsp.cache")
