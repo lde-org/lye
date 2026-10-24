@@ -27,6 +27,7 @@ if #roots == 0 then
 		ROOT .. "packages/lye-analyzer/src", ROOT .. "packages/lye-lsp/src", ROOT .. "packages/lye-doc/src",
 		ROOT .. "packages/lye-parser/src", ROOT .. "packages/lye-framework/src", ROOT .. "packages/lye-cdef/src",
 		ROOT .. "packages/lye-lexer/src", ROOT .. "packages/lye-json/src", ROOT .. "packages/lye-rpc/src",
+		ROOT .. "packages/lye-plugin/src",
 		-- The tools are Lua too, and they are the files most likely to drift: they read the packages
 		-- through the same annotations a document does.
 		ROOT .. "tools",

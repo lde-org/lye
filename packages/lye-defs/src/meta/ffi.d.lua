@@ -1,23 +1,17 @@
 ---@meta ffi
 
----@class ffilib
----@field C    ffi.namespace* the C namespace: what a `cdef` declared, reached by name
----@field arch 'x86'|'x64'|'arm'|'arm64'|'arm64be'|'ppc'|'ppc64'|'ppc64le'|'mips'|'mipsel'|'mips64'|'mips64el'|string
----@field os   'Windows'|'Linux'|'OSX'|'BSD'|'POSIX'|'Other'|string
-ffi = {}
-
 ---@class ffi.namespace*: table
 ---@field [string] function
 
 ---@class ffi.ctype*: userdata
 ---@overload fun(init?: any, ...): ffi.cdata*
 ---@overload fun(nelem?: integer, init?: any, ...): ffi.cdata*
-local ctype
 
 ---@class ffi.cdecl*: string
 ---@class ffi.cdata*: userdata
 ---@alias ffi.ct*     ffi.ctype*|ffi.cdecl*|ffi.cdata*
----@class ffi.cb*:    ffi.cdata*
+
+---@class ffi.cb*: ffi.cdata*
 local cb
 ---@class ffi.VLA*:   userdata
 ---@class ffi.VLS*:   userdata
@@ -80,116 +74,66 @@ local cb
 ---@class ffi.ptr<T: ffi.cdata*>: ffi.cdata
 ---@field [integer] T
 
-
-
 ---@class ffilib
----@field C    ffi.namespace*
----@field os   string
----@field arch string
+---@field C    ffi.namespace* the C namespace: what a `cdef` declared, reached by name
+---@field arch 'x86'|'x64'|'arm'|'arm64'|'arm64be'|'ppc'|'ppc64'|'ppc64le'|'mips'|'mipsel'|'mips64'|'mips64el'|string
+---@field os   'Windows'|'Linux'|'OSX'|'BSD'|'POSIX'|'Other'|string
 local ffi = {}
 
----@param def     string
----@param params? any
-function ffi.cdef(def, params, ...) end
+function ffi.cdef(def: string, params?: any, ...) end
 
----@param name    string
----@param global? boolean
----@return ffi.namespace* clib
 ---@nodiscard
-function ffi.load(name, global) end
+function ffi.load(name: string, global?: boolean): ffi.namespace* end
 
 ---@overload fun(ct: ffi.ct*, init: any, ...)
----@param ct     ffi.ct*
----@param nelem? integer
----@param init?  any
----@return ffi.cdata* cdata
 ---@nodiscard
-function ffi.new(ct, nelem, init, ...) end
+function ffi.new(ct: ffi.ct*, nelem?: integer, init?: any, ...): ffi.cdata* end
 
----@param ct      ffi.ct*
----@param params? any
----@return ffi.ctype* ctype
 ---@nodiscard
-function ffi.typeof(ct, params, ...) end
+function ffi.typeof(ct: ffi.ct*, params?: any, ...): ffi.ctype* end
 
----@param ct   ffi.ct*
----@param init any
----@return ffi.cdata* cdata
 ---@nodiscard
-function ffi.cast(ct, init) end
+function ffi.cast(ct: ffi.ct*, init: any): ffi.cdata* end
 
----@param ct        ffi.ctype*|ffi.cdata* a type, not the name of one: `ffi.metatype("int", ...)` is refused
----@param metatable table
----@return ffi.ctype* ctype
-function ffi.metatype(ct, metatable) end
+---The type has to be one, not the name of one: `ffi.metatype("int", ...)` is refused.
+function ffi.metatype(ct: ffi.ctype*|ffi.cdata*, metatable: table): ffi.ctype* end
 
----@generic T: ffi.cdata*
----@param cdata T
----@param finalizer? fun(obj: T)
----@return T cdata
-function ffi.gc(cdata, finalizer) end
+function ffi.gc<T: ffi.cdata*>(cdata: T, finalizer?: fun(obj: T)): T end
 
----@param ct     ffi.ct*
----@param nelem? integer
----@return integer|nil size
 ---@nodiscard
-function ffi.sizeof(ct, nelem) end
+function ffi.sizeof(ct: ffi.ct*, nelem?: integer): integer? end
 
----@param ct ffi.ct*
----@return integer align
 ---@nodiscard
-function ffi.alignof(ct) end
+function ffi.alignof(ct: ffi.ct*): integer end
 
----@param ct    ffi.ct*
----@param field string
 ---@return integer  ofs
 ---@return integer? bpos
 ---@return integer? bsize
 ---@nodiscard
-function ffi.offsetof(ct, field) end
+function ffi.offsetof(ct: ffi.ct*, field: string) end
 
----@param ct  ffi.ct*
----@param obj any
----@return boolean status
 ---@nodiscard
-function ffi.istype(ct, obj) end
+function ffi.istype(ct: ffi.ct*, obj: any): boolean end
 
----@param newerr? integer
----@return integer err
 ---@nodiscard
-function ffi.errno(newerr) end
+function ffi.errno(newerr?: integer): integer end
 
----@param ptr  ffi.cdata*|string
----@param len? integer
----@return string str
-function ffi.string(ptr, len) end
+function ffi.string(ptr: ffi.cdata*|string, len?: integer): string end
 
 ---@overload fun(dst: ffi.cdata*, str: string)
----@param dst ffi.cdata*
----@param src ffi.cdata*|string
----@param len integer
-function ffi.copy(dst, src, len) end
+function ffi.copy(dst: ffi.cdata*, src: ffi.cdata*|string, len: integer) end
 
----@param dst ffi.cdata*
----@param len integer
----@param c?  integer
-function ffi.fill(dst, len, c) end
+function ffi.fill(dst: ffi.cdata*, len: integer, c?: integer) end
 
----@param param string
----@return boolean status
-function ffi.abi(param) end
+function ffi.abi(param: string): boolean end
 
 ---A table describing a C type: how large it is, how it is aligned, what it is an array or a
 ---pointer of, and the names and offsets of its fields.
----@param ct ffi.ct*
----@param ... any
----@return table info
 ---@nodiscard
-function ffi.typeinfo(ct, ...) end
+function ffi.typeinfo(ct: ffi.ct*, ...: any): table end
 
 function cb:free() end
 
----@param func function
-function cb:set(func) end
+function cb:set(func: function) end
 
 return ffi

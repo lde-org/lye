@@ -29,6 +29,9 @@
 		"lye-defs": {
 			"path": "../lye-defs"
 		},
+		"lye-plugin": {
+			"path": "../lye-plugin"
+		},
 		"lye-cdef": {
 			"path": "../lye-cdef"
 		},

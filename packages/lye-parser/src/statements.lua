@@ -177,7 +177,11 @@ function statements.parseLocal(self, start)
 			-- `local held: number = 1` writes the type where the name is.
 			if self.definition then
 				self:skipComments()
-				if self:accept(":") then declaration.inlineType = self:skipInlineType() end
+				if self:accept(":") then
+					local text, from, to = self:skipInlineType()
+					declaration.inlineType, declaration.inlineTypeStart, declaration.inlineTypeStop =
+						text, from, to
+				end
 			end
 			first = first or self.lastDeclaration
 			count += 1

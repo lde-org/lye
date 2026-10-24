@@ -14,6 +14,7 @@ usage: lye [options] [files...]
 
   (no arguments)   serve the language server over stdio
   --stdio          the same, and what editors pass
+  init [dir]       write a lye.json there, or in the working directory, if there is not one already
   check [paths...] check every Lua file under the paths, or the working directory
   --check <file>   the same for the files named, kept for scripts that pass it
   --cache <dir>    keep what a run worked out there, instead of ./.lye
@@ -22,6 +23,16 @@ usage: lye [options] [files...]
   --color          report with it, for a log that will render it
   --version        print the version
   --help           print this message
+]]
+
+--- What `lye init` writes: the file lye reads, with every key it knows about and nothing said yet.
+--- A workspace that wants a plugin or a search path of its own edits this rather than remembering
+--- the shape of it.
+local STARTER = [[
+{
+	"plugins": [],
+	"requirePaths": []
+}
 ]]
 
 local args = arg or {}
@@ -42,6 +53,31 @@ local index = 1
 if args[1] == "check" then
 	isCheck = true
 	index = 2
+elseif args[1] == "init" then
+	-- A workspace says what it wants in a file beside it, and the file has a shape worth getting
+	-- right: this writes it, and never over one that is already there — a configuration is
+	-- somebody's work, not an output. A directory may be named, since the file belongs beside what
+	-- it configures rather than where a shell happens to be.
+	local dir = args[2] or "."
+	if dir:sub(-1) == "/" then dir = dir:sub(1, -2) end
+	if dir == "" then dir = "." end
+	local path = dir .. "/lye.json"
+	local handle = io.open(path, "rb")
+	if handle then
+		handle:close()
+		io.stderr:write(string.format("lye: %s is already here, and is yours to edit\n", path))
+		os.exit(1)
+	end
+	local write, err = io.open(path, "wb")
+	if not write then
+		io.stderr:write(string.format("lye: cannot write %s: %s\n", path, err or "?"))
+		os.exit(1)
+	end
+	write:write(STARTER)
+	write:close()
+	print(string.format("wrote %s: `plugins` is a list of the plugins this workspace reads with, "
+		.. "and `requirePaths` where its modules are", path))
+	return
 end
 while args[index] do
 	local value = args[index]

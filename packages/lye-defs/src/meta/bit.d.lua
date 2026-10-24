@@ -3,73 +3,40 @@
 ---@class bitlib
 bit = {}
 
----@param x integer
----@return integer y
 ---@nodiscard
-function bit.tobit(x) end
+function bit.tobit(x: integer): integer end
 
----@param x  integer
----@param n? integer
----@return string y
 ---@nodiscard
-function bit.tohex(x, n) end
+function bit.tohex(x: integer, n?: integer): string end
 
----@param x integer
----@return integer y
 ---@nodiscard
-function bit.bnot(x) end
+function bit.bnot(x: integer): integer end
 
----@param x   integer
----@param ... integer
----@return integer y
 ---@nodiscard
-function bit.bor(x, ...) end
+function bit.bor(x: integer, ...: integer): integer end
 
----@param x   integer
----@param ... integer
----@return integer y
 ---@nodiscard
-function bit.band(x, ...) end
+function bit.band(x: integer, ...: integer): integer end
 
----@param x   integer
----@param ... integer
----@return integer y
 ---@nodiscard
-function bit.bxor(x, ...) end
+function bit.bxor(x: integer, ...: integer): integer end
 
----@param x integer
----@param n integer
----@return integer y
 ---@nodiscard
-function bit.lshift(x, n) end
+function bit.lshift(x: integer, n: integer): integer end
 
----@param x integer
----@param n integer
----@return integer y
 ---@nodiscard
-function bit.rshift(x, n) end
+function bit.rshift(x: integer, n: integer): integer end
 
----@param x integer
----@param n integer
----@return integer y
 ---@nodiscard
-function bit.arshift(x, n) end
+function bit.arshift(x: integer, n: integer): integer end
 
----@param x integer
----@param n integer
----@return integer y
 ---@nodiscard
-function bit.rol(x, n) end
+function bit.rol(x: integer, n: integer): integer end
 
----@param x integer
----@param n integer
----@return integer y
 ---@nodiscard
-function bit.ror(x, n) end
+function bit.ror(x: integer, n: integer): integer end
 
----@param x integer
----@return integer y
 ---@nodiscard
-function bit.bswap(x) end
+function bit.bswap(x: integer): integer end
 
 return bit

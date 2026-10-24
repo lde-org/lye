@@ -5,43 +5,34 @@
 coroutine = {}
 
 ---Creates a new coroutine, with body `f`. `f` must be a function. Returns this new coroutine, an object with type `"thread"`.
----@param f fun(...):...
----@return thread
 ---@nodiscard
-function coroutine.create(f) end
+function coroutine.create(f: function): thread end
 
 
 
 ---Starts or continues the execution of coroutine `co`.
----@param co    thread
----@param val1? any
 ---@return boolean success
 ---@return any ...
-function coroutine.resume(co, val1, ...) end
+function coroutine.resume(co: thread, val1?: any, ...: any) end
 
 ---Returns the running coroutine, or nil when called by the main thread.
----@return thread|nil running
 ---@nodiscard
-function coroutine.running() end
+function coroutine.running(): thread? end
 
 ---Returns the status of coroutine `co`.
----@param co thread
 ---@return
 ---| '"running"'   # Is running.
 ---| '"suspended"' # Is suspended or not started.
 ---| '"normal"'    # Is active but not running.
 ---| '"dead"'      # Has finished or stopped with an error.
 ---@nodiscard
-function coroutine.status(co) end
+function coroutine.status(co: thread) end
 
 ---Creates a new coroutine, with body `f`; `f` must be a function. Returns a function that resumes the coroutine each time it is called.
----@param f fun(...):...
----@return fun(...):...
 ---@nodiscard
-function coroutine.wrap(f) end
+function coroutine.wrap(f: function): function end
 
 ---Suspends the execution of the calling coroutine.
----@return any ...
-function coroutine.yield(...) end
+function coroutine.yield(...: any): any ... end
 
 return coroutine

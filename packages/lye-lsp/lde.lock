@@ -32,6 +32,9 @@
 		"lye-parser": {
 			"path": "../lye-parser"
 		},
+		"lye-plugin": {
+			"path": "../lye-plugin"
+		},
 		"lye-rpc": {
 			"path": "../lye-rpc"
 		},
@@ -44,6 +47,6 @@
 			"git": "https://github.com/lde-org/rapidhash.git"
 		}
 	},
-	"manifestHash": "477cffd3490530b9",
+	"manifestHash": "0de4d1845fcddda3",
 	"version": "1"
 }

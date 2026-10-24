@@ -1,85 +1,77 @@
 # lye-defs
 
-LuaJIT standard library definitions, as `---@` annotations the analyzer can read.
+LuaJIT's standard library, as `---@` annotations the analyzer reads.
 
-They are derived from [LuaLS](https://github.com/LuaLS/lua-language-server)'s `meta/template`, with
-its generator directives evaluated for this target and removed:
+Written by hand against the engine rather than derived from another editor's definitions: what
+matters is that a signature is what LuaJIT does, and lye's type system can say more of it than
+LuaCATS can — types are written inline where a reader sees them, so a signature is one line:
 
-| Removed | Why |
-|---|---|
-| `---#if` / `---#elseif` / `---#else` / `---#end` | evaluated, not carried: `VERSION` is 5.1 and `JIT` is true |
-| `---#DES '...'` | documentation text for LuaLS's own website |
-| `---@version ...` | about the edition the entry came from, which the conditionals already decided |
-| `utf8.lua` | dropped whole: its file guard is `VERSION <= 5.2`, and LuaJIT has no utf8 library |
-
-`bit.lua` and `jit.lua` are kept for the same reason in reverse: their guard is `not JIT`.
-
-## Regenerating
-
-```sh
-lde run -C packages/lye-defs tools/derive.lua [path/to/lua-language-server] [--check]
+```lua
+function table.move<T>(a1: T[], f: integer, e: integer, t: integer, a2?: T[]): T[] end
 ```
 
-`tools/derive.lua` decides every guard for LuaJIT (`VERSION` is 5.1, `JIT` is true, `DISABLE()` marks
-what belongs to another edition), drops the entries whose `---@version` says another edition, fills
-in the documentation from `locale/en-us/meta.lua`, and writes both `meta/` and the embedded
-`src/init.lua`. Edit the tool, not the output: regenerating overwrites it.
+`?` marks a parameter a caller may leave out, `...: T` says what the extra arguments are, `<T>`
+declares a generic, and everything after `):` is what the call gives back. Only what cannot be
+written that way stays an annotation: `---@overload` for the other shapes a call may take,
+`---@nodiscard`, `---@deprecated`, a `---@return` of several values, and the prose above each
+entry.
 
-**It walks the result against the running engine.** The tool runs inside LuaJIT, so it asks whether
-each `function lib.name` it is about to write actually exists — `table.pack`, `table.unpack`,
-`rawlen`, `debug.getuservalue`, `debug.setuservalue` and `debug.setcstacklimit` do not, and are
-dropped rather than offered.
+Where the shape of a value decides what a caller may write, it is written out: `debug.sethook`'s
+hook is `fun(event: string, line: integer?)`, `table.concat` takes `(string|number)[]`, `ffi.cast`
+gives back `ffi.cdata*`, and `getmetatable` answers `lye.Metatable<any>?`. Where nothing is known —
+the chunk `load` hands back, the callback `jit.attach` is given — the definition says `function`,
+and a table whose contents do not matter says `table`. A precise spelling that says no more than
+those is noise, and the analyzer says so: writing `fun(...):...` is hinted as identical to
+`function`, since every parameter of it is `any`, it takes any number of them and it gives back
+`any`.
 
-**Five entries are deliberately not what the template says**, and the tool enforces each of them so
-they survive a regeneration:
+Classes are declared with `---@field` rather than a table literal: the fields are the class, and a
+local that exists only to carry them is a value nothing reads. Where a name is only another type's
+name, it is an `---@alias` (`---@alias jit.snap integer[]`, `---@alias ffi.ct* ffi.ctype*|ffi.cdecl*|ffi.cdata*`).
 
-| Entry | Deviation | Why |
+A module (`jit.util`, `jit.profile`, `string.buffer`) declares the class its own table is, so
+`require` answers with a name rather than a shape. It also keeps the `---@overload` shapes on
+`util.tracesnap`, `profile.dumpstack` and `buffer.new` reachable: an overload written on a plain
+table's field is not consulted today, which made `buffer.new({ dict = ... })` a false positive.
+
+## Layout
+
+`src/meta/` holds one file per library. `build.lua` gathers them into `defs.lua`, which `src/init.lua`
+requires — so the files are read and edited one at a time and nothing generated is stored in the
+repository.
+
+The analyzer reads them as a **prelude**: `analyzer.prelude(require("lye-defs"))` parses them once
+per process, and `analyze(source, prelude)` folds their classes, aliases, signatures and returns in
+under the document's own declarations. Both the editor and `lye check` pass it, so they see the same
+standard library.
+
+## Engines and editions
+
+Only what the running engine has is declared. `table.pack`, `table.unpack`, `rawlen` and
+`debug.setuservalue` are not in this LuaJIT and are not here; `bit.lua` and `jit.lua` are, because
+this engine has them. `utf8` is absent for the same reason. A definition for a function that is not
+there is a completion that lies.
+
+`ffi` and the rest are what `require` hands back: `local ffi = require("ffi")` is the module table
+each file returns, and `os`, `io`, `string`, `table`, `math`, `debug`, `coroutine`, `package`,
+`bit` and `jit` are also globals, which the file declares as well.
+
+## Entries written to say more
+
+| Entry | Difference | Why |
 |---|---|---|
 | `setmetatable` | `---@generic T: table` with `---@return T` | the result is the metatable's class, which is what makes `setmetatable({}, Point)` a `Point` |
 | `assert` | `---@return v is -nil` | a predicate: the call proves its argument is not nil |
 | `error` | `---@return never` | the call does not come back, so what follows it is dead code |
 | `unpack` (two entries) | `---@generic T...` | ten parameters and ten indexed fields imitating a tuple, where a variadic generic says the same |
 
-**The shape of a metatable is written here rather than derived**, because a LuaCATS template has no
-way to say "this table is a metatable": `LYE_ONLY` in the tool appends `lye.Metatable<T>` to
-`basic`, with every metamethod optional and typed as the function the engine calls it as. The
-analyzer enforces that shape on every `setmetatable` call — a `__add` that is not a function, a
-name Lua does not have, or an operand of the wrong kind is an error — since a class used as a
-metatable could not satisfy a class constraint under nominal typing.
+**The shape of a metatable is written here rather than described**, because LuaCATS has no other way
+to say "this table is a metatable": `lye.Metatable<T>` in `basic` lists every metamethod as optional
+and typed as the function the engine calls it as. The analyzer enforces that shape on every
+`setmetatable` call — a `__add` that is not a function, a name Lua does not have, or an operand of
+the wrong kind is an error.
 
-`src/meta/` is the editable copy. `src/init.lua` embeds the same text, because `lde compile` produces a
-standalone binary and a path into a package would not exist on the machine running the server.
-
-The analyzer reads them as a **prelude**: `analyzer.prelude(require("lye-defs"))` parses them once
-per process, and `analyze(source, prelude)` folds their classes, aliases, signatures and returns in
-under the document's own declarations. Both the editor and `lye check` pass it, so they see the
-same standard library.
-
-Three entries are written differently from the template they came from, because the difference is
-worth typing:
-
-```lua
----@generic T
----@param v? T
----@param message? any
----@param ... any
----@return T
----@return any ...
----@return v is -nil           -- a call to assert proves v is not nil
-function assert(v, message, ...) end
-
----@param message any
----@param level?  integer
----@return never               -- error does not come back
-function error(message, level) end
-```
-
-`never` makes what follows the call dead code, which the analyzer reports; the predicate narrows
-the argument for the rest of the block, so `if not handle then error("...") end` leaves `handle`
-non-nil. `setmetatable` is the third: the template returns `table`, and the copy here takes a
-`---@generic T: table` and returns `T`, so `setmetatable({}, Point)` is a `Point`.
-
-Everything else keeps the documentation LuaLS wrote for it, which is what hover and completion show:
+Everything else keeps the documentation the entry came with, which is what hover and completion show:
 
     math.floor(x: number) -> integer
 

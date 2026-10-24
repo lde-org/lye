@@ -233,6 +233,27 @@ test.it("reads the signature a definition file writes inline", function()
 	test.truthy(shown:find("string", 1, true), "and so is what it gives back: " .. shown)
 end)
 
+test.it("colours the types a definition file writes inline", function()
+	-- `function takes(n: number): string` writes its types where a reader sees them, and they are
+	-- types: an editor colours the word inside one as a type rather than as a variable.
+	local source = table.concat({
+		"function takes(n: number, s: string): boolean\n",
+		"\treturn true\n",
+		"end\n",
+		"return takes\n",
+	}, "")
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/semanticTokens/full",
+		params = { textDocument = { uri = "file:///f.d.lua" } },
+	} }, source, nil, "file:///f.d.lua")
+	local counts = {}
+	for index = 1, #(results["2"].data), 5 do
+		local kind = results["2"].data[index + 3]
+		counts[kind] = (counts[kind] or 0) + 1
+	end
+	test.equal(counts[8] or 0, 3, "the two parameter types and the return type all read as types")
+end)
+
 test.it("answers for a dotted type name as one name", function()
 	-- Dots are characters in a type name, so `jit.funcinfo.c` is one name: the jumps land on the
 	-- class, and the highlight covers the whole name rather than one segment of it.
@@ -572,6 +593,28 @@ test.it("formats the way the project's editorconfig asks", function()
 	test.truthy((replaced[6] or ""):find("\n", 1, true) ~= nil, "with a newline at the end of the file")
 end)
 
+--- The substrings a semantic-token answer marks with a kind, in order. What a reader sees is which
+--- bytes are marked, so that is what is asked; how many pieces the answer is cut into is the
+--- server's business.
+---@param data table the answer's five numbers per token
+---@param text string the document
+---@param kind integer the kind to collect
+---@return string
+local function marked(data, text, kind)
+	local lines = {}
+	for piece in (text .. "\n"):gmatch("([^\n]*)\n") do lines[#lines + 1] = piece end
+	local out = {}
+	local line, character = 0, 0
+	for index = 1, #data, 5 do
+		line = line + data[index]
+		character = data[index] == 0 and (character + data[index + 1]) or data[index + 1]
+		if data[index + 3] == kind then
+			out[#out + 1] = lines[line + 1]:sub(character + 1, character + data[index + 2])
+		end
+	end
+	return table.concat(out, ",")
+end
+
 test.it("colours the conversions and the pattern inside a literal a function interprets", function()
 	-- `string.format("%d")` reads its first argument as conversions and the pattern functions read
 	-- theirs as patterns, so the parts that are interpreted are not text. Nothing in the definitions
@@ -585,14 +628,13 @@ test.it("colours the conversions and the pattern inside a literal a function int
 	}, "")
 	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
 	local data = results["2"].data
-	local counts = {}
+	test.equal(marked(data, source, 13), "%d,%s,%s,+",
+		"the two conversions and every part of the pattern are marked")
+	local strings = 0
 	for index = 1, #data, 5 do
-		-- A token is five numbers from where `index` points: the two deltas, the length, the kind.
-		local kind = data[index + 3]
-		counts[kind] = (counts[kind] or 0) + 1
+		if data[index + 3] == 1 then strings = strings + 1 end
 	end
-	test.equal(counts[13] or 0, 4, "the two conversions and the two halves of the pattern are marked")
-	test.truthy((counts[1] or 0) > 0, "while the strings they sit in are still strings")
+	test.truthy(strings > 0, "while the strings they sit in are still strings")
 end)
 
 test.it("colours a pattern a method is called on a value rather than a name", function()
@@ -605,14 +647,8 @@ test.it("colours a pattern a method is called on a value rather than a name", fu
 	}, "")
 	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
 	local data = results["2"].data
-	local counts = {}
-	for index = 1, #data, 5 do
-		local kind = data[index + 3]
-		counts[kind] = (counts[kind] or 0) + 1
-	end
-	-- Three pieces from each `%s+` — the class and its quantifier — and two from `^%s+`, which is
-	-- the two of them plus the anchor.
-	test.equal(counts[13] or 0, 7, "both halves of the chained pattern and the literal's own")
+	test.equal(marked(data, source, 13), "%s,+,^,%s,+,%s,+",
+		"the pattern of each call, the anchor's included")
 end)
 
 test.it("colours an ffi.cdef from its own parse", function()

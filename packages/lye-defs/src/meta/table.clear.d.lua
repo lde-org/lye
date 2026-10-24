@@ -6,7 +6,6 @@
 ---```
 ---Please note this function is meant for very specific situations. In most cases it's better to replace the (usually single) link with a new table and let the GC do its work.
 ---
----@param tab table
-local function clear(tab) end
+local function clear(tab: table) end
 
 return clear

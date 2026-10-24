@@ -25,11 +25,10 @@ io = {}
 ---| "a+b" # Append update mode, previous data is preserved, writing is only allowed at the end of file. (in binary mode.)
 
 ---Close `file` or default output file.
----@param file? file*
 ---@return true?    suc
 ---@return string?  errmsg
 ---@return integer? errcode
-function io.close(file) end
+function io.close(file?: file*) end
 
 ---Saves any written data to default output file.
 ---@return true?    suc
@@ -38,9 +37,7 @@ function io.close(file) end
 function io.flush() end
 
 ---Sets `file` as the default input file.
----@param file? string|file*
----@return file*
-function io.input(file) end
+function io.input(file?: string|file*): file* end
 
 ---------
 ---```lua
@@ -49,43 +46,34 @@ function io.input(file) end
 ---end
 ---```
 ---
----@param filename string?
----@param ... readmode
 ---@return fun():any
-function io.lines(filename, ...) end
+function io.lines(filename?: string, ...: readmode) end
 
 ---Opens a file, in the mode specified in the string `mode`.
----@param filename string
----@param mode?    openmode
 ---@return file*?
 ---@return string?  errmsg
 ---@return integer? errcode
 ---@nodiscard
-function io.open(filename, mode) end
+function io.open(filename: string, mode?: openmode) end
 
 ---Sets `file` as the default output file.
----@param file? string|file*
----@return file*
-function io.output(file) end
+function io.output(file?: string|file*): file* end
 
 ---@alias popenmode
 ---| "r" # Read data from this program by `file`.
 ---| "w" # Write data to this program by `file`.
 
 ---Starts program prog in a separated process.
----@param prog  string
----@param mode? popenmode
 ---@return file*?
 ---@return string?  errmsg
 ---@return integer? errcode
-function io.popen(prog, mode) end
+function io.popen(prog: string, mode?: popenmode) end
 
 ---Reads the `file`, according to the given formats, which specify what to read.
----@param ... readmode
 ---@return any
 ---@return any ...
 ---@nodiscard
-function io.read(...) end
+function io.read(...: readmode) end
 
 ---In case of success, returns a handle for a temporary file.
 ---@return file*?
@@ -100,17 +88,14 @@ function io.tmpfile() end
 ---| `nil`         # Is not a file handle.
 
 ---Checks whether `obj` is a valid file handle.
----@param file any
----@return filetype
 ---@nodiscard
-function io.type(file) end
+function io.type(file: any): filetype end
 
 ---Writes the value of each of its arguments to default output file.
----@param ... string|number
 ---@return true?    suc
 ---@return string?  errmsg
 ---@return integer? errcode
-function io.write(...) end
+function io.write(...: string|number) end
 
 ---
 ---@class file*
@@ -141,16 +126,14 @@ function file:flush() end
 ---end
 ---```
 ---
----@param ... readmode
 ---@return fun():any
-function file:lines(...) end
+function file:lines(...: readmode) end
 
 ---Reads the `file`, according to the given formats, which specify what to read.
----@param ... readmode
 ---@return any
 ---@return any ...
 ---@nodiscard
-function file:read(...) end
+function file:read(...: readmode) end
 
 ---@alias seekwhence
 ---| "set" # Base is beginning of the file.
@@ -158,12 +141,10 @@ function file:read(...) end
 ---| "end" # Base is end of file.
 
 ---Sets and gets the file position, measured from the beginning of the file.
----@param whence? seekwhence
----@param offset? integer
 ---@return integer? offset
 ---@return string?  errmsg
 ---@return integer? errcode
-function file:seek(whence, offset) end
+function file:seek(whence?: seekwhence, offset?: integer) end
 
 ---@alias vbuf
 ---| "no"   # Output operation appears immediately.
@@ -171,18 +152,15 @@ function file:seek(whence, offset) end
 ---| "line" # Buffered until a newline is output.
 
 ---Sets the buffering mode for an output file.
----@param mode vbuf
----@param size? integer
 ---@return true?    suc
 ---@return string?  errmsg
 ---@return integer? errcode
-function file:setvbuf(mode, size) end
+function file:setvbuf(mode: vbuf, size?: integer) end
 
 ---Writes the value of each of its arguments to `file`.
----@param ... string|number
 ---@return true?    suc
 ---@return string?  errmsg
 ---@return integer? errcode
-function file:write(...) end
+function file:write(...: string|number) end
 
 return io

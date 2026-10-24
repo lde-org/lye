@@ -111,6 +111,28 @@ types.VOID = make("void")
 --- The bottom type: a call that does not come back, as `error` does. Nothing is a `never`, and a
 --- `never` is everything, so it sits under every other type in the lattice.
 types.NEVER = make("never")
+--- The name a value's fields are found under, which is what says whether a field is a function of
+--- the standard library: a string reads `string`'s fields, and a class is its own name. A value
+--- that may be absent still names what it is where it is one — which is the case a `?.` is written
+--- for — so a union answers with the first of its members that names something.
+---@param held lye.doc.Type?
+---@return string?
+function types.ownerOf(held)
+	if not held then return nil end
+	if held.variant == "union" then
+		for _, member in ipairs(held.types) do
+			local owner = types.ownerOf(member)
+			if owner then return owner end
+		end
+		return nil
+	end
+	if held.variant == "class" then return held.name end
+	if held.variant == "string" then return "string" end
+	-- A value written as a string literal is a string: `("a b"):gsub("%s+", "-")` reads `string`'s
+	-- fields the same way a variable holding one does, and the literal is not a class to be named.
+	if held.variant == "extern" and held.name and held.name:match("^[\"']") then return "string" end
+end
+
 --- A class this file declares. It is nominal: `Foo<number>` is not `Foo<string>`, and a class
 --- satisfies what it extends. The fields are already resolved, so reading one costs nothing.
 ---@param name string

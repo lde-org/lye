@@ -1,0 +1,2 @@
+let holding: number = "not a number"
+let plain: number = 1

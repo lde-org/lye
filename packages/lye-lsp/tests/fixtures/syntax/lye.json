@@ -1,0 +1,8 @@
+{
+	"plugins": [
+		"./toy.lua",
+		"!patterns",
+		"!formats",
+		"!cdef"
+	]
+}

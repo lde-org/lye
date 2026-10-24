@@ -258,6 +258,8 @@ end
 --- tokens are consumed, so what the caller sees next is what follows the type.
 ---@param self lye.parser.Parser
 ---@return string? text
+---@return integer? from where the type starts, for a reader that colours it
+---@return integer? to where it ends
 local function skipInlineType(self)
 	local depth, from, to, arrow = 0, nil, nil, false
 	while true do
@@ -274,7 +276,7 @@ local function skipInlineType(self)
 			if depth == 0 and not arrow then break end
 			if depth > 0 then depth = depth - 1 end
 		elseif depth == 0
-			and (text == "," or text == ":" or text == "=" or text == "end" or text == "do") then
+			and (text == "," or text == "=" or text == "end" or text == "do") then
 			break
 		elseif not isTypeToken(self, token) then
 			break
@@ -285,7 +287,7 @@ local function skipInlineType(self)
 		self:advance()
 	end
 	if not from then return nil end
-	return self.source:sub(from, to)
+	return self.source:sub(from, to), from, to
 end
 
 --- Read the `<T: number, V>` a definition file writes after a function's name, and give back its
@@ -323,7 +325,7 @@ local function parseFunctionBody(self, start, isMethod)
 
 	-- A comment may sit between any two of these: `f(a --[[string]], b)` is written that way. The
 	-- lexer emits comments as tokens, so each step past one is a step past a token.
-	local isVariadic, inlineVariadic = false, nil
+	local isVariadic, inlineVariadic, inlineVariadicStart, inlineVariadicStop = false, nil, nil, nil
 	while true do
 		self:skipComments()
 		if self:check(")") or self:isEof(self:peek()) then break end
@@ -332,7 +334,9 @@ local function parseFunctionBody(self, start, isMethod)
 			-- `function f(...: string|number)` writes what the extra arguments have to be.
 			if self.definition then
 				self:skipComments()
-				if self:accept(":") then inlineVariadic = skipInlineType(self) end
+				if self:accept(":") then
+					inlineVariadic, inlineVariadicStart, inlineVariadicStop = skipInlineType(self)
+				end
 			end
 			break
 		end
@@ -343,8 +347,12 @@ local function parseFunctionBody(self, start, isMethod)
 			-- A definition file writes the type where a caller reads it: `function f(n: number)`.
 			if self.definition then
 				self:skipComments()
+				-- `pc?: integer` marks a parameter a caller may leave out, the way `---@param pc?`
+				-- does.
+				if self:accept("?") then param.inlineOptional = true end
+				self:skipComments()
 				if self:accept(":") then
-					param.inlineType = skipInlineType(self)
+					param.inlineType, param.inlineTypeStart, param.inlineTypeStop = skipInlineType(self)
 				end
 			end
 		end
@@ -355,10 +363,12 @@ local function parseFunctionBody(self, start, isMethod)
 	self:expect(")")
 
 	-- `function f(): string` writes the type of what the body gives back.
-	local inlineReturns
+	local inlineReturns, inlineReturnsStart, inlineReturnsStop
 	if self.definition then
 		self:skipComments()
-		if self:accept(":") then inlineReturns = skipInlineType(self) end
+		if self:accept(":") then
+			inlineReturns, inlineReturnsStart, inlineReturnsStop = skipInlineType(self)
+		end
 	end
 
 	self:parseBlock()
@@ -367,7 +377,10 @@ local function parseFunctionBody(self, start, isMethod)
 	local index = self:emit("function", start, self.arena[self.index - 1].stop,
 		{
 			isFunction = true, isVariadic = isVariadic, params = params,
-			inlineReturns = inlineReturns, inlineVariadic = inlineVariadic,
+			inlineReturns = inlineReturns, inlineReturnsStart = inlineReturnsStart,
+			inlineReturnsStop = inlineReturnsStop,
+			inlineVariadic = inlineVariadic, inlineVariadicStart = inlineVariadicStart,
+			inlineVariadicStop = inlineVariadicStop,
 		})
 	-- Set last, since parsing the body overwrites it.
 	self.lastKind = "function"

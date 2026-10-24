@@ -1,20 +1,13 @@
 ---@meta jit.profile
 
+---@class jit.profile
 local profile = {}
 
----@param mode? string
----@param func  fun(L: thread, samples: integer, vmst: string)
-function profile.start(mode, func)
-end
+function profile.start(mode?: string, func: fun(L: thread, samples: integer, vmst: string)) end
 
-function profile.stop()
-end
+function profile.stop() end
 
 ---@overload fun(th: thread, fmt: string, depth: integer): string
----@param fmt   string
----@param depth integer
----@return string dump
-function profile.dumpstack(fmt, depth)
-end
+function profile.dumpstack(fmt: string, depth: integer): string end
 
 return profile

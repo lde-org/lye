@@ -5,9 +5,6 @@
 ---    require("table.new")
 ---```
 ---
----@param narray integer
----@param nhash integer
----@return table
-local function new(narray, nhash) end
+local function new(narray: integer, nhash: integer): table end
 
 return new

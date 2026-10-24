@@ -12,4 +12,3 @@ Cargo.lock
 *.wasm
 editors/zed/grammars/*/
 lde.lock
-packages/lye-defs/src/defs.lua

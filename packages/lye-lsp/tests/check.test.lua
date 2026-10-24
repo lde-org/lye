@@ -8,6 +8,7 @@
 
 local test = require("lde-test")
 local check = require("lye-lsp.check")
+local env = require("env")
 
 local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
@@ -69,6 +70,86 @@ local function exitCode(source, flag)
 	))
 	return tonumber(out) or -1
 end
+
+test.it("checks a file of a language a plugin reads, and reports it where it is written", function()
+	-- The fixture plugin compiles `let name: type = value` to a `---@type` annotation over a
+	-- `local`. Handed the file as it stands, a check would report a syntax error on the first
+	-- word; what it reports instead is the fault lye found inside the line the plugin wrote, at
+	-- the line of the file whose reader wrote it.
+	local workspace = TESTS_DIR .. "/fixtures/syntax"
+	local toy = workspace .. "/main.toy"
+
+	local discovered = {}
+	for _, path in ipairs(check.discover(workspace)) do discovered[path] = true end
+	test.truthy(discovered[toy], "the walk finds the file its plugin claims: "
+		.. table.concat(check.discover(workspace), " "))
+
+	local output = run("lde run " .. string.format("%q", MAIN) .. " --check " .. string.format("%q", toy)
+		.. " 2>&1")
+	test.includes(output, "holding is declared as number but is assigned string",
+		"the fault the plugin's own line has: " .. output)
+	test.includes(output, "main.toy:1:", "reported on the first line of the file, where it was written")
+
+	-- The same file a second time, and the same file named the way a run in a directory names it:
+	-- what is held between the two is the analysis of the lowered text, and a finding of it has to
+	-- travel back once per report rather than once per analysis.
+	local again = run("lde run " .. string.format("%q", MAIN) .. " --check " .. string.format("%q", toy)
+		.. " " .. string.format("%q", toy) .. " 2>&1")
+	test.equal(again, output, "a file named twice is checked once, and reported the same way")
+
+	local relative = run("lde run " .. string.format("%q", MAIN)
+		.. " --check tests/fixtures/syntax/main.toy 2>&1")
+	test.includes(relative, "holding is declared as number but is assigned string",
+		"and a path relative to the run finds the plugin beside it: " .. relative)
+end)
+
+test.it("finds the package of a file named relatively", function()
+	-- A file named on the command line keeps the spelling it was given, and `src/x.lua` has a
+	-- package above it that a walk over that spelling never reaches: the run's own directory is
+	-- where the walk has to end. What the package links into `target/` is only known once it is
+	-- found, so a file using it says so when it is not.
+	local dir = PACKAGE_DIR .. "/target"
+	local dep = io.open(dir .. "/relative-dep.lua", "wb")
+	dep:write("---@class RelativeDep\n---@field amount integer\nreturn {}\n")
+	dep:close()
+	writeInput("---@param d RelativeDep\nlocal function f(d)\n\treturn d.amount\nend\n"
+		.. "f({ amount = 1 })\n")
+
+	local previous = env.cwd()
+	env.chdir(PACKAGE_DIR)
+	local isOk = check.file("target/check-input.lua")
+	env.chdir(previous)
+	test.equal(isOk, true, "the package's own link answers for a relatively named file")
+end)
+
+test.it("writes a configuration where there is none, and never over one", function()
+	-- A workspace says what it wants in a file beside it: `lye init` writes the shape of that file
+	-- and nothing else, since what goes in it is the workspace's own answer.
+	local dir = PACKAGE_DIR .. "/target/init-fixture"
+	os.execute("rm -rf " .. string.format("%q", dir) .. " && mkdir -p " .. string.format("%q", dir))
+	local command = "lde run " .. string.format("%q", MAIN) .. " init " .. string.format("%q", dir)
+
+	local first = run(command .. " 2>&1")
+	test.includes(first, "init-fixture/lye.json", "the file is written: " .. first)
+	---@type string?
+	local written
+	do
+		local handle = io.open(dir .. "/lye.json", "rb")
+		if handle then
+			written = handle:read("*a")
+			handle:close()
+		end
+	end
+	test.truthy(written, "lye.json is there")
+	local ok, config = pcall(require("lye-json").decode, written or "")
+	test.equal(ok, true, "and it parses")
+	test.equal(#config.plugins, 0, "with the keys lye reads, and nothing said yet")
+	test.equal(#config.requirePaths, 0)
+
+	local second = run(command .. " 2>&1; echo EXIT:$?")
+	test.includes(second, "already here", "a second run leaves the file alone: " .. second)
+	test.equal(tonumber(second:match("EXIT:(%d+)")), 1, "and refuses with a failure, since it did not do it")
+end)
 
 test.it("exits 1 for a file with an error and 0 for a clean one", function()
 	test.equal(exitCode("local = 2\n", "--check"), 1)

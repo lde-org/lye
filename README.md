@@ -117,6 +117,29 @@ what keeps the numbers above honest about the code that produced them.
 | VS Code | `editors/vscode/` | `npm install && npm run package` |
 | anything else | — | speak LSP to `lye --stdio` |
 
+## Plugins
+
+A workspace can add to what lye knows, in a `lye.json` that lists the plugins its files are read
+with — a path for a file of the workspace's own, a name for a module the package installed with
+`lde add`, and `!name` to turn off one lye ships. `lye init` writes the file:
+
+```json
+{ "plugins": ["./tools/moonscript.lua", "lye-plugin-moonscript", "!patterns"] }
+```
+
+A plugin answers one or both of two hooks, and names the files its language is written in. `lower`
+turns a document into Lua — the plugin compiles what it can and says where each piece came from, lye
+reads the result and reports in the original, so a fault inside a synthesized line lands on the line
+the reader wrote, and something like MoonScript gets the analysis lye would give the Lua it compiles
+to. `tokens` adds colours of its own, for a language or a library lye does not know: a plugin's span
+wins over what lye's own walk found, so it can colour `%d` inside a literal without hiding the
+literal. `lye check` reads a package through the same plugins, and its walk reaches the files they
+claim — `extensions = { "moon" }` is what makes `lye check .` check a MoonScript project.
+
+lye's own pattern, format and `ffi.cdef` colouring are plugins now, and they are the worked
+examples: `packages/lye-plugin` documents the interface, the hooks a plugin answers, and what each
+context carries.
+
 ## lde projects
 
 `lde run -C <package>` resolves a module against `<package>/target/?.lua` and

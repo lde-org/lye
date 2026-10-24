@@ -11,11 +11,11 @@ local json = require("lye-json")
 local definitionsIndex = require("lye-lsp.definitions")
 local Parser = require("lye-parser")
 local analyzer = require("lye-analyzer")
-local cdef = require("lye-cdef")
 local editorconfig = require("lye-lsp.editorconfig")
 local KIND = require("lye-lexer").KIND
 local types = require("lye-doc.type")
 local cache = require("lye-lsp.cache")
+local plugin = require("lye-plugin")
 local rapidhash = require("rapidhash")
 
 local SYMBOL_KIND = { ["function"] = 12, variable = 13 }
@@ -62,104 +62,9 @@ local TOKEN_LEGEND = {
 	tokenModifiers = { "documentation" },
 }
 
---- A conversion in a format string: `%d`, `%.2f`, `%%`, with the flags and the width a reader may
---- write between the `%` and the letter. Only strings handed to `string.format` are read for them.
-local FORMAT_SPECIFIER = "^%%[-+ #0]*%d*%.?%d*[cdiouxXeEfgGqs%%]" 
-
---- Which argument of which function is interpreted rather than passed on: a `string.format` is
---- read for its conversions and a pattern function for its pattern. Lua has no annotation for
---- that, so the list lives in the layer that knows the environment, indexed the way a method
---- call writes it — a dotted call passes the receiver first.
----@type table<string, table<integer, string>>
-local INTERPRETED = {
-	["string.format"] = { "format" },
-	["string.pack"] = { "format" },
-	["string.unpack"] = { "format" },
-	["string.packsize"] = { "format" },
-	["os.date"] = { "format" },
-	["string.find"] = { "pattern" },
-	["string.match"] = { "pattern" },
-	["string.gmatch"] = { "pattern" },
-	["string.gsub"] = { "pattern", "replacement" },
-}
-
---- The functions that take the subject they work on as their first argument, so that a dotted call
---- writes the literal one place later than a method call does.
-local SUBJECT_FIRST = { find = true, match = true, gmatch = true, gsub = true }
-
---- The parts of a literal read as something rather than as text: a format's `%` and the flags
---- between it and the conversion, a pattern's escapes and classes, a replacement's escapes.
----@param content string the text between the delimiters
----@param kind string `format`, `pattern` or `replacement`
----@return { start: integer, stop: integer }[] offsets into the content, 1-based
-local function interpretedSpans(content, kind)
-	local marks = {}
-	if kind == "format" then
-		local at = 1
-		while true do
-			local percent = content:find("%", at, true)
-			if not percent then break end
-			local spec = content:match(FORMAT_SPECIFIER, percent)
-			if spec then
-				marks[#marks + 1] = { start = percent, stop = percent + #spec - 1 }
-				at = percent + #spec
-			else
-				at = percent + 1
-			end
-		end
-		return marks
-	end
-
-	local at = 1
-	while at <= #content do
-		local char = content:sub(at, at)
-		if kind == "replacement" then
-			if char == "%" and at < #content then
-				marks[#marks + 1] = { start = at, stop = at + 1 }
-				at += 2
-			else
-				at += 1
-			end
-		else
-		local class = char == "[" and content:match("^%[%^?%]?[^%]]*%]", at)
-		if char == "%" and at < #content then
-			marks[#marks + 1] = { start = at, stop = at + 1 }
-			at += 2
-		elseif class then
-			marks[#marks + 1] = { start = at, stop = at + #class - 1 }
-			at += #class
-		elseif char:match("[%^%$%.%*%+%-%?%(%)]") then
-			marks[#marks + 1] = { start = at, stop = at }
-			at += 1
-		else
-			at += 1
-		end
-		end
-	end
-	return marks
-end
-
---- The name a receiver's type is declared under, which is what says whether a field is a function
---- of the standard library: a string reads `string`'s fields, and a class is its own name.
----@param held lye.doc.Type?
-local function ownerOf(held)
-	if not held then return nil end
-	-- A value that may be absent still names what it is where it is one, which is the case a `?.` is
-	-- written for: `s?.:lower()` on a `string?` jumps to `string.lower`, where `s:lower()` on a
-	-- plain string already lands. Reading only the variant left every optional receiver ownerless.
-	if held.variant == "union" then
-		for _, member in ipairs(held.types) do
-			local owner = ownerOf(member)
-			if owner then return owner end
-		end
-		return nil
-	end
-	if held.variant == "class" then return held.name end
-	if held.variant == "string" then return "string" end
-	-- A value written as a string literal is a string: `("a b"):gsub("%s+", "-")` reads `string`'s
-	-- fields the same way a variable holding one does, and the literal is not a class to be named.
-	if held.variant == "extern" and held.name and held.name:match("^[\"']") then return "string" end
-end
+-- The name a receiver's type is declared under, which says whether a field is one of the standard
+-- library's. It lives with the types, because a plugin is handed it as well.
+local ownerOf = types.ownerOf
 
 local TOKEN_TYPE = {}
 for index, name in ipairs(TOKEN_LEGEND.tokenTypes) do
@@ -178,6 +83,52 @@ local TYPE_KEYWORD = {
 	-- The values a type can name are constants rather than names of one.
 	["true"] = true, ["false"] = true, ["nil"] = true,
 }
+
+--- Walk the words of a type and hand each to `visit` with the kind it reads as. A type holds
+--- names, string literals, numbers and the `|` between union members; the punctuation around them
+--- is grammar and is left to whatever writes the token.
+---
+--- A type is written in two places — inside an annotation and in a definition file's own
+--- signature — and both colour the same way, so both walk it here.
+---@param text string
+---@param from integer
+---@param stop integer
+---@param visit fun(start: integer, stop: integer, target: string)
+local function typeWords(text, from, stop, visit)
+	local written = text:sub(from, stop)
+	local cursor = 1
+	while cursor <= #written do
+		local quoteAt = written:find("['\"]", cursor)
+		local nameAt = written:find("[%a_]", cursor)
+		local numberAt = written:find("%d", cursor)
+		local barAt = written:find("|", cursor, true)
+		if quoteAt and (not nameAt or quoteAt < nameAt) then
+			local quote = written:sub(quoteAt, quoteAt)
+			local closeAt = written:find(quote, quoteAt + 1, true) or #written
+			visit(from + quoteAt - 1, from + closeAt - 1, "string")
+			cursor = closeAt + 1
+		elseif nameAt and (not numberAt or nameAt < numberAt) and (not barAt or nameAt < barAt) then
+			local _, nameStop = written:find("^[%a_][%w_%.]*", nameAt)
+			local word = written:sub(nameAt, nameStop)
+			-- `const` and the signature keywords are grammar rather than names of a type:
+			-- `---@alias Font<const Size: number>` marks a parameter.
+			visit(from + nameAt - 1, from + nameStop - 1, TYPE_KEYWORD[word] and "keyword" or "type")
+			cursor = nameStop + 1
+		elseif numberAt and (not barAt or numberAt < barAt) then
+			-- `---@type 2149 | 231` lists numbers, and a number is a number.
+			local _, numberStop = written:find("^%d[%w%.]*", numberAt)
+			visit(from + numberAt - 1, from + numberStop - 1, "number")
+			cursor = numberStop + 1
+		elseif barAt then
+			-- The `|` between members is punctuation rather than text, so it reads in the editor's
+			-- own colour instead of the colour of what holds it.
+			visit(from + barAt - 1, from + barAt - 1, "operator")
+			cursor = barAt + 1
+		else
+			break
+		end
+	end
+end
 
 
 --- A `---@tag` inside a comment, with the tag's own span. Whitespace is matched without
@@ -198,7 +149,12 @@ local DOC_TAG_NAME = "[%a_][%w_]*"
 ---@field order string[] the documents whose analyses are held, least recently used first
 ---@field order string[] the documents whose analyses are held, least recently used first
 ---@field definitions table? the definitions, indexed by name, built once
----@field cdefCache { text: string, spans: { start: integer, stop: integer, kind: string }[] }?
+---@field plugins_ table<string, lye.plugin.Spec[]>? the plugins each package asked for, loaded once
+---@field views table<string, lye.View>? what lye reads of each open document, and the way back
+---@field tokens_ table<string, { text: string, answer: table }>? the token answer for a document
+--- that has not changed since it was worked out
+---@field viewByIndex table<lye.framework.LineIndex, lye.View>? the same, found by a line index a
+--- range was written with
 ---@field workspace table[]? the symbols of the workspace, listed once
 ---@field settings table<string, table<string, string>>? the `.editorconfig` per directory
 local Lye = {}
@@ -376,6 +332,124 @@ end
 ---@return boolean
 local function isDefinitionFile(uri)
 	return uri:match("%.d%.lua$") ~= nil
+end
+
+--- The `plugins` a document's package and its workspace listed, in that order: the package's
+--- entries first, since a package that says something about a plugin means it, and each entry read
+--- from the file that wrote it — the rule `requirePaths` follows.
+---@param self lye.Server
+---@param uri string?
+---@return string[]
+function Lye:pluginConfig(uri)
+	local out, seen = {}, {}
+	---@param dir string?
+	local function read(dir)
+		if not dir or seen[dir] then return end
+		seen[dir] = true
+		local handle = io.open(dir .. "/lye.json", "rb")
+		if not handle then return end
+		local written = handle:read("*a")
+		handle:close()
+		local ok, config = pcall(json.decode, written)
+		if not ok or type(config) ~= "table" or type(config.plugins) ~= "table" then return end
+		for _, entry in ipairs(config.plugins) do
+			if type(entry) == "string" and entry ~= "" then
+				-- A relative path is read from the file that wrote it, and a name is left as it is
+				-- for the package's own resolution.
+				local named = entry:sub(1, 1) ~= "!" and entry:sub(1, 1) ~= "/"
+					and (entry:sub(1, 1) == "." or entry:sub(-4) == ".lua")
+				out[#out + 1] = named and (dir .. "/" .. entry:gsub("^%./", "")) or entry
+			end
+		end
+	end
+	read(self:packageRoot(uri))
+	read(self.server.rootPath)
+	return out
+end
+
+--- The plugins a package asked for, loaded once per package: a plugin is code, and code that is
+--- loaded again on every keystroke is code that is loaded for nothing.
+---@param self lye.Server
+---@param uri string?
+---@return lye.plugin.Spec[]
+function Lye:plugins(uri)
+	local root = self:packageRoot(uri) or self.server.rootPath
+	self.plugins_ = self.plugins_ or {}
+	local held = self.plugins_[root or ""]
+	if held then return held end
+	local specs = plugin.load(self:pluginConfig(uri), root, function(name)
+		-- A plugin named rather than pathed is a module, and a module of this package is one lde
+		-- linked into its `target/`: the same place `require` finds, so `lde add` is how one is
+		-- installed and `lye.json` is where it is turned on.
+		return self:moduleFile(name, uri)
+	end, function(message)
+		-- A fault in a plugin is the plugin author's to fix, and the user's to see once.
+		self.server:log(message, framework.LOG.warning)
+	end)
+	self.plugins_[root or ""] = specs
+	return specs
+end
+
+--- What lye reads of a document, and the way back to what the editor holds. A plugin for another
+--- language lowers the document — `lye.json` names it — and then the analysis reads the lowered
+--- text while every position and range an editor sees is the one it wrote. With nothing lowered
+--- the text is the document itself and the map moves nothing.
+---@class lye.View
+---@field source string the document as the editor holds it
+---@field sourceIndex lye.framework.LineIndex the line index of that text
+---@field text string what the analysis reads
+---@field index lye.framework.LineIndex the line index of that text
+---@field map lye.plugin.Map
+---@field specs lye.plugin.Spec[]
+
+---@param self lye.Server
+---@param uri string
+---@return lye.View?
+function Lye:view(uri)
+	local document = self.server.documents:get(uri)
+	if not document then return nil end
+	self.views = self.views or {}
+	self.viewByIndex = self.viewByIndex or {}
+	local held = self.views[uri]
+	if held and held.source == document.text then return held end
+
+	local specs = self:plugins(uri)
+	local context = {
+		uri = uri, source = document.text, text = document.text, root = self:packageRoot(uri),
+	}
+	local map = plugin.lower(specs, context, function(message)
+		self.server:log(message, framework.LOG.warning)
+	end)
+	local view = {
+		source = document.text, sourceIndex = document.lineIndex,
+		text = map.text, index = document.lineIndex, map = map, specs = specs,
+	}
+	if not map:isEmpty() then
+		-- The lowered text is its own text: a line index of its own is what turns an offset of it
+		-- into a position, and nothing else reads the one it replaced.
+		view.index = position.buildLineIndex(view.text)
+	end
+	if held then
+		-- The view this one replaces was found by the line index of the text it was built from, and
+		-- a keystroke builds a new one: leaving the old pair behind keeps a document's worth of
+		-- lowered text and its map alive for every keystroke of a session.
+		if self.viewByIndex[held.sourceIndex] == held then self.viewByIndex[held.sourceIndex] = nil end
+		if held.index ~= held.sourceIndex and self.viewByIndex[held.index] == held then
+			self.viewByIndex[held.index] = nil
+		end
+	end
+	self.views[uri] = view
+	self.viewByIndex[document.lineIndex] = view
+	self.viewByIndex[view.index] = view
+	return view
+end
+
+--- Where the map of a document is, from a line index that belongs to it: a range is written with
+--- the text it was read from, and that pair is the document's own.
+---@param self lye.Server
+---@param index lye.framework.LineIndex?
+function Lye:viewOf(index)
+	return index and self.viewByIndex and self.viewByIndex[index] or nil
 end
 
 --- What `require("name")` is: the type the module file returns, analysed once and kept until its
@@ -710,11 +784,16 @@ end
 function Lye:analyze(uri, from)
 	local document = self.server.documents:get(uri)
 	if not document then return nil end
+	local view = self:view(uri)
+	if not view then return nil end
 	-- The analyzer parses the document itself, so its result carries the tree, the scopes and the
 	-- comments this needs. Parsing the same text a second time is a third of the cost of a
 	-- keystroke on a large file, for the same tree.
-	local previous = from and self.analysis[uri]
-	local names = analyzer.analyze(document.text, PRELUDE, self:declaredTypes(uri), function(name)
+	--
+	-- A lowered document is analyzed as it stands: resuming from an offset of the text the editor
+	-- holds would be resuming from a text this analysis never read.
+	local previous = from and view.map:isEmpty() and self.analysis[uri]
+	local names = analyzer.analyze(view.text, PRELUDE, self:declaredTypes(uri), function(name)
 		return self:moduleType(name, uri)
 	end, previous and Parser.resumeAt(previous, from) or nil, nil, nil, isDefinitionFile(uri))
 	local result = names.parser
@@ -736,18 +815,26 @@ end
 ---@return string?
 ---@return lye.framework.LineIndex?
 function Lye:textOf(uri)
-	local document = self.server.documents:get(uri)
-	if not document then return nil end
-	return document.text, document.lineIndex
+	local view = self:view(uri)
+	if not view then return nil end
+	return view.text, view.index
 end
 
 ---@param self lye.Server
----@param text string
+---@param text string the text the offsets were read from
 ---@param index lye.framework.LineIndex
 ---@param start integer
 ---@param stop integer
 ---@return table
 function Lye:toRange(text, index, start, stop)
+	-- A document a plugin lowered is read and answered about in two texts: the offsets are the
+	-- lowered text's and the editor's positions are its own, so the range travels back before it is
+	-- written down. With nothing lowered there is no view to find and nothing moves.
+	local view = self:viewOf(index)
+	if view and not view.map:isEmpty() then
+		start, stop = view.map:toOriginalRange(start, stop)
+		text, index = view.source, view.sourceIndex
+	end
 	local encoding = self.server.encoding
 	local startLine, startCharacter = position.toPosition(text, index, start, encoding)
 	local stopLine, stopCharacter = position.toPosition(text, index, stop + 1, encoding)
@@ -756,6 +843,24 @@ function Lye:toRange(text, index, start, stop)
 		start = { line = startLine, character = startCharacter },
 		["end"] = { line = stopLine, character = stopCharacter },
 	}
+end
+
+--- The byte an editor's position names, in the text the analysis reads. It is the one place a
+--- position from a client enters the server, so it is where a lowered document carries it across.
+---@param self lye.Server
+---@param uri string
+---@param line integer
+---@param character integer
+---@return integer?
+function Lye:offsetAt(uri, line, character)
+	local document = self.server.documents:get(uri)
+	if not document then return nil end
+	local offset = position.toOffset(
+		document.text, document.lineIndex, line, character, self.server.encoding
+	)
+	local view = self:view(uri)
+	if view and not view.map:isEmpty() then offset = view.map:toLowered(offset) end
+	return offset
 end
 
 ---@param self lye.Server
@@ -899,16 +1004,22 @@ function Lye:resolvePosition(params)
 	local uri = params.textDocument?.uri
 	if not uri then return nil end
 
-	local text, index = self:textOf(uri)
-	if not text then return nil end
+	local document = self.server.documents:get(uri)
+	if not document then return nil end
+	local view = self:view(uri)
 	local result = self.analysis[uri] or self:analyze(uri)
 	local names = self.names[uri]
-	if not result or not names then return nil end
+	if not result or not names or not view then return nil end
 
 	local offset = position.toOffset(
-		text, index, params.position.line, params.position.character, self.server.encoding
+		document.text, document.lineIndex, params.position.line, params.position.character,
+		self.server.encoding
 	)
-	return uri, text, index, names, offset
+	-- The editor holds one text and lye reads another: the position is carried across before
+	-- anything is asked about it. What is handed back is the text the offsets belong to, so every
+	-- read a caller makes of it — the word under the cursor, a token, a field — is of that text.
+	if not view.map:isEmpty() then offset = view.map:toLowered(offset) end
+	return uri, view.text, view.index, names, offset
 end
 
 --- The type a value expression has, walking the suffix chain the arena recorded: a name reads its
@@ -1492,27 +1603,24 @@ function Lye:onDefinition(params)
 	return { uri = target.uri, range = self:rangeIn(target) }
 end
 
---- The tokens of a `ffi.cdef` block, parsed once and kept: a header is small, and they are asked
---- for on every edit.
----@param self lye.Server
----@param text string
-function Lye:cdefSpans(text)
-	local cached = self.cdefCache
-	if cached and cached.text == text then return cached.spans end
-	local spans = cdef.spans(cdef.parse(text))
-	self.cdefCache = { text = text, spans = spans }
-	return spans
-end
-
 ---@param self lye.Server
 ---@return table
 function Lye:onSemanticTokens(params)
 	local uri = params.textDocument?.uri
 	local document = uri and self.server.documents:get(uri)
 	local result = uri and (self.analysis[uri] or self:analyze(uri))
-	if not document or not result then return { data = json.array() } end
+	local view = uri and self:view(uri)
+	if not document or not result or not view then return { data = json.array() } end
 
-	local text, index = document.text, document.lineIndex
+	-- Colouring a document is a walk of all of it, and an editor asks for it again as the cursor
+	-- moves and the view scrolls: the answer for a document that has not changed is the answer.
+	self.tokens_ = self.tokens_ or {}
+	local held = self.tokens_[uri]
+	if held and held.text == document.text then return held.answer end
+
+	-- What lye reads is the lowered text, and what the editor colours is its own: every span is
+	-- carried back through the map before a token is written down.
+	local text = view.text
 	local encoding = self.server.encoding
 
 	local kinds = {}
@@ -1523,6 +1631,29 @@ function Lye:onSemanticTokens(params)
 			for at = declaration.start, declaration.stop do
 				kinds[at] = target
 			end
+		end
+	end
+
+	-- A definition file writes its types where a reader sees them — `function f(n: number): string`
+	-- — and they are types like any other: the word inside one reads as a type rather than as the
+	-- variable it would be outside one. The span is what the parser kept beside the text.
+	---@param at integer
+	---@param stop integer
+	---@param target string
+	local function asType(at, stop, target)
+		kinds[at] = target
+	end
+	for _, declaration in ipairs(result.declarations) do
+		if declaration.inlineTypeStart then
+			typeWords(text, declaration.inlineTypeStart, declaration.inlineTypeStop, asType)
+		end
+	end
+	for _, node in ipairs(result.nodes) do
+		if node.inlineVariadicStart then
+			typeWords(text, node.inlineVariadicStart, node.inlineVariadicStop, asType)
+		end
+		if node.inlineReturnsStart then
+			typeWords(text, node.inlineReturnsStart, node.inlineReturnsStop, asType)
 		end
 	end
 
@@ -1559,116 +1690,24 @@ function Lye:onSemanticTokens(params)
 		end
 	end
 
-	local data, count = json.array(), 0
-	local lastLine, lastStart = 0, 0
-	local isFirst = true
+	-- Every span the walk below decides is collected rather than written out: a plugin answers with
+	-- spans of its own over the same text, and the two sets have to become one before any of it is
+	-- carried back through the map and written down.
+	---@type { from: integer, to: integer, kind: string, modifiers: integer? }[]
+	local spans = {}
+	local spanCount = 0
 
-	--- Tokens are relative to the one before, and a token never spans a line, so a comment or a
-	--- string that does is emitted as one token per line it covers.
 	---@param spanStart integer
 	---@param spanStop integer
 	---@param target string
 	---@param modifiers integer?
 	local function emitSpan(spanStart, spanStop, target, modifiers)
 		if spanStop < spanStart then return end
-		local from = spanStart
-		while from <= spanStop do
-			local newline = text:find("\n", from, true)
-			local to = (newline and newline - 1 <= spanStop) and (newline - 1) or spanStop
-			if to >= from then
-				local line, start = position.toPosition(text, index, from, encoding)
-				local stopCharacter = select(2, position.toPosition(text, index, to, encoding))
-				local deltaLine = isFirst and line or (line - lastLine)
-				local deltaStart = isFirst and start or (deltaLine == 0 and (start - lastStart) or start)
-
-				count += 1
-				data[count] = deltaLine
-				count += 1
-				data[count] = deltaStart
-				count += 1
-				data[count] = math.max(stopCharacter - start + 1, 1)
-				count += 1
-				data[count] = TOKEN_TYPE[target]
-				count += 1
-				data[count] = modifiers or 0
-
-				lastLine, lastStart, isFirst = line, start, false
-			end
-			if not newline or newline > spanStop then break end
-			from = newline + 1
-		end
-	end
-
-	-- The text of an `ffi.cdef` call is C, coloured from *our* parse of it rather than by asking the
-	-- editor to inject a C grammar: that needs the grammar installed and would not know this dialect.
-	local cdefSpans = {}
-	for _, node in ipairs(result.nodes) do
-		if node.kind == "call" and node.args and node.args[1] then
-			local target = node.target and result.nodes[node.target]
-			local field = node.field or (target and target.field)
-			if field == "cdef" then
-				local argument = result.nodes[node.args[1]]
-				if argument and argument.kind == "string" and type(argument.value) == "string" then
-					cdefSpans[argument.start] = {
-						spans = self:cdefSpans(argument.value),
-						from = cdef.textStart(text, argument.start, argument.stop),
-					}
-				end
-			end
-		end
-	end
-
-	-- A literal handed to a function that interprets it is a string with a pattern inside it, so the
-	-- parts that are read as a pattern are marked and the rest stays a string.
-	local interpreted = {}
-	if names then
-		for _, node in ipairs(result.nodes) do
-			if node.kind == "call" and node.args then
-				local target = node.target and result.nodes[node.target]
-				local field = node.field or (target and target.field)
-				-- Who the field belongs to, as it is written where a namespace is named — the
-				-- definitions call the `string` table's class `stringlib`, so a dotted call is read
-				-- by the name in the source — and by the receiver's own type for a method call.
-				local owner
-				if node.isMethod then
-					owner = ownerOf(typeOfExpression(names, node.target, node.start))
-				else
-					local base = target and target.target and result.nodes[target.target]
-					owner = base and base.callee
-				end
-				local kinds = field and owner and INTERPRETED[owner .. "." .. field]
-				for index, kind in pairs(kinds or {}) do
-					-- By the position it is written in: the pattern functions take the subject first, so the pattern is
-					-- the second argument of `string.find(s, p)`, while `string.format(fmt, ...)` writes its format first.
-					local shorthand = node.isMethod or not SUBJECT_FIRST[field or ""]
-					local argument = result.nodes[node.args[shorthand and index or index + 1] or 0]
-					local from = argument and argument.kind == "string"
-						and cdef.textStart(text, argument.start, argument.stop)
-					-- Only where the literal reads as it was written: an escape inside it moves every
-					-- offset after it, and marking the wrong bytes is worse than marking none.
-					local plain = from and text:sub(from, argument.stop - 1) == argument.value
-					if plain then
-						local spans = {}
-						for _, mark in ipairs(interpretedSpans(argument.value, kind)) do
-							local piece = { start = from + mark.start - 1, stop = from + mark.stop - 1 }
-							if not text:find("\n", piece.start, true)
-								or text:find("\n", piece.start, true) > piece.stop then
-								spans[#spans + 1] = piece
-							end
-						end
-						if #spans > 0 then interpreted[argument.start] = spans end
-					end
-				end
-			end
-		end
+		spanCount += 1
+		spans[spanCount] = { from = spanStart, to = spanStop, kind = target, modifiers = modifiers }
 	end
 
 	-- What the parser calls a token, in the vocabulary this server advertises.
-	local CDEF_KIND = {
-		keyword = "keyword", type = "type", class = "class", member = "property",
-		constant = "property", ["function"] = "function", number = "number", variable = "variable",
-		comment = "comment",
-	}
 
 	--- A doc comment is emitted as the comment it is, with the tags, parameter names and types
 	--- inside it marked out. The spans are cut at newlines because a token may not cross one.
@@ -1734,41 +1773,7 @@ function Lye:onSemanticTokens(params)
 					carve(annotation.nameStart, annotation.nameStop, target)
 				end
 				if annotation.typeStart then
-					local typeText = text:sub(annotation.typeStart, annotation.typeStop)
-					local cursor = 1
-					while cursor <= #typeText do
-						local quoteAt = typeText:find("['\"]", cursor)
-						local nameAt = typeText:find("[%a_]", cursor)
-						local numberAt = typeText:find("%d", cursor)
-						local barAt = typeText:find("|", cursor, true)
-						if quoteAt and (not nameAt or quoteAt < nameAt) then
-							local quote = typeText:sub(quoteAt, quoteAt)
-							local closeAt = typeText:find(quote, quoteAt + 1, true) or #typeText
-							carve(annotation.typeStart + quoteAt - 1, annotation.typeStart + closeAt - 1, "string")
-							cursor = closeAt + 1
-						elseif nameAt and (not numberAt or nameAt < numberAt) and (not barAt or nameAt < barAt) then
-							local _, nameStop = typeText:find("^[%a_][%w_%.]*", nameAt)
-							local word = typeText:sub(nameAt, nameStop)
-							-- `const` and the signature keywords are grammar rather than names of a
-							-- type: `---@alias Font<const Size: number>` marks a parameter.
-							local target = TYPE_KEYWORD[word] and "keyword" or "type"
-							carve(annotation.typeStart + nameAt - 1, annotation.typeStart + nameStop - 1, target)
-							cursor = nameStop + 1
-						elseif numberAt and (not barAt or numberAt < barAt) then
-							-- `---@type 2149 | 231` lists numbers, and a number is a number.
-							local _, numberStop = typeText:find("^%d[%w%.]*", numberAt)
-							carve(annotation.typeStart + numberAt - 1, annotation.typeStart + numberStop - 1,
-								"number")
-							cursor = numberStop + 1
-						elseif barAt then
-							-- The `|` between members is punctuation rather than comment text, so it
-							-- reads in the editor's own colour instead of the comment's.
-							carve(annotation.typeStart + barAt - 1, annotation.typeStart + barAt - 1, "operator")
-							cursor = barAt + 1
-						else
-							break
-						end
-					end
+					typeWords(text, annotation.typeStart, annotation.typeStop, carve)
 				end
 			end
 		end
@@ -1821,20 +1826,9 @@ function Lye:onSemanticTokens(params)
 			if token.kind == KIND.keyword then
 				target = "keyword"
 			elseif token.kind == KIND.string then
-				local spans = interpreted[token.start]
-				if spans then
-					-- The literal is a string, and the parts of it that are interpreted read as what
-					-- they are: the pattern inside a pattern argument is not text.
-					local cursor = token.start
-					for _, span in ipairs(spans) do
-						if span.start > cursor then emitSpan(cursor, span.start - 1, "string") end
-						emitSpan(span.start, span.stop, "regexp")
-						cursor = span.stop + 1
-					end
-					if cursor <= token.stop then emitSpan(cursor, token.stop, "string") end
-				else
-					target = "string"
-				end
+				-- The literal is a string. What is read rather than spelled — a pattern's escapes,
+				-- a format's conversions — is a plugin's to colour, and it answers over this text.
+				target = "string"
 			elseif token.kind == KIND.number then
 				target = "number"
 			elseif token.kind == KIND.symbol and written ~= "::" and written ~= "label" then
@@ -1842,27 +1836,122 @@ function Lye:onSemanticTokens(params)
 			elseif token.kind == KIND.name then
 				target = kinds[token.start] or "variable"
 			end
-			local declared = cdefSpans[token.start]
-			if declared then
-				-- The brackets are what says this is a string at all, so they keep that colour.
-				-- A long string is closed the way it was opened. The three go out in the order they appear: a
-				-- token's position is the distance from the one before it, so out of order every token after lands wrong.
-				local width = declared.from - token.start
-				emitSpan(token.start, declared.from - 1, "string")
-				for _, span in ipairs(declared.spans) do
-					local kind = CDEF_KIND[span.kind]
-					if kind then
-						emitSpan(declared.from + span.start - 1, declared.from + span.stop - 1, kind)
-					end
-				end
-				emitSpan(token.stop - width + 1, token.stop, "string")
-			elseif target then
+			if target then
 				emitSpan(token.start, token.stop, target)
 			end
 		end
 	end
 
-	return { data = data }
+	-- What the plugins asked to colour, by the byte of *the reader's* text: a plugin colours the
+	-- language it reads, so its spans are already in the offsets the editor holds and need no map.
+	-- A kind the legend does not have is left out rather than advertised to an editor that cannot
+	-- know it.
+	local askedKind, askedMods = {}, {}
+	local asked = plugin.tokens(view.specs, {
+		uri = uri, source = view.source, text = view.text, root = self:packageRoot(uri),
+		map = view.map, parsed = result, analysis = self.names[uri] or {},
+		typeOf = function(nodeIdx)
+			local node = nodeIdx and result.nodes[nodeIdx]
+			return node and typeOfExpression(self.names[uri], nodeIdx, node.start) or nil
+		end,
+		ownerOf = types.ownerOf,
+	})
+	for _, span in ipairs(asked) do
+		local from, to, kind = span.from, span.to, span.type
+		if type(from) == "number" and type(to) == "number" and TOKEN_TYPE[kind] and to >= from then
+			for at = math.max(from, 1), math.min(to, #view.source) do
+				askedKind[at] = kind
+				askedMods[at] = span.modifiers or 0
+			end
+		end
+	end
+
+	-- Every span in the editor's own offsets, in order, with what a plugin coloured cut out of what
+	-- the walk found: a `%d` inside a string is a conversion, and the string is written around it.
+	local pieces = {}
+	local function collect(from, to, kind, modifiers)
+		if from > to then return end
+		pieces[#pieces + 1] = { from = from, to = to, kind = kind, modifiers = modifiers }
+	end
+	for _, span in ipairs(spans) do
+		-- What lye read out of the text a plugin wrote has nowhere to be pointed at: `---@type
+		-- number` exists in the lowered text, not in the line the reader wrote.
+		if not view.map:rangeIsWritten(span.from, span.to) then
+			local from, to = view.map:toOriginalRange(span.from, span.to)
+			local at = from
+			while at <= to do
+				local kind = askedKind[at] or span.kind
+				local modifiers = askedKind[at] and askedMods[at] or span.modifiers
+				local stop = at
+				while stop < to
+					and (askedKind[stop + 1] or span.kind) == kind
+					and ((askedKind[stop + 1] and askedMods[stop + 1] or span.modifiers) == modifiers) do
+					stop += 1
+				end
+				-- A span a plugin covers is the plugin's: the walk writes up to it and carries on
+				-- after it, and the plugin's own span is written from its own list below.
+				if not askedKind[at] then collect(at, stop, kind, modifiers) end
+				at = stop + 1
+			end
+		end
+	end
+	for _, span in ipairs(asked) do
+		if TOKEN_TYPE[span.type] and type(span.from) == "number" and type(span.to) == "number" then
+			collect(math.max(span.from, 1), math.min(span.to, #view.source), span.type, span.modifiers)
+		end
+	end
+	table.sort(pieces, function(left, right)
+		if left.from ~= right.from then return left.from < right.from end
+		return left.to > right.to
+	end)
+
+	local data, count = json.array(), 0
+	local lastLine, lastStart, lastStop = 0, 0, 0
+	local isFirst = true
+
+	--- Tokens are relative to the one before, and a token never spans a line, so a span that does
+	--- is written as one token per line it covers.
+	---@param from integer
+	---@param to integer
+	---@param kind string
+	---@param modifiers integer?
+	local function write(from, to, kind, modifiers)
+		-- Two spans of the lowered text can stand for one span of the editor's — everything a
+		-- plugin wrote inside a statement answers with that statement — so a span that begins where
+		-- the one before it already reached is not one to send.
+		if from <= lastStop then from = lastStop + 1 end
+		if from > to then return end
+		local at = from
+		while at <= to do
+			local newline = view.source:find("\n", at, true)
+			local lineStop = (newline and newline - 1 <= to) and (newline - 1) or to
+			if lineStop >= at then
+				local line, start = position.toPosition(view.source, view.sourceIndex, at, encoding)
+				local stopCharacter = select(2, position.toPosition(view.source, view.sourceIndex, lineStop, encoding))
+				local deltaLine = isFirst and line or (line - lastLine)
+				local deltaStart = isFirst and start or (deltaLine == 0 and (start - lastStart) or start)
+				count += 1
+				data[count] = deltaLine
+				count += 1
+				data[count] = deltaStart
+				count += 1
+				data[count] = math.max(stopCharacter - start + 1, 1)
+				count += 1
+				data[count] = TOKEN_TYPE[kind]
+				count += 1
+				data[count] = modifiers or 0
+				lastLine, lastStart, isFirst, lastStop = line, start, false, lineStop
+			end
+			if not newline or newline > to then break end
+			at = newline + 1
+		end
+	end
+
+	for _, piece in ipairs(pieces) do write(piece.from, piece.to, piece.kind, piece.modifiers) end
+
+	local answer = { data = data }
+	self.tokens_[uri] = { text = document.text, answer = answer }
+	return answer
 end
 
 --- Completion kinds, by number, as the protocol defines them.
@@ -2030,10 +2119,9 @@ function Lye:onCompletion(params)
 	local names = self.names[uri] or (self:analyze(uri) and self.names[uri])
 	if not names then return { isIncomplete = false, items = json.array() } end
 
-	local source = document.text
-	local offset = position.toOffset(
-		source, document.lineIndex, params.position.line, params.position.character, self.server.encoding
-	)
+	local source = self:textOf(uri)
+	local offset = self:offsetAt(uri, params.position.line, params.position.character)
+	if not source or not offset then return { isIncomplete = false, items = json.array() } end
 
 	-- Inside `require("...")` what is wanted is a module name, and the files of the workspace are
 	-- the list of them. The item replaces the text inside the quotes.
@@ -2232,6 +2320,17 @@ function Lye:onDocumentClosed(params)
 
 	self:forget(uri)
 	self.dirty[uri] = nil
+	if self.views then
+		local view = self.views[uri]
+		if view then
+			-- A view is found by the line index of the text it was read from, and by that of the
+			-- lowered text it made, so both keys go with it.
+			if self.viewByIndex[view.sourceIndex] == view then self.viewByIndex[view.sourceIndex] = nil end
+			if self.viewByIndex[view.index] == view then self.viewByIndex[view.index] = nil end
+			self.views[uri] = nil
+		end
+	end
+	if self.tokens_ then self.tokens_[uri] = nil end
 	self.server:notify(framework.METHOD.publishDiagnostics, { uri = uri, diagnostics = json.array() })
 end
 
@@ -2427,11 +2526,20 @@ function Lye:onFoldingRange(params)
 	local result = uri and self.analysis[uri]
 	if not document or not result then return json.array() end
 
-	local text, index = document.text, document.lineIndex
+	local view = self:view(uri)
+	local text, index = self:textOf(uri)
+	if not view or not text or not index then return json.array() end
 	local out, seen = json.array(), {}
 	local function add(from, to, kind)
-		local startLine = select(1, position.toPosition(text, index, from, self.server.encoding))
-		local endLine = select(1, position.toPosition(text, index, to, self.server.encoding))
+		local source, sourceIndex = text, index
+		if not view.map:isEmpty() then
+			-- A folding range is a pair of lines in the editor's text, so the span an analysis
+			-- reports travels back before it is read as lines.
+			from, to = view.map:toOriginalRange(from, to)
+			source, sourceIndex = view.source, view.sourceIndex
+		end
+		local startLine = select(1, position.toPosition(source, sourceIndex, from, self.server.encoding))
+		local endLine = select(1, position.toPosition(source, sourceIndex, to, self.server.encoding))
 		if endLine > startLine then
 			local key = startLine .. ":" .. endLine
 			if not seen[key] then
@@ -2470,10 +2578,11 @@ function Lye:onSelectionRange(params)
 	local result = uri and self.analysis[uri]
 	if not document or not result then return json.array() end
 
-	local text, index, encoding = document.text, document.lineIndex, self.server.encoding
+	local text, index = self:textOf(uri)
 	local out = json.array()
 	for _, where in ipairs(params.positions or {}) do
-		local offset = position.toOffset(text, index, where.line, where.character, encoding)
+		local offset = self:offsetAt(uri, where.line, where.character)
+		if not offset or not text then return out end
 		local held = {}
 		for _, node in ipairs(result.nodes) do
 			if node.start <= offset and offset <= node.stop then held[#held + 1] = node end
@@ -2530,9 +2639,14 @@ function Lye:onInlayHint(params)
 	local names = uri and self.names[uri]
 	if not document or not names then return json.array() end
 
-	local text, index, encoding = document.text, document.lineIndex, self.server.encoding
-	local from = params.range and position.toOffset(text, index, params.range.start.line, params.range.start.character, encoding) or 1
-	local to = params.range and position.toOffset(text, index, params.range["end"].line, params.range["end"].character, encoding) or #text
+	local view = self:view(uri)
+	local text = self:textOf(uri)
+	if not view or not text then return json.array() end
+	local encoding = self.server.encoding
+	local from = params.range
+		and self:offsetAt(uri, params.range.start.line, params.range.start.character) or 1
+	local to = params.range
+		and self:offsetAt(uri, params.range["end"].line, params.range["end"].character) or #text
 
 	local out = json.array()
 	for _, variable in ipairs(names.variables) do
@@ -2548,11 +2662,11 @@ function Lye:onInlayHint(params)
 			-- would be the name written twice.
 			if shown == variable.name then shown = nil end
 			if shown and shown ~= "unknown" and shown ~= "any" then
+				local at = declaration.stop + 1
+				if view and not view.map:isEmpty() then at = select(1, view.map:toOriginal(at)) end
+				local line, character = position.toPosition(view.source, view.sourceIndex, at, encoding)
 				out[#out + 1] = {
-					position = select(2, position.toPosition(text, index, declaration.stop + 1, encoding)) and {
-						line = select(1, position.toPosition(text, index, declaration.stop + 1, encoding)),
-						character = select(2, position.toPosition(text, index, declaration.stop + 1, encoding)),
-					} or nil,
+					position = { line = line, character = character },
 					label = ": " .. shown,
 					kind = 1,
 					paddingLeft = false,
@@ -2867,6 +2981,10 @@ function Lye:onFormatting(params)
 	local uri = params.textDocument?.uri
 	local document = uri and self.server.documents:get(uri)
 	if not document then return json.array() end
+	-- A document a plugin lowered has lines lye did not write and must not lay out: a plugin that
+	-- knows the language it lowered from is the one that knows its style.
+	local view = self:view(uri)
+	if view and not view.map:isEmpty() then return json.array() end
 	local text = document.text
 	local lines = 0
 	for _ in text:gmatch("\n") do lines += 1 end
@@ -2957,6 +3075,10 @@ function Lye:onTypeFormatting(params)
 	local uri = params.textDocument?.uri
 	local where = params.position
 	if not uri or not where then return json.array() end
+	-- A document a plugin lowered is the plugin's text to lay out: lye's own style is about the
+	-- lines it read, and those are not the lines the editor is showing.
+	local view = self:view(uri)
+	if view and not view.map:isEmpty() then return json.array() end
 	local continuation = self:aliasContinuation(uri, where.line)
 	if continuation then
 		local out = json.array()
@@ -3099,7 +3221,10 @@ function Lye:onDocumentColor(params)
 	local parsed = uri and self.analysis[uri]
 	if not document or not parsed then return json.array() end
 
-	local text, index, encoding = document.text, document.lineIndex, self.server.encoding
+	local view = self:view(uri)
+	local text, index = self:textOf(uri)
+	if not view or not text or not index then return json.array() end
+	local encoding = self.server.encoding
 	local out = json.array()
 	for at = 1, parsed.tokens.count do
 		local token = parsed.tokens.arena[at]
@@ -3112,12 +3237,18 @@ function Lye:onDocumentColor(params)
 				end
 				local alpha = #digits == 8 and channel(1, 2) or 1
 				local shift = #digits == 8 and 2 or 0
-				local from = select(1, position.toPosition(text, index, token.start, encoding))
-				local to, character = position.toPosition(text, index, token.stop + 1, encoding)
+				local from, to = token.start, token.stop
+				local source, sourceIndex = text, index
+				if not view.map:isEmpty() then
+					from, to = view.map:toOriginalRange(from, to)
+					source, sourceIndex = view.source, view.sourceIndex
+				end
+				local startLine, startCharacter = position.toPosition(source, sourceIndex, from, encoding)
+				local stopLine, stopCharacter = position.toPosition(source, sourceIndex, to + 1, encoding)
 				out[#out + 1] = {
 					range = {
-						start = { line = from, character = select(2, position.toPosition(text, index, token.start, encoding)) },
-						["end"] = { line = to, character = character },
+						start = { line = startLine, character = startCharacter },
+						["end"] = { line = stopLine, character = stopCharacter },
 					},
 					color = {
 						red = channel(1 + shift, 2 + shift),

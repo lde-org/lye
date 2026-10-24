@@ -184,6 +184,56 @@ local function publishedDiagnostics(frames)
 	return published
 end
 
+test.it("reads a lowered document, and reports where the reader wrote it", function()
+	-- The fixture plugin compiles `let name: type = value` to a `---@type` annotation over a
+	-- `local`. The annotation is text the plugin wrote, so the fault lye finds inside it has to
+	-- come back to the line the reader wrote — and the tokens the plugin coloured come back with it.
+	local workspace = TESTS_DIR .. "/fixtures/syntax"
+	local uri = "file://" .. workspace .. "/main.toy"
+	local source = "let holding: number = \"not a number\"\nlet plain: number = 1\n"
+	local frames = run(endingWithShutdown({
+		didOpen(source, uri),
+		{
+			jsonrpc = "2.0", id = 7, method = "textDocument/semanticTokens/full",
+			params = { textDocument = { uri = uri } },
+		},
+	}), workspace)
+
+	local params = assert(publishedDiagnostics(frames)[1])
+	test.equal(#params.diagnostics, 1, "the value contradicts the type the line declares")
+	test.truthy(params.diagnostics[1].message:find("number", 1, true), params.diagnostics[1].message)
+	test.equal(params.diagnostics[1].range.start.line, 0, "reported on the line the reader wrote")
+	test.equal(params.diagnostics[1].range["end"].line, 0, "and within it")
+
+	-- What the plugin coloured is in the lowered text's offsets and is answered in the reader's.
+	local answer
+	for _, message in ipairs(frames) do
+		if message.id == 7 then answer = message.result end
+	end
+	local data = assert(answer and answer.data, "the token answer")
+	local lines = {}
+	for piece in (source .. "\n"):gmatch("([^\n]*)\n") do lines[#lines + 1] = piece end
+	local seen, marked = {}, {}
+	local line, character = 0, 0
+	for index = 1, #data, 5 do
+		line = line + data[index]
+		character = data[index] == 0 and (character + data[index + 1]) or data[index + 1]
+		local text = lines[line + 1] and lines[line + 1]:sub(character + 1, character + data[index + 2])
+		seen[data[index + 3]] = true
+		marked[#marked + 1] = { line = line, text = text, kind = data[index + 3] }
+	end
+	test.equal(seen[11], true, "a property is coloured, which is the plugin's own kind")
+	test.equal(seen[1], nil, "and nothing lye read out of the text the plugin wrote is sent: a "
+		.. "string that exists in the lowered line has no place in the one the reader wrote")
+
+	local names = {}
+	for _, token in ipairs(marked) do
+		if token.line == 0 then names[#names + 1] = token.text end
+	end
+	test.equal(table.concat(names, " "), "holding",
+		"the name the plugin coloured, in the reader's own offsets")
+end)
+
 test.it("answers initialize with a capabilities object", function()
 	local frames = run(endingWithShutdown({}))
 	test.equal(frames[1].id, 1)
@@ -202,6 +252,22 @@ test.it("publishes a syntax diagnostic when a document with an error is opened",
 	test.equal(params.diagnostics[1].severity, 1)
 	test.equal(params.diagnostics[1].range.start.line, 1)
 	test.equal(params.diagnostics[1].range.start.character, 6)
+end)
+
+test.it("publishes the hint that `fun(...):...` says what `function` says", function()
+	-- The permissive callable written out is not wrong, so it is published as a hint at the type
+	-- it is written in rather than as something to fix.
+	local source = "---@param cb fun(...):...\nlocal function take(cb) end\nreturn take\n"
+	local frames = run(endingWithShutdown({ didOpen(source) }))
+
+	local params = assert(publishedDiagnostics(frames)[1])
+	test.equal(#params.diagnostics, 1, "the hint, and nothing wrong with the code")
+	test.equal(params.diagnostics[1].severity, 3, "a hint rather than a warning")
+	test.equal(params.diagnostics[1].message,
+		"`fun(...):...` is identical to `function`")
+	test.equal(params.diagnostics[1].range.start.line, 0)
+	test.equal(params.diagnostics[1].range.start.character, 13, "the type is what is marked")
+	test.equal(params.diagnostics[1].range["end"].character, 25)
 end)
 
 test.it("clears diagnostics when the document is fixed", function()

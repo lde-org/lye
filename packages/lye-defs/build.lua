@@ -10,11 +10,18 @@
 	script at all: a build runs when the size, mtime or hash of a file under `src/`, `lde.json` or
 	`build.lua` changes. Data kept outside `src/` is invisible to that check, so editing a
 	definition used to leave the previous `defs.lua` in place and the edit silently without
-	effect. Nothing pays for the move: an unreferenced file under `src/` is not bundled — a
-	100 KB file added there does not change the compiled binary by a byte.
+	effect.
 
-	Two places are written, and both are needed: the package's own output, so requiring it here
-	works, and `src/`, because a package that depends on this one is given the source.
+	The bundler compiles every `.lua` file under a package's output directory, not only the ones
+	something requires — and the definitions are written for the analyzer, not for Lua (`x: integer`
+	is not a parameter list), so it stops at the first of them. They are this script's input and
+	nothing else, and every word of them is in `defs.lua` by the time it is done, so the copy of
+	`meta/` is deleted before the build ends. They keep their place in the source, which is what
+	the build watches.
+
+	Only the output is written: a package that depends on this one gets a copy of it, since a
+	build script is what makes lde copy rather than link the source, and writing beside the script
+	would land in whichever package's target the build happened to run in.
 ]]
 
 local build = require("lde-build")
@@ -63,4 +70,13 @@ local gathered = table.concat({
 }, "\n") .. "\n"
 
 build:write("defs.lua", gathered)
-build:write("../../src/defs.lua", gathered)
+
+-- The definitions are gathered now, and this output directory is what lde copies into every package
+-- that depends on this one. The bundler bytecode-compiles every `.lua` it finds there, and these
+-- files are written for the analyzer rather than for Lua (`x: integer` is not a parameter list), so
+-- the copy cannot stay. `build:delete` takes a file, so the files go first and the folder after
+-- them. The source keeps the definitions; this copy is done with.
+for _, file in ipairs(build:scan("meta")) do
+	build:delete(file)
+end
+build:delete("meta")

@@ -5,44 +5,27 @@
 string = {}
 
 ---Returns the internal numeric codes of the characters `s[i], s[i+1], ..., s[j]`.
----@param s  string|number
----@param i? integer
----@param j? integer
----@return integer ...
 ---@nodiscard
-function string.byte(s, i, j) end
+function string.byte(s: string|number, i?: integer, j?: integer): integer ... end
 
 ---Returns a string with length equal to the number of arguments, in which each character has the internal numeric code equal to its corresponding argument.
----@param byte integer
----@param ... integer
----@return string
 ---@nodiscard
-function string.char(byte, ...) end
+function string.char(byte: integer, ...: integer): string end
 
 ---Returns a string containing a binary representation (a *binary chunk*) of the given function.
----@param f      fun(...):...
----@param strip? boolean
----@return string
 ---@nodiscard
-function string.dump(f, strip) end
+function string.dump(f: function, strip?: boolean): string end
 
 ---Looks for the first match of `pattern` (see §6.4.1) in the string.
----@param s       string|number
----@param pattern string|number
----@param init?   integer
----@param plain?  boolean
 ---@return integer|nil start
 ---@return integer|nil end
 ---@return any|nil ... captured
 ---@nodiscard
-function string.find(s, pattern, init, plain) end
+function string.find(s: string|number, pattern: string|number, init?: integer, plain?: boolean) end
 
 ---Returns a formatted version of its variable number of arguments following the description given in its first argument.
----@param s string|number
----@param ... any
----@return string
 ---@nodiscard
-function string.format(s, ...) end
+function string.format(s: string|number, ...: any): string end
 
 ---Returns an iterator function. Each call to that iterator continues matching `pattern` (see §6.4.1) over s and returns all captures.
 ---
@@ -55,70 +38,44 @@ function string.format(s, ...) end
 ---    end
 ---```
 ---
----@param s       string|number
----@param pattern string|number
 ---@return fun():string|number, ...
 ---@nodiscard
-function string.gmatch(s, pattern) end
+function string.gmatch(s: string|number, pattern: string|number) end
 
 ---Returns a copy of s where all occurrences of `pattern` (or the first n occurrences if n is given) are replaced by repl (see §6.4.1).
----@param s       string|number
----@param pattern string|number
----@param repl    string|number|table|function
----@param n?      integer
 ---@return string
 ---@return integer count
-function string.gsub(s, pattern, repl, n) end
+function string.gsub(s: string|number, pattern: string|number, repl: string|number|table<any, any>|fun(...: string|number): string|number|false|nil, n?: integer) end
 
 ---Returns its length.
----@param s string|number
----@return integer
 ---@nodiscard
-function string.len(s) end
+function string.len(s: string|number): integer end
 
 ---Returns a copy of this string with all uppercase letters changed to lowercase.
----@param s string|number
----@return string
 ---@nodiscard
-function string.lower(s) end
+function string.lower(s: string|number): string end
 
 ---Looks for the first match of `pattern` (see §6.4.1) in the string. If it finds one, `match` returns the captures; otherwise it returns nil.
----@param s       string|number
----@param pattern string|number
----@param init?   integer
----@return any ...
 ---@nodiscard
-function string.match(s, pattern, init) end
+function string.match(s: string|number, pattern: string|number, init?: integer): any ... end
 
 
 
 ---Returns a string that is the concatenation of `n` copies of the string `s` separated by the string `sep`.
----@param s    string|number
----@param n    integer
----@param sep? string|number
----@return string
 ---@nodiscard
-function string.rep(s, n, sep) end
+function string.rep(s: string|number, n: integer, sep?: string|number): string end
 
 ---Returns a string that is the string `s` reversed.
----@param s string|number
----@return string
 ---@nodiscard
-function string.reverse(s) end
+function string.reverse(s: string|number): string end
 
 ---Returns the substring of the string that starts at `i` and continues until `j`.
----@param s  string|number
----@param i  integer
----@param j? integer
----@return string
 ---@nodiscard
-function string.sub(s, i, j) end
+function string.sub(s: string|number, i: integer, j?: integer): string end
 
 
 ---Returns a copy of this string with all lowercase letters changed to uppercase.
----@param s string|number
----@return string
 ---@nodiscard
-function string.upper(s) end
+function string.upper(s: string|number): string end
 
 return string

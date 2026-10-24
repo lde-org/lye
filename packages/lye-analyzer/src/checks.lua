@@ -37,6 +37,49 @@ local isNeverNumeric, callLabel = annotations.isNeverNumeric, annotations.callLa
 
 local checks = {}
 
+--- A type written `fun(...):...` is the permissive callable written the long way: every parameter
+--- it names is `any`, it takes any number of them and it gives back `any` — which is exactly what
+--- the name `function` says. A hint rather than a warning, because what it means is right and it is
+--- only longer; and the same hint for the inline spelling a definition file uses.
+---@param ctx lye.analyzer.CheckContext
+local function anyFunctionHints(ctx)
+	local self, parsed, resolve = ctx.self, ctx.parsed, ctx.resolve
+
+	---@param text string?
+	---@param start integer?
+	---@param stop integer?
+	local function check(text, start, stop)
+		-- `function` itself is the answer, not the question: the name stands for the same callable
+		-- and is what a reader of the hint is being asked to write.
+		if not text or not start or text == "function" then return end
+		-- Only the spelling: `Foo` where `---@alias Foo fun(...):...` says the same callable is a
+		-- name for it, and the name is what the reader is owed. The check is also what keeps this
+		-- cheap — the annotations of a document are mostly names and literals.
+		if not text:match("^%s*%(?%s*fu?n%s*%(") then return end
+		local held = types.parse(text, resolve)
+		if held and types.isAnyFn(held) then
+			diagnostic.add(self, string.format("`%s` is identical to `function`", text), start, stop, 3)
+		end
+	end
+
+	for _, annotation in ipairs(self.doc and self.doc.annotations or {}) do
+		-- An `---@overload` is the one place a function type cannot be written as a name: it
+		-- describes a call shape — `fun(...):...` says every call fits — and `function` says
+		-- nothing about shape, so the advice would not apply.
+		if annotation.tag ~= "overload" then
+			check(annotation.type, annotation.typeStart or annotation.start,
+				annotation.typeStop or annotation.stop)
+		end
+	end
+	for _, declaration in ipairs(parsed.declarations) do
+		check(declaration.inlineType, declaration.inlineTypeStart, declaration.inlineTypeStop)
+	end
+	for _, node in ipairs(ctx.functionNodes or {}) do
+		check(node.inlineReturns, node.inlineReturnsStart, node.inlineReturnsStop)
+		check(node.inlineVariadic, node.inlineVariadicStart, node.inlineVariadicStop)
+	end
+end
+
 ---@param first lye.parser.Node
 ---@param second lye.parser.Node
 local function startsBefore(first, second)
@@ -539,6 +582,7 @@ checks.moduleExport = moduleExport
 
 function checks.report(ctx)
 	returnHints(ctx)
+	anyFunctionHints(ctx)
 	constWrites(ctx)
 	declaredMismatches(ctx)
 	fieldWrites(ctx)

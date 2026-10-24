@@ -755,16 +755,29 @@ end
 ---@return lye.doc.Annotation[]
 ---@return lye.doc.Annotation?
 local function withInline(params, returned, generics, constraints, body)
+	--- A parameter written `pc?: integer` may be left out: the marker belongs to the type, and a
+	--- signature is bracketed first, the way `---@param pc?` is read.
+	---@param param table
+	---@return string?
+	local function writtenTypeOf(param)
+		local written = param.inlineType
+		if not written or written == "" then return nil end
+		if not param.inlineOptional then return written end
+		local signature = written:match("^fun%s*%(") or written:match("^fn%s*%(")
+		return signature and ("(" .. written .. ")?") or (written .. "?")
+	end
+
 	for _, param in ipairs(body.params or {}) do
-		if param.inlineType and param.inlineType ~= "" then
+		local written = writtenTypeOf(param)
+		if written then
 			local found
 			for _, annotation in ipairs(params) do
 				if annotation.name == param.name then found = annotation end
 			end
 			if found then
-				found.type = found.type or param.inlineType
+				found.type = found.type or written
 			else
-				params[#params + 1] = { tag = "param", name = param.name, type = param.inlineType }
+				params[#params + 1] = { tag = "param", name = param.name, type = written }
 			end
 		end
 	end
@@ -1327,6 +1340,14 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		-- declared by the signature, not typos in the file.
 		for angle in (annotation.typeText or ""):gmatch("[%a_]+%s*<([^<>]*)>") do
 			for word in angle:gmatch("[%a_][%w_]*") do declared[word] = true end
+		end
+	end
+	-- A declaration may write its generics in front of its own parameter list — `function f<T>(x: T)`
+	-- — and they are declared the same way, by the declaration rather than by an annotation.
+	for _, declaration in ipairs(parsed.declarations) do
+		local body = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
+		for word in ((body and body.inlineGenerics) or ""):gmatch("[%a_][%w_]*") do
+			declared[word] = true
 		end
 	end
 	-- Which annotations say something about a type, and where in what they write the type is: a

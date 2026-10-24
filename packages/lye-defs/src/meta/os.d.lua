@@ -5,9 +5,8 @@
 os = {}
 
 ---Returns an approximation of the amount in seconds of CPU time used by the program.
----@return number
 ---@nodiscard
-function os.clock() end
+function os.clock(): number end
 
 ---@class osdate:osdateparam
 ---four digits
@@ -30,49 +29,34 @@ function os.clock() end
 ---@field isdst boolean?
 
 ---Returns a string or a table containing date and time, formatted according to the given string `format`.
----@param format? string
----@param time?   integer
----@return string|osdate|nil
 ---@nodiscard
-function os.date(format, time) end
+function os.date(format?: string, time?: integer): string|osdate|nil end
 
 ---Returns the difference, in seconds, from time `t1` to time `t2`.
----@param t2 integer
----@param t1? integer
----@return integer
 ---@nodiscard
-function os.difftime(t2, t1) end
+function os.difftime(t2: integer, t1?: integer): integer end
 
 ---Passes `command` to be executed by an operating system shell.
----@param command? string
----@return integer status
-function os.execute(command) end
+function os.execute(command?: string): integer end
 
 ---Calls the ISO C function `exit` to terminate the host program.
----@param code?  boolean|integer
----@param close? boolean
-function os.exit(code, close) end
+function os.exit(code?: boolean|integer, close?: boolean) end
 
 ---Returns the value of the process environment variable `varname`.
----@param varname string
----@return string?
 ---@nodiscard
-function os.getenv(varname) end
+function os.getenv(varname: string): string? end
 
 ---Deletes the file with the given name.
----@param filename string
 ---@return true? suc
 ---@return string? errmsg
 ---@return integer? errcode
-function os.remove(filename) end
+function os.remove(filename: string) end
 
 ---Renames the file or directory named `oldname` to `newname`.
----@param oldname string
----@param newname string
 ---@return true? suc
 ---@return string? errmsg
 ---@return integer? errcode
-function os.rename(oldname, newname) end
+function os.rename(oldname: string, newname: string) end
 
 ---@alias localecategory
 ---|>"all"
@@ -83,10 +67,7 @@ function os.rename(oldname, newname) end
 ---| "time"
 
 ---Sets the current locale of the program.
----@param locale    string?
----@param category? localecategory
----@return string? locale
-function os.setlocale(locale, category) end
+function os.setlocale(locale: string?, category?: localecategory): string? end
 
 ---@class osdateparam
 ---four digits
@@ -109,14 +90,11 @@ function os.setlocale(locale, category) end
 ---@field isdst boolean?
 
 ---Returns the current time when called without arguments, or a time representing the local date and time specified by the given table.
----@param date? osdateparam
----@return integer
 ---@nodiscard
-function os.time(date) end
+function os.time(date?: osdateparam): integer end
 
 ---Returns a string with a file name that can be used for a temporary file.
----@return string
 ---@nodiscard
-function os.tmpname() end
+function os.tmpname(): string end
 
 return os

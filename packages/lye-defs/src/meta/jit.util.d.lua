@@ -3,118 +3,74 @@
 ---@class Trace
 ---@class Proto
 
+---@class jit.util
 local util = {}
 
 ---@class jit.funcinfo.lua
-local funcinfo = {
-    linedefined = 0,
-    lastlinedefined = 0,
-    stackslots = 0,
-    params = 0,
-    bytecodes = 0,
-    gcconsts = 0,
-    nconsts = 0,
-    upvalues = 0,
-    currentline = 0,
-    isvararg = false,
-    children = false,
-    source = "",
-    loc = "",
-    ---@type Proto[]
-    proto = {}
-}
+---@field linedefined integer
+---@field lastlinedefined integer
+---@field stackslots integer
+---@field params integer
+---@field bytecodes integer
+---@field gcconsts integer
+---@field nconsts integer
+---@field upvalues integer
+---@field currentline integer
+---@field isvararg boolean
+---@field children boolean
+---@field source string
+---@field loc string
+---@field proto Proto[]
 
 ---@class jit.funcinfo.c
----@field ffid integer|nil
-local funcinfo2 = {
-    addr = 0,
-    upvalues = 0,
-}
+---@field addr integer
+---@field upvalues integer
+---@field ffid integer?
 
+function util.funcinfo(func: fn(), pc: integer?): jit.funcinfo.c | jit.funcinfo.lua end
 
----@param func function
----@param pc? integer
----@return jit.funcinfo.c|jit.funcinfo.lua info
-function util.funcinfo(func, pc)
-end
-
----@param func function
----@param pc integer
 ---@return integer? ins
 ---@return integer? m
-function util.funcbc(func, pc)
-end
+function util.funcbc(func: function, pc: integer) end
 
----@param func function
----@param idx integer
----@return any? k
-function util.funck(func, idx)
-end
+function util.funck(func: function, idx: integer): any? end
 
----@param func function
----@param idx integer
----@return string? name
-function util.funcuvname(func, idx)
-end
+function util.funcuvname(func: function, idx: integer): string? end
 
 ---@class jit.traceinfo
-local traceinfo = {
-    nins = 0,
-    nk = 0,
-    link = 0,
-    nexit = 0,
-    linktype = ""
-}
+---@field nins integer
+---@field nk integer
+---@field link integer
+---@field nexit integer
+---@field linktype string
 
----@param tr integer
----@return jit.traceinfo? info
-function util.traceinfo(tr)
-end
+function util.traceinfo(tr: integer): jit.traceinfo? end
 
----@param tr integer
----@param ref integer
 ---@return integer? m
 ---@return integer? ot
 ---@return integer? op1
 ---@return integer? op2
 ---@return integer? prev
-function util.traceir(tr, ref)
-end
+function util.traceir(tr: integer, ref: integer) end
 
----@param tr integer
----@param idx integer
 ---@return any? k
 ---@return integer? t
 ---@return integer? slot
-function util.tracek(tr, idx)
-end
+function util.tracek(tr: integer, idx: integer) end
 
----@class jit.snap : integer[]
+---@alias jit.snap integer[]
 
 ---@overload fun(tr: integer, sn: integer, getpos: boolean): jit.snap, integer
----@param tr integer
----@param sn integer
----@return jit.snap? snap
-function util.tracesnap(tr, sn)
-end
+function util.tracesnap(tr: integer, sn: integer): jit.snap? end
 
----@param tr integer
 ---@return string? mcode
 ---@return integer? addr
 ---@return integer? loop
-function util.tracemc(tr)
-end
+function util.tracemc(tr: integer) end
 
 ---@overload fun(exitno: integer): integer
----@param tr integer
----@param exitno integer
----@return integer? addr
-function util.traceexitstub(tr, exitno)
-end
+function util.traceexitstub(tr: integer, exitno: integer): integer? end
 
----@param idx integer
----@return integer? addr
-function util.ircalladdr(idx)
-end
+function util.ircalladdr(idx: integer): integer? end
 
 return util

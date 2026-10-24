@@ -1344,6 +1344,78 @@ test.it("reads the types a definition file writes inline through a prepared prel
 		"and what it gives back is read too")
 end)
 
+test.it("hints that `fun(...):...` is what `function` already says", function()
+	-- The permissive callable written the long way: every part of it is `any`, so the name says
+	-- the same thing. A hint, since what it means is right — it is only longer.
+	local source = table.concat({
+		"---@param callback fun(...):...\n",
+		"---@return fun(...):... \n",
+		"local function take(callback) end\n",
+		"return take\n",
+	}, "")
+	local found = {}
+	for _, entry in ipairs(analyzer.analyze(source).diagnostics) do
+		if entry.message:find("identical to `function`", 1, true) then found[#found + 1] = entry end
+	end
+	test.equal(#found, 2, "the parameter and the return are both told")
+	for _, entry in ipairs(found) do
+		test.equal(entry.severity, 3, "a hint, not a warning: " .. entry.message)
+		test.truthy(entry.message:find("`fun(...):...` is identical", 1, true), entry.message)
+	end
+	-- The hint points at the type, so an editor marks the spelling rather than the line.
+	test.equal(source:sub(found[1].start, found[1].stop), "fun(...):...")
+
+	-- What the name says already, and what it does not: a callable that takes an argument, or
+	-- gives something else back, is not the same callable and is left alone.
+	local kept = table.concat({
+		"---@param a function\n",
+		"---@param b fun(...): string\n",
+		"---@param c fun(x: any): any\n",
+		"---@return fun(...):...\n",
+		"---@overload fun(...):...\n",
+		"local function take(a, b, c) return a end\n",
+		"return take\n",
+	}, "")
+	local told = {}
+	for _, entry in ipairs(analyzer.analyze(kept).diagnostics) do
+		if entry.message:find("identical to `function`", 1, true) then told[#told + 1] = entry end
+	end
+	test.equal(#told, 1, "only the return is the permissive callable; an overload is a call shape")
+	test.equal(kept:sub(told[1].start, told[1].stop), "fun(...):...", "and the return is what it marks")
+
+	-- An alias that stands for the callable is told where it is written, and a name that uses it
+	-- is not: `Callback` is the name a reader wants, and `function` is not what it says.
+	local aliased = table.concat({
+		"---@alias Callback fun(...):...\n",
+		"---@param f Callback\n",
+		"local function take(f) end\n",
+		"return take\n",
+	}, "")
+	local told_again = {}
+	for _, entry in ipairs(analyzer.analyze(aliased).diagnostics) do
+		if entry.message:find("identical to `function`", 1, true) then
+			told_again[#told_again + 1] = entry
+		end
+	end
+	test.equal(#told_again, 1, "the alias body is the spelling, the use of it is a name")
+	test.equal(aliased:sub(told_again[1].start, told_again[1].stop), "fun(...):...")
+end)
+
+test.it("hints at the inline spelling of the same permissive callable", function()
+	-- A definition file writes its types where a reader sees them, and `fun(...):...` means the
+	-- same there: `function takes(cb: function): function` is the whole of this.
+	local hints = 0
+	local source = table.concat({
+		"local function localised(cb: fun(...):...) end\n",
+		"function takes(cb: fun(...):...): fun(...):... end\n",
+		"return localised, takes\n",
+	}, "")
+	for _, entry in ipairs(analyzer.analyze(source, nil, nil, nil, nil, nil, nil, true).diagnostics) do
+		if entry.message:find("identical to `function`", 1, true) then hints = hints + 1 end
+	end
+	test.equal(hints, 3, "the parameter of each and the return")
+end)
+
 test.it("checks each argument against its own parameter", function()
 	local result = analyzer.analyze(
 		"---@param a string\n---@param b number\nlocal function f(a, b) end\nf(\"s\", \"t\")\n"
@@ -1569,7 +1641,11 @@ test.it("takes any function where a variadic wildcard is wanted", function()
 		"local function specific(a) return a end\n",
 		"call(specific)\n",
 	}, "")
-	test.equal(#analyzer.analyze(source).diagnostics, 0)
+	-- Errors only: `fn(...) -> ...` is the permissive callable written out, which the analysis
+	-- hints about, and the accepted call is what this is about.
+	for _, entry in ipairs(analyzer.analyze(source).diagnostics) do
+		test.truthy((entry.severity or 1) >= 3, "nothing is refused: " .. entry.message)
+	end
 end)
 
 test.it("reads the definitions' map spelling as a table of values", function()

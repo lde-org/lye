@@ -10,9 +10,19 @@ local rapidhash = require("rapidhash")
 local env = require("env")
 local parallel = require("lye-lsp.parallel")
 local cache = require("lye-lsp.cache")
+local plugin = require("lye-plugin")
+local json = require("lye-json")
 
 local check = {}
 
+--- What lye reads of a document no plugin lowered: the text itself, and a map that moves nothing.
+--- A shared one, since it holds no state: a check reads every file of a package through this.
+local IDENTITY = require("lye-plugin.source").lower("", {})
+
+--- Whether a file is a definition file: `.d.lua` describes a library the way a `---@meta` file
+--- does, so a check holds it to its annotations rather than to bodies it does not have.
+---@param path string
+---@return boolean
 --- Whether a file is a definition file: `.d.lua` describes a library the way a `---@meta` file
 --- does, so a check holds it to its annotations rather than to bodies it does not have.
 ---@param path string
@@ -67,11 +77,13 @@ local function absolute(path)
 end
 
 --- The package a file belongs to: the nearest `lde.json` above it, which is what says where its
---- modules were built.
+--- modules were built. A path named relatively is read from the run's own directory, so it is made
+--- whole first — `src/x.lua` has a package above it that the walk over its own spelling never
+--- reaches.
 ---@param path string
 ---@return string?
 local function packageOf(path)
-	local at = path:match("^(.*)/[^/]+$")
+	local at = absolute(path)
 	while at and at ~= "" and at ~= "/" do
 		if fs.exists(at .. "/lde.json") then return at end
 		at = at:match("^(.*)/[^/]+$")
@@ -263,6 +275,16 @@ local function scopeFor(owner, scopes, elsewhere, store)
 	return scope
 end
 
+--- The plugins a package asked for, loaded once per package: `lye.json` beside the package and in
+--- the directory the run was started in, the package's answer winning — the way an editor session
+--- reads them, so that a file is checked in whatever language its package said it is written in.
+--- A plugin named rather than pathed is a module the package installed, which is one lde linked
+--- into its `target/`: the same place a `require` finds. A plugin that cannot be loaded goes to the
+--- run's error stream, because that is a fault of the run rather than of the file being checked.
+---@param path string
+---@return lye.plugin.Spec[]
+local pluginsByPackage = {}
+
 --- The file a module name resolves to inside a package's `target/`, without reading it: lde
 --- links every module a package can reach under that directory, so one rule answers a dependency
 --- and a sibling alike.
@@ -278,6 +300,77 @@ local function modulePath(owner, name)
 	}) do
 		if fs.exists(candidate) then return candidate end
 	end
+end
+
+--- The plugins a package asked for, loaded once per package: `lye.json` beside the package and in
+--- the directory the run was started in, the package's answer winning — the way an editor session
+--- reads them, so that a file is checked in whatever language its package said it is written in.
+--- A plugin named rather than pathed is a module the package installed, which is one lde linked
+--- into its `target/`: the same place a `require` finds. A plugin that cannot be loaded goes to the
+--- run's error stream, because that is a fault of the run rather than of the file being checked.
+---@param path string
+---@return lye.plugin.Spec[]
+local function pluginsFor(path)
+	local owner = packageOf(path)
+	local key = owner or ""
+	local held = pluginsByPackage[key]
+	if held then return held end
+
+	local entries, seen = {}, {}
+	---@param dir string
+	local function read(dir)
+		if seen[dir] then return end
+		seen[dir] = true
+		local written = readSource(dir .. "/lye.json")
+		if type(written) ~= "string" then return end
+		local ok, config = pcall(json.decode, written)
+		if not ok or type(config) ~= "table" or type(config.plugins) ~= "table" then return end
+		for _, entry in ipairs(config.plugins) do
+			if type(entry) == "string" and entry ~= "" then
+				local named = entry:sub(1, 1) ~= "!" and entry:sub(1, 1) ~= "/"
+					and (entry:sub(1, 1) == "." or entry:sub(-4) == ".lua")
+				entries[#entries + 1] = named and (absolute(dir .. "/" .. entry:gsub("^%./", ""))) or entry
+			end
+		end
+	end
+	if owner then read(absolute(owner)) end
+	read(absolute(env.cwd()))
+
+	local specs = plugin.load(entries, owner and absolute(owner) or absolute(env.cwd()), function(name)
+		return modulePath(owner or env.cwd(), name)
+	end, function(message)
+		io.stderr:write("check: " .. message .. "\n")
+	end)
+	pluginsByPackage[key] = specs
+	return specs
+end
+
+--- What lye reads of a file: the text itself, lowered when the package it belongs to asked for a
+--- plugin that knows its language. The map is what carries a finding back to the file it was found
+--- in, so a report says where a reader would look for it.
+---
+--- Kept by the file and the text, because a run asks twice: once for the batch it builds and once
+--- for each file it checks, and a plugin that compiles a language is not something to do twice for
+--- one unchanged file.
+---@type table<string, { text: string, map: lye.plugin.Map }>
+local loweredBySource = {}
+
+---@param path string
+---@param source string
+---@return string text
+---@return lye.plugin.Map map
+local function lowered(path, source)
+	local specs = pluginsFor(path)
+	if #specs == 0 then return source, IDENTITY end
+	local cacheKey = path .. "\0" .. textKey(source)
+	local held = loweredBySource[cacheKey]
+	if held then return held.text, held.map end
+	local context = { uri = path, source = source, text = source, root = packageOf(path) }
+	local map = plugin.lower(specs, context, function(message)
+		io.stderr:write("check: " .. message .. "\n")
+	end)
+	loweredBySource[cacheKey] = { text = map.text, map = map }
+	return map.text, map
 end
 
 --- The type `require("name")` has in `path`: lde links every module a package can reach under its
@@ -300,10 +393,11 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 		return nil
 	end
 
-	local written = readSource(found)
-	if type(written) ~= "string" then
+	local source = readSource(found)
+	if type(source) ~= "string" then
 		return nil
 	end
+	local written = lowered(found, source)
 	local key = textKey(written)
 
 	-- What the module came to is kept, including when it came to nothing: a package that requires
@@ -388,7 +482,11 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	if type(source) ~= "string" then
 		return nil, string.format("%s: not a readable file", path)
 	end
-	key = key or textKey(source)
+
+	-- The plugins the file's package asked for: what lye reads is the lowered text, and every
+	-- finding is carried back to the file the reader wrote before it is reported or kept.
+	local written, map = lowered(path, source)
+	key = key or textKey(written)
 
 	-- What a previous run found for this file, when nothing it was read against has changed:
 	-- reported as it stands, with no analysis at all.
@@ -404,7 +502,7 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	local analysing = { [key] = true }
 	local names = analysesByText[key]
 	if names == nil then
-		names = analyzer.analyze(source, PRELUDE, elsewhere, function(name)
+		names = analyzer.analyze(written, PRELUDE, elsewhere, function(name)
 			return moduleOf(path, name, modules or {}, analysing, elsewhere, scopes, batch, store)
 		end, nil, docsByText[key], nil, isDefinitionPath(path))
 		analysesByText[key] = names
@@ -419,6 +517,15 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	local parsed = names.parser
 	for _, entry in ipairs(parsed and parsed.diagnostics or {}) do all[#all + 1] = entry end
 	for _, entry in ipairs(names.diagnostics) do all[#all + 1] = entry end
+	-- Every finding travels back to the file it was found in, as a copy: what is held here is the
+	-- analysis of the *lowered* text, and a finding of it that a report has already carried back
+	-- would be carried back again the next time the same text is checked in this run.
+	local mapped = {}
+	for _, entry in ipairs(all) do
+		local from, to = map:toOriginalRange(entry.start, entry.stop or entry.start)
+		mapped[#mapped + 1] = { message = entry.message, severity = entry.severity, start = from, stop = to }
+	end
+	all = mapped
 	table.sort(all, function(a, b) return a.start < b.start end)
 
 	local isOk = reportEntries(reporter, path, source, all)
@@ -435,7 +542,9 @@ function check.file(path, elsewhere, modules, reporter, scopes)
 	return checkSource(path, elsewhere, modules, reporter, scopes, nil, nil, false)
 end
 
---- Every Lua file under `root`, which is what a check with no paths named checks.
+--- Every file a check with no paths named checks: the Lua files under `root`, and the files of any
+--- other language a plugin of the workspace claims. `.moon` is Lua to a project that said so, and a
+--- walk that only knew `.lua` would check none of what such a project is made of.
 ---@param root string
 ---@return string[]
 function check.discover(root)
@@ -446,8 +555,50 @@ function check.discover(root)
 	-- way the caller named it, so a run in a directory reports `./src/x.lua` and not the whole path.
 	local cleaned = root:gsub("/+$", "")
 	local prefix = (cleaned == "" or cleaned == ".") and "./" or (cleaned:gsub("^%./", "") .. "/")
-	for path in fs.scan(base, "**/*.lua", { ignore = ignored }) do
-		found[#found + 1] = prefix .. path
+	---@param glob string
+	local function scan(glob)
+		for path in fs.scan(base, glob, { ignore = ignored }) do
+			found[#found + 1] = prefix .. path
+		end
+	end
+	scan("**/*.lua")
+	for _, extension in ipairs(check.extensions(root)) do
+		scan("**/*." .. extension)
+	end
+	table.sort(found)
+	return found
+end
+
+--- The extensions the plugins of the packages under `root` say their languages are written in,
+--- each once. Read from the `lye.json` files the walk finds rather than from every package's own
+--- listing, so a directory that holds no plugin pays one walk and nothing else.
+---@param root string
+---@return string[]
+function check.extensions(root)
+	local found, seen = {}, {}
+	local base = absolute(root)
+	for path in fs.scan(base, "**/lye.json", { ignore = ignored }) do
+		local file = base .. "/" .. path
+		local written = readSource(file)
+		if type(written) == "string" then
+			local ok, config = pcall(json.decode, written)
+			if ok and type(config) == "table" and type(config.plugins) == "table" then
+				local dir = file:match("^(.*)/[^/]+$")
+				-- The plugins that file names, loaded the way the package's own check loads them,
+				-- so that the extensions it walks for are the ones its files really have.
+				local specs = plugin.load(config.plugins, dir, function(name)
+					return modulePath(dir, name)
+				end, function() end)
+				for _, spec in ipairs(specs) do
+					for _, extension in ipairs(spec.extensions or {}) do
+						if not seen[extension] and extension ~= "lua" then
+							seen[extension] = true
+							found[#found + 1] = extension
+						end
+					end
+				end
+			end
+		end
 	end
 	table.sort(found)
 	return found
@@ -499,11 +650,14 @@ function check.files(paths, reporter)
 		local source = readSource(path)
 		sourcesByPath[path] = source
 		if type(source) == "string" then
-			local key = textKey(source)
+			-- A file a plugin reads is keyed by what lye reads of it: that is what an analysis is
+			-- about, and the annotations a batch hands over are the ones written in it.
+			local written = lowered(path, source)
+			local key = textKey(written)
 			keysByPath[path] = key
 			local parsed = docsByText[key]
 			if parsed == nil then
-				local isOk, one = pcall(doc.parse, source)
+				local isOk, one = pcall(doc.parse, written)
 				parsed = isOk and one or false
 				docsByText[key] = parsed
 			end
