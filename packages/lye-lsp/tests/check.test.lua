@@ -23,15 +23,113 @@ local function writeInput(source)
 	handle:close()
 end
 
+--- A command with a cache of the test's own: a test that must start cold says where it starts.
+---@param cacheDir string?
+---@param command string
+---@return string output
+local function runWith(cacheDir, command)
+	local env = cacheDir and ("LYE_CACHE_DIR=" .. string.format("%q", cacheDir) .. " ") or ""
+	local pipe = assert(io.popen(env .. command))
+	local output = pipe:read("*a")
+	pipe:close()
+	return output
+end
+
 --- Every command runs with the cache of this suite, so a test never reads or writes the one a
 --- developer's own runs leave beside their project.
 ---@param command string
 ---@return string output
 local function run(command)
-	local pipe = assert(io.popen("LYE_CACHE_DIR=" .. string.format("%q", CACHE) .. " " .. command))
-	local output = pipe:read("*a")
-	pipe:close()
-	return output
+	return runWith(CACHE, command)
+end
+
+-- A check in a process of its own, which is the only way to tell what came from the cache from
+-- what this process still held: the counters are printed after `check.files`, and `seconds` is
+-- the CPU the check itself took, without the command line's startup.
+local PROBE = PACKAGE_DIR .. "/target/check-probe.lua"
+
+local function writeProbe()
+	local handle = assert(io.open(PROBE, "wb"))
+	handle:write(table.concat({
+		'local check = require("lye-lsp.check")\n',
+		"local paths = {}\n",
+		"for index = 1, #arg do paths[#paths + 1] = arg[index] end\n",
+		"local started = os.clock()\n",
+		"local ok = check.files(paths)\n",
+		"local seconds = os.clock() - started\n",
+		'local stats = check.stats()\n',
+		'print(string.format("CHECK ok=%s analyses=%d hits=%d loaded=%d misses=%d stored=%d parseddocs=%d loadeddocs=%d seconds=%.4f",\n',
+		"\ttostring(ok), stats.analyses, stats.interfaces.hits, stats.interfaces.loaded,\n",
+		"\tstats.interfaces.misses, stats.interfaces.stored,\n",
+		"\tstats.documents.parsed, stats.documents.loaded, seconds))\n",
+	}))
+	handle:close()
+end
+
+---@param paths string[]
+---@param cacheDir string|false
+---@return table counters
+local function probe(paths, cacheDir)
+	writeProbe()
+	local named = {}
+	for _, path in ipairs(paths) do named[#named + 1] = string.format("%q", path) end
+	local command = string.format("LYE_WORKERS=1 lde run %q -- %s 2>&1",
+		PROBE, table.concat(named, " "))
+	local output = cacheDir == false and runWith(nil, "LYE_CACHE=off " .. command)
+		or runWith(cacheDir, command)
+	local line = output:match("CHECK ([^\n]+)")
+	test.truthy(line, "the probe should report what it did: " .. output)
+	local counters = {}
+	for key, value in line:gmatch("(%a+)=(%S+)") do counters[key] = value end
+	counters.output = output
+	return counters
+end
+
+---@param root string
+---@param files table<string, string> by relative path
+local function writeTree(root, files)
+	local fs = require("fs")
+	os.execute("rm -rf " .. string.format("%q", root) .. " && mkdir -p " .. string.format("%q", root))
+	for path, source in pairs(files) do
+		local dir = path:match("^(.*)/[^/]+$")
+		if dir then fs.mkdirAll(root .. "/" .. dir) end
+		fs.write(root .. "/" .. path, source)
+	end
+end
+
+--- A path the index and the check both name the same way. A persisted entry is keyed by its root,
+--- so a test that builds one has to spell the root as the run under test will.
+---@param path string
+---@return string
+local function absolutePath(path)
+	if path:sub(1, 1) == "/" then return path end
+	return env.cwd() .. "/" .. (path:gsub("^%./", ""))
+end
+
+--- An index entry written by this process, under the cache directory the probe will read it from.
+--- The check never builds one; this is the earlier run it is supposed to find.
+---@param root string
+---@param cacheDir string
+---@return boolean
+local function buildIndex(root, cacheDir)
+	local cache = require("lye-lsp.cache")
+	local Index = require("lye-lsp.index")
+	local wasEnabled, wasNamed, wasRoot = cache.enabled(), cache.named(), cache.root()
+	cache.setEnabled(true)
+	cache.setRoot(cacheDir)
+	local index = Index.new()
+	local saved = index:save(index:build(root, { kind = "workspace" }))
+	cache.setEnabled(wasEnabled)
+	cache.setRoot(wasNamed and wasRoot or nil)
+	return saved
+end
+
+--- The findings of a probe run, without its counters: two runs that found the same thing say the
+--- same thing.
+---@param output string
+---@return string
+local function findingsOf(output)
+	return (output:match("^(.-)CHECK ") or output)
 end
 
 test.it("accepts a file that parses", function()
@@ -300,6 +398,186 @@ test.it("checks a batch across processes the way one process does", function()
 	test.truthy(one:match(": hint: "), "the fixture has something to compare, got: " .. one)
 	test.equal(checkIn(2), one, "two processes must say what one said")
 	test.equal(checkIn(4), one, "and so must four")
+end)
+
+test.it("reads an unchanged tree back without analysing it", function()
+	-- A warm check is the cache's whole point: every file's findings are reported as they were
+	-- found, and no analysis runs at all. `seconds` is the check's own CPU time, so the command
+	-- line's startup — the same in both runs — does not decide the comparison.
+	local root = PACKAGE_DIR .. "/target/warm-fixture"
+	local cacheDir = PACKAGE_DIR .. "/target/warm-entries"
+	os.execute("rm -rf " .. string.format("%q", cacheDir))
+	local files = {}
+	for index = 1, 16 do
+		files[string.format("src/file%02d.lua", index)] = table.concat({
+			string.format("local seed = %d\n", index),
+			"---@param value number\n",
+			"local function bump(value)\n",
+			"\tlocal total = value + seed\n",
+			"\tfor _ = 1, 2 do total = total + 1 end\n",
+			"\treturn total\n",
+			"end\n",
+			"return bump\n",
+		})
+	end
+	files["lde.json"] = '{ "name": "warm-fixture", "version": "0.1.0" }\n'
+	writeTree(root, files)
+	local named = {}
+	for relative in pairs(files) do
+		if relative:sub(-4) == ".lua" then named[#named + 1] = root .. "/" .. relative end
+	end
+	table.sort(named)
+
+	local cold = probe(named, cacheDir)
+	test.equal(cold.analyses, "16", "a cold run analyses every file: " .. cold.output)
+	local warm = probe(named, cacheDir)
+	test.equal(warm.analyses, "0", "a warm run analyses nothing: " .. warm.output)
+	test.equal(warm.ok, "true", "and finds what the cold run found: " .. warm.output)
+	test.truthy(tonumber(warm.seconds) < tonumber(cold.seconds),
+		"and takes less CPU than the cold run: " .. warm.seconds .. " vs " .. cold.seconds)
+end)
+
+test.it("re-checks only the files whose text changed", function()
+	-- A file whose findings were kept is reported from the entry; the one that changed is read
+	-- again. The fixture is one package of three independent files, so the reachable slice of a
+	-- change is the file itself.
+	local root = PACKAGE_DIR .. "/target/slice-fixture"
+	local cacheDir = PACKAGE_DIR .. "/target/slice-entries"
+	os.execute("rm -rf " .. string.format("%q", cacheDir))
+	local files = {
+		["lde.json"] = '{ "name": "slice-fixture", "version": "0.1.0" }\n',
+		["src/a.lua"] = "local a = 1\nreturn a\n",
+		["src/b.lua"] = "local b = 2\nreturn b\n",
+		["src/c.lua"] = "local c = 3\nreturn c\n",
+	}
+	writeTree(root, files)
+	local named = {}
+	for relative in pairs(files) do
+		if relative:sub(-4) == ".lua" then named[#named + 1] = root .. "/" .. relative end
+	end
+	table.sort(named)
+
+	local cold = probe(named, cacheDir)
+	test.equal(cold.analyses, "3", "a cold run analyses the three files: " .. cold.output)
+
+	local fs = require("fs")
+	fs.write(root .. "/src/b.lua", "local b = 4\nreturn b\n")
+	local warm = probe(named, cacheDir)
+	test.equal(warm.analyses, "1", "only the changed file is analysed: " .. warm.output)
+	test.equal(warm.ok, "true", "and the batch still passes: " .. warm.output)
+end)
+
+--- A package whose files annotate each other, which is what a batch pre-parse is for: one file
+--- declares a class, another uses it in a signature, and one writes a `---@type` whose diagnostic
+--- sits on the type's own span rather than on the annotation's.
+---@param root string
+---@return table<string, string> files
+local function indexFixture(root, name)
+	local files = {
+		["lde.json"] = string.format('{ "name": "%s", "version": "0.1.0" }\n', name),
+		["src/declares.lua"] = table.concat({
+			"---@class IndexedPoint\n",
+			"---@field x number\n",
+			"---@field y number\n",
+			"return {}\n",
+		}),
+		["src/uses.lua"] = table.concat({
+			"---@param point IndexedPoint\n",
+			"---@return number\n",
+			"local function total(point)\n",
+			"\treturn point.x + point.y\n",
+			"end\n",
+			"return total\n",
+		}),
+		["src/typed.lua"] = "---@type string\nlocal x = 5\nreturn x\n",
+		["src/warns.lua"] = "local unused = 1\nreturn 2\n",
+	}
+	writeTree(root, files)
+	return files
+end
+
+---@param root string
+---@param files table<string, string>
+---@return string[] sorted absolute paths of the Lua files
+local function luaPaths(root, files)
+	local named = {}
+	for relative in pairs(files) do
+		if relative:sub(-4) == ".lua" then named[#named + 1] = root .. "/" .. relative end
+	end
+	table.sort(named)
+	return named
+end
+
+test.it("reads the batch's annotations from the declaration index instead of parsing them", function()
+	-- The parent reads every checked file before it forks so that a name one declares is not a typo
+	-- in another. That comment-lex is what the persisted index already holds: a record whose hash
+	-- is the text read here answers for the file, and only a file the index does not describe is
+	-- parsed. The fixture has an annotation type error, whose span has to survive the round trip.
+	local root = absolutePath(PACKAGE_DIR .. "/target/index-annotations-fixture")
+	local cacheDir = absolutePath(PACKAGE_DIR .. "/target/index-annotations-entries")
+	os.execute("rm -rf " .. string.format("%q", cacheDir))
+	local files = indexFixture(root, "index-annotations-fixture")
+	local named = luaPaths(root, files)
+	test.equal(buildIndex(root, cacheDir), true, "the earlier run wrote an index entry")
+
+	local cold = probe(named, false)
+	test.equal(cold.parseddocs, tostring(#named), "an uncached run parses every file: " .. cold.output)
+	test.equal(cold.loadeddocs, "0", "and reads no index: " .. cold.output)
+
+	local warm = probe(named, cacheDir)
+	test.equal(warm.parseddocs, "0", "no checked file is comment-lexed: " .. warm.output)
+	test.equal(warm.loadeddocs, tostring(#named), "every file comes from the index: " .. warm.output)
+	test.equal(warm.ok, cold.ok, "and the batch passes as it did: " .. warm.output)
+	test.equal(findingsOf(warm.output), findingsOf(cold.output),
+		"the findings are byte-for-byte what an uncached run found")
+end)
+
+test.it("parses only the file whose text the index does not hold", function()
+	local root = absolutePath(PACKAGE_DIR .. "/target/index-changed-fixture")
+	local cacheDir = absolutePath(PACKAGE_DIR .. "/target/index-changed-entries")
+	os.execute("rm -rf " .. string.format("%q", cacheDir))
+	local files = indexFixture(root, "index-changed-fixture")
+	local named = luaPaths(root, files)
+	test.equal(buildIndex(root, cacheDir), true, "the earlier run wrote an index entry")
+
+	-- The first run fills the diagnostic cache too; the edit then makes exactly one file's record
+	-- a miss. What the index still holds answers for the other three.
+	probe(named, cacheDir)
+	local written = "local unused = 2\nreturn 2\n"
+	local fs = require("fs")
+	fs.write(root .. "/src/warns.lua", written)
+
+	local cold = probe(named, false)
+	local warm = probe(named, cacheDir)
+	test.equal(warm.parseddocs, "1", "only the changed file is comment-lexed: " .. warm.output)
+	test.equal(warm.loadeddocs, tostring(#named - 1), "the rest come from the index: " .. warm.output)
+	test.equal(warm.analyses, "1", "and only the changed file is analysed: " .. warm.output)
+	test.equal(findingsOf(warm.output), findingsOf(cold.output),
+		"the findings are what an uncached run finds for the new text")
+end)
+
+test.it("an index that cannot be read is parsed as it always was", function()
+	local root = absolutePath(PACKAGE_DIR .. "/target/index-corrupt-fixture")
+	local cacheDir = absolutePath(PACKAGE_DIR .. "/target/index-corrupt-entries")
+	os.execute("rm -rf " .. string.format("%q", cacheDir))
+	local files = indexFixture(root, "index-corrupt-fixture")
+	local named = luaPaths(root, files)
+	test.equal(buildIndex(root, cacheDir), true, "the earlier run wrote an index entry")
+
+	-- Half an entry is what a crash between the write and the rename leaves; a reader refuses it
+	-- rather than trusting the part that happens to parse.
+	local cache = require("lye-lsp.cache")
+	local Index = require("lye-lsp.index")
+	local entryPath = cacheDir .. "/" .. cache.codeVersion() .. "/" .. Index.new():key(root) .. ".entry"
+	local fs = require("fs")
+	local written = assert(fs.read(entryPath), "the entry is where its key says")
+	fs.write(entryPath, written:sub(1, math.floor(#written / 2)))
+
+	local cold = probe(named, false)
+	local warm = probe(named, cacheDir)
+	test.equal(warm.parseddocs, tostring(#named), "a corrupt index leaves every file to the parser: " .. warm.output)
+	test.equal(warm.loadeddocs, "0", "and nothing is read from it: " .. warm.output)
+	test.equal(findingsOf(warm.output), findingsOf(cold.output), "the findings are the same either way")
 end)
 
 return true

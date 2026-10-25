@@ -1,0 +1,17 @@
+{
+	"$schema": "https://raw.githubusercontent.com/lde-org/lde/master/schemas/lde.schema.json",
+	"name": "lye-plugin-require",
+	"version": "0.1.0",
+	"description": "Module names for require() completion",
+	"dependencies": {
+		"lye-plugin": {
+			"path": "../lye-plugin"
+		},
+		"fs": {
+			"version": "^0.3.0"
+		},
+		"lye-json": {
+			"path": "../lye-json"
+		}
+	}
+}

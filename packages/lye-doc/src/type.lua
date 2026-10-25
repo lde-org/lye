@@ -196,6 +196,32 @@ function types.array(inner) return make("array", { type = inner }) end
 ---@param indexed { key: string, type: lye.doc.Type }? what any other key holds
 function types.object(fields, indexed) return make("object", { fields = fields, indexed = indexed }) end
 
+--- The base type a literal is a value of, when it is one. A number or boolean literal carries its
+--- value; a string literal is the quoted extern the parser builds. A literal is already a member of
+--- its base type, so a union naming both says no more than the base.
+---@param held lye.doc.Type
+---@return lye.doc.Type? base
+local function baseOfLiteral(held)
+	if held.variant == "number" and held.value ~= nil then return types.NUMBER end
+	if held.variant == "boolean" and held.value ~= nil then return types.BOOLEAN end
+	if held.variant == "extern" and type(held.name) == "string" then
+		local first, last = held.name:sub(1, 1), held.name:sub(-1)
+		if (first == '"' or first == "'") and last == first then return types.STRING end
+	end
+end
+
+--- Whether `held` is the base type a literal belongs to. Compared by shape rather than identity:
+--- `number` parsed from text and the `types.NUMBER` singleton answer the same question.
+---@param held lye.doc.Type
+---@param base lye.doc.Type
+---@return boolean
+local function isLiteralBase(held, base)
+	if base == types.NUMBER then return held.variant == "number" and held.value == nil end
+	if base == types.BOOLEAN then return held.variant == "boolean" and held.value == nil end
+	if base == types.STRING then return held.variant == "string" end
+	return false
+end
+
 --- Flatten nested unions and drop duplicates. An unknown member absorbs the whole union,
 --- since `string | unknown` tells us no more than the unknown did.
 ---@param members lye.doc.Type[]
@@ -220,6 +246,32 @@ function types.union(members)
 		end
 	end
 	for _, member in ipairs(members) do add(member) end
+
+	-- A literal is a value of its base type, so a union that names both is the base:
+	-- `20261024 | number` is number, `true | boolean` is boolean, `"s" | string` is string. Only the
+	-- base absorbs a literal; literals alone keep their exact values, which is what a discriminant
+	-- needs. This cannot be a general subtype sweep: a string intentionally satisfies a string
+	-- literal, so `satisfies` would let the literal absorb the base in the other direction.
+	local absorbed = {}
+	for index, member in ipairs(flat) do
+		local base = baseOfLiteral(member)
+		if base then
+			for otherIndex, other in ipairs(flat) do
+				if otherIndex ~= index and isLiteralBase(other, base) then
+					absorbed[index] = true
+					break
+				end
+			end
+		end
+	end
+	if next(absorbed) then
+		local kept = {}
+		for index, member in ipairs(flat) do
+			if not absorbed[index] then kept[#kept + 1] = member end
+		end
+		flat = kept
+	end
+
 	if #flat == 1 then return flat[1] end
 	return make("union", { types = flat })
 end
@@ -656,6 +708,9 @@ end
 ---@param wanted lye.doc.Type?
 function types.narrowToType(type, wanted)
 	if not wanted then return type end
+	-- `type(x) == "table"` is exactly the information an unknown or `any` lacks, so the test
+	-- replaces it with the type it names instead of letting `satisfies` accept the unknown as-is.
+	if type.variant == "unknown" or type.variant == "any" then return wanted end
 	if type.variant ~= "union" then
 		return types.satisfies(type, wanted) and type or nil
 	end
@@ -1260,9 +1315,10 @@ local function parseFn(text, resolve)
 		if first ~= "..." then returns = types.parse(first, resolve) or types.ANY_TYPE end
 	end
 
-	local params, isVariadic = {}, false
-	for _, part in ipairs(splitParams(text:sub(openAt + 1, closeAt - 1))) do
+	local params, isVariadic, method = {}, false, false
+	for index, part in ipairs(splitParams(text:sub(openAt + 1, closeAt - 1))) do
 		local one = part:gsub("^%s+", ""):gsub("%s+$", "")
+		if index == 1 and one:match("^self[%s%?:]") then method = true end
 		if one == "..." or one:match("^%.%.%.[%s:]*") then
 			isVariadic = true
 		elseif one ~= "" then
@@ -1280,6 +1336,7 @@ local function parseFn(text, resolve)
 		end
 	end
 	local signature = types.fn(params, returns, isVariadic)
+	if method then signature.isMethod = true end
 	if declared then
 		signature.generics, signature.constraints = readGenericNames(declared)
 	end

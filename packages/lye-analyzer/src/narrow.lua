@@ -6,6 +6,7 @@
 ]]
 
 local types = require("lye-doc.type")
+local memo = require("lye-analyzer.memo")
 local names = require("lye-analyzer.names")
 local writtenNameOf, readSubject, readTypeSubject, callName =
 	names.writtenNameOf, names.readSubject, names.readTypeSubject, names.callName
@@ -13,6 +14,13 @@ local writtenNameOf, readSubject, readTypeSubject, callName =
 local CONJUNCTIONS = { ["and"] = true, ["&&"] = true }
 local DISJUNCTIONS = { ["or"] = true, ["||"] = true }
 local NEGATIONS = { ["not"] = true, ["!"] = true }
+
+-- What `type()` can answer. A comparison against anything else is a mistake, not a narrowing:
+-- LuaJIT's `type` returns one of these strings and adds `"cdata"` to the standard set.
+local TYPE_NAMES = {
+	["nil"] = true, number = true, string = true, boolean = true, table = true,
+	["function"] = true, thread = true, userdata = true, cdata = true,
+}
 
 --- The narrowing a predicate asserts about a call's argument, and the parameter it names.
 --- `v is T` narrows where the call's value is truthy; `v is -T` narrows to what is *not* a T,
@@ -62,13 +70,14 @@ end
 ---@param idx integer? arena index of the condition expression, absent when there is none
 ---@param invert boolean
 ---@param signatures table<string, lye.analyzer.Signature>
+---@param resolve fun(text: string): lye.doc.Type?
 ---@return lye.analyzer.Condition?
-local function readCondition(parsed, idx, invert, signatures)
+local function readCondition(parsed, idx, invert, signatures, resolve)
 	local node = parsed.nodes[idx]
 	if not node then return nil end
 
 	if node.kind == "unary" and NEGATIONS[node.op] then
-		return readCondition(parsed, node.operand, not invert, signatures)
+		return readCondition(parsed, node.operand, not invert, signatures, resolve)
 	end
 
 	-- `if isString(x) then`: a call whose declaration carries a predicate proves something about
@@ -122,10 +131,17 @@ local function readCondition(parsed, idx, invert, signatures)
 			local callIdx, literal = pair[1], pair[2]
 			local name, field = readTypeSubject(parsed, callIdx)
 			if name and literal and literal.kind == "string" and literal.value then
+				-- `"f"` is not something `type` can return, so it proves nothing about the value.
+				local runtime = literal.value
+				if not TYPE_NAMES[runtime] then return nil end
+				-- A cdata is not the bare name `cdata`: lye defines it as the `ffi.cdata*` class, which
+				-- is what a value known to be a cdata has to be handed as.
+				local written = runtime == "cdata" and "ffi.cdata*" or runtime
+				local held = resolve(written) or types.parse(written)
 				local wantsType = isEqual ~= invert
 				return {
 					name = name, field = field, kind = wantsType and "type" or "nottype",
-					wantTruthy = wantsType, typeName = literal.value,
+					wantTruthy = wantsType, type = held, typeName = runtime,
 				}
 			end
 		end
@@ -157,7 +173,8 @@ end
 ---@param conditionIdx integer? arena index of the guarding expression
 ---@param invert boolean the assertions hold where the condition is false
 ---@param signatures table<string, lye.analyzer.Signature>
-local function readConditions(parsed, conditionIdx, invert, signatures)
+---@param resolve fun(text: string): lye.doc.Type?
+local function readConditions(parsed, conditionIdx, invert, signatures, resolve)
 	local node = conditionIdx and parsed.nodes[conditionIdx]
 	if not node then return {} end
 	local op = node.kind == "binary" and node.op
@@ -165,13 +182,13 @@ local function readConditions(parsed, conditionIdx, invert, signatures)
 	if isConjunction or isDisjunction then
 		-- Only one of the two keeps asserting the same operands once inverted.
 		if invert ~= isDisjunction then return {} end
-		local conditions = readConditions(parsed, node.left, invert, signatures)
-		for _, condition in ipairs(readConditions(parsed, node.right, invert, signatures)) do
+		local conditions = readConditions(parsed, node.left, invert, signatures, resolve)
+		for _, condition in ipairs(readConditions(parsed, node.right, invert, signatures, resolve)) do
 			conditions[#conditions + 1] = condition
 		end
 		return conditions
 	end
-	local condition = readCondition(parsed, conditionIdx, invert, signatures)
+	local condition = readCondition(parsed, conditionIdx, invert, signatures, resolve)
 	if not condition then return {} end
 	return { condition }
 end
@@ -530,7 +547,7 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 			local right = parsed.nodes[node.right]
 			local scope = left and scopeAtOffset(left.stop)
 			if scope and right then
-				for _, condition in ipairs(readConditions(parsed, node.left, node.op == "or", signatures)) do
+				for _, condition in ipairs(readConditions(parsed, node.left, node.op == "or", signatures, resolve)) do
 					-- The fact holds while the right operand runs, so it starts where that operand
 					-- starts. Starting at the left operand's own `stop` covered its name: a prefix
 					-- node's span is a point, so `opts or {}` read the left `opts` as already falsy.
@@ -553,7 +570,7 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 			local marker = rest and rest:match("^%s*([%+%-])")
 			local wanted = rest and (rest:gsub("^%s*[%+%-!%?]%s*", ""))
 			local scope = scopeAtOffset(annotation.stop)
-			local held = wanted and wanted ~= "" and types.parse(wanted, resolve)
+			local held = wanted and wanted ~= "" and memo.parse(wanted, resolve)
 			if subject and held and scope then
 				add({ name = subject, kind = marker == "-" and "nottype" or "cast",
 					type = held, wantTruthy = true }, scope, annotation.stop)
@@ -568,11 +585,11 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 			local knownIdxs = {}
 			for _, scope in ipairs(clausesOf(node)) do
 				for _, knownIdx in ipairs(knownIdxs) do
-					for _, condition in ipairs(readConditions(parsed, knownIdx, true, signatures)) do
+					for _, condition in ipairs(readConditions(parsed, knownIdx, true, signatures, resolve)) do
 						add(condition, scope)
 					end
 				end
-				for _, condition in ipairs(readConditions(parsed, scope.conditionIdx, false, signatures)) do
+				for _, condition in ipairs(readConditions(parsed, scope.conditionIdx, false, signatures, resolve)) do
 					add(condition, scope)
 				end
 				-- A clause that cannot fall through leaves its own condition false afterwards:
@@ -581,7 +598,7 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 				-- what narrows `if not handle then error("...") end` for the rest of the block.
 				local enclosing = scope.branch ~= "else" and not fallsThrough(scope) and scopeAtOffset(node.stop)
 				if enclosing then
-					for _, condition in ipairs(readConditions(parsed, scope.conditionIdx, true, signatures)) do
+					for _, condition in ipairs(readConditions(parsed, scope.conditionIdx, true, signatures, resolve)) do
 						add(condition, enclosing, node.stop)
 					end
 				end
@@ -592,7 +609,7 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 			-- `repeat` tests after the body, so only a nil comparison is worth asserting.
 			local isInverted = node.kind == "repeat"
 			if scope then
-				for _, condition in ipairs(readConditions(parsed, scope.conditionIdx, isInverted, signatures)) do
+				for _, condition in ipairs(readConditions(parsed, scope.conditionIdx, isInverted, signatures, resolve)) do
 					if not isInverted or condition.kind == "nil" or condition.kind == "notnil" then
 						add(condition, scope)
 					end
@@ -616,7 +633,7 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 						-- Cheap to parse once: the predicate belongs to the declaration, so every
 						-- call to it shares this.
 						if not predicate.parsed then
-							predicate.parsed = types.parse(predicate.type, resolve)
+							predicate.parsed = memo.parse(predicate.type, resolve)
 						end
 						-- From the end of the call: a fact is only about what comes after it, and
 						-- a name is looked up where the fact starts, which is past the argument.

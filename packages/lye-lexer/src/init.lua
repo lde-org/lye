@@ -431,11 +431,29 @@ end
 ---@param source string
 ---@param from integer byte offset to resume at, 1-based
 ---@param prefix lye.lexer.Tokens the scan being continued
----@return lye.lexer.Tokens
+---@return lye.lexer.Tokens? nil when the cut falls inside a literal or comment, so no prefix agrees with the text
 function lexer.resume(source, from, prefix)
-	local self = Lexer.new(source)
 	local keep = 0
 	while keep < prefix.count and prefix.arena[keep + 1].start < from do keep += 1 end
+	-- A kept token must end before the cut: a token that starts before it and runs past it is a
+	-- literal or comment whose bytes and text belong to the old source, and the scan below would
+	-- begin in the middle of it. A statement boundary never lies inside one, so this is a cut the
+	-- token stream does not have and no prefix describes the new text at: nil says to scan afresh.
+	if keep > 0 and prefix.arena[keep].stop >= from then return nil end
+	-- The same holds for a problem's span. A problem that starts before the cut and reaches past
+	-- it describes text the resumed scan re-reads, and keeping it would report it twice at best
+	-- and at a stale span at worst.
+	for _, problem in ipairs(prefix.problems or {}) do
+		if problem.start < from and problem.stop >= from then return nil end
+	end
+	local self = Lexer.new(source)
+	-- A short new source says little about how many tokens came before the change: deleting a
+	-- large tail leaves a long prefix and a small estimate, and the copy below would run past the
+	-- arena. Size it from the tokens that survive instead.
+	if keep > self.capacity then
+		self.capacity = keep
+		self.arena = ffi.new("lye_token[?]", keep + 1)
+	end
 	-- `ffi.copy` counts from the start of the array and index 0 is unused, so one slot more.
 	ffi.copy(self.arena, prefix.arena, (keep + 1) * ffi.sizeof("lye_token"))
 	for index = 1, keep do self.texts[index] = prefix.texts[index] end

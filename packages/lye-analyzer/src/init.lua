@@ -20,6 +20,10 @@ local narrow = require("lye-analyzer.narrow")
 local annotations = require("lye-analyzer.annotations")
 local checks = require("lye-analyzer.checks")
 local typing = require("lye-analyzer.typing")
+local items = require("lye-analyzer.items")
+local reuse = require("lye-analyzer.reuse")
+local memo = require("lye-analyzer.memo")
+local rapidhash = require("rapidhash")
 local callName, writtenNameOf = names.callName, names.writtenNameOf
 local nodesOf = require("lye-parser").nodesOf
 local annotationValues, annotationSpan, documentationOf, trailsCode, sameLine, collectAssignments, factHolds, withGenerics, signatureOf, paramTypeOf, callLabel =
@@ -49,6 +53,7 @@ end
 ---@field stop integer
 ---@field scope lye.analyzer.Scope
 ---@field declared lye.doc.Type? the type an annotation fixed, if any
+---@field evolvedType lye.doc.Type? the shape an empty table took from a parameter it was passed to
 ---@field initializer lye.doc.Type
 ---@field assignments { at: integer, type: lye.doc.Type }[]
 ---@field references integer[]
@@ -139,6 +144,14 @@ end
 ---@field returns table<string, lye.doc.Type>
 ---@field globalNames table<string, boolean> the globals the definitions declare, `arg` among them
 
+--- What a caller may tell an analysis beyond its arguments. Every field is optional.
+---@class lye.analyzer.Options
+---@field uri string? the document's URI, used by structural item IDs and cache keys
+---@field previous lye.analyzer.Result? the last result for this text's predecessor
+---@field from integer? 1-based byte where the edit starts
+---@field incremental boolean? false runs the cold path, whatever `previous` and `from` hold
+---@field counters table<string, number>? filled in place with phase timings, in seconds
+
 ---@class lye.analyzer.Result
 ---@field parser lye.parser.Result
 ---@field doc lye.doc.File the annotations the analysis read
@@ -156,6 +169,11 @@ end
 ---@field callTypes table<integer, lye.doc.Type> what each call was bound to, by node index
 ---@field module lye.doc.Type? what `require` of this file means, when it returns a table
 ---@field providers lye.plugin.TypeProviders[]? what the plugins of this document answer
+---@field items lye.analyzer.ItemTree the item manifest, built for every analysis
+---@field reused table<string, boolean> item IDs whose cached results were reused
+---@field declarationNames table<string, boolean> names resolved through `elsewhere`
+---@field requiredModules table<string, boolean> names passed to the `modules` callback
+---@field counters table<string, number>? the phase timings, when the caller asked for them
 
 ---@param result lye.parser.Result
 ---@return lye.analyzer.Scope
@@ -319,7 +337,7 @@ function analyzer.declaredTypeFor(parsed, file, declaration, resolve)
 	-- same thing, and it wins where both are written.
 	local inline = declaration.inlineType and declaration.inlineType ~= "" and declaration.inlineType
 	if inline then
-		local held = types.parse(inline, resolve)
+		local held = memo.parse(inline, resolve)
 		if held then return held end
 	end
 
@@ -353,9 +371,9 @@ function analyzer.declaredTypeFor(parsed, file, declaration, resolve)
 		local written = types.splitValues(annotation.type or "")
 		if #written > 1 then
 			local at = declaration.position or 1
-			if written[at] then return types.parse(written[at], resolve) end
+			if written[at] then return memo.parse(written[at], resolve) end
 		end
-		return types.parse(annotation.type, resolve)
+		return memo.parse(annotation.type, resolve)
 	end
 
 	-- The trailing annotation is written at the declaration it describes, so it is the answer
@@ -520,7 +538,7 @@ end
 function analyzer.typeAt(self, variable, offset)
 	-- A declaration with neither annotation nor initializer has nothing to start from, and the
 	-- mutable unknown says so: it can still be refined by what is assigned below.
-	local base = variable.declared or variable.initializer or types.mutable()
+	local base = variable.declared or variable.evolvedType or variable.initializer or types.mutable()
 
 	local latest
 	for _, assignment in ipairs(variable.assignments) do
@@ -589,7 +607,7 @@ end
 ---@param inferCtx lye.infer.Context
 ---@param source string the document, so a string literal can be read where it was written
 ---@param positionalParams fun(signature: lye.analyzer.Signature, resolve: fun(text: string): lye.doc.Type?): (lye.doc.Type?)[]
-local function checkCalls(self, parsed, signatureOfCall, returns, resolve, inferCtx, source, positionalParams)
+local function checkCalls(self, parsed, signatureOfCall, returns, resolve, inferCtx, source, positionalParams, reused)
 	--- A generic name in a signature is a type variable: the argument cannot be checked against
 	--- the name itself, so it is checked against what the name was limited to, if anything.
 	---@param signature lye.analyzer.Signature?
@@ -605,19 +623,12 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	---@type table<lye.analyzer.Signature, { params: (lye.doc.Type?)[], returns: lye.doc.Type? }>
 	local parsedSignatures = {}
 
-	-- The type a written text came to, parsed once per document. A generic signature is read at
-	-- every call site of the function, and parsing `T` or `T[]` again at each of them is a tree
-	-- per read; one resolution context covers the whole analysis, so one text is one type here.
-	---@type table<string, lye.doc.Type|false>
-	local parsedTypes = {}
+	-- The type a written text came to, read through the analysis's memo: a generic signature is read
+	-- at every call site of the function, and one resolution context covers the whole analysis.
 	---@param text string
 	---@return lye.doc.Type?
 	local function typeOfText(text)
-		local held = parsedTypes[text]
-		if held ~= nil then return held or nil end
-		local parsed = types.parse(text, resolve)
-		parsedTypes[text] = parsed or false
-		return parsed
+		return memo.parse(text, resolve)
 	end
 	---@param signature lye.analyzer.Signature
 	---@return (lye.doc.Type?)[]
@@ -633,11 +644,11 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 		local variadic
 		for _, annotation in ipairs(signature.params or {}) do
 			if annotation.name == "..." and annotation.type then
-				variadic = types.parse(annotation.type, local_) or nil
+				variadic = memo.parse(annotation.type, local_) or nil
 			end
 		end
 		local written = signature.returns and signature.returns.type
-		local returned = written and types.parse(written, local_) or nil
+		local returned = written and memo.parse(written, local_) or nil
 		-- Kept for a generic signature too: what a name of its own stands for is read the same at
 		-- every call — the call's own binding is applied by `types.substitute` on the answer, not
 		-- by reading the signature again, and re-reading it per call was a tree per call.
@@ -657,7 +668,64 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 			-- are the same argument, and only the value compares against a parameter written `"read"`.
 			return types.stringValue(argument.value or source:sub(argument.start, argument.stop))
 		end
+		if argument and argument.kind == "prefix" and argument.callee then
+			local variable = lookupIn(scopeAt(self, argument.start), argument.callee, argument.start)
+			if variable then return analyzer.typeAt(self, variable, argument.start) end
+		end
 		return infer.at(inferCtx, argIdx)
+	end
+
+	--- A settled unknown cannot be handed to a parameter that says what it takes. Passing it on
+	--- without a use is allowed, but a call is a use: the callee promised a shape and the argument
+	--- has none. Generic and `any` parameters are left alone; a placeholder the typing rounds have
+	--- not settled yet is not an answer and is not reported.
+	---@param held lye.doc.Type?
+	---@return boolean
+	local function unknownValue(held)
+		if not held then return false end
+		if held.variant == "union" then
+			for _, member in ipairs(held.types) do
+				if unknownValue(member) then return true end
+			end
+			return false
+		end
+		return held.variant == "any" or (held.variant == "unknown" and not types.isMutable(held))
+	end
+
+	---@param held lye.doc.Type
+	---@return boolean
+	local function concrete(held)
+		local variant = held.variant
+		return variant == "number" or variant == "string" or variant == "boolean" or variant == "table"
+			or variant == "class" or variant == "array" or variant == "object" or variant == "fn"
+			or variant == "nil" or variant == "void"
+	end
+
+	-- The check every argument and receiver goes through. Unknown fits everything by the type
+	-- lattice, which is right when a value is passed through and wrong when it is used in a call.
+	local function mismatch(wanted, actual, label)
+		if wanted and actual and concrete(wanted) and unknownValue(actual) then
+			return label .. " is unknown"
+		end
+		return types.mismatch(wanted, actual, label)
+	end
+
+	local function receiverParamOf(signature, calleeType, params, receiver)
+		if not receiver then return false end
+		-- A method declaration's own parameters were already built without `self`, so its first
+		-- parameter is an argument the caller writes even when it is the receiver's type.
+		if signature and signature.declaration
+			and signature.declaration.name:find(":", 1, true) then
+			return false
+		end
+		if calleeType and calleeType.isMethod then return true end
+		local first = params[1]
+		if first == nil then return true end
+		local annotation = signature and signature.params and signature.params[1]
+		if annotation and annotation.name == "self" then return true end
+		-- A library method is often declared as a plain function whose first parameter is the
+		-- subject: `string.find(s, pattern, …)` reads `s:find(pattern, …)` with `s` as receiver.
+		return types.mismatch(first, receiver, "argument 1") == nil
 	end
 
 	--- The first argument that cannot be what its parameter says, so the caller can decide whether
@@ -666,22 +734,29 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	---@param params (lye.doc.Type?)[]
 	---@param receiver lye.doc.Type? the value a `:` call passes, which fills the first parameter
 	---@param variadic lye.doc.Type? what an argument past the named ones has to be
+	---@param receiverParam boolean? whether `params[1]` is an explicit `self`
 	---@return integer? nodeIdx the argument, or the receiver, that cannot be what it is
 	---@return lye.doc.Type? wanted
 	---@return lye.doc.Type? actual
-	local function firstMismatch(node, params, receiver, variadic)
-		-- A `:` call passes the receiver as its first argument. Its type decides whether that argument
-		-- occupies a parameter, while a mismatch leaves the written arguments unshifted.
+	local function firstMismatch(node, params, receiver, variadic, receiverParam)
+		-- A `:` call passes the receiver as its first argument. A definition may spell that
+		-- parameter (`fun(self: P, x: number)`) or leave it implicit, as `function P:add(x)` does;
+		-- an implicit receiver is not one of the parameters the caller writes, so it only shifts.
 		local shift = 0
 		if receiver then
-			local wanted = params[1]
-			if wanted == nil then
-				shift = 1
-			elseif not types.mismatch(wanted, receiver, "argument 1") then
-				if types.mismatch(wanted, receiver, "argument 1") then
+			if receiverParam then
+				local wanted = params[1]
+				if wanted == nil then
+					shift = 1
+				elseif mismatch(wanted, receiver, "argument 1") then
 					return node.target, wanted, receiver
+				else
+					shift = 1
 				end
-				shift = 1
+			else
+				-- The signature's parameters already leave the receiver out; the written arguments
+				-- start at the first one.
+				shift = 0
 			end
 		end
 		for index, argIdx in ipairs(node.args or {}) do
@@ -691,11 +766,25 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 			if not wanted and variadic and index + shift > #params then wanted = variadic end
 			if wanted and parsed.nodes[argIdx] then
 				local actual = argumentAt(argIdx)
-				if types.mismatch(wanted, actual, "argument " .. (index + shift)) then
+				if mismatch(wanted, actual, "argument " .. (index + shift)) then
 					return argIdx, wanted, actual
 				end
 			end
 		end
+	end
+
+	--- Whether a call fits one overload shape, arity included. `firstMismatch` only asks about the
+	--- arguments a shape declares, so a no-argument shape would otherwise accept any extra ones.
+	---@param node lye.parser.Node
+	---@param shape lye.doc.Type
+	---@param receiver lye.doc.Type?
+	---@return boolean
+	local function fitsOverload(node, shape, receiver)
+		local receiverParam = receiver ~= nil and shape.isMethod == true
+		if firstMismatch(node, shape.params, receiver, shape.variadic, receiverParam) then return false end
+		local occupied = receiverParam and 1 or 0
+		local count = #(node.args or {}) + occupied
+		return shape.variadic or count <= #shape.params
 	end
 
 	--- Report the arguments that cannot be what the parameters say they are. A call that fits one of
@@ -707,14 +796,13 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	---@param params (lye.doc.Type?)[]
 	---@param overloads string[]?
 	---@param receiver lye.doc.Type?
-	local function checkArgs(node, name, params, overloads, receiver, variadic)
-		local blame, wanted, actual = firstMismatch(node, params, receiver, variadic)
+	local function checkArgs(node, name, params, overloads, receiver, variadic, receiverParam)
+		local blame, wanted, actual = firstMismatch(node, params, receiver, variadic, receiverParam)
 		if not blame then return end
 
 		for _, written in ipairs(overloads or {}) do
-			local shape = types.parse(written, resolve)
-			if shape and shape.variant == "fn"
-				and not firstMismatch(node, shape.params, receiver, shape.variadic) then
+			local shape = memo.parse(written, resolve)
+			if shape and shape.variant == "fn" and fitsOverload(node, shape, receiver) then
 				return
 			end
 		end
@@ -728,6 +816,7 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	end
 
 	for _, node in ipairs(nodesOf(parsed, "call")) do
+		if not (reused and reused(node.start, node.stop)) then
 		do
 			local signature, calleeType, byName = signatureOfCall(node)
 			-- The name the call is written with, when it is one: the label a mismatch is reported
@@ -741,7 +830,8 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 			if signature then
 				local params, returned, variadic = typesOf(signature)
 				if byName and returned then returns[node.callee] = returned end
-				checkArgs(node, name, params, signature.overloads, receiver, variadic)
+				local receiverParam = receiverParamOf(signature, calleeType, params, receiver)
+				checkArgs(node, name, params, signature.overloads, receiver, variadic, receiverParam)
 			elseif calleeType and types.isFn(calleeType) and not types.isAnyFn(calleeType) then
 				-- A callable nothing annotated, such as a method declared in this document: its own type is all
 				-- there is to check against, and a parameter of the signature's own is bound by this very call.
@@ -760,8 +850,10 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 					params = replaced
 					if variadic then variadic = types.substitute(variadic, bindings) end
 				end
-				checkArgs(node, name, params, nil, receiver, variadic)
+				checkArgs(node, name, params, nil, receiver, variadic,
+					receiverParamOf(nil, calleeType, params, receiver))
 			end
+		end
 		end
 	end
 end
@@ -939,16 +1031,28 @@ function analyzer.prelude(sources)
 				for _, annotation in ipairs(entry.params) do
 					if annotation.name == "..." then
 						isVariadic = true
-						variadic = annotation.type and types.parse(annotation.type, local_) or nil
+						variadic = annotation.type and memo.parse(annotation.type, local_) or nil
 					else
 						params[#params + 1] = annotation.type
-							and types.parse(annotation.type, local_) or types.UNKNOWN_TYPE
+							and memo.parse(annotation.type, local_) or types.UNKNOWN_TYPE
 					end
 				end
 				local returned = entry.returns and entry.returns.type
 				local bare = returned and (returned:gsub("%.%.%.$", "")) or nil
 				local fnType = types.fn(params,
-					(bare and types.parse(bare, local_)) or types.ANY_TYPE, isVariadic, nil, variadic)
+					(bare and memo.parse(bare, local_)) or types.ANY_TYPE, isVariadic, nil, variadic)
+				-- The overloads a definition writes are call shapes, and their returns are what a
+				-- matching call gets: `file:read("*a")` is a string even though the primary return
+				-- is `any`, because the mode decided it. Kept on the callable so an analysis can
+				-- select one at the call site without re-reading the definition.
+				if entry.overloads and #entry.overloads > 0 then
+					local shapes = {}
+					for _, written in ipairs(entry.overloads) do
+						local shape = memo.parse(written, resolveAll)
+						if shape and shape.variant == "fn" then shapes[#shapes + 1] = shape end
+					end
+					if #shapes > 0 then fnType.overloads = shapes end
+				end
 				doc.classes.evolve(prepared, className, field, fnType)
 				-- The annotations stay reachable from the type they built, so a call through the field is checked
 				-- and bound exactly as a call to a named function is.
@@ -1057,31 +1161,86 @@ end
 --- ships, and an empty list means none. A plugin contributes classes, aliases and the types of the
 --- calls and fields only it understands — the ffi dialect is one.
 ---@param report fun(message: string)? where a plugin's fault is written, when the caller has a log
+---@param options lye.analyzer.Options? the document's URI, what the previous analysis kept, and
+--- where the counters go. `incremental = false`, or `LYE_INCREMENTAL=0`, is the cold path: any
+--- resume and the previous result are ignored.
 function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAnnotations, isModuleOnly,
-	isDefinition, plugins, report)
+	isDefinition, plugins, report, options)
 	assert(type(source) == "string", "analyzer.analyze expects a string")
 
-	local parsed = Parser.new(source, resume, isDefinition):parse()
-	local annotations = cachedAnnotations or doc.parse(source, parsed.tokens)
-	
-	-- What this file declares, so a class name or an alias in an annotation means what it says. Read
-	-- before anything parses a type, with the definitions folded in first.
-	local namespace = doc.classes.read(annotations)
-	if prepared then
-		-- The definitions are reached through the namespace rather than copied into it: copying hundreds
-		-- of classes and aliases on each keystroke is work thrown away with the namespace.
-		setmetatable(namespace.classes, { __index = prepared.classes })
-		setmetatable(namespace.aliases, { __index = prepared.aliases })
-		-- The methods the definitions added to their classes, which the resolver reads from here. Copied,
-		-- because a method declared on a definition's class has to merge into the prepared entry.
-		for className, fields in pairs(prepared.evolved or {}) do
-			namespace.evolved = namespace.evolved or {}
-			namespace.evolved[className] = namespace.evolved[className] or {}
-			for field, method in pairs(fields) do
-				namespace.evolved[className][field] = method
-			end
+	local counters = options and options.counters
+	local incremental = options and options.incremental
+	if incremental == nil then incremental = os.getenv("LYE_INCREMENTAL") ~= "0" end
+	if not incremental then
+		-- The cold path, regardless of what the caller kept: no resume, and later no item reuse.
+		resume = nil
+	elseif not resume and options and options.previous and options.from then
+		-- The caller did not derive one itself, so the previous tree and the edit's start say
+		-- where a parse may carry on from.
+		resume = Parser.resumeAt(options.previous.parser, options.from)
+	end
+
+	-- Timing is only collected when the caller hands a table over: the cold path must not pay an
+	-- os.clock per phase. `mark` is a closure, but one the counters path asked for.
+	local started, mark
+	if counters then
+		counters.parse, counters.annotations, counters.namespace, counters.scopes = 0, 0, 0, 0
+		counters.typing, counters.typing2, counters.checks, counters.dedupe = 0, 0, 0, 0
+		-- Counts, not seconds, for the three a timing mark prints: an item count, what was reused
+		-- and what had to be looked at again. The timings live under the names that say so.
+		counters.items, counters.reused, counters.retyped = 0, 0, 0
+		counters.retypedItems, counters.rebased, counters.conservative = 0, 0, 0
+		counters.invalidated = 0
+		counters.itemsTime, counters.reuseTime = 0, 0
+		-- Cache work: a parsed text reused, a resolver lookup reused, a namespace read kept.
+		counters.typeHits, counters.typeMisses = 0, 0
+		counters.namespaceReused = 0
+		started = os.clock()
+		---@param name string
+		mark = function(name)
+			counters[name] = os.clock() - started
+			started = os.clock()
 		end
 	end
+	local parsed = Parser.new(source, resume, isDefinition):parse()
+	if counters then mark("parse") end
+	local annotations = cachedAnnotations or doc.parse(source, parsed.tokens)
+	if counters then mark("annotations") end
+	-- The manifest is what item reuse is decided from, so it is built before typing rather than
+	-- after it: a keystroke asks which items changed before it knows what any of them mean.
+	local itemTree = items.build(source, parsed, annotations, options and options.uri)
+
+	-- What other files declare, read once per name: the resolver reaches it directly, so the
+	-- recording has to sit in that lookup rather than in this file's own fallback alone. It is
+	-- index-only: a consumer may ask for a name, never iterate it.
+	local declarationNames = {}
+	local elsewhereProxy
+	if elsewhere then
+		elsewhereProxy = setmetatable({}, {
+			__index = function(_, name)
+				local held = elsewhere[name]
+				if type(held) == "table" then declarationNames[name] = true end
+				return held
+			end,
+		})
+	end
+	-- The names `require` is handed, recorded even when the callback has no answer for them.
+	local requiredModules = {}
+	local moduleLookup
+	if modules then
+		moduleLookup = function(name)
+			requiredModules[name] = true
+			return modules(name)
+		end
+	end
+
+	-- What this file declares, so a class name or an alias in an annotation means what it says. The
+	-- classes and aliases of one annotation digest are read once and shared; the tables a resolver
+	-- writes to while it works — `evolved` and `built` — are this analysis's own, so a method or a
+	-- class type one analysis grows is never handed to the next.
+	local annotationDigest = reuse.annotationsDigest(source, annotations)
+	local namespace, namespaceReused = memo.namespace(annotations, annotationDigest, prepared)
+	if counters then counters.namespaceReused = namespaceReused and 1 or 0 end
 	---@param node lye.parser.Node
 	local function calledName(node) return callName(parsed, node) end
 
@@ -1096,9 +1255,17 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		callName = calledName,
 	}, report or function() end)
 	local pluginDiagnostics = {}
+	local contributedDeclarations = false
 	for _, contribution in ipairs(contributions) do
 		local contributed = contribution.types
-		for _, file in ipairs(contributed.annotations or {}) do
+		local files = contributed.annotations or {}
+		if #files > 0 and not contributedDeclarations then
+			-- A contribution writes into the namespace by assignment, so it gets tables of its own
+			-- rather than the shared read of this document's annotations.
+			contributedDeclarations = true
+			memo.writable(namespace)
+		end
+		for _, file in ipairs(files) do
 			local from = doc.classes.read(file)
 			for name, class in pairs(from.classes) do
 				-- A block that only referred to a name writes a class for it with no members — the
@@ -1115,7 +1282,8 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		end
 	end
 
-	local own = doc.classes.resolver(namespace, elsewhere)
+	local own = doc.classes.resolver(namespace, elsewhereProxy)
+	if counters then mark("namespace") end
 	-- A name this file does not declare may be one that another file does, and the caller is the
 	-- one that can say so. When it hands over what the name *is* — the alias body, the class — that
 	-- answer is used as it stands: `---@param t lye.doc.Type` in one file means the same thing as it
@@ -1126,9 +1294,13 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	local function resolve(text)
 		local found = own(text)
 		if found then return found end
-		local foreign = elsewhere and elsewhere[text]
+		local foreign = elsewhereProxy and elsewhereProxy[text]
 		if type(foreign) == "table" then return foreign end
 	end
+	-- Every parsed type is this analysis's own and is dropped with it: a table kept from an earlier
+	-- analysis would share differently than a fresh reading, and `serial.write` writes by identity.
+	-- The cache is keyed by the resolver, and a resolver is made per analysis.
+	memo.bind(resolve, counters)
 
 	-- What each plugin answers about this document, now that the namespace is complete. The ffi
 	-- plugin's `ffi.new("Vec")`, `ffi.C` and callback signatures are all read here rather than by
@@ -1191,7 +1363,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		if returned and returned.type then
 			-- The return of a generic function is a type variable too: `@generic T` with
 			-- `@return T` says the function returns whatever it was given.
-			returns[declaration.name] = types.parse(returned.type,
+			returns[declaration.name] = memo.parse(returned.type,
 				withGenerics(generics, constraints, resolve))
 		end
 	end
@@ -1491,8 +1663,12 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 			return paramsFor(signature.declaration, signature, resolve)
 		end
 		local params = {}
-		for index, annotation in ipairs(signature.params) do
-			params[index] = annotation.type and types.parse(annotation.type, resolve)
+		for _, annotation in ipairs(signature.params) do
+			-- `...` is not a positional parameter: it accepts every argument past the named ones,
+			-- and putting it here made a method receiver look like the variadic itself.
+			if annotation.name ~= "..." then
+				params[#params + 1] = annotation.type and memo.parse(annotation.type, resolve)
+			end
 		end
 		return params
 	end
@@ -1508,14 +1684,14 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		for _, annotation in ipairs(signature.params) do
 			if annotation.name == "..." then
 				isVariadic = true
-				variadic = annotation.type and types.parse(annotation.type, local_) or nil
+				variadic = annotation.type and memo.parse(annotation.type, local_) or nil
 			end
 		end
 		-- A definition file writes it inline instead: `function f(...: string|number)`.
 		local inlineBody = not variadic and declaration.valueIdx and parsed.nodes[declaration.valueIdx]
 		if inlineBody and inlineBody.inlineVariadic then
 			isVariadic = true
-			variadic = types.parse(inlineBody.inlineVariadic, local_) or nil
+			variadic = memo.parse(inlineBody.inlineVariadic, local_) or nil
 		end
 		local returned = signature.returns and signature.returns.type
 		-- `---@return T1, T2` and `---@return T...` spread: each returned value is that type.
@@ -1531,13 +1707,13 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		if written and #written > 1 then
 			values = {}
 			for index, text in ipairs(written) do
-				values[index] = types.parse(text, local_) or types.UNKNOWN_TYPE
+				values[index] = memo.parse(text, local_) or types.UNKNOWN_TYPE
 			end
 			returned = written[1]
 		end
 		-- A signature that names its parameters but not its return promises nothing about one. A mutable
 		-- unknown says exactly that, and the body's own return is promoted into it in place.
-		local fnType = types.fn(params, (returned and types.parse(returned, local_)) or types.mutable(),
+		local fnType = types.fn(params, (returned and memo.parse(returned, local_)) or types.mutable(),
 			isVariadic, isSpread, variadic)
 		if values then fnType.values = values end
 		return fnType
@@ -1602,7 +1778,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 				-- it is not. Dropping it made `raw ---@cast raw -nil` mean the value *is* nil, which
 				-- is how a read that had already ruled nil out was reported as still possibly nil.
 				local marker, wanted = (written or ""):match("^%s*([%+%-]?)%s*(.*)$")
-				local held = wanted ~= "" and types.parse(wanted, resolve)
+				local held = wanted ~= "" and memo.parse(wanted, resolve)
 				if held then
 					-- The last node ending at or before the cast: the one it was written after.
 					local low, high = 1, #byEnd
@@ -1624,15 +1800,354 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		end
 	end
 
+	if counters then started = os.clock() end
 	local root, byRecord, scopes = buildScopes(parsed)
 	self.root = root
 	self.scopes = scopes
 	-- The list itself, not the file it was parsed into: a `---@cast` is read from there.
 	narrow.collect(parsed, byRecord, signatures, resolve, annotations.annotations)
+	if counters then mark("scopes") end
 	inferCtx = infer.context(parsed, typeOfName, returns, function(base, baseName, field, offset)
 		return analyzer.fieldTypeAt(self, base, baseName, field, offset)
-	end, modules, hasCallProvider and providerCall or nil)
+	end, moduleLookup, hasCallProvider and providerCall or nil)
 	inferCtx.casts = inlineCasts
+
+	-- An empty table has no shape of its own, and a function that expects one gives it that shape:
+	--
+	--     local out = {}
+	--     add(out, ...)          -- add expects Entry[]
+	--     for _, entry in ipairs(out) do entry.name end
+	--
+	-- The shape is a constraint, not an annotation: it is only taken when the table had none, and
+	-- a later call that wants a different shape is a mismatch against the type it now has. It is
+	-- applied before typing so `ipairs` sees the element type on its first walk.
+	local function evolveUnknownTables()
+		---@param node lye.parser.Node
+		---@return (lye.doc.Type?)[]? params
+		---@return lye.doc.Type? variadic
+		local function parametersOf(node)
+			-- A named call only: its signature is in the table the analyzer built. A method or a
+			-- field call would have to infer the receiver, and inferring before typing caches the
+			-- mutable placeholders this pass exists to avoid.
+			local signature = node.callee and signatures[node.callee]
+			if not signature then return nil end
+			local params, variadic = {}, nil
+			for _, annotation in ipairs(signature.params or {}) do
+				if annotation.name == "..." then
+					variadic = annotation.type and memo.parse(annotation.type, resolve) or nil
+				else
+					params[#params + 1] = annotation.type
+						and memo.parse(annotation.type, resolve) or types.UNKNOWN_TYPE
+				end
+			end
+			return params, variadic
+		end
+
+		for _, node in ipairs(nodesOf(parsed, "call")) do
+			local params, variadic = parametersOf(node)
+			if params then
+				for index, argIdx in ipairs(node.args or {}) do
+					local wanted = params[index]
+					if not wanted and variadic and index > #params then wanted = variadic end
+					if wanted and (wanted.variant == "array" or wanted.variant == "object"
+						or wanted.variant == "class") then
+						local argument = parsed.nodes[argIdx]
+						if argument and argument.kind == "prefix" and argument.callee then
+							local variable = lookupIn(scopeAt(self, argument.start), argument.callee, argument.start)
+							if variable and not variable.declared and not variable.evolvedType then
+								local declaration = variable.declaration
+								local literal = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
+								local isEmpty = literal and literal.kind == "table"
+									and not next(parsed.tableFields[literal.index] or {})
+									and not next(parsed.tableIndexes[literal.index] or {})
+								if isEmpty then variable.evolvedType = wanted end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	-- The items of this text, in source order. A class or alias item is an annotation span and a
+	-- function item is a statement, so at the top level they do not overlap: one bisection finds
+	-- the item a node or a diagnostic belongs to.
+	local allItems = {}
+	for _, item in pairs(itemTree.items) do allItems[#allItems + 1] = item end
+	table.sort(allItems, function(left, right)
+		if left.start ~= right.start then return left.start < right.start end
+		return left.stop < right.stop
+	end)
+	---@param from integer
+	---@param to integer
+	---@return lye.analyzer.Item? the item whose span holds the range
+	local function ownerItemAt(from, to)
+		local low, high, index = 1, #allItems, 0
+		while low <= high do
+			local mid = math.floor((low + high) / 2)
+			if allItems[mid].start <= from then
+				index = mid
+				low = mid + 1
+			else
+				high = mid - 1
+			end
+		end
+		local item = allItems[index]
+		if item and item.start <= from and to <= item.stop then return item end
+		return nil
+	end
+
+	-- What a cache key is allowed to depend on. The resolver here does not record the names it
+	-- reads: asking whether `Remote` changed is not the analysis resolving it.
+	---@param text string
+	---@return lye.doc.Type?
+	local function digestResolve(text)
+		local found = own(text)
+		if found then return found end
+		local foreign = elsewhere and elsewhere[text]
+		if type(foreign) == "table" then return foreign end
+	end
+
+	local topDeclarations, moduleTables, assignedGlobals = {}, {}, {}
+	for _, declaration in ipairs(parsed.declarations) do
+		if declaration.depth == 0 then
+			topDeclarations[declaration.name] = declaration
+			if declaration.initializer == "table" then moduleTables[declaration.name] = true end
+		end
+	end
+	-- A top-level statement that assigns a name without declaring it writes a global. What such a
+	-- global holds is the module-level code itself, so an item reading it depends on that code.
+	local moduleAssignParts = {}
+	local topLevel = {}
+	for _, index in ipairs(parsed.topLevel or {}) do topLevel[index] = true end
+	for index, node in ipairs(parsed.nodes) do
+		if topLevel[index] and node.kind == "assignment" then
+			local written = node.target and writtenNameOf(parsed, node.target)
+			if written and not written:find("[%.:]") then
+				assignedGlobals[written] = true
+				moduleAssignParts[#moduleAssignParts + 1] = source:sub(node.start, node.stop)
+			end
+		end
+	end
+	table.sort(moduleAssignParts)
+	local moduleAssignDigest = rapidhash.hex(table.concat(moduleAssignParts, "\0"))
+
+	local declarationDigests = {}
+	---@param name string
+	---@return string
+	local function declarationDigest(name)
+		local held = declarationDigests[name]
+		if held ~= nil then return held end
+		local declaration = topDeclarations[name]
+		if not declaration then
+			declarationDigests[name] = ""
+			return ""
+		end
+		local from = items.annotationStart(source, annotations.annotations or {}, declaration.start)
+		local value = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
+		local to = value and math.max(value.stop, declaration.stop) or declaration.stop
+		held = rapidhash.hex(source:sub(from, to))
+		declarationDigests[name] = held
+		return held
+	end
+
+	-- A plain name a function assigns: the declaration's own text does not move, so a reader of
+	-- the name sees the new value only through the writes. The assignments' text, in source
+	-- order, is what such a reader depends on; a same-length replacement inside a writer's body
+	-- then still dirties the reader even though every span rebases cleanly.
+	local moduleWrites = {}
+	for _, node in ipairs(parsed.byKind.assignment or {}) do
+		-- Every target, not only the last one the tree links: `a, b = 1, 2` writes both names.
+		for _, target in ipairs(node.targets or { node.target }) do
+			local written = target and writtenNameOf(parsed, target)
+			if written and not written:find("[%.:]") then
+				local parts = moduleWrites[written]
+				if not parts then
+					parts = {}
+					moduleWrites[written] = parts
+				end
+				parts[#parts + 1] = source:sub(node.start, node.stop)
+			end
+		end
+	end
+	local moduleWriteDigests = {}
+	---@param name string
+	---@return string
+	local function moduleWriteDigest(name)
+		local held = moduleWriteDigests[name]
+		if held ~= nil then return held end
+		local parts = moduleWrites[name]
+		held = parts and rapidhash.hex(table.concat(parts, "\0")) or ""
+		moduleWriteDigests[name] = held
+		return held
+	end
+
+	local nameToItem = {}
+	for _, item in pairs(itemTree.items) do
+		if item.kind == "function" then
+			nameToItem[item.name] = item
+			local dotted = item.name:gsub(":", ".")
+			if dotted ~= item.name then nameToItem[dotted] = item end
+		end
+	end
+
+	local globalDigests = {}
+	---@param name string
+	---@return string
+	local function globalDigest(name)
+		local held = globalDigests[name]
+		if held ~= nil then return held end
+		local className = prepared and prepared.globals and prepared.globals[name]
+		local found = className and digestResolve(className) or digestResolve(name)
+		held = found and types.display(found) or (className or "nil")
+		globalDigests[name] = held
+		return held
+	end
+
+	local moduleDigests = {}
+	---@param name string
+	---@return string
+	local function moduleDigest(name)
+		local held = moduleDigests[name]
+		if held ~= nil then return held end
+		local answer = modules and modules(name) or nil
+		held = answer and types.display(answer) or "nil"
+		moduleDigests[name] = held
+		return held
+	end
+
+	-- Item reuse is opt-in until its answer is provably the cold one: the default path keeps the
+	-- previous result for resume only, never for carrying an item's results over.
+	local reuseEnabled = options ~= nil and options.reuse == true
+	local previous = incremental and reuseEnabled and options.previous or nil
+	if previous and not (previous.parser and previous.parser.source and previous.items) then previous = nil end
+	-- Structural changes the item cache does not follow: a name added, removed or re-kinded, and
+	-- a parse that gained or lost a problem. Both make an unchanged body observe something else,
+	-- so the edit is answered cold rather than with a carried-over answer.
+	local forceDirty = false
+	if previous then
+		-- The skeleton is every byte outside function bodies plus annotation text and module-level
+		-- names. When it moved, the edit touched a signature, an annotation or module-level code;
+		-- no reused body can be proven to observe the same things, so this edit is answered cold.
+		-- A body edit leaves it alone, which is the case item reuse exists for.
+		if previous.items.skeletonHash ~= itemTree.skeletonHash then forceDirty = true end
+		if reuse.declarationShape(previous.parser, previous.doc) ~= reuse.declarationShape(parsed, annotations) then
+			forceDirty = true
+		end
+		local function problemShape(result)
+			local parts = {}
+			for _, entry in ipairs(result.diagnostics or {}) do
+				parts[#parts + 1] = tostring(entry.message or "")
+			end
+			table.sort(parts)
+			return table.concat(parts, "\1")
+		end
+		if problemShape(previous.parser) ~= problemShape(parsed) then forceDirty = true end
+	end
+	local reuseCtx = {
+		source = source, parsed = parsed, annotations = annotations, tree = itemTree,
+		digestResolve = digestResolve,
+		namespaceDigest = reuse.namespaceDigest(source, annotations),
+		pluginsDigest = reuse.pluginsDigest(specs),
+		nameToItem = nameToItem, declarationDigest = declarationDigest,
+		writeDigest = moduleWriteDigest,
+		globalDigest = globalDigest, moduleDigest = moduleDigest,
+		assignedGlobals = assignedGlobals, moduleAssignDigest = moduleAssignDigest,
+		forceDirty = forceDirty,
+		allowRebase = options ~= nil and options.rebase == true,
+	}
+	local region = previous and reuse.region(previous.parser.source, source) or nil
+	-- A replacement keeps every offset where it was; an insertion or deletion moves them, and a
+	-- dirty item's inference can then read a seeded dependency at a different arena position.
+	-- Only same-length replacements are carried over until that is proven not to matter.
+	if region and region.delta ~= 0 then
+		forceDirty = true
+		reuseCtx.forceDirty = true
+	end
+	local reuseStart = counters and os.clock() or nil
+	local plan = reuse.plan(reuseCtx, previous, region or reuse.region(source, source))
+	local cleanList = {}
+	for id, entry in pairs(plan.clean) do
+		local item = itemTree.items[id]
+		cleanList[#cleanList + 1] = { id = id, item = item, old = entry.old, delta = entry.delta, rebased = entry.rebased }
+	end
+	table.sort(cleanList, function(left, right) return left.item.start < right.item.start end)
+
+	--- Whether every offset of a range belongs to an item whose cached result is being reused.
+	--- Checks and typing skip those ranges; their results are copied, not recomputed.
+	---@param from integer
+	---@param to integer
+	---@return boolean
+	local function cleanSpan(from, to)
+		local item = ownerItemAt(from, to)
+		return item ~= nil and plan.clean[item.id] ~= nil
+	end
+
+	-- Every arena index that starts at an offset, split by node kind and kept in parse order. A
+	-- call shares its start with the prefix it is written on, and a chain of calls shares one
+	-- start with all of them, so an offset alone does not name one node: a cached record carries
+	-- the kind and the ordinal among nodes of that kind at the offset, and this maps it back.
+	local nodesAtStart, nodeOrdinals = {}, {}
+	local ordinalAt = {}
+	for index, node in ipairs(parsed.nodes) do
+		local key = node.start .. "\0" .. node.kind
+		local ordinal = (ordinalAt[key] or 0) + 1
+		ordinalAt[key] = ordinal
+		nodeOrdinals[index] = ordinal
+		local byKind = nodesAtStart[node.start]
+		if not byKind then
+			byKind = {}
+			nodesAtStart[node.start] = byKind
+		end
+		local list = byKind[node.kind]
+		if not list then
+			list = {}
+			byKind[node.kind] = list
+		end
+		list[ordinal] = index
+	end
+	--- The node of this parse a cached record names: the same kind at the same relative offset,
+	--- in the same parse order among that kind.
+	---@param start integer
+	---@param kind string
+	---@param ordinal integer?
+	---@return integer? index arena index of the node
+	local function cachedNode(start, kind, ordinal)
+		local byKind = nodesAtStart[start]
+		local list = byKind and byKind[kind]
+		return list and list[ordinal or 1]
+	end
+
+	-- Seed the callables and call bindings of the reused items before anything asks for them: a
+	-- dirty caller has to see what the cached body returned, and the class a method evolved onto
+	-- is built from the same callable.
+	for _, entry in ipairs(cleanList) do
+		local cache = entry.old.cache
+		if cache then
+			for _, record in ipairs(cache.callTypes or {}) do
+				local index = cachedNode(entry.item.start + record.rel, "call", record.ordinal)
+				if index and inferCtx.callTypes[index] == nil then
+					inferCtx.callTypes[index] = reuse.copyType(record.type)
+				end
+			end
+			for _, record in ipairs(cache.signatureInferred or {}) do
+				local signature = signatures[record.name]
+				if signature and signature.declaration
+					and signature.declaration.start == entry.item.start + record.rel then
+					signature.inferred = reuse.copyType(record.inferred)
+					if record.inferredValues then
+						local values = {}
+						for position, value in ipairs(record.inferredValues) do
+							values[position] = reuse.copyType(value)
+						end
+						signature.inferredValues = values
+					end
+				end
+			end
+		end
+	end
+	if counters and reuseStart then counters.reuseTime = os.clock() - reuseStart end
+
 	for index, node in ipairs(parsed.nodes) do
 		if node.kind == "function" then
 			local declaration = bodyOwner[index]
@@ -1653,6 +2168,68 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 				end
 			end
 		end
+	end
+	-- A reused item's callable is this analysis's own object, so a caller that narrows or promotes
+	-- it cannot reach into the previous result. Only the settled return is carried over.
+	for _, entry in ipairs(cleanList) do
+		for _, record in ipairs((entry.old.cache and entry.old.cache.fnTypes) or {}) do
+			local index = cachedNode(entry.item.start + record.rel, "function", record.ordinal)
+			local held = index and inferCtx.fnTypes[index]
+			local cached = record.type
+			if held and cached then
+				if types.isMutable(held.returns) and cached.returns then
+					types.promote(held.returns, cached.returns)
+				end
+				if cached.values then
+					local values = {}
+					for position, value in ipairs(cached.values) do
+						values[position] = reuse.copyType(value)
+					end
+					held.values = values
+				end
+			end
+		end
+	end
+
+	-- Node indexes grouped by the top-level item that holds them. A nested function belongs to
+	-- the item it was written in, so an item's cached body state is everything in its span.
+	local itemBodyIndex = {}
+	local fnIndexesByItem, callIndexesByItem, assignmentsByItem, declarationsByItem = {}, {}, {}, {}
+	---@param map table
+	---@param key string
+	---@param value integer
+	local function push(map, key, value)
+		local list = map[key]
+		if not list then
+			list = {}
+			map[key] = list
+		end
+		list[#list + 1] = value
+	end
+	for index, node in ipairs(parsed.nodes) do
+		if node.kind == "function" or node.kind == "call" or node.kind == "assignment" then
+			local owner = ownerItemAt(node.start, node.stop)
+			if owner then
+				if node.kind == "function" then
+					push(fnIndexesByItem, owner.id, index)
+				elseif node.kind == "call" then
+					push(callIndexesByItem, owner.id, index)
+				else
+					push(assignmentsByItem, owner.id, index)
+				end
+			end
+		end
+	end
+	for _, declaration in ipairs(parsed.declarations) do
+		local body = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
+		if body and body.kind == "function" and declaration.depth == 0 then
+			local owner = ownerItemAt(declaration.start, body.stop)
+			if owner and owner.kind == "function" and owner.name == declaration.name then
+				itemBodyIndex[owner.id] = declaration.valueIdx
+			end
+		end
+		local holder = ownerItemAt(declaration.start, declaration.stop or declaration.start)
+		if holder then push(declarationsByItem, holder.id, declaration) end
 	end
 
 	-- The class a table declaration gives its name to. A class is often spelled longer than the
@@ -1792,6 +2369,91 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		end
 	end
 
+	-- Every name is in scope now; an empty table can take the shape the calls written below
+	-- expect from it, before typing reads the table through `ipairs` and friends.
+	evolveUnknownTables()
+
+	-- Which item declares each variable: a local of a rooted item, or nothing for a module-level
+	-- name. A name whose item is reused keeps what the previous analysis worked out; the rest are
+	-- typed again.
+	local varsByItem = {}
+	for _, variable in ipairs(self.variables) do
+		local owner = ownerItemAt(variable.start, variable.stop or variable.start)
+		if owner and owner.kind == "function" then push(varsByItem, owner.id, variable) end
+	end
+	---@param declaration lye.parser.Declaration?
+	---@return boolean whether the function's own annotation says what it returns
+	local function annotatedReturns(declaration)
+		local signature = declaration and signatureOfDecl[declaration]
+		return signature ~= nil and signature.returns ~= nil
+	end
+	-- What a reused item's body left in its names. The return of an unannotated callable is the
+	-- one thing a dirty caller reads through a reused body, and it is promoted into the fresh
+	-- callable this analysis built rather than shared, so a later invalidation can clear it.
+	for _, entry in ipairs(cleanList) do
+		local cache = entry.old.cache
+		local variables = varsByItem[entry.item.id] or {}
+		local byRelative = {}
+		for _, variable in ipairs(variables) do
+			byRelative[variable.declaration.start - entry.item.start] = variable
+		end
+		for _, record in ipairs(cache and cache.variables or {}) do
+			local variable = byRelative[record.rel]
+			if variable and variable.name == record.name then
+				if record.initializer then variable.initializer = record.initializer end
+				for position, held in ipairs(record.assignments or {}) do
+					local assignment = variable.assignments[position]
+					if assignment then assignment.type = held end
+				end
+				local cached = record.declared
+				if cached and variable.declared and types.isFn(variable.declared) then
+					if types.isMutable(variable.declared.returns) and cached.returns then
+						types.promote(variable.declared.returns, cached.returns)
+					end
+					if cached.values then
+						local values = {}
+						for position, value in ipairs(cached.values) do
+							values[position] = reuse.copyType(value)
+						end
+						variable.declared.values = values
+					end
+				end
+			end
+		end
+	end
+
+	-- Forget what a reused item was seeded with, because something it reads changed. The callable
+	-- objects are the ones the class this item evolved onto holds, so they are reset in place
+	-- rather than replaced.
+	---@param id string
+	local function unseedItem(id)
+		for _, variable in ipairs(varsByItem[id] or {}) do
+			variable.initializer = types.mutable()
+			for _, assignment in ipairs(variable.assignments) do assignment.type = types.mutable() end
+			if variable.declared and types.isFn(variable.declared)
+				and not annotatedReturns(variable.declaration) then
+				variable.declared.returns = types.mutable()
+				variable.declared.values = nil
+			end
+		end
+		for _, index in ipairs(fnIndexesByItem[id] or {}) do
+			local held = inferCtx.fnTypes[index]
+			local declaration = bodyOwner[index]
+			if held and not annotatedReturns(declaration) then
+				held.returns = types.mutable()
+				held.values = nil
+			end
+		end
+		for _, index in ipairs(callIndexesByItem[id] or {}) do inferCtx.callTypes[index] = nil end
+		for _, declaration in ipairs(declarationsByItem[id] or {}) do
+			local signature = declaration.name and signatures[declaration.name]
+			if signature and signature.declaration == declaration then
+				signature.inferred = nil
+				signature.inferredValues = nil
+			end
+		end
+	end
+
 	--- The type of the table a name is a field of: `x` in `x.call`, `A.B` in `A.B.c`. A local,
 	--- a global or a class all answer, and a dotted name is walked one field at a time.
 	---@param text string
@@ -1860,20 +2522,40 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		end
 	end
 
+	-- A write that lands on a module-level table only: a write inside a reused item to a table
+	-- the item owns is already in that item's cached type.
+	---@param written string
+	---@param offset integer
+	---@return boolean
+	local function writesModuleTable(written, offset)
+		local root = written:match("^([%w_]+)[%.:]")
+		if not root then return false end
+		local variable = lookupIn(scopeAt(self, offset), root, offset)
+		if not variable then return true end
+		local owner = ownerItemAt(variable.start, variable.stop or variable.start)
+		return owner == nil
+	end
+
 	for _, declaration in ipairs(parsed.declarations) do
 		if declaration.valueIdx then
 			local className, methodName = declaration.name:match("^([%w_%.]+)%s*[%.:]([%w_]+)$")
 			if className and methodName and not namespace.classes[className] then
-				local methodType = inferCtx.fnTypes[declaration.valueIdx]
-					or infer.at(inferCtx, declaration.valueIdx)
-				addTableField(declaration.name, declaration.start, methodType)
+				local owner = ownerItemAt(declaration.start, declaration.stop or declaration.start)
+				if not (owner and plan.clean[owner.id]) or writesModuleTable(declaration.name, declaration.start) then
+					local methodType = inferCtx.fnTypes[declaration.valueIdx]
+						or infer.at(inferCtx, declaration.valueIdx)
+					addTableField(declaration.name, declaration.start, methodType)
+				end
 			end
 		end
 	end
 	--- What a table holds at a computed key, read off the writes to it. Run before the rounds, where a
 	--- key a literal spells is known, and again after them, where a name is.
-	local function recordIndexedWrites()
+	---@param onlyId string? one item, when an item was invalidated after the setup pass
+	local function recordIndexedWrites(onlyId)
 	for _, node in ipairs(nodesOf(parsed, "assignment")) do
+		local nodeOwner = onlyId and ownerItemAt(node.start, node.stop)
+		if not onlyId or (nodeOwner and nodeOwner.id == onlyId) then
 		if node.target and node.value then
 			-- A write through a computed key says what the table holds at it: `consts[name] = true` is a
 			-- `table<string, true>`. Without this the table is a plain `table` and every read of it is unknown.
@@ -1883,6 +2565,11 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 				local base = parsed.nodes[target.target]
 				local name = base and (base.callee or base.name)
 				local variable = name and lookupIn(scopeAt(self, node.start), name, node.start)
+				-- A write inside a reused item to a table of that item is already in the cached
+				-- type. A write to a module-level table is not: the module item is dirty, and this
+				-- is part of what its results are.
+				local owner = variable and ownerItemAt(variable.start, variable.stop or variable.start)
+				if owner and plan.clean[owner.id] then goto continue_indexed end
 				local declaration = variable and variable.declaration
 				local held = declaration and declaration.valueIdx
 					and infer.at(inferCtx, declaration.valueIdx)
@@ -1913,6 +2600,8 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 					end
 				end
 			end
+			::continue_indexed::
+		end
 		end
 	end
 	end
@@ -1923,7 +2612,36 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		if node.value then
 			local written = writtenNameOf(parsed, node.target)
 			if written and written:find("[%.:]") then
-				addTableField(written, node.start, infer.at(inferCtx, node.value))
+				local owner = ownerItemAt(node.start, node.stop)
+				if not (owner and plan.clean[owner.id]) or writesModuleTable(written, node.start) then
+					addTableField(written, node.start, infer.at(inferCtx, node.value))
+				end
+			end
+		end
+	end
+
+	-- The table-shape effects of one item's code. An item that was reused at setup time had these
+	-- skipped, so an item early cutoff invalidates has to have them applied before it is typed.
+	---@param id string
+	local function applyItemShapes(id)
+		for _, declaration in ipairs(declarationsByItem[id] or {}) do
+			if declaration.valueIdx then
+				local className, methodName = declaration.name:match("^([%w_%.]+)%s*[%.:]([%w_]+)$")
+				if className and methodName and not namespace.classes[className] then
+					local methodType = inferCtx.fnTypes[declaration.valueIdx]
+						or infer.at(inferCtx, declaration.valueIdx)
+					addTableField(declaration.name, declaration.start, methodType)
+				end
+			end
+		end
+		recordIndexedWrites(id)
+		for _, index in ipairs(assignmentsByItem[id] or {}) do
+			local node = parsed.nodes[index]
+			if node and node.value then
+				local written = writtenNameOf(parsed, node.target)
+				if written and written:find("[%.:]") then
+					addTableField(written, node.start, infer.at(inferCtx, node.value))
+				end
 			end
 		end
 	end
@@ -1969,7 +2687,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		-- has typed yet. When a `---@field` says what the signature is, that promise is read instead.
 		local className = held and held.name
 		local byHand = className and doc.classes.fieldsOf(namespace, className)[field]
-		if byHand then wanted = types.parse(byHand.type, resolve) or wanted end
+		if byHand then wanted = memo.parse(byHand.type, resolve) or wanted end
 		if not wanted or not types.isFn(wanted) then return end
 
 		-- Either side may spell the receiver out and the other leave it implicit, so a parameter list one
@@ -2027,7 +2745,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 			local limits = {}
 			for name in pairs(held.generics or {}) do
 				local constraint = held.constraints and held.constraints[name]
-				limits[name] = (constraint and types.parse(constraint, resolve)) or types.UNKNOWN_TYPE
+				limits[name] = (constraint and memo.parse(constraint, resolve)) or types.UNKNOWN_TYPE
 			end
 			for index, param in ipairs(list) do
 				local variable = byDeclaration[param]
@@ -2118,25 +2836,126 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		end
 	end
 
-	typing.typeAll(typingCtx)
-	-- A second walk settles what the first could not: a value read before its type was known is
-	-- left a placeholder, and the pass that typed it has to read it again. Only the names holding
-	-- one are read again — everything else settled, and walking it finds nothing.
-	if typingCtx.pending then
-		local only = {}
-		for _, variable in ipairs(self.variables) do
-			if variable.pending then
-				variable.pending = nil
-				only[variable] = true
+	-- The names a dirty item declares are the ones typed this time; a reused item's were seeded.
+	local only = {}
+	for _, variable in ipairs(self.variables) do
+		local owner = ownerItemAt(variable.start, variable.stop or variable.start)
+		if not owner or plan.dirty[owner.id] or not plan.clean[owner.id] then only[variable] = true end
+	end
+	local diagnosticsFrom = #self.diagnostics + 1
+	---@param subset table<lye.analyzer.Variable, boolean>
+	local function typeVariables(subset)
+		if not next(subset) then return end
+		if counters then started = os.clock() end
+		typing.typeAll(typingCtx, subset, cleanSpan)
+		if counters then
+			counters.typing += os.clock() - started
+			started = os.clock()
+		end
+		-- A second walk settles what the first could not: a value read before its type was known is
+		-- left a placeholder, and the pass that typed it has to read it again. Only the names holding
+		-- one are read again — everything else settled, and walking it finds nothing.
+		if typingCtx.pending then
+			local pending = {}
+			for variable in pairs(subset) do
+				if variable.pending then
+					variable.pending = nil
+					pending[variable] = true
+				end
+			end
+			typingCtx.pending = nil
+			if next(pending) then
+				typing.typeAll(typingCtx, pending, cleanSpan)
+				if counters then
+					counters.typing2 += os.clock() - started
+					started = os.clock()
+				end
 			end
 		end
-		typingCtx.pending = nil
-		typing.typeAll(typingCtx, only)
+	end
+	typeVariables(only)
+
+	-- Early cutoff: a dirty item whose result hash did not move leaves its dependents' cached
+	-- results valid. One that moved invalidates only the items reading it — which then have to be
+	-- typed, and may move something they export in turn.
+	local reverseDeps = {}
+	for id, item in pairs(itemTree.items) do
+		for dependency in pairs(item.deps.items or {}) do
+			local list = reverseDeps[dependency]
+			if not list then
+				list = {}
+				reverseDeps[dependency] = list
+			end
+			list[id] = true
+		end
+	end
+	---@param id string
+	---@return string
+	local function itemResultHash(id)
+		local item = itemTree.items[id]
+		local bodyIdx = itemBodyIndex[id]
+		local fnType = bodyIdx and inferCtx.fnTypes[bodyIdx] or nil
+		local exports
+		if item.kind == "function" then
+			for _, index in ipairs(assignmentsByItem[id] or {}) do
+				local node = parsed.nodes[index]
+				if node and node.value then
+					local written = writtenNameOf(parsed, node.target)
+					local base = written and written:match("^([%w_]+)[%.:]")
+					if base and (moduleTables[base] or assignedGlobals[base]) then
+						exports = exports or {}
+						local held = infer.at(inferCtx, node.value)
+						exports[written] = held and types.display(held) or "?"
+					end
+				end
+			end
+		end
+		return reuse.resultHash(item, fnType, exports)
+	end
+
+	if previous then
+		local evaluated = {}
+		for id in pairs(plan.dirty) do evaluated[id] = false end
+		while true do
+			local newly = {}
+			for id in pairs(plan.dirty) do
+				if evaluated[id] == false then
+					evaluated[id] = true
+					local oldItem = previous.items.items[id]
+					local oldHash = oldItem and oldItem.cache and oldItem.cache.resultHash
+					if oldHash ~= itemResultHash(id) then
+						for dependent in pairs(reverseDeps[id] or {}) do
+							if plan.clean[dependent] then
+								plan.clean[dependent] = nil
+								plan.dirty[dependent] = true
+								evaluated[dependent] = false
+								unseedItem(dependent)
+								applyItemShapes(dependent)
+								if counters then counters.invalidated += 1 end
+								newly[#newly + 1] = dependent
+							end
+						end
+					end
+				end
+			end
+			if #newly == 0 then break end
+			local subset = {}
+			for _, id in ipairs(newly) do
+				for _, variable in ipairs(varsByItem[id] or {}) do subset[variable] = true end
+			end
+			typeVariables(subset)
+		end
+	end
+	-- A loop over a table with no known element type yields an unknown, and leaving that as a
+	-- mutable placeholder would let the body use it without a word. Once both typing rounds have
+	-- run, what is still unknown is an answer.
+	for _, variable in ipairs(self.variables) do
+		if variable.qualifier == "loop" and not variable.declared then
+			local held = variable.initializer
+			if not held or held.variant == "unknown" then variable.declared = types.UNKNOWN_TYPE end
+		end
 	end
 	recordIndexedWrites()
-
-	-- What each function's own body gives back, beside what its annotation promised. Nothing is
-	-- reported from it: it is how a tool asks whether an annotation says something the body does not.
 	local ctx = {
 		prepared = prepared,
 		parsed = parsed, self = self, signatures = signatures, returns = returns,
@@ -2145,23 +2964,43 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		receiverTypeOf = receiverTypeOf, declaredHere = declaredHere, functionNodes = functionNodes, bodyOwner = bodyOwner, annotatedBodies = annotatedBodies,
 		inferredValuesOf = inferredValuesOf, inferredReturnOf = inferredReturnOf,
 		scopeAt = scopeAt, lookupIn = lookupIn, declaredField = declaredField,
+		typeAt = analyzer.typeAt,
 		arithmetic = ARITHMETIC,
+		reusedSpan = cleanSpan,
 	}
+	if counters then started = os.clock() end
 	if isModuleOnly then
 		-- What `require("this.file")` is — the one thing a module analysis is read for.
 		checks.moduleExport(ctx)
 	else
 		checks.report(ctx)
-		checkCalls(self, parsed, signatureOfCall, returns, resolve, inferCtx, source, positionalParams)
+		checkCalls(self, parsed, signatureOfCall, returns, resolve, inferCtx, source, positionalParams, cleanSpan)
 	end
+	if counters then mark("checks") end
 	-- What each call was bound to, by node: a generic result is settled per call, and a reader
 	-- asking what `f()` is — a completion after `f().` — has no other way to that answer.
 	self.callTypes = inferCtx.callTypes
 	self.signatures = signatures
 	self.returns = returns
 
+	-- What a reused item reported last time: its checks did not run now, so their diagnostics are
+	-- copied with the item's own delta and deduped against everything the global checks said again.
+	for id, entry in pairs(plan.clean) do
+		local item = itemTree.items[id]
+		for _, record in ipairs(entry.old.cache.diagnostics or {}) do
+			self.diagnostics[#self.diagnostics + 1] = {
+				message = record.message,
+				start = item.start + record.relStart,
+				stop = item.start + record.relStop,
+				severity = record.severity,
+			}
+		end
+	end
+
 	-- Typing runs twice, so a check that reports while typing would see the same fault twice and a
-	-- reader should be told about it once.
+	-- reader should be told about it once. The order is by position: a reader and a diff both want
+	-- the list in the order the file is written, and a reused item's copied findings take their
+	-- place among the recomputed ones.
 	local seen, unique = {}, {}
 	for _, entry in ipairs(self.diagnostics) do
 		local key = string.format("%d:%d:%s", entry.start, entry.stop or entry.start, entry.message)
@@ -2170,7 +3009,113 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 			unique[#unique + 1] = entry
 		end
 	end
+	table.sort(unique, function(left, right)
+		if left.start ~= right.start then return left.start < right.start end
+		local leftStop, rightStop = left.stop or left.start, right.stop or right.start
+		if leftStop ~= rightStop then return leftStop < rightStop end
+		if left.message ~= right.message then return left.message < right.message end
+		return (left.severity or 1) < (right.severity or 1)
+	end)
 	self.diagnostics = unique
+	if counters then mark("dedupe") end
+
+	-- What this analysis kept for each item, index-free: offsets relative to the item, structural
+	-- names and ordinals. The next edit maps them onto its own parse rather than trusting an arena.
+	local diagnosticsByItem = {}
+	for _, entry in ipairs(self.diagnostics) do
+		local owner = ownerItemAt(entry.start, entry.stop or entry.start)
+		if owner then push(diagnosticsByItem, owner.id, entry) end
+	end
+	local captureStart = counters and os.clock() or nil
+	for id, item in pairs(itemTree.items) do
+		local meta = plan.meta[id]
+		local cache = {
+			signatureDigest = meta and meta.signatureDigest or reuse.signatureDigest(item),
+			depsHash = meta and meta.depsHash or reuse.depsHash(reuseCtx, item),
+			resultHash = itemResultHash(id),
+			variables = {}, fnTypes = {}, callTypes = {}, signatureInferred = {}, diagnostics = {},
+		}
+		for _, variable in ipairs(varsByItem[id] or {}) do
+			local record = {
+				name = variable.name, rel = variable.declaration.start - item.start,
+				declared = variable.declared, initializer = variable.initializer, assignments = {},
+			}
+			for position, assignment in ipairs(variable.assignments) do
+				record.assignments[position] = assignment.type
+			end
+			cache.variables[#cache.variables + 1] = record
+		end
+		for _, index in ipairs(fnIndexesByItem[id] or {}) do
+			local held = inferCtx.fnTypes[index]
+			if held then
+				cache.fnTypes[#cache.fnTypes + 1] = {
+					rel = parsed.nodes[index].start - item.start, ordinal = nodeOrdinals[index], type = held,
+				}
+			end
+		end
+		for _, index in ipairs(callIndexesByItem[id] or {}) do
+			local held = inferCtx.callTypes[index]
+			if held then
+				cache.callTypes[#cache.callTypes + 1] = {
+					rel = parsed.nodes[index].start - item.start, ordinal = nodeOrdinals[index], type = held,
+				}
+			end
+		end
+		for _, declaration in ipairs(declarationsByItem[id] or {}) do
+			local signature = declaration.name and signatures[declaration.name]
+			if signature and signature.declaration == declaration
+				and (signature.inferred ~= nil or signature.inferredValues ~= nil) then
+				cache.signatureInferred[#cache.signatureInferred + 1] = {
+					name = declaration.name, rel = declaration.start - item.start,
+					inferred = signature.inferred, inferredValues = signature.inferredValues,
+				}
+			end
+		end
+		for _, entry in ipairs(diagnosticsByItem[id] or {}) do
+			-- Whether a local is read is the one finding that other items can change: a module-level
+			-- name's readers live wherever they are called from. It is cheap to run again, so it is
+			-- never cached.
+			if entry.message:sub(1, 13) ~= "unused local `" then
+				cache.diagnostics[#cache.diagnostics + 1] = {
+					message = entry.message, relStart = entry.start - item.start,
+					relStop = (entry.stop or entry.start) - item.start, severity = entry.severity,
+				}
+			end
+		end
+		item.cache = cache
+	end
+	if counters then
+		counters.itemsTime = captureStart and (os.clock() - captureStart) or 0
+	end
+
+	self.items = itemTree
+	-- Names this analysis resolved elsewhere, and the modules it asked for: what a module cache
+	-- keys a dependent by, so a body edit that changes neither keeps its entry.
+	self.declarationNames = declarationNames
+	self.requiredModules = requiredModules
+
+	-- Which items were carried over, and how much work the edit actually left. `retyped` is a
+	-- count of the items looked at again, not the time: a caller printing it wants to know one
+	-- edit touched one function.
+	self.reused = {}
+	local reusedCount, retypedCount, rebasedCount = 0, 0, 0
+	for id in pairs(plan.clean) do
+		self.reused[id] = true
+		reusedCount += 1
+	end
+	for _ in pairs(plan.dirty) do retypedCount += 1 end
+	for _, entry in ipairs(cleanList) do
+		if plan.clean[entry.id] and entry.rebased then rebasedCount += 1 end
+	end
+	if counters then
+		counters.items = #allItems + 1
+		counters.reused = reusedCount
+		counters.retyped = retypedCount
+		counters.retypedItems = retypedCount
+		counters.rebased = rebasedCount
+		counters.conservative = plan.conservative
+	end
+	self.counters = counters
 
 	return self
 end

@@ -43,6 +43,9 @@
 		},
 		"env": {
 			"version": "^0.1.0"
+		},
+		"lye-plugin-require": {
+			"path": "../lye-plugin-require"
 		}
 	}
 }

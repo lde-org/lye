@@ -13,15 +13,62 @@ local fs = require("fs")
 local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local FIXTURE = TESTS_DIR .. "/fixtures/server.lua"
-local CACHE = PACKAGE_DIR .. "/target/session-cache"
+
+--- This process's own id. `math.random` alone is not enough: two copies started in the same second
+--- seed it identically, so both would write the same files.
+---@return string
+local function processId()
+	local ok, value = pcall(function()
+		local ffi = require("ffi")
+		pcall(ffi.cdef, "int getpid(void);")
+		return tonumber(ffi.C.getpid())
+	end)
+	if ok and value then return tostring(value) end
+	return tostring({}):match("0x(%x+)") or "0"
+end
+
+-- A tag no other test process shares: two acceptance runs of this file must not write the same
+-- input or cache files, or one session reads another one's bytes. Within this process the tag is
+-- constant, so the suite's own directory still carries an entry from one test to the next.
+local RUN_TAG = processId() .. "-" .. tostring(os.time()) .. "-" .. tostring(math.random(1, 1e9))
+local CACHE = PACKAGE_DIR .. "/target/session-cache-" .. RUN_TAG
+
+---@param path string
+---@return string
+local function quote(path)
+	return string.format("%q", path)
+end
+
+-- The fixture projects the suite opens are writable: a session leaves `.lye` beside them, a test
+-- writes a linked module and another wipes the directory. Each process gets its own copy so two
+-- runs never write the same tree.
+local WORK = PACKAGE_DIR .. "/target/session-" .. RUN_TAG
+os.execute("rm -rf " .. quote(WORK) .. " && mkdir -p " .. quote(WORK))
+for _, name in ipairs({ "workspace", "package", "interface" }) do
+	local status = os.execute("cp -a " .. quote(TESTS_DIR .. "/fixtures/" .. name) .. " " .. quote(WORK .. "/."))
+	assert(status == 0 or status == true, "cannot copy fixture " .. name)
+	os.execute("rm -rf " .. quote(WORK .. "/" .. name .. "/.lye"))
+end
+
+local WORKSPACE = WORK .. "/workspace"
+local PACKAGE_PROJECT = WORK .. "/package"
+local INTERFACE = WORK .. "/interface"
 
 -- Every session of the suite reads and writes under one directory of its own, wiped first: the
 -- entries and the definitions are written there rather than beside the workspace the session was
 -- handed, and the first test that reaches a module reads it while the ones after it read the
 -- answer, so the whole file runs the same way every time rather than depending on what an earlier
 -- run — or another session — left behind.
-os.execute("rm -rf " .. string.format("%q", CACHE))
-local INPUT = PACKAGE_DIR .. "/target/lsp-test-input.bin"
+os.execute("rm -rf " .. quote(CACHE))
+local INPUT = PACKAGE_DIR .. "/target/lsp-test-input-" .. RUN_TAG .. ".bin"
+
+-- `lde` relinks a package's dependencies into the shared `target/` when it thinks they are stale,
+-- and two relinks at once can leave a module half written. The lock serialises just that step, so
+-- two copies of this file can run at once; where `flock` is absent the command runs unlocked.
+local LOCK
+if os.execute("command -v flock >/dev/null 2>&1") == 0 then
+	LOCK = "flock " .. string.format("%q", PACKAGE_DIR .. "/target/.session-lock")
+end
 
 local URI = "file:///tmp/lye-session.lua"
 
@@ -58,11 +105,14 @@ local function run(messages, root, cache)
 
 	-- `lde run` resolves package dependencies from the working directory, and `io.popen`
 	-- close reports the shell's status rather than the child's, so the child prints its
-	-- own exit code as the final line.
+	-- own exit code as the final line. Two sessions at once may make `lde` relink the
+	-- package's shared `target/`, which is not concurrent-safe; a lock file keeps one
+	-- process's links whole while the other waits its turn.
 	local env = cache == false and "" or ("LYE_CACHE_DIR=" .. string.format("%q", cache or CACHE))
+	local lock = LOCK and (LOCK .. " ") or ""
 	local pipe = assert(io.popen(string.format(
-		"cd %q && %s cat %q | lde run %q 2>/dev/null; echo \"EXIT:$?\"",
-		PACKAGE_DIR, env, INPUT, FIXTURE
+		"cd %q && %s cat %q | %slde run %q 2>/dev/null; echo \"EXIT:$?\"",
+		PACKAGE_DIR, env, INPUT, lock, FIXTURE
 	)))
 	local output = pipe:read("*a")
 	pipe:close()
@@ -296,7 +346,7 @@ test.it("resolves a class another workspace file declares for a document that ne
 	-- another file's class has to mean that class all the same, or every table built for it is
 	-- refused. No document is opened here, so only the workspace scan can know it — which is what
 	-- `lye check` reads the pair of files as too.
-	local workspace = TESTS_DIR .. "/fixtures/workspace"
+	local workspace = WORKSPACE
 	local uri = "file://" .. workspace .. "/use.lua"
 	local source = table.concat({
 		"---@param p Point\n",
@@ -317,7 +367,7 @@ test.it("resolves a class the document's package has linked into target", functi
 	-- `target/` is left out of the workspace walk — it mirrors other packages — and what a
 	-- document can reach is what lde linked into its own package: the same resolution a check
 	-- does for the package's links.
-	local project = TESTS_DIR .. "/fixtures/package"
+	local project = PACKAGE_PROJECT
 	local uri = "file://" .. project .. "/src/use.lua"
 	local source = table.concat({
 		"---@param d Dep\n",
@@ -337,7 +387,7 @@ end)
 test.it("keeps what a module came to for the session after it", function()
 	-- The first session analyses `dep` to answer `require`; the second reads that answer instead
 	-- of the file. Both must report the same thing about the caller.
-	local project = TESTS_DIR .. "/fixtures/interface"
+	local project = INTERFACE
 	local uri = "file://" .. project .. "/src/use.lua"
 	local source = table.concat({
 		"local dep = require(\"dep\")\n",
@@ -360,7 +410,7 @@ end)
 test.it("reads a module again when the file it names has changed", function()
 	-- What a session keeps for a module is only the answer for the links it read it against, so a
 	-- dependency that changed on disk is read again rather than answered for.
-	local project = TESTS_DIR .. "/fixtures/interface"
+	local project = INTERFACE
 	local uri = "file://" .. project .. "/src/use.lua"
 	local module = project .. "/target/dep.lua"
 	local source = table.concat({
@@ -384,7 +434,7 @@ end)
 test.it("keeps what it works out beside the workspace it was handed", function()
 	-- No directory named: an editor session writes beside the project it opened, so a session
 	-- after it on the same project reads what this one worked out, definitions and all.
-	local project = TESTS_DIR .. "/fixtures/interface"
+	local project = INTERFACE
 	local uri = "file://" .. project .. "/src/use.lua"
 	local source = "local ffi = require(\"ffi\")\nreturn ffi\n"
 	local beside = project .. "/.lye"
@@ -417,7 +467,7 @@ test.it("reads ffi types only while the ffi plugin is on", function()
 	-- The analyzer has no cdef code left in it: the shipped ffi plugin contributes the classes a
 	-- block declares and the type of `ffi.new`. Turning it off in `lye.json` removes both, which is
 	-- the proof that a dialect can be a plugin rather than a branch in the analyzer.
-	local project = PACKAGE_DIR .. "/target/ffi-toggle"
+	local project = WORK .. "/ffi-toggle"
 	os.execute("rm -rf " .. string.format("%q", project))
 	writeFile(project .. "/lye.json", "{\"plugins\":[\"!ffi\"]}\n")
 	local uri = "file://" .. project .. "/main.lua"
@@ -452,6 +502,12 @@ end)
 test.it("exits 0 when exit follows shutdown", function()
 	local _, code = run(endingWithShutdown({}))
 	test.equal(code, 0)
+end)
+
+-- These paths belong to this process alone, and the cache has already carried what the module
+-- tests needed from one session to the next; the last test can take them away again.
+test.afterAll(function()
+	os.execute("rm -rf " .. quote(WORK) .. " " .. quote(INPUT) .. " " .. quote(CACHE))
 end)
 
 return true

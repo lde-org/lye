@@ -47,6 +47,25 @@ local function cpuCount()
 	return 4
 end
 
+--- Whether this machine can fork at all. A caller that does something other than checking files —
+--- building an index, say — asks before it plans for more than one process.
+---@return boolean
+function parallel.canFork()
+	return HAS_FORK
+end
+
+--- This process's pid, which names the files a forked worker writes.
+---@return integer
+function parallel.pid()
+	return PID
+end
+
+--- As many processors as this machine will admit to.
+---@return integer
+function parallel.cores()
+	return cpuCount()
+end
+
 --- The most processes a batch of this many files is worth splitting across, or 1 for one process.
 --- Below a handful of files the processes cost more than they save; `LYE_WORKERS` says otherwise,
 --- and `LYE_WORKERS=1` turns the split off.
@@ -112,6 +131,7 @@ end
 ---@field bytes integer
 ---@field out string where its findings are written
 ---@field pid integer? the process that took it, when one was forked for it
+---@field ranInParent boolean? whether this process ran the slice itself, after a child failed or because it kept it
 
 ---@param found lye.parallel.Found
 ---@param entry lye.Report.Finding
@@ -180,8 +200,10 @@ end
 --- slice, so no worker is handed twice what another was.
 ---@param groups lye.parallel.Group[]
 ---@param workers integer
+---@param outOf fun(index: integer): string? where each slice's answer is written; the check batch's
+--- own files when a caller does not say
 ---@return lye.parallel.Slice[]
-local function splitWork(groups, workers)
+local function splitWork(groups, workers, outOf)
 	local total = 0
 	for _, group in ipairs(groups) do total += group.bytes end
 	local share = math.max(math.floor(total / workers), 1)
@@ -203,7 +225,7 @@ local function splitWork(groups, workers)
 
 	local slices = {}
 	for index = 1, workers do
-		slices[index] = { files = {}, bytes = 0, out = outPath(index) }
+		slices[index] = { files = {}, bytes = 0, out = outOf and outOf(index) or outPath(index) }
 		-- A file left over from a run this pid happens to repeat would read as this run's result.
 		os.remove(slices[index].out)
 	end
@@ -218,6 +240,68 @@ local function splitWork(groups, workers)
 	end
 	for _, slice in ipairs(slices) do table.sort(slice.files) end
 	return slices
+end
+
+--- Hand the groups out as slices, for a caller that writes something other than diagnostics — an
+--- index record, say — and runs the slices itself.
+parallel.splitWork = splitWork
+
+--- Run a slice's work in a forked child, and the slice this process keeps while the children run.
+--- `work` writes wherever the slice says its answer goes and returns whether it did. A child that
+--- ends with anything but success leaves its slice to this process, which runs it again: a caller
+--- that merges what the children wrote never sees a missing shard.
+---@param slices lye.parallel.Slice[]
+---@param work fun(slice: lye.parallel.Slice, index: integer, isChild: boolean): boolean
+---@param spawn fun(): integer? process creation, injectable for a test that watches or refuses it
+---@return integer workers how many processes ran a slice
+---@return integer fellBack how many slices a failed child left to this process
+function parallel.dispatch(slices, work, spawn)
+	spawn = spawn or function() return ffi.C.fork() end
+
+	-- Everything this process has buffered goes out before a copy of it exists, so a child that
+	-- writes cannot echo it a second time.
+	io.stdout:flush()
+	io.stderr:flush()
+
+	local started = 0
+	for index = 2, #slices do
+		local slice = slices[index]
+		if #slice.files == 0 then break end
+		local pid = spawn()
+		if pid == 0 then
+			-- The child. It must not come back: returning would run the rest of this process's
+			-- work a second time, in a process the parent is not watching.
+			ffi.C._exit(work(slice, index, true) and 0 or 2)
+		end
+		if pid and pid > 0 then
+			slice.pid = pid
+			started += 1
+		else
+			-- No fork: the rest of the slices are this process's to run.
+			break
+		end
+	end
+
+	local fellBack = 0
+	-- The slice this process keeps is worked while the children run, so no core sits idle.
+	for index, slice in ipairs(slices) do
+		if not slice.pid and #slice.files > 0 then
+			slice.ranInParent = true
+			work(slice, index, false)
+		end
+	end
+
+	for index, slice in ipairs(slices) do
+		if slice.pid then
+			if waitFor(slice.pid) ~= 0 then
+				-- A worker that could not write its record leaves its files to this process.
+				fellBack += 1
+				slice.ranInParent = true
+				work(slice, index, false)
+			end
+		end
+	end
+	return 1 + started, fellBack
 end
 
 --- Read back one worker's findings: one record per line, the fields split at their tabs, and a

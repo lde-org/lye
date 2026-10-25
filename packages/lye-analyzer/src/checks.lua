@@ -5,6 +5,7 @@
 ]]
 
 local types = require("lye-doc.type")
+local memo = require("lye-analyzer.memo")
 local diagnostic = require("lye-analyzer.diagnostic")
 local infer = require("lye-analyzer.infer")
 local names = require("lye-analyzer.names")
@@ -32,10 +33,22 @@ local isNeverNumeric, callLabel = annotations.isNeverNumeric, annotations.callLa
 ---@field inferredReturnOf fun(index: integer): lye.doc.Type?
 ---@field scopeAt fun(self: lye.analyzer.Result, offset: integer): lye.analyzer.Scope
 ---@field lookupIn fun(scope: lye.analyzer.Scope, name: string, offset: integer): lye.analyzer.Variable?
+---@field typeAt fun(self: lye.analyzer.Result, variable: lye.analyzer.Variable, offset: integer): lye.doc.Type
 ---@field declaredField fun(held: lye.doc.Type, field: string): lye.doc.Type?
 ---@field arithmetic table<string, boolean>
 
 local checks = {}
+
+--- Whether a span belongs to an item whose cached result is being reused. Its diagnostics were
+--- produced by the analysis that cached it and are copied from there; running the check again
+--- would either duplicate them or report a stale one.
+---@param ctx lye.analyzer.CheckContext
+---@param start integer
+---@param stop integer
+---@return boolean
+local function reused(ctx, start, stop)
+	return ctx.reusedSpan ~= nil and ctx.reusedSpan(start, stop) == true
+end
 
 --- A type written `fun(...):...` is the permissive callable written the long way: every parameter
 --- it names is `any`, it takes any number of them and it gives back `any` — which is exactly what
@@ -56,7 +69,7 @@ local function anyFunctionHints(ctx)
 		-- name for it, and the name is what the reader is owed. The check is also what keeps this
 		-- cheap — the annotations of a document are mostly names and literals.
 		if not text:match("^%s*%(?%s*fu?n%s*%(") then return end
-		local held = types.parse(text, resolve)
+		local held = memo.parse(text, resolve)
 		if held and types.isAnyFn(held) then
 			diagnostic.add(self, string.format("`%s` is identical to `function`", text), start, stop, 3)
 		end
@@ -66,17 +79,21 @@ local function anyFunctionHints(ctx)
 		-- An `---@overload` is the one place a function type cannot be written as a name: it
 		-- describes a call shape — `fun(...):...` says every call fits — and `function` says
 		-- nothing about shape, so the advice would not apply.
-		if annotation.tag ~= "overload" then
+		if annotation.tag ~= "overload" and not reused(ctx, annotation.start, annotation.stop) then
 			check(annotation.type, annotation.typeStart or annotation.start,
 				annotation.typeStop or annotation.stop)
 		end
 	end
 	for _, declaration in ipairs(parsed.declarations) do
-		check(declaration.inlineType, declaration.inlineTypeStart, declaration.inlineTypeStop)
+		if not reused(ctx, declaration.start, declaration.stop or declaration.start) then
+			check(declaration.inlineType, declaration.inlineTypeStart, declaration.inlineTypeStop)
+		end
 	end
 	for _, node in ipairs(ctx.functionNodes or {}) do
-		check(node.inlineReturns, node.inlineReturnsStart, node.inlineReturnsStop)
-		check(node.inlineVariadic, node.inlineVariadicStart, node.inlineVariadicStop)
+		if not reused(ctx, node.start, node.stop) then
+			check(node.inlineReturns, node.inlineReturnsStart, node.inlineReturnsStop)
+			check(node.inlineVariadic, node.inlineVariadicStart, node.inlineVariadicStop)
+		end
 	end
 end
 
@@ -118,9 +135,13 @@ local function returnHints(ctx)
 	for _, declaration in ipairs(parsed.declarations) do
 		---@type lye.analyzer.Signature?
 		local signature = declaration.name and signatures[declaration.name]
-		local annotation = signature and signature.returns
-		local held = annotation and annotation.type and types.parse(annotation.type, resolve)
-		if signature and declaration.valueIdx then
+		-- A signature keyed by a name belongs to the declaration it was read from: another
+		-- declaration that happens to use the same name does not get to settle its return.
+		local owned = signature ~= nil and signature.declaration == declaration
+		local annotation = owned and signature.returns
+		local held = annotation and annotation.type and memo.parse(annotation.type, resolve)
+		if owned and declaration.valueIdx
+			and not reused(ctx, declaration.start, declaration.stop or declaration.start) then
 			local values = inferredValuesOf(declaration.valueIdx)
 			signature.inferred = values[1]
 			-- Nothing written down, so what a reader is shown is what the body gives back — all of
@@ -129,14 +150,17 @@ local function returnHints(ctx)
 		end
 		-- An annotation that says exactly what the body says is a line kept in step with the code
 		-- for nothing. A hint rather than a warning, since a written signature is often what a
-		-- reader wants. Only a lone one: with a second line below it, the line is a position.
-		local inferred = signature and signature.inferred
+		-- reader wants. Only a lone one: with a second line below it, the line is a position. The
+		-- annotation may hang above a prose line and so sit outside the item it describes: that
+		-- finding was not cached with the item and is reported here.
+		local inferred = owned and signature.inferred
 		-- One value only: `---@return number, string` is one signature, and its first half agreeing
 		-- says nothing about the second. The shape has to match too, not just what it prints.
 		local single = annotation and annotation.type and #types.splitValues(annotation.type) == 1
 			and returnsWritten(declaration, previous) == 1
 		if single and held and inferred and held.variant == inferred.variant
-			and types.display(held) == types.display(inferred) then
+			and types.display(held) == types.display(inferred)
+			and not reused(ctx, annotation.start, annotation.stop) then
 			diagnostic.add(self, string.format("`---@return %s` says what the body already infers", annotation.type), annotation.start, annotation.stop, 3)
 		end
 		previous = declaration
@@ -148,7 +172,8 @@ end
 
 local function constWrites(ctx)
 	for _, variable in ipairs(ctx.self.variables) do
-		if variable.declaration.isConst then
+		if variable.declaration.isConst
+			and not reused(ctx, variable.declaration.start, variable.declaration.stop or variable.declaration.start) then
 			for _, assignment in ipairs(variable.assignments) do
 				diagnostic.add(ctx.self, string.format("`%s` is const, so it cannot be assigned to", variable.name),
 					assignment.at, assignment.at + #variable.name - 1)
@@ -166,7 +191,8 @@ local function declaredMismatches(ctx)
 	for _, variable in ipairs(self.variables) do
 		-- A name starting with `_` is a discard: what is written to it is not meant to be read, so
 		-- the type it happens to have — often a loop's own index — is not a promise to check against.
-		if variable.declared and not variable.name:match("^_") then
+		if variable.declared and not variable.name:match("^_")
+			and not reused(ctx, variable.declaration.start, variable.declaration.stop or variable.declaration.start) then
 			local declaration = variable.declaration
 			local message = types.mismatch(variable.declared, variable.initializer, variable.name)
 			if message then
@@ -207,6 +233,7 @@ local function fieldWrites(ctx)
 	-- A value with a type does not grow fields nobody declared, and a function written for a field has
 	-- to be the function that field says it is: what was written does not fit what the type said.
 	for _, node in ipairs(parsed.nodes) do
+		if not reused(ctx, node.start, node.stop) then
 		local target = node.kind == "assignment" and parsed.nodes[node.target]
 		local field = target and target.kind == "index" and target.field
 		local base = field and writtenNameOf(parsed, target.target)
@@ -270,6 +297,7 @@ local function fieldWrites(ctx)
 				end
 			end
 		end
+		end
 	end
 
 	-- A field a class keeps to itself is read only from that class, or, when it is protected,
@@ -281,6 +309,7 @@ local function metatableChecks(ctx)
 	local resolve, inferCtx = ctx.resolve, ctx.inferCtx
 	local functionNodes, bodyOwner = ctx.functionNodes, ctx.bodyOwner
 	for _, node in ipairs(parsed.nodes) do
+		if not reused(ctx, node.start, node.stop) then
 		if node.kind == "index" and node.field and not node.isMethod then
 			local targetType = infer.at(inferCtx, node.target)
 			if targetType and targetType.variant == "class" then
@@ -305,6 +334,7 @@ local function metatableChecks(ctx)
 					end
 				end
 			end
+		end
 		end
 	end
 
@@ -352,6 +382,7 @@ local function deadCode(ctx)
 		table.sort(list, startsBefore)
 		local stopped, stopping = false, nil
 		for _, node in ipairs(list) do
+			if not reused(ctx, node.start, node.stop) then
 			-- What cannot run is what comes *after* the call that never comes back. The call itself is
 			-- not it, and a block lists a statement more than once — the call, and whatever the arena
 			-- holds over the same span — so being a different node is not enough: the statement has to
@@ -363,6 +394,7 @@ local function deadCode(ctx)
 			end
 			stopped = neverStatement(node)
 			stopping = stopped and node or nil
+			end
 		end
 	end
 
@@ -375,6 +407,7 @@ local function arithmeticChecks(ctx)
 	local inferCtx = ctx.inferCtx
 	local ARITHMETIC = ctx.arithmetic
 	for _, node in ipairs(parsed.nodes) do
+		if not reused(ctx, node.start, node.stop) then
 		if node.kind == "binary" and ARITHMETIC[node.op] then
 			local left = infer.at(inferCtx, node.left)
 			local right = infer.at(inferCtx, node.right)
@@ -403,6 +436,7 @@ local function arithmeticChecks(ctx)
 				end
 			end
 		end
+		end
 	end
 
 	-- An index with a computed key asks a value what it holds there. A class that declares an index
@@ -413,6 +447,7 @@ local function indexedReads(ctx)
 	local parsed, self = ctx.parsed, ctx.self
 	local inferCtx = ctx.inferCtx
 	for _, node in ipairs(parsed.nodes) do
+		if not reused(ctx, node.start, node.stop) then
 		if node.kind == "index" and node.isDynamic == true and node.target and node.key then
 			local base = infer.at(inferCtx, node.target)
 			local key = infer.at(inferCtx, node.key)
@@ -428,6 +463,7 @@ local function indexedReads(ctx)
 				diagnostic.add(self, string.format("%s cannot be indexed by a number", types.display(base)),
 					at.start, at.stop)
 			end
+		end
 		end
 	end
 
@@ -465,9 +501,11 @@ local function globalNames(ctx)
 			if found then
 				found.references[#found.references + 1] = node.start
 				self.byStart[node.start] = found
-			elseif not globals[name] then
+			elseif not globals[name] and not reused(ctx, node.start, node.start + #name - 1) then
 				-- A name nothing declares and nothing in the definitions declares either: the reader is asking
 				-- for a global that is not there. A global assigned in this file is in `self.variables`.
+				-- The reference is recorded whether or not the item is reused: an unused local is
+				-- judged by all of its readers, and the reading items may be different ones.
 				diagnostic.add(self, string.format("undefined global `%s`", name),
 					node.start, node.start + #name - 1, 2)
 			end
@@ -499,7 +537,11 @@ local function paramNames(ctx)
 				for _, annotation in ipairs(signature.params) do
 					local name = annotation.name
 					-- `...` is how the variadic parameter is annotated, and it has no name of its own.
-					if name and name ~= "..." and not taken[name] then
+					-- The annotation can hang above a prose line and sit outside the item it
+					-- describes, so its own span is what decides whether it was cached.
+					if name and name ~= "..." and not taken[name]
+						and not reused(ctx, annotation.nameStart or annotation.start,
+							annotation.nameStop or annotation.stop) then
 						diagnostic.add(self, string.format("`%s` is not a parameter of this function", name),
 							annotation.nameStart or annotation.start, annotation.nameStop or annotation.stop)
 					end
@@ -532,6 +574,8 @@ local function callbackReturns(ctx)
 	local inferredReturnOf = ctx.inferredReturnOf
 	local annotatedBodies = ctx.annotatedBodies
 	for index, promised in pairs(callbackReturns) do
+		local node = parsed.nodes[index]
+		if node and not reused(ctx, node.start, node.stop) then
 		local inferred = inferredReturnOf(index)
 		local gives = inferred and inferred ~= types.VOID
 		if not gives and promised.variant ~= "nil" and promised.variant ~= "void" then
@@ -555,6 +599,7 @@ local function callbackReturns(ctx)
 				}
 			end
 		end
+		end
 	end
 
 	-- What this file gives a caller: a top-level `return { ... }` is what a module is, and its type
@@ -572,13 +617,175 @@ local function moduleExport(ctx)
 		-- being built, which a statement inside a function body also answers with the root.
 		if node.kind == "return" and ctx.scopeAt(ctx.self, node.start) == ctx.self.root and not ctx.self.module then
 			local first = node.children and node.children[1]
-			if first then ctx.self.module = infer.at(ctx.inferCtx, first) end
+			if first then
+				-- A definition file returns the table it declares, and that table is the class the
+				-- annotations describe: `bit = {}` followed by `return bit` is `bitlib`. The
+				-- analyzer's own typing of a global declaration is an object it grows from
+				-- assignments, not the class, so the definitions' answer is asked first.
+				local firstNode = ctx.parsed.nodes[first]
+				local name = firstNode and firstNode.kind == "prefix" and firstNode.callee
+				-- Only a definition file's global backing table is the class: a document's own
+				-- `local bit = {}` shadows the library and must answer as the value it built.
+				local className = ctx.self.isDefinition and name
+					and ctx.prepared and ctx.prepared.globals and ctx.prepared.globals[name]
+				local classType = className and ctx.resolve(className)
+				ctx.self.module = classType or infer.at(ctx.inferCtx, first)
+			end
 		end
 end
 end
 
 
 checks.moduleExport = moduleExport
+
+--- A value nothing is known about. `any` is the same promise from the other side: it names no
+--- operation either, so indexing it, operating on it or passing it to a concrete parameter is a
+--- use the analysis cannot check. Returning or storing it is not.
+---@param held lye.doc.Type?
+---@return boolean
+local function settledUnknown(held)
+	if not held then return false end
+	if held.variant == "union" then
+		for _, member in ipairs(held.types) do
+			if settledUnknown(member) then return true end
+		end
+		return false
+	end
+	if held.variant == "any" then return true end
+	return held.variant == "unknown" and not types.isMutable(held)
+end
+
+--- The values a type can be when it is written as one or more string literals, or nil when it
+--- names a wider family. `type()` returns such a union, and comparing it with anything outside it
+--- cannot be true.
+---@param held lye.doc.Type?
+---@return table<string, boolean>?
+local function literalStrings(held)
+	if not held then return nil end
+	---@param member lye.doc.Type
+	---@return string?
+	local function one(member)
+		if member.variant ~= "extern" or type(member.name) ~= "string" then return nil end
+		local first, last = member.name:sub(1, 1), member.name:sub(-1)
+		if (first == '"' or first == "'") and last == first then return types.display(member) end
+	end
+	if held.variant == "union" then
+		local out = {}
+		for _, member in ipairs(held.types) do
+			local written = one(member)
+			if not written then return nil end
+			out[written] = true
+		end
+		return out
+	end
+	local written = one(held)
+	return written and { [written] = true } or nil
+end
+
+--- A string literal compared against a union of string literals must be one of them. The case that
+--- matters is `type(x) == "f"`: `type` can only answer one of its named results, so the comparison
+--- is a mistake rather than a test that is simply false.
+---@param ctx lye.analyzer.CheckContext
+local function comparisonChecks(ctx)
+	local parsed, self, inferCtx = ctx.parsed, ctx.self, ctx.inferCtx
+	for _, node in ipairs(parsed.nodes) do
+		if not reused(ctx, node.start, node.stop)
+			and node.kind == "binary" and (node.op == "==" or node.op == "~=" or node.op == "!=") then
+			local left = parsed.nodes[node.left]
+			local right = parsed.nodes[node.right]
+			local literal, other, otherIdx
+			if left and left.kind == "string" then
+				literal, other, otherIdx = left, right, node.right
+			elseif right and right.kind == "string" then
+				literal, other, otherIdx = right, left, node.left
+			end
+			if literal and literal.value and other and otherIdx then
+				local allowed = literalStrings(infer.at(inferCtx, otherIdx))
+				if allowed then
+					local written = types.display(types.stringValue(literal.value))
+					if not allowed[written] then
+						local message = other.kind == "call" and other.callee == "type"
+							and string.format("%s is not a type `type` can return", written)
+							or string.format("%s is not one of the values this comparison allows", written)
+						diagnostic.add(self, message, literal.start, literal.stop, 1)
+					end
+				end
+			end
+		end
+	end
+end
+
+--- Reading, operating on or calling an unknown answer is an error. Passing one on, returning it or
+--- storing it is not: an editor asking what a value is may legitimately get `unknown`, and the
+--- program has not used the answer for anything yet.
+---@param ctx lye.analyzer.CheckContext
+local function unknownUses(ctx)
+	-- A definition file is a declaration, not a program: its bodies are stubs and its unannotated
+	-- values say nothing about a running program.
+	if ctx.self.isDefinition then return end
+	local parsed, inferCtx, self = ctx.parsed, ctx.inferCtx, ctx.self
+
+	local function report(node, message)
+		if reused(ctx, node.start, node.stop) then return end
+		diagnostic.add(self, message, node.start, node.stop, 1)
+	end
+
+	-- The type of an expression as the analysis now has it. A name is read through its variable,
+	-- because inference may have cached the placeholder it had before the variable settled.
+	---@param index integer?
+	---@return lye.doc.Type?
+	local function typeOfNode(index)
+		local node = index and parsed.nodes[index]
+		if node and node.kind == "prefix" and node.callee then
+			local variable = ctx.lookupIn(ctx.scopeAt(self, node.start), node.callee, node.start)
+			if variable then return ctx.typeAt(self, variable, node.start) end
+		end
+		return index and infer.at(inferCtx, index) or nil
+	end
+
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "index" and node.target then
+			if settledUnknown(typeOfNode(node.target)) then
+				report(node, "cannot index a value of unknown type")
+			end
+		elseif node.kind == "call" then
+			local targetNode = node.target and parsed.nodes[node.target]
+			local field = node.field or (targetNode and targetNode.field)
+			local name = node.callee or (targetNode and targetNode.callee)
+			local known = name and (ctx.signatures[name]
+				or (ctx.prepared and ctx.prepared.globalNames and ctx.prepared.globalNames[name]))
+			if field then
+				-- A field call reads a method from the value it targets.
+				if settledUnknown(typeOfNode(node.target)) then
+					report(node, "cannot index a value of unknown type")
+				end
+			elseif not known and node.target then
+				-- A call with no field and no signature calls the value itself: `v()` where `v` is
+				-- an unknown is a use; `ipairs(...)` is a declared function and is not.
+				if settledUnknown(typeOfNode(node.target)) then
+					report(node, "cannot call a value of unknown type")
+				end
+			elseif not known and node.callee then
+				if settledUnknown(infer.calleeTypeOf(inferCtx, node)) then
+					report(node, "cannot call a value of unknown type")
+				end
+			end
+		elseif node.kind == "binary" then
+			-- `and`/`or` are control flow and pass a value through; every other operator turns its
+			-- operands into a result, which nothing can say about an unknown one.
+			if node.op ~= "and" and node.op ~= "or" then
+				if settledUnknown(typeOfNode(node.left))
+					or settledUnknown(typeOfNode(node.right)) then
+					report(node, string.format("cannot use an unknown value with `%s`", node.op or "an operator"))
+				end
+			end
+		elseif node.kind == "unary" then
+			if node.op ~= "not" and settledUnknown(typeOfNode(node.operand)) then
+				report(node, string.format("cannot use an unknown value with `%s`", node.op or "an operator"))
+			end
+		end
+	end
+end
 
 function checks.report(ctx)
 	returnHints(ctx)
@@ -589,11 +796,13 @@ function checks.report(ctx)
 	metatableChecks(ctx)
 	deadCode(ctx)
 	arithmeticChecks(ctx)
+	comparisonChecks(ctx)
 	indexedReads(ctx)
 	globalNames(ctx)
 	paramNames(ctx)
 	unusedLocals(ctx)
 	callbackReturns(ctx)
+	unknownUses(ctx)
 	moduleExport(ctx)
 end
 

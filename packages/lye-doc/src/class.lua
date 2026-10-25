@@ -316,7 +316,9 @@ function classes.resolver(namespace, elsewhere)
 					classType.visibility[name] = field.visibility
 				end
 			end
-			for name, field in pairs(evolved[found.name] or {}) do classType.fields[name] = field end
+			local methods = found.name
+				and (evolved[found.name] or evolved[bareName(found.name)])
+			for name, field in pairs(methods or {}) do classType.fields[name] = field end
 			if found.parent then
 				local parentType = resolve(substitute(found.parent, found.params, args))
 				if parentType then classType.parents[#classType.parents + 1] = parentType end
@@ -368,10 +370,22 @@ end
 function classes.evolve(namespace, className, field, method)
 	namespace.evolved = namespace.evolved or {}
 	namespace.built = namespace.built or {}
-	namespace.evolved[className] = namespace.evolved[className] or {}
-	namespace.evolved[className][field] = method
+	-- A class may be written with the marker that says how a name is used (`file*`) while the
+	-- method is declared against the name without it (`function file:read`), or the other way
+	-- round. The resolver builds the class type under the written name, so both spellings have to
+	-- reach the same method table; storing only one left every `file:read` invisible.
+	local bare = bareName(className)
+	local fields = namespace.evolved[bare]
+	if not fields then
+		fields = {}
+		namespace.evolved[bare] = fields
+	end
+	if className ~= bare then namespace.evolved[className] = fields end
+	fields[field] = method
 	for _, classType in pairs(namespace.built or {}) do
-		if classType.name == className then classType.fields[field] = method end
+		if classType.variant == "class" and classType.name and bareName(classType.name) == bare then
+			classType.fields[field] = method
+		end
 	end
 end
 

@@ -15,6 +15,9 @@
 		},
 		"lye-plugin": {
 			"path": "../lye-plugin"
+		},
+		"rapidhash": {
+			"git": "https://github.com/lde-org/rapidhash.git"
 		}
 	}
 }

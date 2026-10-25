@@ -196,8 +196,9 @@ function tostring(v: any): string end
 ---| "function"
 ---| "thread"
 ---| "userdata"
+---| "cdata"
 
----Returns the type of its only argument, coded as a string. The possible results of this function are `"nil"` (a string, not the value `nil`), `"number"`, `"string"`, `"boolean"`, `"table"`, `"function"`, `"thread"`, and `"userdata"`.
+---Returns the type of its only argument, coded as a string. The possible results of this function are `"nil"` (a string, not the value `nil`), `"number"`, `"string"`, `"boolean"`, `"table"`, `"function"`, `"thread"`, `"userdata"`, and `"cdata"` (LuaJIT).
 ---
 ---@nodiscard
 function type(v: any): type end

@@ -394,6 +394,83 @@ test.it("reads a pattern written at the call to see what the call gives back", f
 	test.equal(typeOf(source, "count"), "number", "and a count")
 end)
 
+test.it("reads a file method's mode to type what it returns", function()
+	-- The definitions give `file:read` an `any` return because the mode decides the value. The
+	-- mode is written at the call, so it is read there: `*a` is a string, the line and number
+	-- forms may find nothing.
+	local prelude = analyzer.prelude({
+		file = table.concat({
+			"---@class file*\n",
+			"local file = {}\n",
+			"---@class iolib\n",
+			"io = {}\n",
+			"---@return file*?\n",
+			"function io.open(name: string) end\n",
+			"---@overload fun(self: file*, fmt: \"*a\"): string\n",
+			"---@overload fun(self: file*, fmt: \"*l\"|\"*L\"): string?\n",
+			"---@overload fun(self: file*, fmt: \"*n\"): number?\n",
+			"---@overload fun(self: file*): string?\n",
+			"---@param ... integer|\"*a\"|\"*l\"|\"*L\"|\"*n\"\n",
+			"---@return any\n",
+			"function file:read(...) end\n",
+		}, ""),
+	})
+	local source = table.concat({
+		"local function read()\n",
+		"  local h = io.open(\"x\")\n",
+		"  if not h then return nil end\n",
+		"  local whole = h:read(\"*a\")\n",
+		"  local line = h:read(\"*l\")\n",
+		"  local number = h:read(\"*n\")\n",
+		"  return whole, line, number\n",
+		"end\n",
+	}, "")
+	local result = analyzer.analyze(source, prelude)
+	local function held(name)
+		for _, variable in ipairs(result.variables) do
+			if variable.name == name then return types.display(analyzer.typeAt(result, variable, #source)) end
+		end
+	end
+	test.equal(held("whole"), "string", "the whole file is a string")
+	test.equal(held("line"), "string?", "a line may be absent")
+	test.equal(held("number"), "number?", "a numeral may be absent")
+
+	local bad = analyzer.analyze(table.concat({
+		"local function read()\n",
+		"  local h = io.open(\"x\")\n",
+		"  if not h then return nil end\n",
+		"  h:read({})\n",
+		"end\n",
+	}, ""), prelude)
+	test.equal(#bad.diagnostics, 1, "a table is not a read mode")
+	test.truthy(bad.diagnostics[1].message:match("expects"), bad.diagnostics[1].message)
+
+	local badText = analyzer.analyze(table.concat({
+		"local function read()\n",
+		"  local h = io.open(\"x\")\n",
+		"  if not h then return nil end\n",
+		"  h:read(\"nope\")\n",
+		"end\n",
+	}, ""), prelude)
+	test.equal(#badText.diagnostics, 1, "an arbitrary string is not a read mode")
+	test.truthy(badText.diagnostics[1].message:match("expects"), badText.diagnostics[1].message)
+end)
+
+test.it("exports a definition's global table as the class it describes", function()
+	-- `bit = {}` is a global the definitions declare, and `return bit` is what `require("bit")`
+	-- gives. The class is `bitlib`; an object grown from assignments is not that answer.
+	local text = table.concat({
+		"---@meta bit\n",
+		"---@class bitlib\n",
+		"bit = {}\n",
+		"function bit.tobit(x: integer): integer end\n",
+		"return bit\n",
+	}, "")
+	local prelude = analyzer.prelude({ bit = text })
+	local result = analyzer.analyze(text, prelude, nil, nil, nil, nil, true, true)
+	test.equal(types.display(result.module), "bitlib")
+end)
+
 test.it("gives each name the value the callee returns at its position", function()
 	-- `local class, args = resolve(ns, text)`: a function handing back two values fills two names,
 	-- whether the values were written down or read off its body.
@@ -711,16 +788,21 @@ test.it("checks a call chained off another call against its own callee", functio
 	-- second call's node, so the function was checked against `load`'s `string` parameter — every
 	-- `require("x").something(f)` in a project was reported.
 	local source = table.concat({
+		"---@class M\n",
+		"---@field lazy fun(fn: fun(): any): any\n",
 		"local M = {}\n",
-		"---@param fn fun(): any\n",
 		"function M.lazy(fn) return fn end\n",
 		"---@param name string\n",
-		"---@return any\n",
+		"---@return M\n",
 		"local function load(name) return M end\n",
 		"local held = load(\"x\").lazy(function() return 1 end)\n",
 		"return held\n",
 	}, "")
-	test.equal(#analyzer.analyze(source).diagnostics, 0, "the function is what `lazy` takes")
+	local reported = {}
+	for _, entry in ipairs(analyzer.analyze(source).diagnostics) do
+		if (entry.severity or 1) < 3 then reported[#reported + 1] = entry.message end
+	end
+	test.equal(#reported, 0, "the function is what `lazy` takes: " .. table.concat(reported, " / "))
 end)
 
 test.it("reports an assignment mismatch on the assignment, not the declaration", function()
@@ -767,6 +849,48 @@ test.it("narrows on a type test", function()
 
 	local inverted = "---@type string|number\nlocal x = 1\nif type(x) == \"number\" then\n\tprint(1)\nelse\n\tprint(x)\nend\n"
 	test.equal(typeAtOffset(inverted, "x", offsetOf(inverted, "print(x)")), "string")
+end)
+
+test.it("narrows unknown and any to the type a type() test proves", function()
+	for _, annotation in ipairs({ "unknown", "any" }) do
+		local source = "---@type " .. annotation .. "\nlocal x = 5\n"
+			.. "if type(x) == \"table\" then\n\tprint(x)\nend\n"
+		test.equal(typeAtOffset(source, "x", offsetOf(source, "print")), "table",
+			annotation .. " becomes the tested type")
+	end
+end)
+
+test.it("rejects a type() comparison with a name type cannot return", function()
+	local prelude = analyzer.prelude({
+		basic = table.concat({
+			"---@alias type\n",
+			"---| \"nil\"\n---| \"number\"\n---| \"string\"\n---| \"boolean\"\n",
+			"---| \"table\"\n---| \"function\"\n---| \"thread\"\n---| \"userdata\"\n---| \"cdata\"\n",
+			"---@param v any\n---@return type\nfunction type(v) end\n",
+		}, ""),
+	})
+	local bad = "---@type unknown\nlocal x = 5\nif type(x) == \"f\" then\n\tlocal y = x\nend\n"
+	local result = analyzer.analyze(bad, prelude)
+	local errors = {}
+	for _, entry in ipairs(result.diagnostics) do
+		if (entry.severity or 1) < 3 then errors[#errors + 1] = entry.message end
+	end
+	test.equal(#errors, 1, "the comparison is reported: " .. table.concat(errors, " / "))
+	test.truthy(errors[1]:match("not a type"))
+	for _, variable in ipairs(result.variables) do
+		if variable.name == "y" then
+			test.equal(types.display(analyzer.typeAt(result, variable, #bad)), "unknown",
+				"and nothing is narrowed from an impossible test")
+		end
+	end
+
+	local good = "---@type unknown\nlocal x = 5\nif type(x) == \"cdata\" then\n\tlocal y = x\nend\n"
+	local narrowed = analyzer.analyze(good, prelude)
+	for _, variable in ipairs(narrowed.variables) do
+		if variable.name == "y" then
+			test.equal(types.display(analyzer.typeAt(narrowed, variable, #good)), "ffi.cdata*")
+		end
+	end
 end)
 
 test.it("narrows a negation", function()
@@ -976,12 +1100,13 @@ test.it("reports arithmetic on a type that cannot be a number", function()
 	test.equal(#analyzer.analyze("local n = 2 * 3\n").diagnostics, 0)
 end)
 
-test.it("claims nothing about arithmetic on an any", function()
-	-- Whatever an `any` holds may have a metamethod, so the result is unknown rather than a
-	-- number, and nothing is reported against it.
+test.it("errors on arithmetic on an any", function()
+	-- An `any` names no operation, so an operator applied to it is a use nothing can check. The
+	-- result may have a metamethod and is left unknown, but the use itself is reported.
 	local source = "local y = |x| -> x * 2\n"
 	local result = analyzer.analyze(source)
-	test.equal(#result.diagnostics, 0)
+	test.equal(#result.diagnostics, 1)
+	test.truthy(result.diagnostics[1].message:match("unknown value"), result.diagnostics[1].message)
 	local y = result.variables[1]
 	test.equal(types.display(analyzer.typeAt(result, y, #source)), "fn(any) -> unknown")
 end)
@@ -1258,6 +1383,114 @@ test.it("reads the standard library through a prepared prelude", function()
 	test.equal(#with.diagnostics, 0)
 end)
 
+test.it("absorbs a literal into the number a call returns", function()
+	-- The definitions are the real source of `tonumber`'s signature, but the analyzer package
+	-- does not depend on lye-defs; the shape being tested is a call returning number beside a
+	-- number literal.
+	local prelude = analyzer.prelude({
+		basic = table.concat({
+			"---@param s string\n",
+			"---@return number\n",
+			"function tonumber(s) end\n",
+		}, ""),
+	})
+	local source = 'local SEED = tonumber("10") or 20261024'
+	local result = analyzer.analyze(source, prelude)
+	local seed
+	for _, variable in ipairs(result.variables) do
+		if variable.name == "SEED" then seed = variable end
+	end
+	test.truthy(seed)
+	test.equal(types.display(analyzer.typeAt(result, seed, #source)), "number",
+		"a number literal beside number is just number")
+	test.equal(#result.diagnostics, 0)
+end)
+
+test.it("errors when a settled unknown is used", function()
+	local prefix = "---@return unknown\nlocal function unknown() end\nlocal v = unknown()\n"
+	---@param source string
+	---@return string[]
+	local function reported(source)
+		local out = {}
+		for _, entry in ipairs(analyzer.analyze(source).diagnostics) do
+			if not entry.message:match("^unused local") then out[#out + 1] = entry.message end
+		end
+		return out
+	end
+	test.equal(#reported(prefix .. "return v\n"), 0, "returning it is not a use")
+	test.equal(#reported(prefix .. "if v then end\n"), 0, "a truth test does not read a field")
+	test.equal(#reported(prefix .. "return v.x\n"), 1, "indexing it is")
+	test.truthy(reported(prefix .. "return v.x\n")[1]:match("cannot index"))
+	test.equal(#reported(prefix .. "return v + 1\n"), 1, "an operator is")
+	test.equal(#reported(prefix .. "return #v\n"), 1, "a unary operator is")
+	test.equal(#reported(prefix .. "return v()\n"), 1, "calling it is")
+	test.truthy(reported(prefix .. "return v()\n")[1]:match("cannot call"))
+end)
+
+test.it("errors when an any value is used the same way", function()
+	local prefix = "---@return any\nlocal function anything() end\nlocal v = anything()\n"
+	---@param source string
+	---@return string[]
+	local function reported(source)
+		local out = {}
+		for _, entry in ipairs(analyzer.analyze(source).diagnostics) do
+			if not entry.message:match("^unused local") then out[#out + 1] = entry.message end
+		end
+		return out
+	end
+	test.equal(#reported(prefix .. "return v\n"), 0, "returning it is not a use")
+	test.equal(#reported(prefix .. "return v.x\n"), 1, "indexing any is an error")
+	test.equal(#reported(prefix .. "return v + 1\n"), 1, "an operator on any is an error")
+	test.equal(#reported(prefix .. "return v()\n"), 1, "calling any is an error")
+	local passed = analyzer.analyze("---@return any\nlocal function anything() end\n"
+		.. "---@param a string\nlocal function f(a) end\nf(anything())\n")
+	local said = {}
+	for _, entry in ipairs(passed.diagnostics) do said[#said + 1] = entry.message end
+	test.truthy(table.concat(said, " / "):match("f expects string, got any"), table.concat(said, " / "))
+end)
+
+test.it("gives an empty table the shape a parameter expects", function()
+	local source = table.concat({
+		"---@class Entry\n",
+		"---@field name string\n",
+		"\n",
+		"---@param out Entry[]\n",
+		"---@param seen table<string, boolean>\n",
+		"---@param name string\n",
+		"local function add(out, seen, name) end\n",
+		"\n",
+		"local out, seen = {}, {}\n",
+		"add(out, seen, \"x\")\n",
+		"for _, entry in ipairs(out) do\n",
+		"  local name = entry.name\n",
+		"end\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	local held = {}
+	for _, variable in ipairs(result.variables) do held[variable.name] = variable end
+	test.equal(types.display(analyzer.typeAt(result, held.out, #source)), "Entry[]",
+		"the empty table took the parameter's shape")
+	test.equal(types.display(analyzer.typeAt(result, held.seen, #source)), "table<string, boolean>")
+	test.equal(types.display(analyzer.typeAt(result, held.entry, #source)), "Entry",
+		"so ipairs yields the element type")
+	test.equal(types.display(analyzer.typeAt(result, held.name, #source)), "string")
+	for _, entry in ipairs(result.diagnostics) do
+		test.falsy(entry.message:match("unknown"), entry.message)
+	end
+
+	-- A later call that wants another shape is a mismatch against the type it now has.
+	local conflict = analyzer.analyze(table.concat({
+		"---@param a string[]\nlocal function first(a) end\n",
+		"---@param b number[]\nlocal function second(b) end\n",
+		"local out = {}\n",
+		"first(out)\n",
+		"second(out)\n",
+	}, ""))
+	local said = {}
+	for _, entry in ipairs(conflict.diagnostics) do said[#said + 1] = entry.message end
+	test.truthy(table.concat(said, " / "):match("second expects"), table.concat(said, " / "))
+end)
+
 test.it("checks an argument against its parameter type", function()
 	local bad = analyzer.analyze("---@param a string\nlocal function f(a) end\nf(5)\n")
 	test.equal(#bad.diagnostics, 1)
@@ -1265,9 +1498,16 @@ test.it("checks an argument against its parameter type", function()
 	test.equal(bad.diagnostics[1].severity, 1)
 
 	test.equal(#analyzer.analyze("---@param a string\nlocal function f(a) end\nf(\"s\")\n").diagnostics, 0)
-	-- An argument whose type cannot be inferred must not be reported.
-	test.equal(#analyzer.analyze(
+	-- A settled unknown handed to a parameter that says what it takes is a use of the unknown.
+	local unknown = analyzer.analyze(
 		"---@return unknown\nlocal function g() end\n---@param a string\nlocal function f(a) end\nf(g())\n"
+	)
+	test.equal(#unknown.diagnostics, 1)
+	test.truthy(unknown.diagnostics[1].message:match("f expects string, got unknown"),
+		unknown.diagnostics[1].message)
+	-- Returning it, storing it or branching on it is not a use.
+	test.equal(#analyzer.analyze(
+		"---@return unknown\nlocal function g() end\nlocal x = g()\nif x then end\nreturn x\n"
 	).diagnostics, 0)
 end)
 

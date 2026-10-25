@@ -10,6 +10,8 @@ local rapidhash = require("rapidhash")
 local env = require("env")
 local parallel = require("lye-lsp.parallel")
 local cache = require("lye-lsp.cache")
+local Index = require("lye-lsp.index")
+local timing = require("lye-lsp.timing")
 local plugin = require("lye-plugin")
 local json = require("lye-json")
 
@@ -35,6 +37,56 @@ end
 --- editor session does.
 local PRELUDE = analyzer.prelude(require("lye-defs"))
 
+--- The definitions' own types, by a name an entry can say them with. A module's answer holds them
+--- — `ffi.cdecl` is a function the definitions declared — and a run that reads that answer back
+--- has to reach the very tables the definitions built, because a signature is looked up by the
+--- type it was built for. Built once, from the maps the definitions are already keyed by.
+---@type { names: table<unknown, string>, tables: table<string, unknown> }?
+local preludeTypes
+
+---@return { names: table<unknown, string>, tables: table<string, unknown> }
+local function namedPreludeTypes()
+	if preludeTypes then return preludeTypes end
+	local names, tables = {}, {}
+	---@param held unknown
+	---@param name string
+	local function add(held, name)
+		if type(held) ~= "table" or names[held] then return end
+		names[held] = name
+		tables[name] = held
+	end
+	-- A field's type is what a signature is looked up by, so it needs its name most: `evolved` is
+	-- where the definitions' methods were put as they were declared.
+	for className, fields in pairs(PRELUDE.evolved or {}) do
+		for field, held in pairs(fields) do add(held, "field:" .. className .. "." .. field) end
+	end
+	for name, alias in pairs(PRELUDE.aliases) do add(alias, "alias:" .. name) end
+	for name, held in pairs(PRELUDE.returns) do add(held, "return:" .. name) end
+	for text, held in pairs(PRELUDE.built or {}) do add(held, "built:" .. text) end
+	preludeTypes = { names = names, tables = tables }
+	return preludeTypes
+end
+
+--- What this process has done so far: a warm run is one whose `analyses` did not grow and whose
+--- module answers came back from the cache. Counters only; nothing is decided by them.
+---@class lye.check.Stats
+---@field analyses integer full analyses of a checked file, and module-only analyses
+---@field interfaces { hits: integer, loaded: integer, misses: integer, stored: integer }
+---@field documents { parsed: integer, loaded: integer } the batch's annotations, parsed here and
+--- read from the persisted index
+
+---@type lye.check.Stats
+local stats = {
+	analyses = 0,
+	interfaces = { hits = 0, loaded = 0, misses = 0, stored = 0 },
+	documents = { parsed = 0, loaded = 0 },
+}
+
+---@return lye.check.Stats
+function check.stats()
+	return stats
+end
+
 -- What each piece of text came to, by its own text. lde links or copies one file into every
 -- package's `target/`, so a run of the check meets the same module under many names — the source
 -- and the link beside it, and the link in each package that depends on it. Analysing each name
@@ -47,7 +99,8 @@ local docsByText = {}
 
 -- What a module came to for a `require`, by its text: a module-only analysis, which is a different
 -- thing from `analysesByText` — that one carries the diagnostics of a file being checked, and a
--- file reached as a dependency first must not be handed those away as its answer.
+-- file reached as a dependency first must not be handed those away as its answer. An answer that
+-- is still the answer is also kept between runs, under a key that says what it was read against.
 local interfacesByText = {}
 
 --- The key a piece of source is cached under.
@@ -88,6 +141,97 @@ local function packageOf(path)
 		if fs.exists(at .. "/lde.json") then return at end
 		at = at:match("^(.*)/[^/]+$")
 	end
+end
+
+--- The directory every path of a batch is under: a run with no workspace root named checks the
+--- files it was handed, and the index for that batch is keyed by the smallest tree that holds it.
+---@param paths string[]
+---@return string?
+local function commonRoot(paths)
+	local common
+	for _, path in ipairs(paths) do
+		local at = absolute(path)
+		if not fs.isdir(at) then at = at:match("^(.*)/[^/]+$") or at end
+		if common == nil then
+			common = at
+		else
+			while common ~= "" and common ~= "/" do
+				if at == common or at:sub(1, #common + 1) == common .. "/" then break end
+				common = common:match("^(.*)/[^/]+$")
+			end
+		end
+	end
+	if common == "" then return "/" end
+	return common
+end
+
+--- The roots a batch can find a persisted index under: the directory the run was started in, the
+--- directory the batch lives under, and each package its files belong to. A root is only ever
+--- asked for an entry; a check never builds one, because building it is the reading this is here
+--- to avoid.
+---@param paths string[]
+---@return string[]
+local function indexRoots(paths)
+	local roots, seen = {}, {}
+	---@param root string?
+	local function add(root)
+		if type(root) ~= "string" or root == "" then return end
+		local held = root:gsub("[/\\]+$", "")
+		if held == "" then held = "/" end
+		if seen[held] then return end
+		seen[held] = true
+		roots[#roots + 1] = held
+	end
+	add(env.cwd())
+	add(commonRoot(paths))
+	for _, path in ipairs(paths) do add(packageOf(path)) end
+	return roots
+end
+
+--- The index records a loaded entry holds for the files being checked, by absolute path. The
+--- entry for a workspace describes its sources; the entry for a package root describes the files
+--- linked into its `target/`, which a batch can name as well. Both are read, each once, and an
+--- entry that is missing, corrupt or from another version is simply not there: `open` never
+--- builds, syncs or writes.
+---@param paths string[]
+---@return table<string, lye.lsp.IndexFile>?
+local function indexedFiles(paths)
+	if #paths == 0 then return nil end
+	local wanted, remaining = {}, 0
+	for _, path in ipairs(paths) do
+		local at = absolute(path)
+		if not wanted[at] then
+			wanted[at] = true
+			remaining += 1
+		end
+	end
+	if remaining == 0 then return nil end
+
+	local records = {}
+	local index = Index.new()
+	for _, root in ipairs(indexRoots(paths)) do
+		if remaining == 0 then break end
+		for _, kind in ipairs({ "workspace", "package" }) do
+			local entry = index:open(root, { kind = kind })
+			for path, record in pairs(entry and entry.files or {}) do
+				if wanted[path] and records[path] == nil then
+					records[path] = record
+					remaining -= 1
+				end
+			end
+		end
+	end
+	return records
+end
+
+--- What an index record says a document annotates, in the shape `doc.parse` returns: the
+--- annotations the analyzer and `classes.declare` read, and nothing that would need the source.
+--- The record's own tables are used as they are — a forked worker inherits them copy-on-write —
+--- because nothing in a check writes to an annotation.
+---@param record lye.lsp.IndexFile
+---@return lye.doc.File
+local function annotationDoc(record)
+	return { annotations = record.annotations, isDefinition = record.isDefinition == true }
 end
 
 --- The names the modules linked into a package's `target/` declare. A dependency's class is as
@@ -154,6 +298,11 @@ end
 --- What a run keeps for the next one: the digest of everything a file is read against, and the
 --- text of the files read on the way. `check.files` builds one; `check.file` and a run with the
 --- cache off have none, and every file is then checked the way it always was.
+---
+--- There is no size/mtime manifest: measured on this repository, a warm run over the unchanged
+--- tree is 0.08-0.10 s, of which hashing the sources is under the noise — a manifest would add a
+--- second thing to validate and save nothing. A file's text key is its content hash, and a change
+--- to it is the one thing that makes the entry a miss.
 ---@class lye.check.Store
 ---@field annotations string the digest of every annotation in the batch, which `declared` is built from
 ---@field keys table<string, string> the text key of each file of the batch, by path
@@ -383,6 +532,55 @@ local function lowered(path, source)
 	return map.text, map
 end
 
+--- The key an interface is kept under: the module's analysis key — its text and the plugins that
+--- read it — the code that read it, and what it was read against. What it was read against is the
+--- batch's annotations and everything linked into the module's own package: a module's `require`s
+--- resolve within its package, so a change to any linked file can change the answer.
+---@param key string the module's analysis key
+---@param path string the file the `require` is written in, which says how the module is held
+---@param store lye.check.Store
+---@param owner string the module's package root
+---@return string
+local function interfaceKey(key, path, store, owner)
+	return cache.key("interface", key, cache.codeVersion(),
+		tostring(isDefinitionPath(path)), store.annotations, store:farm(owner))
+end
+
+--- The interface a previous run kept for a module, when its text, its plugins and everything it
+--- was read against are unchanged. A `false` module is kept too, as the answer a module that
+--- returns nothing came to. Anything else — an entry from another version, a corrupt one, one a
+--- concurrent run is writing — is a miss.
+---@param key string
+---@param path string
+---@param store lye.check.Store
+---@param owner string
+---@param written string the lowered text the interface is about
+---@return { type: lye.doc.Type? }?
+local function loadInterface(key, path, store, owner, written)
+	local entry = cache.load(interfaceKey(key, path, store, owner), namedPreludeTypes())
+	if not entry or entry.key ~= cache.codeVersion() or entry.text ~= textKey(written) then
+		return nil
+	end
+	if entry.module == false then return { type = nil } end
+	if type(entry.module) ~= "table" then return nil end
+	return { type = entry.module }
+end
+
+--- Keep a module's interface for the runs after this one. A write that cannot happen is a miss
+--- then, not an error: the answer is already in hand.
+---@param key string
+---@param path string
+---@param store lye.check.Store
+---@param owner string
+---@param written string
+---@param module lye.doc.Type?
+---@return boolean
+local function saveInterface(key, path, store, owner, written, module)
+	return cache.save(interfaceKey(key, path, store, owner), {
+		text = textKey(written), key = cache.codeVersion(), module = module or false,
+	}, namedPreludeTypes())
+end
+
 --- The type `require("name")` has in `path`: lde links every module a package can reach under its
 --- `target/`, so one rule answers a dependency and a sibling alike. `ffi` and the rest of the
 --- engine's modules are named in the definitions rather than in a file, and come from there.
@@ -414,9 +612,25 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 	-- another is read once for the whole run rather than once per file that names it — and the
 	-- same file reached through another package's link is the same module and is not read again.
 	local cached = modules[key] or interfacesByText[key]
-	if cached then return cached.type end
+	if cached then
+		stats.interfaces.hits += 1
+		return cached.type
+	end
 	-- A module that requires its way back here says nothing rather than being read again.
 	if analysing[key] then return nil end
+
+	-- What an earlier run kept, when nothing the module was read against has changed: the same
+	-- answer two package slices, or two runs, would otherwise pay to work out twice.
+	local ownerOfModule = packageOf(found) or owner
+	if store then
+		local kept = loadInterface(key, path, store, ownerOfModule, written)
+		if kept then
+			stats.interfaces.loaded += 1
+			modules[key] = kept
+			interfacesByText[key] = kept
+			return kept.type
+		end
+	end
 
 	-- The module's own `require`s resolve within its package, so it is read with a resolver of its
 	-- own — and the analysis is the one the editor would do, definitions and all.
@@ -434,6 +648,7 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 		or elsewhere
 	local names = analysesByText[key]
 	if names == nil then
+		stats.analyses += 1
 		names = analyzer.analyze(written, PRELUDE, own, function(inner)
 			return moduleOf(found, inner, modules, analysing, own, scopes, batch, store)
 		end, nil, docsByText[key], batchPath == nil, isDefinitionPath(path), pluginsFor(found),
@@ -441,9 +656,13 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 		analysesByText[key] = names
 	end
 	analysing[key] = nil
+	stats.interfaces.misses += 1
 	local held = { type = names.module }
 	modules[key] = held
 	interfacesByText[key] = held
+	if store and saveInterface(key, path, store, ownerOfModule, written, names.module) then
+		stats.interfaces.stored += 1
+	end
 	return names.module
 end
 
@@ -513,6 +732,7 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	local analysing = { [key] = true }
 	local names = analysesByText[key]
 	if names == nil then
+		stats.analyses += 1
 		names = analyzer.analyze(written, PRELUDE, elsewhere, function(name)
 			return moduleOf(path, name, modules or {}, analysing, elsewhere, scopes, batch, store)
 		end, nil, docsByText[key], nil, isDefinitionPath(path), pluginsFor(path),
@@ -522,6 +742,9 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 		-- richer answer: a module another file reaches afterwards takes it rather than being
 		-- analysed a second time.
 		interfacesByText[key] = { type = names.module }
+		if store and owner and saveInterface(key, path, store, owner, written, names.module) then
+			stats.interfaces.stored += 1
+		end
 	end
 	-- The analysis parsed the file already: its own parse carries the syntax errors, so a file is
 	-- read by the parser once per check rather than twice.
@@ -656,8 +879,15 @@ end
 function check.files(paths, reporter)
 	-- Every file in the batch is read first, so a name one of them declares is not a typo in
 	-- another: annotations are workspace-wide even though a document is analysed on its own.
+	-- The annotations themselves are the expensive part of that: an earlier run's declaration
+	-- index already holds them, so a record whose hash is the text read here is used as it stands
+	-- and only the files the index does not describe are comment-lexed. The records are plain
+	-- tables, so a forked worker inherits them copy-on-write rather than through IPC.
 	local parsedFiles = {}
 	local sourcesByPath, keysByPath = {}, {}
+	local records = cache.enabled() and indexedFiles(paths) or nil
+	local loaded, parsed = 0, 0
+	local started = timing.detailed() and timing.now() or nil
 	for _, path in ipairs(paths) do
 		local source = readSource(path)
 		sourcesByPath[path] = source
@@ -667,15 +897,27 @@ function check.files(paths, reporter)
 			local written = lowered(path, source)
 			local key = analysisKey(path, written)
 			keysByPath[path] = key
-			local parsed = docsByText[key]
-			if parsed == nil then
-				local isOk, one = pcall(doc.parse, written)
-				parsed = isOk and one or false
-				docsByText[key] = parsed
+			local held = docsByText[key]
+			if held == nil then
+				-- A lowered text is not the text the index read, and its annotations are the ones
+				-- the plugin wrote rather than the ones in the file: those are parsed as they are.
+				local record = records and written == source and records[absolute(path)] or nil
+				if record and record.hash == textKey(source) then
+					held = annotationDoc(record)
+					loaded += 1
+				else
+					local isOk, one = pcall(doc.parse, written)
+					held = isOk and one or false
+					parsed += 1
+				end
+				docsByText[key] = held
 			end
-			if parsed then parsedFiles[#parsedFiles + 1] = parsed end
+			if held then parsedFiles[#parsedFiles + 1] = held end
 		end
 	end
+	stats.documents.loaded += loaded
+	stats.documents.parsed += parsed
+	if started then timing.detail("check-index", started, "loaded=%d parsed=%d", loaded, parsed) end
 
 	reporter = reporter or report.new()
 	-- What an earlier run kept, when this one can read it: everything a file is read against,

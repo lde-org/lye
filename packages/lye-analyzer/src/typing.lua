@@ -6,6 +6,7 @@
 ]]
 
 local types = require("lye-doc.type")
+local memo = require("lye-analyzer.memo")
 local infer = require("lye-analyzer.infer")
 local annotations = require("lye-analyzer.annotations")
 local kindToType = annotations.kindToType
@@ -140,7 +141,9 @@ local typing = {}
 	--- promote in place, so one pass is not enough on its own.
 	---@param ctx lye.typing.Context
 	---@param only table<lye.analyzer.Variable, boolean>? the names a later pass has to read again
-	function typing.typeAll(ctx, only)
+	---@param reused fun(start: integer, stop: integer): boolean? whether a span belongs to an item
+	--- whose cached result is being reused — its nodes are not typed and its diagnostics are copied
+	function typing.typeAll(ctx, only, reused)
 	local parsed, self = ctx.parsed, ctx.self
 	local inferCtx, signatures = ctx.inferCtx, ctx.signatures
 	local returns, resolve = ctx.returns, ctx.resolve
@@ -151,7 +154,7 @@ local typing = {}
 	local checkMetatable = ctx.checkMetatable
 	-- A written type, read once per document where the analysis gave a cache for it: a context
 	-- built by hand — a test's — has none, and parses as it always did.
-	local parseType = ctx.typeOfText or function(text) return types.parse(text, resolve) end
+	local parseType = ctx.typeOfText or function(text) return memo.parse(text, resolve) end
 
 	-- The resolver a generic return is read with at a call: the bindings from that call's
 	-- arguments first, the signature's own limits behind them. The state is what the loop sets,
@@ -167,7 +170,9 @@ local typing = {}
 		-- first name from what the iterator yields. The pass runs twice, so the slot is claimed either way.
 			local claimed = {}
 		for _, variable in ipairs(self.variables) do
-			local node = variable.qualifier == "loop" and loopOf(variable)
+			local node = variable.qualifier == "loop"
+				and not (reused and reused(variable.start, variable.stop or variable.start))
+				and loopOf(variable)
 			-- Two names are typed: the first takes the iterator's value, the second what the table it walks
 			-- holds. A third is left alone, because Lua's `for` makes no promise about it.
 			if node and (claimed[node.index] or 0) < 2 then
@@ -254,6 +259,12 @@ local typing = {}
 			-- What a function returns is read off its body: the union of every value it returns, or nil when it
 		-- returns nothing. Annotations are left alone, so a `@return` can be compared later.
 		for index, fnType in pairs(inferCtx.fnTypes) do
+			local body = parsed.nodes[index]
+			if body and reused and reused(body.start, body.stop) then
+				-- The cached callable already carries what this body returned; its dependents were
+				-- seeded with it, and re-deriving it would walk a body nobody changed.
+				goto continue_fn
+			end
 			local values = typing.inferredValuesOf(ctx, index)
 			local inferred = values[1]
 			if inferred then
@@ -307,10 +318,12 @@ local typing = {}
 					start = parsed.nodes[index].start, stop = parsed.nodes[index].stop,
 				}
 			end
+			::continue_fn::
 		end
 			-- Generic names are bound from the arguments before the results are read, so `id(5)` is
 		-- number and `unpack(t)` is whatever `t` holds.
 		for _, node in ipairs(parsed.nodes) do
+			if not (reused and reused(node.start, node.stop)) then
 			local signature = node.kind == "call" and signatureOfCall(node)
 			-- A metatable is a relationship of the value it is set on rather than a replacement for its type,
 			-- but a class used as one is how a Lua object is written, so `setmetatable({}, Point)` is a `Point`.
@@ -374,16 +387,19 @@ local typing = {}
 					end
 				end
 			end
+			end
 		end
 			-- `local a, b = unpack(list)` gives every name the spread's type. The model links one
 		-- value to a statement, so the names after the first would otherwise have none.
 		local spreads = {}
 		for _, declaration in ipairs(parsed.declarations) do
+			if not (reused and reused(declaration.start, declaration.stop or declaration.start)) then
 			local node = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
 			local signature = node and node.kind == "call" and node.callee and signatures[node.callee]
 			local returned = signature and signature.returns
 			if declaration.anchorIdx and returned and returned.type and returned.type:sub(-3) == "..." then
 				spreads[declaration.anchorIdx] = inferCtx.callTypes[node.index]
+			end
 			end
 		end
 		for _, variable in ipairs(self.variables) do

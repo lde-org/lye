@@ -8,6 +8,7 @@ local lexer = require("lye-lexer")
 local KIND = lexer.KIND
 local doc = require("lye-doc")
 local types = require("lye-doc.type")
+local memo = require("lye-analyzer.memo")
 local names = require("lye-analyzer.names")
 local targetName = names.targetName
 
@@ -309,7 +310,7 @@ local function withGenerics(generics, constraints, resolve)
 		-- Membership, not truth: a generic that is not variadic is recorded as `false`.
 		if generics[text] ~= nil then
 			local constraint = constraints and constraints[text]
-			local held = constraint and types.parse(constraint, resolve)
+			local held = constraint and memo.parse(constraint, resolve)
 			if held then return held end
 			return types.UNKNOWN_TYPE
 		end
@@ -326,7 +327,7 @@ local function paramTypeOf(params, name, resolve)
 	if not params then return nil end
 	for _, annotation in ipairs(params) do
 		if annotation.name == name and annotation.type then
-			return types.parse(annotation.type, resolve)
+			return memo.parse(annotation.type, resolve)
 		end
 	end
 end

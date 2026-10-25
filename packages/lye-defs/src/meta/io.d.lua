@@ -101,7 +101,7 @@ function io.write(...: string|number) end
 ---@class file*
 local file = {}
 
----@alias readmode integer|string
+---@alias readmode integer|"*n"|"*a"|"*l"|"*L"
 ---| "*n" # Reads a numeral and returns it as number.
 ---| "*a" # Reads the whole file.
 ---|>"*l" # Reads the next line skipping the end of line.
@@ -130,10 +130,15 @@ function file:flush() end
 function file:lines(...: readmode) end
 
 ---Reads the `file`, according to the given formats, which specify what to read.
+---@overload fun(self: file*, fmt: "*a"): string
+---@overload fun(self: file*, fmt: "*l"|"*L"): string?
+---@overload fun(self: file*, fmt: "*n"): number?
+---@overload fun(self: file*, fmt: integer): string?
+---@overload fun(self: file*): string?
 ---@return any
 ---@return any ...
 ---@nodiscard
-function file:read(...: readmode) end
+function file:read(...: "*n"|"*a"|"*l"|"*L"|integer) end
 
 ---@alias seekwhence
 ---| "set" # Base is beginning of the file.

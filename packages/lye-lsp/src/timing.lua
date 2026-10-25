@@ -48,6 +48,46 @@ local origin = now()
 local detailed = os.getenv("LYE_TIMING") == "1"
 local quiet = os.getenv("LYE_TIMING") == "0"
 
+-- The process whose resident set is read. `ps` needs it; `/proc/self` does not.
+local pid
+if ffi.os ~= "Windows" and pcall(ffi.cdef, "int getpid(void);") then
+	pid = ffi.C.getpid()
+end
+
+--- The resident set size in KiB, which is what a user feels: the heap count says how much Lua
+--- holds, but a collected page and a resident one are different answers, and a server's prompt is
+--- about the second. `/proc/self/status` is a one-line read on Linux; `ps` is the fallback for a
+--- system without procfs.
+---@return integer? KiB
+function timing.rss()
+	local handle = io.open("/proc/self/status", "rb")
+	if handle then
+		local value
+		for line in handle:lines() do
+			local at = line:match("^VmRSS:%s*(%d+)%s*kB")
+			if at then
+				value = tonumber(at)
+				break
+			end
+		end
+		handle:close()
+		if value then return value end
+	end
+	if not pid then return nil end
+	local opened, pipe = pcall(io.popen, "ps -o rss= -p " .. pid .. " 2>/dev/null")
+	if not opened or not pipe then return nil end
+	local written = pipe:read("*a") or ""
+	pipe:close()
+	return tonumber(written:match("^%s*(%d+)"))
+end
+
+--- The heap in KiB, as the collector counts it. This is the number a checkpoint compares, since
+--- it is the one a collection moves.
+---@return number KiB
+function timing.heap()
+	return collectgarbage("count")
+end
+
 ---@return number milliseconds since this module was loaded
 function timing.elapsed()
 	return now() - origin
@@ -90,6 +130,17 @@ end
 function timing.detail(label, started, fmt, ...)
 	if not detailed or quiet then return end
 	timing.mark(label, started, fmt and string.format(fmt, ...) or nil)
+end
+
+--- The resident set and heap after an idle checkpoint, with whether that checkpoint collected.
+--- Read here so a run that is not collecting numbers pays for neither the procfs read nor the
+--- heap count. The shape is stable: `memory=12.3ms rss=123456 heap=7890 collected=1`.
+---@param started number
+---@param collected boolean
+function timing.memory(started, collected)
+	if not detailed or quiet then return end
+	timing.mark("memory", started, string.format("rss=%d heap=%d collected=%d",
+		timing.rss() or 0, math.floor(timing.heap()), collected and 1 or 0))
 end
 
 return timing

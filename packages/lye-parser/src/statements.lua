@@ -345,8 +345,22 @@ end
 
 ---@return boolean whether the token started a statement
 function statements.parseStatement(self)
+	-- The kind the last expression gave is read while a table is shaped, and a statement does not
+	-- inherit it from the one before: `local t = { x = y }` asks what `y` is, not what the previous
+	-- statement's last value was. Keeping it here is also what makes a parsed prefix and a resumed
+	-- parse agree, since a resume starts with no such history.
+	self.lastKind = nil
+	-- The same for the declaration cursor: a `local` whose next token is not a name declares
+	-- nothing, and reading the previous statement's cursor made it rewrite that statement's
+	-- declaration — `local = 2` after `local a = 1` moved `a`'s initializer.
+	self.lastDeclaration = nil
 	local token = self:peek()
 	local kind = token.kind
+	-- Every problem reported from here until the statement is done belongs to it, even a problem
+	-- an open argument list reports on the first token of the statement below. Only the outermost
+	-- statement is recorded: a problem inside a block is still its top-level statement's, and that
+	-- is the unit a resume keeps or re-reads.
+	if self.depth == 0 then self.statementStart = token.start end
 	-- The kind of the first token decides which words can matter, so a statement costs a handful
 	-- of comparisons rather than every keyword the grammar knows.
 	if kind == KIND.keyword then

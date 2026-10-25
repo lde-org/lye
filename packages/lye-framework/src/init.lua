@@ -52,6 +52,7 @@ server.METHOD = {
 	typeFormatting = "textDocument/onTypeFormatting",
 	workspaceDidChangeWatchedFiles = "workspace/didChangeWatchedFiles",
 	workspaceDidChangeConfiguration = "workspace/didChangeConfiguration",
+	registerCapability = "client/registerCapability",
 }
 
 server.ERROR = rpc.ERROR
@@ -85,15 +86,17 @@ end
 ---@field isInitialized boolean
 ---@field isShutdown boolean
 ---@field rootPath string? the folder the client opened, as a path
+---@field clientCapabilities table the `capabilities` the client sent with `initialize`
 ---@field handlers table<string, fun(self: lye.framework.Server, params: table?, id: any)>
 ---@field answered table<any, boolean> the requests a handler answered itself
+---@field pending table<any, boolean> the outbound requests whose responses are still ignored
 ---@field options { name: string?, version: string? }
 local Server = {}
 Server.__index = Server
 
 function Server.new(connection, options)
 	local caps = { textDocumentSync = { openClose = true, change = 2 } }
-	return setmetatable({ connection = connection, documents = DocumentStore.new(), capabilities = caps, encoding = position.UTF16, isInitialized = false, isShutdown = false, handlers = {}, answered = {}, options = options or {} }, Server)
+	return setmetatable({ connection = connection, documents = DocumentStore.new(), capabilities = caps, encoding = position.UTF16, isInitialized = false, isShutdown = false, handlers = {}, answered = {}, pending = {}, clientCapabilities = {}, options = options or {} }, Server)
 end
 
 ---@param self lye.framework.Server
@@ -133,6 +136,20 @@ function Server:notify(method, params)
 	self.connection:notify(method, params)
 end
 
+--- Ask the client something — a capability registration is the only such question today. The id
+--- is recorded so the response can be recognised and dropped: nothing waits on it, and a request
+--- the client answers with an error is no worse than one it never answers.
+---@param self lye.framework.Server
+---@param method string
+---@param params table?
+---@return integer? id the request's id, or nil when the handshake has not finished
+function Server:request(method, params)
+	if not self.isInitialized then return nil end
+	local id = self.connection:request(method, params)
+	self.pending[id] = true
+	return id
+end
+
 --- A failure on the notification path has no response to carry it, so `window/logMessage`
 --- is the only channel that can report it.
 ---@param message string
@@ -160,6 +177,7 @@ function Server:onInitialize(params)
 	self.encoding = negotiateEncoding(params)
 	-- Omitting this silently selects the utf-16 default, making every position wrong.
 	self.capabilities.positionEncoding = self.encoding
+	self.clientCapabilities = params.capabilities or {}
 	rememberRoot(self, params)
 
 	local result = { capabilities = self.capabilities }
@@ -199,7 +217,12 @@ end
 ---@param self lye.framework.Server
 function Server:handle(message)
 	local method = message.method
-	if not method then return end
+	if not method then
+		-- A response to a request this server made. Nothing waits on one, and the id is dropped so
+		-- the record does not grow with every registration of a long session.
+		if message.id ~= nil then self.pending[message.id] = nil end
+		return
+	end
 
 	if not self.isInitialized and method ~= server.METHOD.initialize and method ~= server.METHOD.exit then
 		if isRequest(message) then

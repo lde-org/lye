@@ -12,6 +12,7 @@ local newTable = require("table.new")
 ---@field message string
 ---@field start integer
 ---@field stop integer
+---@field statementStart integer? the byte the top-level statement that reported it began at
 
 ---@class lye.parser.Node
 ---@field kind lye.parser.NodeKind
@@ -63,6 +64,11 @@ local newTable = require("table.new")
 ---@field nodes lye.parser.Node[]
 ---@field declarations lye.parser.Declaration[]
 ---@field diagnostics lye.parser.Diagnostic[]
+---@field resumeStats lye.parser.ResumeStats how much of the parse came from a previous one
+
+---@class lye.parser.ResumeStats
+---@field nodes integer nodes kept from the previous parse, 0 for a full parse
+---@field tokens integer tokens kept from the previous scan, 0 for a full parse
 
 ---@class lye.parser.Frame
 ---@field start integer
@@ -92,6 +98,7 @@ local newTable = require("table.new")
 ---@field tableFieldValues table<integer, table>?
 ---@field lastKind string?
 ---@field lastDeclaration integer?
+---@field statementStart integer? the byte the top-level statement now being parsed began at
 ---@field scopeStarts lye.parser.Frame[]
 ---@field scopes_ lye.parser.Scope[]
 ---@field tableFields table<integer, table<string, string>> field kinds per table literal
@@ -150,6 +157,7 @@ for _, symbol in ipairs({"+=", "-=", "*=", "/=", "%=", "^=", "..=", "|=", "&=", 
 end
 
 ---@class lye.parser.Resume
+---@field kind string what was kept: "statement", a run of top-level statements
 ---@field from integer the byte a statement starts at, where scanning resumes
 ---@field tokenIndex integer the token that statement starts with
 ---@field nodeCount integer how many nodes were emitted before it
@@ -158,6 +166,7 @@ end
 ---@field nodes lye.parser.Node[]
 ---@field declarations lye.parser.Declaration[]
 ---@field scopes lye.parser.Scope[]
+---@field diagnostics lye.parser.Diagnostic[] the parser's problems wholly before the resume point
 ---@field tableFields table
 ---@field tableFieldValues table
 ---@field tableIndexes table
@@ -184,7 +193,24 @@ local function marksDefinition(source, tokens)
 end
 
 function Parser.new(source, resume, definition)
-	local tokens = resume and lexer.resume(source, resume.from, resume.tokens) or lexer.tokenize(source)
+	local tokens
+	if resume then
+		tokens = lexer.resume(source, resume.from, resume.tokens)
+		-- A cut inside a literal has no token boundary to start from. The kept nodes and token
+		-- indices belong to the old scan, so the parse starts over rather than build on tokens
+		-- that no longer line up with the text.
+		if not tokens then
+			resume = nil
+			tokens = lexer.tokenize(source)
+		end
+	else
+		tokens = lexer.tokenize(source)
+	end
+	-- The scanner's problems are copied rather than appended to, so the parse's diagnostics and
+	-- `tokens.problems` stay separate lists: a resumed parse reports its own after the carried
+	-- ones, and a reader of the token list sees exactly what the scanner found.
+	local diagnostics = {}
+	for index = 1, #tokens.problems do diagnostics[index] = tokens.problems[index] end
 	local self = setmetatable({
 		source = source,
 		tokens = tokens,
@@ -194,7 +220,7 @@ function Parser.new(source, resume, definition)
 		index = 1,
 		-- A literal the scanner could not finish is a syntax error like any other, and the
 		-- tokens the scan recovered from are what the tree is built on.
-		diagnostics = tokens.problems,
+		diagnostics = diagnostics,
 		-- Nodes and declarations run to a fraction of the source: sizing the arrays from it saves
 		-- the rehashes and copies of growing a table one node at a time.
 		nodes = newTable(math.floor(#source / 12) + 16, 0),
@@ -210,6 +236,9 @@ function Parser.new(source, resume, definition)
 		count_ = 0,
 		building = {},
 		lastKind = nil,
+		-- How much of this parse was taken from a previous one, which the caller reports. A
+		-- full parse keeps nothing.
+		resumeStats = { nodes = 0, tokens = 0 },
 		-- A definition file may write its types inline. A `.d.lua` name says so, and a `---@meta`
 		-- marker says it for any name.
 		definition = definition == true or marksDefinition(source, tokens),
@@ -232,20 +261,26 @@ function Parser.new(source, resume, definition)
 	self.tableFields = resume.tableFields
 	self.tableFieldValues = resume.tableFieldValues
 	self.tableIndexes = resume.tableIndexes
-	-- The lists are rebuilt from the nodes that were kept: a reader looks a kind up to walk fewer
-	-- than every node, and one holding only the new nodes would leave the kept statements out of
-	-- every pass over the tree.
-	for index = 1, keep do
-		local held = nodes[index]
-		if held then
-			local list = self.byKind[held.kind]
-			if list then
-				list[#list + 1] = held
-			else
-				self.byKind[held.kind] = { held }
-			end
-		end
-	end
+	self.resumeStats = { nodes = keep, tokens = resume.tokenIndex - 1 }
+	-- The scanner's problems (kept by `lexer.resume` when they lie before the resume point, and
+	-- found again after it) come first, in source order, then the parser's own. The problems the
+	-- previous parse found before the resume point are stable text, so they are carried rather
+	-- than dropped or duplicated by a second walk over the kept statements.
+	--
+	-- The capped list is a budget, not a filter: a cold parse seeds the scanner's findings first
+	-- and then reports while there is room, and the previous parse kept the first reports its own
+	-- budget allowed. So only the first carried reports that the new scan leaves room for are
+	-- ones a cold parse of this text would still hold; carrying the rest leaves the resumed list
+	-- with findings the cold list dropped. An edit that turns one unterminated literal into many
+	-- scanner findings moves the budget under the kept prefix, and `resumeAt` guarantees the
+	-- previous list is whole, so the kept reports are exactly that prefix.
+	local diagnostics = self.diagnostics
+	local carried = resume.diagnostics or {}
+	local room = Parser.MAX_DIAGNOSTICS - #tokens.problems
+	if room > #carried then room = #carried end
+	for index = 1, room do diagnostics[#diagnostics + 1] = carried[index] end
+	-- `byKind` is left to `parse`: it walks every node, kept ones included, so a list built here
+	-- would hold each kept node twice.
 	return self
 end
 
@@ -261,21 +296,82 @@ function Parser.resumeAt(parsed, offset)
 	local statements = chunk and chunk.children
 	if not statements then return nil end
 
-	-- The last statement that begins at or before the change, which is the one holding it or the
-	-- one it was written after. It has to begin before, not merely end after: an edit in the
-	-- comments above a statement is inside the text the scan would otherwise keep.
+	-- The last statement that begins before the change, which is the one holding it. It has to
+	-- begin strictly before, not merely end after: an edit in the comments above a statement is
+	-- inside the text the scan would otherwise keep, and text inserted exactly at a statement's
+	-- first byte can still be read as a continuation of the statement before it — a trailing `,`
+	-- belongs to the `local` above it, and `+ 2` on the next line continues the value. Starting
+	-- one statement earlier leaves that continuation in the re-read text, where a full parse would
+	-- have read it.
 	-- A nested statement is met part-way through the block holding it and that state is gone, and
 	-- the chunk's children are not all statements, so the depth is what says which are.
 	local first
 	for _, childIdx in ipairs(statements) do
 		local node = nodes[childIdx]
-		if node and node.depth == 0 and node.start <= offset then first = node end
+		if node and node.depth == 0 and node.start < offset then first = node end
 	end
 	if not first then return nil end
+
+	-- A problem at or after the cut can still belong to the statement before it: an argument list
+	-- left open above goes on reading the tokens of the next statement, and reports its missing
+	-- `)` on the first one it cannot use — the token the cut starts at. A parse beginning there
+	-- has no list open, so it reports nothing and the tree would lose a problem the whole text
+	-- has. The cut is only a boundary the previous parse saw if every problem from it on was
+	-- reported by a statement it starts inside, which the owner recorded on each problem says.
+	-- Where one was not, the cut moves back to that statement: read again whole, it finds the same
+	-- problem again on the same text.
+	local rewound = true
+	while rewound do
+		rewound = false
+		for index = 1, #parsed.diagnostics do
+			local diagnostic = parsed.diagnostics[index]
+			local owner = diagnostic.statementStart
+			if owner and owner < first.start and diagnostic.start >= first.start then
+				-- The statement that began at `owner` is the cut. A statement that only recovered
+				-- emits no node of its own, and there is no boundary to trust there: the parse is
+				-- redone whole instead.
+				local target
+				for _, childIdx in ipairs(statements) do
+					local node = nodes[childIdx]
+					if node and node.depth == 0 and node.start == owner then
+						target = node
+						break
+					end
+				end
+				if not target then return nil end
+				first = target
+				rewound = true
+				break
+			end
+		end
+	end
 
 	local keep = 0
 	while keep < #nodes and nodes[keep + 1].stop < first.start do keep += 1 end
 	if keep == 0 then return nil end
+
+	-- A capped list cannot be carried. `report` stops once the cap is reached, so a problem the
+	-- previous parse found before the cut may simply be absent with nothing saying so, and a cold
+	-- parse of the new text can have a larger budget — fewer scanner findings — and hold it again.
+	-- The resumed parse cannot walk the kept text to find it, so the parse is redone whole. An
+	-- uncapped list holds every problem the previous parse found, which is what makes its prefix
+	-- the same prefix a cold parse reports.
+	if #parsed.diagnostics >= Parser.MAX_DIAGNOSTICS then return nil end
+
+	-- A problem wholly before the change is text that did not move, so the resumed parse keeps it
+	-- rather than reporting it twice or losing it. One reaching the change could be about text
+	-- that is being re-read, and nothing says the same problem would come out of the new parse, so
+	-- there is no safe way to keep it: the whole parse is redone instead.
+	local problems = parsed.tokens.problems or {}
+	local carried = {}
+	for index = 1, #parsed.diagnostics do
+		local diagnostic = parsed.diagnostics[index]
+		if diagnostic.start < first.start then
+			if diagnostic.stop >= first.start then return nil end
+			-- The scanner's problems are already carried by `lexer.resume`.
+			if index > #problems then carried[#carried + 1] = diagnostic end
+		end
+	end
 
 	local found, low, high = nil, 1, parsed.tokens.count
 	while low <= high do
@@ -288,6 +384,11 @@ function Parser.resumeAt(parsed, offset)
 		end
 	end
 	if not found or parsed.tokens.arena[found].start ~= first.start then return nil end
+	-- The cut is a token boundary only when the token before it ends before it. A kept token that
+	-- spans the cut is a literal or comment the new scan would start inside of, and `lexer.resume`
+	-- refuses to continue such a prefix, so carrying one would make the resumed parse disagree
+	-- with the text it was handed.
+	if found > 1 and parsed.tokens.arena[found - 1].stop >= first.start then return nil end
 
 	-- The lists a parse builds run to the end of the file, so keeping them whole would count the
 	-- suffix twice.
@@ -311,9 +412,11 @@ function Parser.resumeAt(parsed, offset)
 	end
 
 	return {
+		kind = "statement",
 		from = first.start, tokenIndex = found, nodeCount = keep, chunkIndex = parsed.root,
 		tokens = parsed.tokens, nodes = nodes, declarations = before(parsed.declarations),
-		scopes = before(parsed.scopes), tableFields = indexed(parsed.tableFields),
+		scopes = before(parsed.scopes), diagnostics = carried,
+		tableFields = indexed(parsed.tableFields),
 		tableFieldValues = indexed(parsed.tableFieldValues), tableIndexes = indexed(parsed.tableIndexes),
 	}
 end
@@ -413,7 +516,11 @@ end
 
 function Parser:report(token, message)
 	if #self.diagnostics >= Parser.MAX_DIAGNOSTICS then return end
-	self.diagnostics[#self.diagnostics + 1] = { message = message, start = token.start, stop = token.stop }
+	-- Which statement reported it, so a resume can tell a problem of the kept text from one the
+	-- statement at the cut would report on its own.
+	self.diagnostics[#self.diagnostics + 1] = {
+		message = message, start = token.start, stop = token.stop, statementStart = self.statementStart,
+	}
 end
 
 ---@return boolean
@@ -662,6 +769,7 @@ function Parser:parse()
 		nodes = self.nodes,
 		declarations = self.declarations,
 		diagnostics = self.diagnostics,
+		resumeStats = self.resumeStats,
 	}
 end
 

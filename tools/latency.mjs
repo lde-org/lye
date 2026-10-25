@@ -17,6 +17,9 @@
 //   keystroke  an edit at the top of the file, then the tokens again
 //   hover      ASKS hovers at different lines
 //   tokens     ASKS/4 more token requests over the text as it now stands
+//   edits      EDITS edits of each shape — a statement in a function body, a space in an
+//              annotation, a statement at module level — each measured to its token answer, with
+//              p50 and p95 over the samples
 //
 // Each round is a fresh server, so a round includes the JIT warming up; the best round is reported
 // for that reason. A second line carries the server's own marks — initialize, the workspace scans,
@@ -35,6 +38,7 @@ const text = await Bun.file(file).text();
 const uri = `file://${file}`;
 const rounds = Number(process.env.ROUNDS ?? 5);
 const asks = Number(process.env.ASKS ?? 40);
+const editsPerShape = Number(process.env.EDITS ?? 5);
 // The server's own marks are the only place the workspace scan and the token walk are timed apart
 // from the request that carried them. `COLD=1` makes every round a first run, which is what the
 // scan and the cache are worth measuring on.
@@ -58,7 +62,7 @@ async function once() {
 		stdio: ["pipe", "pipe", "pipe"],
 	});
 
-	let out = "";
+	let out = Buffer.alloc(0);
 	let settled = 0;
 	const phases = {};
 	const waiters = [];
@@ -83,14 +87,15 @@ async function once() {
 	});
 	const startedAt = performance.now();
 	child.stdout.on("data", (chunk) => {
-		out += chunk.toString();
+		out = Buffer.concat([out, chunk]);
 		while (true) {
 			const at = out.indexOf("\r\n\r\n");
 			if (at < 0) break;
-			const length = Number(out.slice(0, at).match(/content-length:\s*(\d+)/i)?.[1]);
+			const head = out.subarray(0, at).toString();
+			const length = Number(head.match(/content-length:\s*(\d+)/i)?.[1]);
 			if (!Number.isFinite(length) || out.length < at + 4 + length) break;
-			const message = JSON.parse(out.slice(at + 4, at + 4 + length));
-			out = out.slice(at + 4 + length);
+			const message = JSON.parse(out.subarray(at + 4, at + 4 + length).toString());
+			out = out.subarray(at + 4 + length);
 			if (message.id !== undefined) {
 				settled = Math.max(settled, message.id);
 			}
@@ -143,6 +148,10 @@ async function once() {
 	await settle(changeId);
 	phases.keystroke = performance.now() - at;
 
+	// The text the server now holds, kept in step with the edits below so a position is a position.
+	let live = `-- typed\n${text}`;
+	let version = 2;
+
 	// What an editor asks while the cursor moves: hover, then the tokens again, `asks` times.
 	at = performance.now();
 	for (let i = 0; i < asks; i += 1) {
@@ -162,12 +171,83 @@ async function once() {
 	}
 	phases.tokens = performance.now() - at;
 
+	// The edit script: three shapes of edit an editor sends all day. Each is measured from the
+	// didChange to the token answer for the text it produced, so it carries the analysis a
+	// keystroke carries and nothing an idle cursor does not.
+	const edits = { body: [], annotation: [], module: [] };
+
+	const lineStarts = (source) => {
+		const starts = [0];
+		for (let index = 0; index < source.length; index += 1) {
+			if (source[index] === "\n") starts.push(index + 1);
+		}
+		return starts;
+	};
+	const offsetOf = (source, position) => lineStarts(source)[position.line] + position.character;
+
+	// The places each shape can be applied, found on the text as it stands: a function line with a
+	// statement after it, an annotation line, and the module's own `return`.
+	const bodyPlaces = (source) => {
+		const lines = source.split("\n");
+		const found = [];
+		for (let index = 0; index + 1 < lines.length; index += 1) {
+			if (!/^\s*(local\s+)?function\b/.test(lines[index])) continue;
+			const next = lines[index + 1];
+			if (next.trim() === "" || next.trim() === "end" || next.trim() === "end)") continue;
+			const indent = next.match(/^\s*/)[0];
+			found.push({ line: index + 1, character: 0, text: `${indent}-- edit\n` });
+		}
+		return found;
+	};
+	const annotationPlaces = (source) => {
+		const found = [];
+		for (const [index, line] of source.split("\n").entries()) {
+			const foundTag = line.match(/^(\s*)(---@[A-Za-z]+)/);
+			if (foundTag) found.push({ line: index, character: foundTag[1].length + foundTag[2].length, text: " " });
+		}
+		return found;
+	};
+	const modulePlaces = (source) => {
+		const lines = source.split("\n");
+		for (let index = lines.length - 1; index >= 0; index -= 1) {
+			if (/^return\b/.test(lines[index])) return [{ line: index, character: 0, text: "local __edit = 1\n" }];
+		}
+		return lines.length > 0 ? [{ line: 0, character: 0, text: "local __edit = 1\n" }] : [];
+	};
+	const shapes = { body: bodyPlaces, annotation: annotationPlaces, module: modulePlaces };
+
+	for (const [shape, places] of Object.entries(shapes)) {
+		for (let sample = 0; sample < editsPerShape; sample += 1) {
+			const candidates = places(live);
+			if (candidates.length === 0) break;
+			// Spread over the candidates, and recomputed per edit because an insertion moved them.
+			const edit = candidates[Math.min(candidates.length - 1,
+				Math.floor(sample * candidates.length / editsPerShape))];
+			const started = performance.now();
+			version += 1;
+			await send({ jsonrpc: "2.0", method: "textDocument/didChange", params: {
+				textDocument: { uri, version },
+				contentChanges: [{
+					range: { start: { line: edit.line, character: edit.character },
+						["end"]: { line: edit.line, character: edit.character } },
+					text: edit.text,
+				}],
+			} });
+			const answer = id++;
+			await send(request(answer, "textDocument/semanticTokens/full", { textDocument: { uri } }));
+			await settle(answer);
+			edits[shape].push(performance.now() - started);
+			const at = offsetOf(live, edit);
+			live = live.slice(0, at) + edit.text + live.slice(at);
+		}
+	}
+
 	at = performance.now();
 	await send(request(id++, "shutdown"));
 	await settle(id - 1);
 	child.kill();
 	phases.shutdown = performance.now() - at;
-	return { phases, marks };
+	return { phases, marks, edits };
 }
 
 const results = [];
@@ -191,4 +271,23 @@ console.log(
 	"server " + Object.entries(marks)
 		.map(([label, mark]) => `${label}=${mark.ms.toFixed(1)}ms${mark.note ? `(${mark.note})` : ""}`)
 		.join(" "),
+);
+
+// The edit samples are pooled across rounds: each is an independent edit of a fresh server, and a
+// percentile over five samples is a percentile of an accident.
+const percentile = (values, share) => {
+	const sorted = [...values].sort((left, right) => left - right);
+	const rank = Math.ceil((share / 100) * sorted.length) - 1;
+	return sorted[Math.max(0, Math.min(sorted.length - 1, rank))];
+};
+const pooled = { body: [], annotation: [], module: [] };
+for (const result of results) {
+	for (const [shape, values] of Object.entries(result.edits)) pooled[shape].push(...values);
+}
+console.log(
+	"edits " + Object.entries(pooled)
+		.map(([shape, values]) => values.length === 0
+			? `${shape}=none`
+			: `${shape} p50=${percentile(values, 50).toFixed(1)}ms p95=${percentile(values, 95).toFixed(1)}ms n=${values.length}`)
+		.join("  "),
 );

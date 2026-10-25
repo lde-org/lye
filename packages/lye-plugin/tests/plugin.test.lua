@@ -266,6 +266,17 @@ test.it("finds a plugin the package installed, and keeps what the workspace list
 	test.equal(#said, 0, "nothing to report")
 end)
 
+test.it("asks a plugin for the modules it offers inside a require", function()
+	local specs = {
+		{ name = "one", complete = function() return { { name = "a.b", detail = "LuaJIT" }, { name = "c" } } end },
+		{ name = "two", complete = function() return { { name = "d", path = "/tmp/d.lua" } } end },
+	}
+	local got = plugin.complete(specs, {})
+	test.equal(#got, 3)
+	test.equal(got[1].name, "a.b")
+	test.equal(got[3].path, "/tmp/d.lua")
+end)
+
 test.it("asks a plugin for the types it contributes, and calls its providers", function()
 	write(WORK .. "/typed.lua", table.concat({
 		"local typed = {}\n",

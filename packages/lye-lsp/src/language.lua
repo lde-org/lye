@@ -19,43 +19,19 @@ local KIND = require("lye-lexer").KIND
 local types = require("lye-doc.type")
 local cache = require("lye-lsp.cache")
 local plugin = require("lye-plugin")
-local rapidhash = require("rapidhash")
+-- A package of its own, but linked into this server: the static `require` is what a bundler can
+-- see, and the hooks are handed to the plugin system below.
+local requireCompletion = require("lye-plugin-require")
+local Declarations = require("lye-lsp.declarations")
+local Modules = require("lye-lsp.modules")
+local AnalysisCache = require("lye-lsp.analysis_cache")
 
 local SYMBOL_KIND = { ["function"] = 12, variable = 13 }
 
 --- The LuaJIT definitions, prepared once: they are the same for every document, and parsing
 --- them per keystroke would be absurd.
 local PRELUDE = analyzer.prelude(require("lye-defs"))
-
---- The definitions' own types, by a name a session can say them with. A module's answer holds
---- them — `ffi.cdecl` is a function the definitions declared — and a session that reads that answer
---- back has to reach the very tables the definitions built, because a signature is looked up by the
---- type it was built for. Built once, from the maps the definitions are already keyed by.
----@type { names: table<unknown, string>, tables: table<string, unknown> }?
-local preludeTypes
-
----@return { names: table<unknown, string>, tables: table<string, unknown> }
-local function namedPreludeTypes()
-	if preludeTypes then return preludeTypes end
-	local names, tables = {}, {}
-	---@param held unknown
-	---@param name string
-	local function add(held, name)
-		if type(held) ~= "table" or names[held] then return end
-		names[held] = name
-		tables[name] = held
-	end
-	-- A field's type is what the completion looks a signature up by, so it needs its name most:
-	-- `evolved` is where the definitions' methods were put as they were declared.
-	for className, fields in pairs(PRELUDE.evolved or {}) do
-		for field, held in pairs(fields) do add(held, "field:" .. className .. "." .. field) end
-	end
-	for name, alias in pairs(PRELUDE.aliases) do add(alias, "alias:" .. name) end
-	for name, held in pairs(PRELUDE.returns) do add(held, "return:" .. name) end
-	for text, held in pairs(PRELUDE.built or {}) do add(held, "built:" .. text) end
-	preludeTypes = { names = names, tables = tables }
-	return preludeTypes
-end
+local PRELUDE_RESOLVE = doc.classes.resolver(PRELUDE)
 
 local TOKEN_LEGEND = {
 	tokenTypes = {
@@ -86,6 +62,12 @@ local TYPE_KEYWORD = {
 	-- The values a type can name are constants rather than names of one.
 	["true"] = true, ["false"] = true, ["nil"] = true,
 }
+
+-- An idle checkpoint after a pass has answered everything. A step is cheap and leaves the heap
+-- smaller than the pause alone would; a full collection is only worth its pause when the heap has
+-- really grown, or when a document that made it grow has closed.
+local GC_STEP_BYTES = 2 * 1024 * 1024
+local GC_FULL_BYTES = 8 * 1024 * 1024
 
 --- Walk the words of a type and hand each to `visit` with the kind it reads as. A type holds
 --- names, string literals, numbers and the `|` between union members; the punctuation around them
@@ -145,16 +127,22 @@ local DOC_TAG_NAME = "[%a_][%w_]*"
 ---@field names table<string, lye.analyzer.Result>
 ---@field packageRoots table<string, string|boolean>? which package each path belongs to, by `find`
 ---@field packageNames table<string, table<string, boolean|lye.doc.Type>>? what each package's `target/` declares
----@field modules table<string, { text: string, type: lye.doc.Type? }>? what each required file gives
----@field requiring table<string, boolean>? the files being required now, so a cycle ends
+---@field packageDigests table<string, string>? the digest of each package's links, keyed by root
+---@field typeLocations table<string, { location: lye.DefinitionLocation, lines: string }>? where each class or alias is written
+---@field annotationsDigest string? the digest of every annotation the workspace scan read
+---@field declarations lye.Declarations the workspace/package declarations and their view
+---@field modules lye.Modules what each required file gives, and the digest of the open documents
+---@field prelude table the definitions, prepared once for every analysis
 ---@field declaredBy table<string, table<string, boolean|lye.doc.Type>> what each document declares, kept after its analysis is dropped
 ---@field known table<string, boolean|lye.doc.Type>? what every file in the workspace declares, resolved
 ---@field order string[] the documents whose analyses are held, least recently used first
----@field order string[] the documents whose analyses are held, least recently used first
+---@field cache lye.AnalysisCache the analyses, parses, predecessors and annotations this session holds
+---@field epoch integer how many changes this session has seen, which a held result is recorded against
 ---@field definitions table? the definitions, indexed by name, built once
 ---@field plugins_ table<string, lye.plugin.Spec[]>? the plugins each package asked for, loaded once
 ---@field views table<string, lye.View>? what lye reads of each open document, and the way back
----@field dirtyAt table<string, number>? when each dirty document's first change of a burst arrived
+---@field dirtyAt table<string, number>? when each dirty document last changed, so the newest is analysed first
+---@field dirtyEpoch table<string, integer>? which change count last marked each dirty document, breaking a tie on the clock
 ---@field tokens_ table<string, { text: string, answer: table }>? the token answer for a document
 --- that has not changed since it was worked out
 ---@field viewByIndex table<lye.framework.LineIndex, lye.View>? the same, found by a line index a
@@ -165,112 +153,64 @@ local Lye = {}
 Lye.__index = Lye
 
 function Lye.new(server)
-	return setmetatable({ server = server, analysis = {}, names = {}, declaredBy = {}, order = {}, dirty = {} }, Lye)
+	local lye = setmetatable({
+		server = server, declaredBy = {}, dirty = {}, epoch = 0, prelude = PRELUDE,
+		lastHeap = timing.heap(),
+	}, Lye)
+	-- The cache owns `analysis`, `names` and `order`; it publishes the same tables on `lye`,
+	-- because the declaration and module facades read them and must see what it clears.
+	lye.cache = AnalysisCache.new(lye)
+	lye.declarations = Declarations.new(lye)
+	lye.modules = Modules.new(lye)
+	return lye
 end
 
---- The modules a `require("...")` could name, in the layout the workspace uses. The listing comes
---- from `find`, because a language server has no way to read a directory in Lua.
+--- What a checkpoint should do, from how many bytes the heap grew since the last one. Kept apart
+--- from `checkpoint` so the policy is testable without a server or a collector.
+---@param grown number bytes the heap grew
+---@param force boolean? a document closed, which makes the answer worth the pause
+---@return boolean collect
+---@return boolean full
+function Lye.gcDecision(grown, force)
+	if force or grown >= GC_FULL_BYTES then return true, true end
+	if grown >= GC_STEP_BYTES then return true, false end
+	return false, false
+end
+
+--- A bounded collection between requests. It runs after an idle pass has published every answer,
+--- or after a close, so no analysis and no reply is paying for it. Growth is measured from the
+--- last checkpoint, so a heap that is not growing is left to the pause alone. Under `LYE_TIMING=1`
+--- the resident set, the heap and whether it collected are written as one stable mark.
+---@param force boolean? collect fully whatever the growth
+---@return boolean collected
+---@return boolean full
+function Lye:checkpoint(force)
+	local started = timing.now()
+	local grown = (timing.heap() - self.lastHeap) * 1024
+	local collect, full = Lye.gcDecision(grown, force)
+	if collect then
+		if full then collectgarbage("collect") else collectgarbage("step") end
+		self.lastHeap = timing.heap()
+	end
+	timing.memory(started, collect)
+	return collect, full
+end
+
+--- The modules a `require("...")` could name, in the layout the workspace uses.
 ---@param self lye.Server
 ---@param prefix string what has been typed inside the quotes so far
 ---@return { name: string, path: string?, detail: string? }[] a workspace file has a path, a module of the engine a detail
 function Lye:moduleNames(prefix)
-	local root = self.server.rootPath
-	local found, seen = {}, {}
-	if root then
-		local pipe = io.popen(string.format(
-			"find %q -type f -name '*.lua' -not -path '*/target/*' -not -path '*/.*/*' 2>/dev/null", root))
-		if pipe then
-			for path in pipe:lines() do
-				local relative = path:sub(#root + 2)
-				if relative ~= "" then
-					local name = (relative:gsub("%.lua$", ""):gsub("/init$", ""):gsub("[/\\]", "."))
-					-- The layout lde builds from: `packages/lye-doc/src/type.lua` is `lye-doc.type`.
-					local pkg, rest = name:match("^packages%.([%w_%-]+)%.src%.(.+)$")
-					if pkg then
-						name = pkg .. "." .. rest
-					elseif name:match("^src%.") then
-						name = name:sub(5)
-					end
-					if name:sub(1, #prefix) == prefix and not seen[name] then
-						seen[name] = true
-						found[#found + 1] = { name = name, path = path }
-					end
-				end
-			end
-			pipe:close()
-		end
-	end
-
-	-- The modules the engine ships are named the same way and are not files here, so they are
-	-- listed from the definitions. A workspace module of the same name was added first and wins,
-	-- which is the order `require` itself resolves in.
-	for name in pairs(self:definitionIndex().modules) do
-		if name:sub(1, #prefix) == prefix and not seen[name] then
-			seen[name] = true
-			found[#found + 1] = { name = name, detail = "LuaJIT" }
-		end
-	end
-
-	table.sort(found, function(left, right) return left.name < right.name end)
-	return found
+	return self.declarations:moduleNames(prefix)
 end
 
-
---- The modules a `require("...")` could name, in the layout the workspace uses. The layouts
---- tried in turn: beside the root, under `src/`, and inside the package directory lde builds a
---- module from — `require("lye-doc.type")` is `packages/lye-doc/src/type.lua` there.
+--- The modules a `require("...")` could name, in the layout the workspace uses.
 ---@param self lye.Server
 ---@param name string
+---@param from string? the document the require is written in
 ---@return string?
 function Lye:moduleFile(name, from)
-	local root = self.server.rootPath
-
-	-- A `lye.json` beside a package or workspace adds search paths of its own, in the shape
-	-- `package.path` uses. Asked first, because a project that says where its modules are wins.
-	for _, pattern in ipairs(self:requirePaths(from)) do
-		local path = pattern:gsub("%?", (name:gsub("%%.", "/")))
-		local handle = io.open(path, "rb")
-		if handle then
-			handle:close()
-			return path
-		end
-	end
-
-	if root then
-		local tail = (name:gsub("%.", "/"))
-		local candidates = {
-			root .. "/" .. tail .. ".lua",
-			root .. "/" .. tail .. "/init.lua",
-			root .. "/src/" .. tail .. ".lua",
-		}
-		local head, rest = name:match("^([%w_]+)%.(.+)$")
-		if head then
-			local under = (rest:gsub("%.", "/"))
-			candidates[#candidates + 1] = root .. "/packages/" .. head .. "/src/" .. under .. ".lua"
-			candidates[#candidates + 1] = root .. "/packages/" .. head .. "/src/" .. under .. "/init.lua"
-		end
-
-		-- What lde itself resolves against: `<package>/target/?.lua` and `<package>/target/?/init.lua`,
-		-- where `target/` holds a link per dependency, so one rule answers a sibling and its own modules.
-		local owner = self:packageRoot(from)
-		if owner then
-			candidates[#candidates + 1] = owner .. "/target/" .. tail .. ".lua"
-			candidates[#candidates + 1] = owner .. "/target/" .. tail .. "/init.lua"
-		end
-
-		for _, path in ipairs(candidates) do
-			local handle = io.open(path, "rb")
-			if handle then
-				handle:close()
-				return path
-			end
-		end
-	end
-
-	-- A module the engine ships is not a file in this workspace: `ffi`, `jit` and `string.buffer` name
-	-- the definitions, whose text is written to the cache for a client to open. The workspace is first.
-	local builtin = self:definitionIndex().modules[name]
-	if builtin then return builtin.path end
+	return self.declarations:moduleFile(name, from)
 end
 
 --- The directory of the lde package a document belongs to: the nearest one above it that declares
@@ -332,9 +272,10 @@ end
 
 --- Whether a document is a definition file: one named `.d.lua` describes a library the way a
 --- `---@meta` file does, and the analyzer holds it to its annotations rather than to a body.
+---@param self lye.Server
 ---@param uri string
 ---@return boolean
-local function isDefinitionFile(uri)
+function Lye:isDefinition(uri)
 	return uri:match("%.d%.lua$") ~= nil
 end
 
@@ -381,15 +322,32 @@ function Lye:plugins(uri)
 	self.plugins_ = self.plugins_ or {}
 	local held = self.plugins_[root or ""]
 	if held then return held end
-	local specs = plugin.load(self:pluginConfig(uri), root, function(name)
+	-- The require-completion plugin is a package of its own. It is on unless the workspace wrote
+	-- `!lye-plugin-require`; its hooks are already linked in, so it is not loaded from a path.
+	local entries = {}
+	local wantsRequire, explicit = true, false
+	for _, entry in ipairs(self:pluginConfig(uri)) do
+		if entry == "!lye-plugin-require" then
+			wantsRequire = false
+		elseif entry == "lye-plugin-require" then
+			explicit = true
+		else
+			entries[#entries + 1] = entry
+		end
+	end
+	local report = function(message)
+		-- A fault in a plugin is the plugin author's to fix, and the user's to see once.
+		self.server:log(message, framework.LOG.warning)
+	end
+	local specs = plugin.load(entries, root, function(name)
 		-- A plugin named rather than pathed is a module, and a module of this package is one lde
 		-- linked into its `target/`: the same place `require` finds, so `lde add` is how one is
 		-- installed and `lye.json` is where it is turned on.
 		return self:moduleFile(name, uri)
-	end, function(message)
-		-- A fault in a plugin is the plugin author's to fix, and the user's to see once.
-		self.server:log(message, framework.LOG.warning)
-	end)
+	end, report)
+	if wantsRequire or explicit then
+		table.insert(specs, 1, plugin.spec(requireCompletion, "lye-plugin-require", report))
+	end
 	self.plugins_[root or ""] = specs
 	return specs
 end
@@ -457,100 +415,21 @@ function Lye:viewOf(index)
 end
 
 --- What `require("name")` is: the type the module file returns, analysed once and kept until its
---- text changes. A module that requires the file being analysed comes back around, so a name
---- already in progress answers nothing rather than recursing.
+--- text changes.
 ---@param self lye.Server
 ---@param name string
 ---@param from string? the document the require is written in, which is what says which package it
 --- resolves within
 ---@return lye.doc.Type?
 function Lye:moduleType(name, from)
-	local path = self:moduleFile(name, from)
-	if not path then return nil end
-	self.modules = self.modules or {}
-	self.requiring = self.requiring or {}
-	if self.requiring[path] then return nil end
-
-	local uri = "file://" .. path
-	local document = self.server.documents:get(uri)
-	local written
-	if document then
-		written = document.text
-	else
-		local handle = io.open(path, "rb")
-		if not handle then return nil end
-		written = handle:read("*a")
-		handle:close()
-	end
-
-	local cached = self.modules[path]
-	if cached and cached.text == written then return cached.type end
-
-	-- A document that is open has been analysed in full, and that analysis already says what
-	-- `require` of it gives back: reading it again as a module is the same work for the same
-	-- answer, and a monorepo with several files of one package open pays it once per file.
-	local open = document and self.names[uri]
-	if open and open.module ~= nil then
-		self.modules[path] = { text = written, type = open.module }
-		return open.module
-	end
-
-	-- What an earlier session worked out for this module. It is read against the workspace's
-	-- declarations, this package's links and the documents that were open, so the key says all
-	-- three: a session that has the same ones reads the same answer, and one that does not reads
-	-- nothing. The first module of a session pays for the scan it needs anyway to say so.
-	local textKey = rapidhash.hex(written)
-	self:workspaceDeclarations()
-	local owner = self:packageRoot(uri)
-	if owner then self:packageDeclarations(owner) end
-	local key = cache.key("module", textKey, self.annotationsDigest or "",
-		(self.packageDigests or {})[owner] or "", self:documentsDigest(),
-		plugin.digest(self:plugins(uri)))
-	local known = namedPreludeTypes()
-	local entry = cache.load(key, known)
-	if entry and entry.key == cache.codeVersion() and entry.text == textKey then
-		-- `false` is the answer a module that returns nothing came to: it is kept too, so a run
-		-- after this one is not made to read the file again to learn nothing.
-		local held = entry.module ~= false and entry.module or nil
-		self.modules[path] = { text = written, type = held }
-		return held
-	end
-
-	self.requiring[path] = true
-	-- The module's own `require`s resolve within *its* package: a dependency's file is a document
-	-- of that package, and what it can reach is what lde linked into that package's `target/`.
-	-- A module reached through `require` is read for its type: its diagnostics belong to its own
-	-- document, which is analysed on its own account when it is open.
-	local names = analyzer.analyze(written, PRELUDE, self:declaredTypes("file://" .. path), function(inner)
-		return self:moduleType(inner, "file://" .. path)
-	end, nil, nil, true, isDefinitionFile("file://" .. path), self:plugins("file://" .. path),
-		function(message) self.server:log(message, framework.LOG.warning) end)
-	self.requiring[path] = nil
-	self.modules[path] = { text = written, type = names.module }
-	-- Kept for the sessions after this one. The graph is written as it stands: a placeholder in
-	-- it is a placeholder in the answer, which is what a session that analysed the file would have
-	-- had. A module that returns nothing is kept too, as `false`.
-	cache.save(key, { text = textKey, key = cache.codeVersion(), module = names.module or false }, known)
-	return names.module
+	return self.modules:type(name, from)
 end
 
---- A digest of the documents an editor has open. A module is analysed against what they declare —
---- a class written in an unsaved buffer is as real to it as one on disk — so an answer kept for a
---- session is only the answer for a session with the same ones open. Kept until one of them
---- changes, which is the only thing that can make it say something else.
+--- A digest of the documents an editor has open, which a kept module answer is read against.
 ---@param self lye.Server
 ---@return string
 function Lye:documentsDigest()
-	if self.openDigest then return self.openDigest end
-	local byUri = self.server.documents and self.server.documents.byUri
-	if not byUri then return "" end
-	local parts = {}
-	for uri, document in pairs(byUri) do
-		parts[#parts + 1] = uri .. "\0" .. rapidhash.hex(document.text or "")
-	end
-	table.sort(parts)
-	self.openDigest = rapidhash.hex(table.concat(parts, "\1"))
-	return self.openDigest
+	return self.modules:documentsDigest()
 end
 
 --- Where this session keeps what it works out: the workspace the editor opened, so a second
@@ -564,83 +443,6 @@ function Lye:useWorkspaceCache()
 end
 
 
---- The start of the line an offset is written on, found by walking back to the newline above it.
---- Cutting the front of the text off and matching the last line removed is the same answer, but it
---- copies and scans everything above the offset for every annotation of every file in the scan —
---- which the profiler showed as most of a first open. A line is short; a file is not.
----@param source string
----@param offset integer
----@return integer
-local function lineStart(source, offset)
-	local at = offset - 1
-	while at >= 1 do
-		if source:byte(at) == 10 then return at + 1 end
-		at -= 1
-	end
-	return 1
-end
-
---- The line at a start offset, without its indentation.
----@param source string
----@param at integer
----@return string
-local function lineAt(source, at)
-	local to = source:find("\n", at, true) or (#source + 1)
-	return (source:sub(at, to - 1):gsub("^%s+", ""))
-end
-
---- The lines that declare a class or an alias: the comment above it, which is its documentation,
---- its own line, and the fields written under it. The annotation above the comment is another
---- type's business, so the walk stops there.
----@param source string
----@param annotations lye.doc.Annotation[]
----@param at integer the index of the class or alias annotation
----@return string
-local function declarationLines(source, annotations, at)
-	local annotation = annotations[at]
-	local declaration = lineStart(source, annotation.start)
-	local lines = {}
-	local above = declaration
-	while #lines < 8 and above > 1 do
-		local previous = lineStart(source, above - 1)
-		local text = lineAt(source, previous)
-		if not text:match("^%-%-") or text:match("^%-%-%-@") then break end
-		table.insert(lines, 1, text)
-		above = previous
-	end
-	lines[#lines + 1] = lineAt(source, declaration)
-	for following = at + 1, #annotations do
-		local next_ = annotations[following]
-		if next_.tag ~= "field" or not next_.name then break end
-		lines[#lines + 1] = lineAt(source, lineStart(source, next_.start))
-	end
-	return table.concat(lines, "\n")
-end
-
---- Remember where a class or an alias is written, with the lines that declare it. A type named in
---- one file has to be answerable from another, and the workspace is read for these once rather
---- than per request.
----@param into table<string, { location: lye.DefinitionLocation, lines: string }>
----@param path string
----@param source string
----@param parsed lye.doc.File
-local function collectTypes(into, path, source, parsed)
-	local annotations = parsed.annotations
-	for index, annotation in ipairs(annotations) do
-		local isType = annotation.tag == "class" or annotation.tag == "alias"
-		if isType and annotation.name and not into[annotation.name] then
-			into[annotation.name] = {
-				location = {
-					uri = "file://" .. path,
-					start = annotation.nameStart or annotation.start,
-					stop = annotation.nameStop or annotation.stop,
-				},
-				lines = declarationLines(source, annotations, index),
-			}
-		end
-	end
-end
-
 --- What one document declares, which `declaredBy` keeps after its analysis is dropped.
 ---@param file lye.doc.File
 ---@return table<string, boolean|lye.doc.Type>
@@ -649,162 +451,38 @@ local function declarationsOf(file)
 end
 
 --- The classes and aliases every file in the workspace declares, each resolved to the type it
---- stands for. A document is analysed on its own, so a class another file declares has to mean
---- that class here: a name alone keeps `---@param p Point` from reading as a typo but disagrees
---- with every table built for it. Read by parsing each file, never by analysing one — a project
---- holds hundreds — and the whole run is read into one namespace the way `lye check` reads a
---- batch, so a type built from another file's annotations still resolves.
+--- stands for.
 ---@param self lye.Server
+---@return table<string, boolean|lye.doc.Type>
 function Lye:workspaceDeclarations()
 	self:useWorkspaceCache()
-	if self.known then return self.known end
-	local started = timing.now()
-	local root = self.server.rootPath
-	local known = {}
-	local files = 0
-	if root then
-		local pipe = io.popen(string.format(
-			"find %q -type f -name '*.lua' -not -path '*/target/*' -not -path '*/.*/*' | head -2000", root))
-		if pipe then
-			local parseStarted = timing.now()
-			local parsedFiles, parts = {}, {}
-			self.typeLocations = self.typeLocations or {}
-			for file in pipe:lines() do
-				local handle = io.open(file, "rb")
-				-- A read that comes back with nothing is not a file this can read — a directory
-				-- opens and then reads as nil — and skipping it is the difference between one file
-				-- going unchecked and the whole workspace never being analysed.
-				local source = handle and handle:read("*a")
-				if handle then handle:close() end
-				if type(source) == "string" then
-					files += 1
-					local isOk, parsed = pcall(doc.parse, source)
-					if isOk then
-						parsedFiles[#parsedFiles + 1] = parsed
-						collectTypes(self.typeLocations, file, source, parsed)
-					end
-					-- What a file declares, for the digest: a module's answer read against this
-					-- workspace is only the answer for a workspace that declares the same things.
-					if isOk then
-						for _, annotation in ipairs(parsed.annotations) do
-							parts[#parts + 1] = annotation.tag .. "\0" .. (annotation.name or "") .. "\0"
-								.. (annotation.text or "") .. "\0" .. (annotation.type or "")
-						end
-					end
-				end
-			end
-			pipe:close()
-			timing.detail("scan-read-parse", parseStarted, "files=%d", files)
-			local declareStarted = timing.now()
-			known = classes.declare(parsedFiles)
-			timing.detail("scan-declare", declareStarted, "files=%d", #parsedFiles)
-			self.annotationsDigest = rapidhash.hex(table.concat(parts, "\1"))
-		end
-	end
-	self.known = known
-	timing.mark("workspace-scan", started,
-		string.format("files=%d elapsed=%.1fms", files, timing.elapsed()))
-	return known
+	return self.declarations:workspace()
 end
 
----@param self lye.Server
 --- The classes and aliases the modules linked into a package's `target/` declare, resolved.
----
---- This is what a project laid out as several lde packages needs and a flat repository does not:
---- the modules a document can `require` are exactly the ones lde linked beside it, and a
---- dependency's classes are as real to it as its own. `target/` is left out of the workspace walk
---- — it mirrors other packages and would be walked many times over — so it is read here, once per
---- package, and only for the package the document belongs to.
 ---@param self lye.Server
 ---@param root string the package root
 ---@return table<string, boolean|lye.doc.Type>
 function Lye:packageDeclarations(root)
-	self.packageNames = self.packageNames or {}
-	self.packageDigests = self.packageDigests or {}
-	local held = self.packageNames[root]
-	if held ~= nil then return held end
-	local started = timing.now()
-	local found = {}
-	local parts = {}
-	local files = 0
-	local pipe = io.popen(string.format(
-		"find -L %q -type f -name '*.lua' -not -path '*/.*/*' 2>/dev/null | head -2000", root .. "/target"))
-	if pipe then
-		local parsedFiles = {}
-		for file in pipe:lines() do
-			local handle = io.open(file, "rb")
-			local source = handle and handle:read("*a")
-			if handle then handle:close() end
-			if type(source) == "string" then
-				files += 1
-				local isOk, parsed = pcall(doc.parse, source)
-				if isOk then
-					parsedFiles[#parsedFiles + 1] = parsed
-					self.typeLocations = self.typeLocations or {}
-					collectTypes(self.typeLocations, file, source, parsed)
-				end
-				-- The file and what it says: a module read against a package's links is only the
-				-- answer for links that are the same.
-				parts[#parts + 1] = file .. "\0" .. rapidhash.hex(source)
-			end
-		end
-		pipe:close()
-		found = classes.declare(parsedFiles)
-	end
-	self.packageNames[root] = found
-	self.packageDigests[root] = rapidhash.hex(table.concat(parts, "\1"))
-	timing.detail("package-scan", started, "files=%d root=%s", files, root)
-	return found
+	return self.declarations:package(root)
 end
 
+--- What a document is analysed against: the workspace, its package, and what each open document
+--- declared.
 ---@param self lye.Server
 ---@param uri string? the document the names are for, which decides which package's modules count
 ---@return table<string, boolean|lye.doc.Type>
 function Lye:declaredTypes(uri)
-	local found = {}
-	-- The workspace first, so what another file declares is known even when that file is closed;
-	-- an open document's own answer then replaces it with the type itself where one can be built.
-	for name, held in pairs(self:workspaceDeclarations()) do found[name] = held end
-	-- Then what the document's own package can reach: a monorepo is several packages, and each
-	-- resolves its `require`s through its own `target/`.
-	local root = uri and self:packageRoot(uri)
-	if root then
-		for name, held in pairs(self:packageDeclarations(root)) do found[name] = held end
-	end
-	-- From what each document declared rather than from the analysis it had: a document whose
-	-- analysis was dropped to keep the process small still declares everything it did, so an
-	-- annotation in another file naming that class goes on meaning it.
-	for _, declarations in pairs(self.declaredBy) do
-		for name, held in pairs(declarations) do found[name] = held end
-	end
-	return found
+	return self.declarations:view(uri)
 end
 
 --- How many analyses are held. One is about eight megabytes for two thousand lines, and what an
 --- editor has open is unbounded, so the least recently used is dropped and analysed again on the
 --- next request for it — which costs one analysis, not correctness. Measured with four such
---- documents open: two held is 43 MiB where four is 61.
-local KEEP_ANALYSES = 2
-
----@param self lye.Server
----@param uri string the document just analysed, which is now the most recently used
-function Lye:keepAnalysis(uri)
-	local order = self.order
-	for index = #order, 1, -1 do
-		if order[index] == uri then table.remove(order, index) end
-	end
-	order[#order + 1] = uri
-	while #order > KEEP_ANALYSES do
-		local dropped = table.remove(order, 1)
-		if dropped and dropped ~= uri then
-			self.analysis[dropped] = nil
-			self.names[dropped] = nil
-		end
-	end
-end
-
+--- documents open: two held is 43 MiB where four is 61. The count is the cache's for now; the byte
+--- budget is what replaces it.
 ---@param uri string
----@param from integer? the byte the change starts at, in the text the held analysis was for
+---@param from integer? the byte the change starts at, in the text the held parse was for
 ---@return lye.parser.Result?
 function Lye:analyze(uri, from)
 	local document = self.server.documents:get(uri)
@@ -812,31 +490,72 @@ function Lye:analyze(uri, from)
 	local view = self:view(uri)
 	if not view then return nil end
 	local started = timing.now()
-	-- The analyzer parses the document itself, so its result carries the tree, the scopes and the
-	-- comments this needs. Parsing the same text a second time is a third of the cost of a
-	-- keystroke on a large file, for the same tree.
-	--
-	-- A lowered document is analyzed as it stands: resuming from an offset of the text the editor
-	-- holds would be resuming from a text this analysis never read.
-	local previous = from and view.map:isEmpty() and self.analysis[uri]
+	local incremental = os.getenv("LYE_INCREMENTAL") ~= "0"
+	if not incremental then from = nil end
+
+	-- Resume from the tree the held parse left. A lowered document is analysed as it stands:
+	-- resuming at an offset of the text the editor holds would be resuming from a text this
+	-- analysis never read.
+	local resume
+	if incremental and from and view.map:isEmpty() then
+		local held = self.cache.parsed[uri]
+		if held then resume = Parser.resumeAt(held.parsed, from) end
+	end
+
+	-- The counters are the analyzer's plain table: it measures its phases with `os.clock`, and
+	-- nothing here is asked for unless a timing run wants to read it.
+	local counters = timing.detailed() and {} or nil
+	local options
+	if incremental then
+		options = {
+			uri = uri, previous = self.cache.previous[uri], from = from,
+			incremental = true, counters = counters,
+		}
+	else
+		-- The cold path: the previous result and the offset are not offered at all.
+		options = { uri = uri, incremental = false, counters = counters }
+	end
+
 	local names = analyzer.analyze(view.text, PRELUDE, self:declaredTypes(uri), function(name)
 		return self:moduleType(name, uri)
-	end, previous and Parser.resumeAt(previous, from) or nil, nil, nil, isDefinitionFile(uri), view.specs,
-		function(message) self.server:log(message, framework.LOG.warning) end)
-	local result = names.parser
-	self.analysis[uri] = result
-	self.names[uri] = names
-	if names.doc then self.declaredBy[uri] = declarationsOf(names.doc) end
-	-- The names other documents declare are built from what each of them declared, and this
-	-- document has just declared its own.
-	-- Type errors from annotations belong in the same list as syntax errors.
-	for _, entry in ipairs(names.diagnostics) do
-		result.diagnostics[#result.diagnostics + 1] = entry
+	end, resume, self.cache:annotationsFor(uri, view.text), nil, self:isDefinition(uri),
+		view.specs, function(message) self.server:log(message, framework.LOG.warning) end, options)
+	local parsed = names.parser
+
+	-- Type errors from annotations belong in the same list as syntax errors, but the parse tree is
+	-- the parser's own: it is what the next text resumes from, and a diagnostic the analyzer
+	-- appended here would be carried into that parse and appended again. So the combined list is
+	-- a result-table copy, and the tree the cache keeps stays parser-only.
+	local result = {}
+	for key, value in pairs(parsed) do result[key] = value end
+	local diagnostics = {}
+	for index = 1, #parsed.diagnostics do diagnostics[index] = parsed.diagnostics[index] end
+	for _, entry in ipairs(names.diagnostics) do diagnostics[#diagnostics + 1] = entry end
+	result.diagnostics = diagnostics
+	if names.doc then
+		self.declaredBy[uri] = declarationsOf(names.doc)
+		-- The declarations of the new text are the open-document layer every view reads.
+		self.declarations:declared(uri, self.declaredBy[uri])
 	end
-	self:keepAnalysis(uri)
+	self.cache:store(uri, names, view, self.epoch)
 	self.dirty[uri] = nil
-	timing.detail("analyze", started, "bytes=%d resumed=%s", #view.text, from and "1" or "0")
+
+	local items, reused = 0, 0
+	if counters then items, reused = counters.items or 0, counters.reused or 0 end
+	timing.detail("analyze", started, "bytes=%d resumed=%s items=%s reused=%s",
+		#view.text, resume and "1" or "0", tostring(items), tostring(reused))
 	return result
+end
+
+--- Enforce the analysis budget after an answer has been published, and say what it holds when
+--- `LYE_TIMING=1` asks. It is never called between an analysis and its diagnostics: an evicted
+--- document is a full-parse miss on the next request, not a missing answer on this one.
+---@param self lye.Server
+function Lye:evictCache()
+	local started = timing.now()
+	local stats = self.cache:evict()
+	timing.detail("cache", started, "entries=%d bytes=%d analyses=%d analysisBytes=%d parsedBytes=%d",
+		stats.entries, stats.bytes, stats.analyses, stats.analysisBytes, stats.parsedBytes)
 end
 
 ---@param self lye.Server
@@ -950,15 +669,39 @@ local function nameAt(result, offset)
 	if token and token.kind == KIND.name then return result.tokens.texts[token.index], token end
 end
 
+--- Whether the token at this offset names the field of an index or a call rather than a lexical
+--- variable. `handle:read()` is the method `read`, not the local function `read`; resolving the
+--- spelling through the scope chain found the local and showed its signature for the method.
+---@param parsed lye.parser.Result
+---@param token lye.lexer.ffi.token
+---@param name string
+---@return boolean
+local function fieldUseAt(parsed, token, name)
+	local source = parsed.source or ""
+	local at = token.start - 1
+	while at >= 1 and source:sub(at, at):match("%s") do at = at - 1 end
+	local separator = at >= 1 and source:sub(at, at) or ""
+	if separator ~= "." and separator ~= ":" then return false end
+	for _, node in ipairs(parsed.nodes) do
+		if node.field == name and (node.kind == "index" or node.kind == "call")
+			and node.start <= token.start and node.stop >= token.stop then
+			return true
+		end
+	end
+	return false
+end
+
 --- The declaration a name at an offset refers to. The analyzer already resolves names
 --- through the scope chain, so this asks it instead of repeating the search with looser rules:
 --- two resolvers can disagree about which declaration shadows which.
 ---@param names lye.analyzer.Result
 ---@return lye.parser.Declaration?
 local function declarationFor(names, offset)
-	local name = nameAt(names.parser, offset)
+	local name, token = nameAt(names.parser, offset)
 	if not name then return nil end
-	local variable = analyzer.lookupAt(names, name, offset)
+	-- A field is not a lexical name, even when a variable of the same spelling is in scope.
+	local variable = not fieldUseAt(names.parser, token, name)
+		and analyzer.lookupAt(names, name, offset)
 	if variable then return variable.declaration end
 	-- A `function t.m()` is declared under its dotted name, which no plain lookup reaches.
 	local declarations = names.parser.declarations
@@ -1091,6 +834,10 @@ local function typeOfExpression(result, idx, offset)
 		-- A generic result belongs to the call rather than to the function, so the analyzer's
 		-- binding is read first and the callee's own return type is the fallback.
 		local bound = result.callTypes and result.callTypes[idx]
+		if node.callee == "require" then
+			io.stderr:write(string.format("DBG require call idx=%s bound=%s offset=%s\\n",
+				tostring(idx), tostring(bound and types.display(bound)), tostring(offset)))
+		end
 		if bound then return bound end
 		local fnType
 		if node.field and node.target then
@@ -1125,7 +872,8 @@ end
 --- signature: a caller that has none shows the type instead.
 ---@param signature lye.analyzer.Signature?
 ---@param name string?
-local function signatureText(signature, name)
+---@param result lye.doc.Type? what this call actually gives, when an overload decided it
+local function signatureText(signature, name, result)
 	if not signature then return "" end
 	local parts = {}
 	for _, annotation in ipairs(signature.params) do
@@ -1135,12 +883,18 @@ local function signatureText(signature, name)
 	end
 	-- Every value it gives back: `fn(...) -> lye.doc.Class?, string[]` is what a caller writing
 	-- `local class, args = resolve(ns, text)` reads, and naming only the first was the complaint.
-	local returned = signature.values and table.concat(signature.values, ", ")
-		or (signature.returns and signature.returns.type)
-	if not returned and signature.inferredValues and #signature.inferredValues > 0 then
-		local values = {}
-		for _, value in ipairs(signature.inferredValues) do values[#values + 1] = types.display(value) end
-		returned = table.concat(values, ", ")
+	-- A call whose overload selected its return shows that answer rather than the primary `any`.
+	local returned
+	if result and not types.isMutable(result) and result.variant ~= "unknown" then
+		returned = types.display(result)
+	else
+		returned = signature.values and table.concat(signature.values, ", ")
+			or (signature.returns and signature.returns.type)
+		if not returned and signature.inferredValues and #signature.inferredValues > 0 then
+			local values = {}
+			for _, value in ipairs(signature.inferredValues) do values[#values + 1] = types.display(value) end
+			returned = table.concat(values, ", ")
+		end
 	end
 	return (name or "") .. "(" .. table.concat(parts, ", ") .. ")"
 		.. (returned and (" -> " .. returned) or "")
@@ -1163,8 +917,11 @@ local function signatureFor(names, node, offset)
 	end
 	if not node.field then return nil end
 
-	-- A field: the type it holds is the identity the definitions recorded it under.
-	local held = typeOfExpression(names, node.key or node.index, offset)
+	-- A field: the type it holds is the identity the definitions recorded it under. Only an index
+	-- node has a key expression; a call node's `index` is its own arena position, and asking that
+	-- read the call's result instead of the field it calls.
+	local held
+	if node.kind == "index" then held = typeOfExpression(names, node.key or node.index, offset) end
 	if not held then
 		local base = typeOfExpression(names, node.target, offset)
 		if base then held = types.indexResult(base, node.field) end
@@ -1417,7 +1174,8 @@ function Lye:onHover(params)
 	local held = typeOfExpression(result, node.index, offset)
 	if not signature and not held then return nil end
 
-	local label = signature and signatureText(signature, writtenName(result, node, text))
+	local label = signature and signatureText(signature, writtenName(result, node, text),
+		node.kind == "call" and held or nil)
 	local blocks = {
 		string.format("```lua\n%s\n```", label or types.display(held)),
 	}
@@ -1460,55 +1218,13 @@ function Lye:rangeIn(target)
 	}
 end
 
---- The class or alias a name stands for, with the lines that declare it: the comment above it,
---- its own line, and the fields written under it. The workspace is read for these when it is read
---- for anything else, so a type written in one file is answerable from another even when that
---- file's own analysis is not held. A builtin is read out of the definitions the same way.
+--- The class or alias a name stands for, with the lines that declare it.
 ---@param self lye.Server
 ---@param name string
 ---@param uri string? the document the question came from, which is read first
 ---@return { location: lye.DefinitionLocation, lines: string }?
 function Lye:typeDeclaration(name, uri)
-	-- The document the cursor is in comes first: a class written in a buffer that was never saved
-	-- is as real as one on disk, and the workspace scan has only read the disk.
-	local names = uri and self.names[uri]
-	local annotations = names and names.doc and names.doc.annotations
-	local text = uri and self:textOf(uri)
-	if annotations and text then
-		for at, annotation in ipairs(annotations) do
-			local isType = annotation.tag == "class" or annotation.tag == "alias"
-			if isType and annotation.name == name then
-				return {
-					location = {
-						uri = uri,
-						start = annotation.nameStart or annotation.start,
-						stop = annotation.nameStop or annotation.stop,
-					},
-					lines = declarationLines(text, annotations, at),
-				}
-			end
-		end
-	end
-
-	local held = self.typeLocations and self.typeLocations[name]
-	if held then return held end
-
-	local index = self:definitionIndex()
-	local found = definitionsIndex.find(index, name)
-	if not found then return nil end
-	local text = definitionsIndex.sourceOf(index, found.uri)
-	if not text then return nil end
-
-	local lines = { lineAt(text, lineStart(text, found.start)) }
-	local fields = {}
-	for fieldName, where in pairs(index.fields) do
-		if fieldName:sub(1, #name + 1) == name .. "." then fields[#fields + 1] = where end
-	end
-	table.sort(fields, function(left, right) return left.start < right.start end)
-	for _, where in ipairs(fields) do
-		lines[#lines + 1] = lineAt(text, lineStart(text, where.start))
-	end
-	return { location = found, lines = table.concat(lines, "\n") }
+	return self.declarations:typeLocation(name, uri)
 end
 
 --- The class or alias a name declares: in this document, in another the server has analysed, or in
@@ -1518,31 +1234,7 @@ end
 ---@param uri string
 ---@return lye.DefinitionLocation?
 function Lye:targetOfType(name, uri)
-	local function inDocument(documentUri, names)
-		for _, annotation in ipairs(names and names.doc and names.doc.annotations or {}) do
-			local isType = annotation.tag == "class" or annotation.tag == "alias"
-			if isType and annotation.name == name then
-				return {
-					uri = documentUri,
-					start = annotation.nameStart or annotation.start,
-					stop = annotation.nameStop or annotation.stop,
-				}
-			end
-		end
-	end
-
-	local indexed = self.typeLocations and self.typeLocations[name]
-	if indexed then return indexed.location end
-
-	local mine = inDocument(uri, self.names[uri])
-	if mine then return mine end
-	for otherUri, names in pairs(self.names) do
-		if otherUri ~= uri then
-			local found = inDocument(otherUri, names)
-			if found then return found end
-		end
-	end
-	return definitionsIndex.find(self:definitionIndex(), name)
+	return self.declarations:targetOfType(name, uri)
 end
 
 --- Where a name resolves: the declaration the parser recorded, or the definitions the server wrote
@@ -1589,11 +1281,30 @@ function Lye:targetAt(uri, text, names, offset)
 		if node.field and (node.kind == "index" or node.kind == "call") then
 			-- Who declares the field: the class the receiver's type names, or `string` for a
 			-- string, because a string reads that table's fields — which is what Lua's own string
-			-- metatable arranges, and what makes `s:sub(2)` jump to `string.sub`.
+			-- metatable arranges, and what makes `s:sub(2)` jump to `string.sub`. A class written
+			-- with a marker (`file*`) and its method declared without one (`function file:read`)
+			-- are the same class, so both spellings and both separators are tried.
 			local owner = ownerOf(typeOfExpression(names, node.target, offset))
 			if owner then
-				found = definitionsIndex.find(self:definitionIndex(), owner .. "." .. node.field)
-				if found then return found end
+				local bare = (owner:gsub("%*$", ""))
+				local candidates = {
+					owner .. "." .. node.field, owner .. ":" .. node.field,
+					bare .. "." .. node.field, bare .. ":" .. node.field,
+				}
+				-- A method this document declares is found where it is written before the
+				-- definitions are asked: a definition only answers the builtin libraries.
+				for _, candidate in ipairs(candidates) do
+					for _, declaration in ipairs(names.parser.declarations) do
+						if declaration.name == candidate
+							and (declaration.qualifier == "field" or declaration.qualifier == "global") then
+							return { uri = uri, start = declaration.start, stop = declaration.stop }
+						end
+					end
+				end
+				for _, candidate in ipairs(candidates) do
+					local method = definitionsIndex.find(self:definitionIndex(), candidate)
+					if method then return method end
+				end
 			end
 		end
 		-- A name that is not declared here may still be a value of a type that is: `math` is the
@@ -2157,18 +1868,48 @@ function Lye:onCompletion(params)
 	local inside = self:requireStringAt(uri, source, offset)
 	if inside then
 		local items = json.array()
-		for _, found in ipairs(self:moduleNames(inside.typed)) do
-			items[#items + 1] = {
-				label = found.name,
-				kind = 9,
-				-- A builtin module has no path in this workspace to show, and its own name is what it
-				-- is called: the definitions are where it comes from.
-				detail = found.detail or found.path:sub(#(self.server.rootPath or "") + 2),
-				textEdit = {
-					range = self:toRange(source, document.lineIndex, inside.from, inside.to),
-					newText = found.name,
-				},
-			}
+		local seen = {}
+		-- A plugin may add modules the workspace index does not cover: the engine's own names, a
+		-- `requirePaths` directory, or what lde linked into the package's target. The workspace's
+		-- own list is added after it, so a file of this project is never hidden by a plugin.
+		local asked = plugin.complete(self:plugins(uri), {
+			uri = uri, source = source, text = source, offset = offset,
+			prefix = inside.typed, workspace = self.server.rootPath, packageRoot = self:packageRoot(uri),
+		})
+		for _, found in ipairs(asked) do
+			if not seen[found.name] and found.name:sub(1, #inside.typed) == inside.typed then
+				seen[found.name] = true
+				items[#items + 1] = {
+					label = found.name,
+					kind = 9,
+					detail = found.detail or found.path,
+					textEdit = {
+						range = self:toRange(source, document.lineIndex, inside.from, inside.to),
+						newText = found.name,
+					},
+				}
+			end
+		end
+		for _, found in ipairs(self:moduleNames(inside.typed, uri)) do
+			if not seen[found.name] then
+				seen[found.name] = true
+				-- A builtin module has no path in this workspace to show, and its own name is what
+				-- it is called: the definitions are where it comes from.
+				local detail = found.detail
+				if not detail and found.path then
+					local root = self.server.rootPath or ""
+					detail = root ~= "" and found.path:sub(#root + 2) or found.path
+				end
+				items[#items + 1] = {
+					label = found.name,
+					kind = 9,
+					detail = detail,
+					textEdit = {
+						range = self:toRange(source, document.lineIndex, inside.from, inside.to),
+						newText = found.name,
+					},
+				}
+			end
 		end
 		return { isIncomplete = false, items = items }
 	end
@@ -2286,70 +2027,98 @@ function Lye:onDocumentChanged(params, atOnce)
 	local uri = params.textDocument?.uri
 	if not uri then return end
 	local started = timing.now()
+	self.epoch = self.epoch + 1
+
+	-- Where this text first differs from the text the held parse read. The change ranges the
+	-- editor sent are not used: a burst may have applied several of them since the last analysis,
+	-- and one span covering all of them is still the right text to re-read, where the first one
+	-- alone would be an offset into text this session never read. A plugin-lowered document has a
+	-- different text at different offsets, so it never resumes.
+	local view = self:view(uri)
+	if view then
+		self.cache.spans[uri] = self.cache:span(uri, view.text, not view.map:isEmpty())
+	end
 
 	-- The text has moved on, so what was worked out for the old text is not an answer about this
 	-- one. It is dropped rather than analysed over: a burst of keystrokes arrives faster than a
-	-- file can be analysed, and the ones in between are answers nobody reads.
+	-- file can be analysed, and the ones in between are answers nobody reads. The parse stays.
 	self:forget(uri)
 
 	if atOnce then
-		-- The document is newly opened, so there is no earlier text to read the change against:
-		-- `forget` above has just dropped what was held for it.
-		local result = self:analyze(uri)
+		local span = self.cache.spans[uri]
+		local result = self:analyze(uri, span and span.from)
 		if result then self:publishDiagnostics(uri, result) end
 		timing.detail("open", started, "bytes=%d", #self.server.documents:get(uri).text)
+		if self.cache.analysis[uri] then self.cache.current = uri end
+		self:evictCache()
 		return
 	end
 	self.dirty[uri] = true
-	-- When the first of a burst arrived, which is what the user felt: the last one may be a
-	-- fraction of a millisecond later, and analyses that happened between them were thrown away.
+	-- When this change arrived. The newest dirty document is the one the writer is looking at, so
+	-- it is analysed first and the others wait for the next tick.
 	self.dirtyAt = self.dirtyAt or {}
 	self.dirtyAt[uri] = started
+	self.dirtyEpoch = self.dirtyEpoch or {}
+	self.dirtyEpoch[uri] = self.epoch
 end
 
 --- Every document whose text has changed since it was last analysed, read once the editor has
---- stopped sending. This is what makes typing cost one analysis rather than one per keystroke.
+--- stopped sending. This is what makes typing cost one analysis rather than one per keystroke. The
+--- one most recently changed goes first — that is the document the writer is looking at — and the
+--- rest follow in the same pass: nothing promises another idle tick if no further message arrives,
+--- and an editor is owed diagnostics for every document it changed.
 function Lye:onIdle()
+	local dirty = {}
 	for uri in pairs(self.dirty) do
+		dirty[#dirty + 1] = {
+			uri = uri,
+			at = self.dirtyAt and self.dirtyAt[uri] or 0,
+			seq = self.dirtyEpoch and self.dirtyEpoch[uri] or 0,
+		}
+	end
+	if #dirty == 0 then
+		-- A request may have analysed a document on demand since the last pass, and that analysis
+		-- stored without a pass of its own. Trim here so a read-only session between changes is
+		-- held to the same budget as a typing one.
+		self:evictCache()
+		self:checkpoint()
+		return
+	end
+	table.sort(dirty, function(a, b)
+		if a.at ~= b.at then return a.at > b.at end
+		if a.seq ~= b.seq then return a.seq > b.seq end
+		return a.uri < b.uri
+	end)
+
+	for _, entry in ipairs(dirty) do
+		local uri = entry.uri
 		self.dirty[uri] = nil
-		local started = self.dirtyAt and self.dirtyAt[uri] or timing.now()
 		if self.dirtyAt then self.dirtyAt[uri] = nil end
+		if self.dirtyEpoch then self.dirtyEpoch[uri] = nil end
+		local started = entry.at > 0 and entry.at or timing.now()
 		local analyzeStarted = timing.now()
-		local result = self:analyze(uri)
+		local span = self.cache.spans[uri]
+		local result = self:analyze(uri, span and span.from)
 		if result then self:publishDiagnostics(uri, result) end
 		timing.detail("keystroke", started, "analyze=%.1fms", timing.now() - analyzeStarted)
 	end
+	-- The newest changed document is the one the writer is looking at, so it is the one the cache
+	-- keeps whatever the older ones needed.
+	if self.cache.analysis[dirty[1].uri] then self.cache.current = dirty[1].uri end
+	self:evictCache()
+	self:checkpoint()
 end
 
---- Everything held for a document, dropped: the analysis, the names it declared, and its place in
---- the order the cache keeps.
+--- Everything the old text meant, dropped: the analysis, the names it declared, what it
+--- contributed to the declaration and module layers, and its parsed annotations. The parse tree
+--- stays, because the next text is read against it.
 ---@param self lye.Server
 ---@param uri string
 function Lye:forget(uri)
-	self.analysis[uri] = nil
-	self.names[uri] = nil
+	self.cache:forget(uri)
+	self.declarations:documentChanged(uri)
+	self.modules:documentChanged(uri, self.declaredBy[uri])
 	self.declaredBy[uri] = nil
-	-- What the documents say has changed with it, and `documentsDigest` reads them again for it.
-	self.openDigest = nil
-	for index = #self.order, 1, -1 do
-		if self.order[index] == uri then table.remove(self.order, index) end
-	end
-end
-
---- The byte a change starts at, against the text the held analysis was for: the statement to
---- re-read is the one the writer was in.
----@param self lye.Server
----@param uri string
----@param params table
----@return integer?
-function Lye:changedAt(uri, params)
-	local previous = self.analysis[uri]
-	local change = params.contentChanges and params.contentChanges[1]
-	local range = change and change.range
-	if not previous or not range then return nil end
-	local old = previous.source
-	return position.toOffset(old, position.buildLineIndex(old), range.start.line,
-		range.start.character, self.server.encoding)
 end
 
 ---@param self lye.Server
@@ -2357,8 +2126,15 @@ function Lye:onDocumentClosed(params)
 	local uri = params.textDocument?.uri
 	if not uri then return end
 
+	self.epoch = self.epoch + 1
+	-- The declarations and module answers it contributed, and then the parse, annotations and
+	-- predecessor that only an open document is worth holding.
 	self:forget(uri)
+	self.cache:close(uri)
+	self.declarations:documentClosed(uri)
 	self.dirty[uri] = nil
+	if self.dirtyAt then self.dirtyAt[uri] = nil end
+	if self.dirtyEpoch then self.dirtyEpoch[uri] = nil end
 	if self.views then
 		local view = self.views[uri]
 		if view then
@@ -2371,6 +2147,9 @@ function Lye:onDocumentClosed(params)
 	end
 	if self.tokens_ then self.tokens_[uri] = nil end
 	self.server:notify(framework.METHOD.publishDiagnostics, { uri = uri, diagnostics = json.array() })
+	-- The document's trees and facts are unreachable now, and the editor is not waiting for the
+	-- close notification's answer. This is the one place a full collection is worth its pause.
+	self:checkpoint(true)
 end
 
 --- Every place a name is written: its declaration and each reference. The analyzer records the
@@ -2730,6 +2509,126 @@ local function callAt(result, offset)
 	return found
 end
 
+--- Whether a call argument satisfies an overload parameter. A parameter written as a literal names
+--- one value, and the text typed at the call is what says whether that overload is still possible.
+---@param wanted lye.doc.Type
+---@param actual lye.doc.Type
+---@return boolean mismatch
+local function overloadMismatch(wanted, actual)
+	if wanted.variant == "union" then
+		for _, member in ipairs(wanted.types) do
+			if not overloadMismatch(member, actual) then return false end
+		end
+		return true
+	end
+	local exact = (wanted.variant == "number" and wanted.value ~= nil)
+		or (wanted.variant == "boolean" and wanted.value ~= nil)
+		or (wanted.variant == "extern" and wanted.name
+			and wanted.name:match("^[\"']") and wanted.name:match("[\"']$"))
+	if exact then return types.display(wanted) ~= types.display(actual) end
+	return types.mismatch(wanted, actual, "argument") ~= nil
+end
+
+--- The type of one argument as the call wrote it. A string literal is the one string it spells,
+--- which is what an overload's `"*a"` names; a name keeps the type the analysis gave it.
+---@param names lye.analyzer.Result
+---@param node lye.parser.Node
+---@param offset integer
+---@return lye.doc.Type
+local function argumentTypeAt(names, node, offset)
+	if node.kind == "string" then return types.stringValue(node.value or "") end
+	return typeOfExpression(names, node.index, offset) or types.UNKNOWN_TYPE
+end
+
+--- The overloads still possible after the arguments already written, with the index of the first
+--- parameter that is not the receiver. Returns nil when the callee has no usable overloads.
+---@param names lye.analyzer.Result
+---@param node lye.parser.Node
+---@param offset integer
+---@param signature lye.analyzer.Signature
+---@param completed integer how many arguments are wholly before the cursor
+---@return { shape: lye.doc.Type, first: integer }[]?
+local function remainingOverloads(names, node, offset, signature, completed)
+	if not signature.overloads or #signature.overloads == 0 then return nil end
+	local receiver = node.isMethod and typeOfExpression(names, node.target, offset) or nil
+	if receiver then receiver = types.narrowTruthiness(receiver, true) or receiver end
+
+	local kept = {}
+	for _, written in ipairs(signature.overloads) do
+		local shape = types.parse(written, PRELUDE_RESOLVE)
+		if shape and shape.variant == "fn" then
+			local first, fits = 1, true
+			if receiver then
+				local wanted = shape.params[1]
+				if wanted ~= nil then
+					if overloadMismatch(wanted, receiver) then
+						fits = false
+					else
+						first = 2
+					end
+				end
+			end
+			if fits then
+				for index = 1, completed do
+					local argIdx = node.args[index]
+					local wanted = shape.params[index + first - 1]
+					if not wanted and shape.variadic and index + first - 1 > #shape.params then
+						wanted = shape.variadic
+					end
+					if wanted and overloadMismatch(wanted, argumentTypeAt(names, names.parser.nodes[argIdx], offset)) then
+						fits = false
+						break
+					end
+				end
+			end
+			if fits and not shape.variadic then
+				local available = #shape.params - first + 1
+				if #(node.args or {}) > available then fits = false end
+			end
+			if fits then kept[#kept + 1] = { shape = shape, first = first } end
+		end
+	end
+	if #kept == 0 then return nil end
+	return kept
+end
+
+--- One signature whose parameter types are the union still possible at each position. As the
+--- writer types an argument, the overloads it rules out disappear and the next parameter narrows;
+--- when one shape is left it is that shape's exact signature.
+---@param names lye.analyzer.Result
+---@param node lye.parser.Node
+---@param text string
+---@param kept { shape: lye.doc.Type, first: integer }[]
+---@return table signature
+local function narrowedSignature(names, node, text, kept)
+	local count = 0
+	for _, entry in ipairs(kept) do
+		count = math.max(count, #entry.shape.params - entry.first + 1)
+	end
+	local parts, parameters = {}, json.array()
+	for index = 1, count do
+		local members = {}
+		for _, entry in ipairs(kept) do
+			local wanted = entry.shape.params[entry.first + index - 1]
+			if wanted then members[#members + 1] = wanted end
+		end
+		local shown = members[1] and types.display(types.union(members)) or "any"
+		parts[#parts + 1] = shown
+		parameters[#parameters + 1] = { label = shown }
+	end
+	local returns = {}
+	for _, entry in ipairs(kept) do
+		if entry.shape.returns then returns[#returns + 1] = entry.shape.returns end
+	end
+	local returned = returns[1] and types.display(types.union(returns)) or nil
+	return {
+		label = writtenName(names, node, text) .. "(" .. table.concat(parts, ", ") .. ")"
+			.. (returned and (" -> " .. returned) or ""),
+		parameters = parameters,
+		count = count,
+	}
+end
+
 ---@param self lye.Server
 ---@return table?
 function Lye:onSignatureHelp(params)
@@ -2753,11 +2652,27 @@ function Lye:onSignatureHelp(params)
 	local label = writtenName(names, node, text) .. "(" .. table.concat(parts, ", ") .. ")"
 		.. (returned and (" -> " .. returned) or "")
 
-	-- Which argument the cursor is in: as many as have started before it.
-	local active = 0
+	-- How many arguments are wholly written before the cursor. The one being typed is left out:
+	-- its overload is not decided until the literal is complete.
+	local completed = 0
 	for index_, argIdx in ipairs(node.args or {}) do
 		local argument = result.nodes[argIdx]
-		if argument and argument.start <= offset then active = index_ end
+		if argument and argument.stop < offset then completed = index_ else break end
+	end
+
+	-- An overload this call can still take decides the parameter type shown. The arguments already
+	-- written have eliminated the shapes they do not fit; the rest contribute a union, and one
+	-- shape left is its own exact signature.
+	local kept = remainingOverloads(names, node, offset, signature, completed)
+	local active = completed
+
+	if kept then
+		local narrowed = narrowedSignature(names, node, text, kept)
+		label = narrowed.label
+		params_ = narrowed.parameters
+		active = math.min(completed, math.max(narrowed.count - 1, 0))
+	elseif #signature.params > 0 then
+		active = math.min(completed, #signature.params - 1)
 	end
 
 	return {
@@ -2767,7 +2682,7 @@ function Lye:onSignatureHelp(params)
 			documentation = signature.doc and { kind = "markdown", value = signature.doc } or nil,
 		} }),
 		activeSignature = 0,
-		activeParameter = math.min(active, math.max(#signature.params - 1, 0)),
+		activeParameter = active,
 	}
 end
 
@@ -3403,6 +3318,22 @@ function Lye:register()
 	})
 	-- `.` and `:` are what a field or method call starts with; a name is completed as it is typed.
 	-- `[` is a trigger too: `t[` is where a field with a name that is not an identifier is reached.
+	-- A client that supports dynamic registration is asked for file watching when the handshake
+	-- ends, which is the first moment it accepts a request. One that does not gets no registration
+	-- and no request, which is what it had before the watcher was advertised.
+	server:on(framework.METHOD.initialized, function()
+		local watched = server.clientCapabilities?.workspace?.didChangeWatchedFiles
+		if not (watched and watched.dynamicRegistration) then return end
+		server:request(framework.METHOD.registerCapability, {
+			registrations = {
+				{
+					id = "lye-watched-files",
+					method = method.workspaceDidChangeWatchedFiles,
+					registerOptions = { watchers = { { globPattern = "**/*.lua" } } },
+				},
+			},
+		})
+	end)
 	server.connection:setIdleHandler(function() self:onIdle() end)
 	-- A change may be followed by more of the same burst, which is worth waiting for; anything else
 	-- is reading what the burst described and has to find it done.
@@ -3469,11 +3400,16 @@ function Lye:register()
 	server:on(method.formatting, function(_, params) return self:onFormatting(params or {}) end)
 	server:on(method.formattingRange, function(_, params) return self:onFormattingRange(params or {}) end)
 	server:on(method.typeFormatting, function(_, params) return self:onTypeFormatting(params or {}) end)
-	server:on(method.workspaceDidChangeWatchedFiles, function()
+	server:on(method.workspaceDidChangeWatchedFiles, function(_, params)
+		-- A symbol list is of files as they were, and the event has already moved one of them.
 		self.workspace = nil
+		if self.declarations:watchedFiles(params or {}) then return end
+		self.epoch = self.epoch + 1
 		self.known = nil
 		self.packageNames = nil
-		end)
+		self.declarations:invalidate()
+		self.modules:clear()
+	end)
 end
 
 ---@return lye.Server

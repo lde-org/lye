@@ -12,6 +12,9 @@
 	* `types(context)` answers the classes and aliases a dialect declares, and provider hooks for
 	  the calls, fields and callback signatures only it understands. The ffi plugin is what reads
 	  `ffi.cdef` now; nothing in the analyzer knows what a cdef is.
+	* `complete(context)` answers the module names an editor offers inside a `require("...")`
+	  string. The `lye-plugin-require` package is the shipped one: the engine's own modules, a
+	  project's `requirePaths`, and what lde linked into its `target/`.
 
 	Only what a plugin has to be handed is handed: the document, the text lye reads, what the
 	analysis worked out, and the map it is working under. Nothing about the server is visible, so a
@@ -94,8 +97,36 @@ local SHIPPED_ORDER = { "patterns", "formats", "ffi" }
 ---@field to integer byte offset one past the last byte
 ---@field type string a token type from the legend: `regexp`, `property`, `number`, `keyword`, …
 
+--- A module a plugin offers inside a `require("...")`: the name written there, and where it comes
+--- from when the plugin found a file for it.
+---@class lye.plugin.Completion
+---@field name string
+---@field path string?
+---@field detail string? a short label for where the module comes from, `LuaJIT` or `lde`
+
+--- What a plugin is handed inside a `require("...")` string. `prefix` is what has been typed in
+--- the quotes so far, and `workspace`/`packageRoot` are the roots its own files may be under.
+---@class lye.plugin.CompletionContext
+---@field uri string
+---@field source string the document as the editor holds it
+---@field text string the text lye reads
+---@field offset integer
+---@field prefix string
+---@field workspace string?
+---@field packageRoot string?
+
+--- The hooks a plugin file returns. A plugin of a workspace writes these; the loader adds the name
+--- and path it was loaded under and protects each hook.
+---@class lye.plugin.Hooks
+---@field extensions string[]? the file extensions its language is written in, without the dot:
+--- `{ "moon" }` says a `.moon` file is one lye should read through this plugin
+---@field lower fun(context: lye.plugin.Context): lye.plugin.Edit[]?
+---@field tokens fun(context: lye.plugin.TokenContext): lye.plugin.Span[]?
+---@field types fun(context: lye.plugin.TypeContext): lye.plugin.Types?
+---@field complete fun(context: lye.plugin.CompletionContext): lye.plugin.Completion[]?
+
 --- A loaded plugin: the hooks it answered with, and what a fault in one costs.
----@class lye.plugin.Spec
+---@class lye.plugin.Spec: lye.plugin.Hooks
 ---@field name string the name it was loaded under
 ---@field path string? the file it came from, for a plugin of the workspace's own
 ---@field extensions string[]? the file extensions its language is written in, without the dot:
@@ -103,6 +134,7 @@ local SHIPPED_ORDER = { "patterns", "formats", "ffi" }
 ---@field lower fun(context: lye.plugin.Context): lye.plugin.Edit[]?
 ---@field tokens fun(context: lye.plugin.TokenContext): lye.plugin.Span[]?
 ---@field types fun(context: lye.plugin.TypeContext): lye.plugin.Types?
+---@field complete fun(context: lye.plugin.CompletionContext): lye.plugin.Completion[]?
 
 --- A file of the workspace's own, loaded the way a plugin file is: a Lua chunk that returns the
 --- hooks. `require` is reachable from it under the name the server's runtime gives it, which is
@@ -150,7 +182,7 @@ local function protect(hooks, name, path, report)
 		end
 		if #list > 0 then spec.extensions = list end
 	end
-	for _, hook in ipairs({ "lower", "tokens", "types" }) do
+	for _, hook in ipairs({ "lower", "tokens", "types", "complete" }) do
 		local asked = hooks[hook]
 		if type(asked) == "function" then
 			local broken = false
@@ -165,6 +197,17 @@ local function protect(hooks, name, path, report)
 		end
 	end
 	return spec
+end
+
+--- Build a loaded plugin from hooks the caller already has. The server uses this for a plugin it
+--- ships as a package of its own: `require` is visible to the bundler, while a plugin a workspace
+--- names is loaded by `load`.
+---@param hooks table
+---@param name string
+---@param report fun(message: string)
+---@return lye.plugin.Spec
+function plugin.spec(hooks, name, report)
+	return protect(hooks, name, nil, report)
 end
 
 --- Whether an entry names a file rather than a plugin: a path is written as one — `./tools/x.lua`,
@@ -299,6 +342,28 @@ function plugin.tokens(specs, context)
 		end
 	end
 	return spans
+end
+
+--- Every module every plugin offers inside a `require("...")`, in the order they were asked. The
+--- caller merges them with the workspace's own module list and removes duplicates by name.
+---@param specs lye.plugin.Spec[]
+---@param context lye.plugin.CompletionContext
+---@return lye.plugin.Completion[]
+function plugin.complete(specs, context)
+	local modules = {}
+	for _, spec in ipairs(specs) do
+		if spec.complete then
+			local asked = spec.complete(context)
+			if type(asked) == "table" then
+				for _, entry in ipairs(asked) do
+					if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= "" then
+						modules[#modules + 1] = entry
+					end
+				end
+			end
+		end
+	end
+	return modules
 end
 
 --- What each plugin contributes to the type side of a document, in the order it was asked. The

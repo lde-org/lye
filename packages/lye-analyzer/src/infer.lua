@@ -74,6 +74,126 @@ local function cache(ctx, idx, value)
 	return value
 end
 
+--- The identity of a value a type names exactly, or nil when it names a family. Used to match an
+--- overload parameter written `"*a"` against the argument actually written: lye deliberately lets
+--- any string satisfy a string literal, which is right for annotations and wrong for choosing
+--- between overloads.
+---@param type lye.doc.Type
+---@return string?
+local function literalKey(type)
+	if type.variant == "number" and type.value ~= nil then return "n:" .. tostring(type.value) end
+	if type.variant == "boolean" and type.value ~= nil then return "b:" .. tostring(type.value) end
+	if type.variant == "extern" and type.name then
+		local first, last = type.name:sub(1, 1), type.name:sub(-1)
+		if (first == '"' or first == "'") and last == first then return "s:" .. type.name end
+	end
+end
+
+--- Whether an argument cannot be the shape a chosen overload names.
+---@param wanted lye.doc.Type
+---@param actual lye.doc.Type
+---@return string? mismatch
+local function overloadMismatch(wanted, actual)
+	if wanted.variant == "union" then
+		for _, member in ipairs(wanted.types) do
+			if not overloadMismatch(member, actual) then return nil end
+		end
+		return "argument"
+	end
+	local key = literalKey(wanted)
+	if key then
+		if literalKey(actual) == key then return nil end
+		return "argument"
+	end
+	return types.mismatch(wanted, actual, "argument")
+end
+
+--- The argument's type as the call wrote it: a string literal is the one string it spells, which
+--- is what an overload parameter names.
+---@param ctx lye.infer.Context
+---@param idx integer
+---@param valueOf fun(ctx: lye.infer.Context, idx: integer): lye.doc.Type
+---@return lye.doc.Type
+local function argumentValue(ctx, idx, valueOf)
+	local node = ctx.parser.nodes[idx]
+	if node and node.kind == "string" then return types.stringValue(node.value or "") end
+	return valueOf(ctx, idx)
+end
+
+--- How exact a parameter is: a literal names one value, a union of literals names a few, and a
+--- type names a family. The most specific shape a call fits is the one whose answer it gets.
+---@param wanted lye.doc.Type
+---@return integer
+local function specificity(wanted)
+	if literalKey(wanted) then return 2 end
+	if wanted.variant == "union" then
+		for _, member in ipairs(wanted.types) do
+			if literalKey(member) then return 1 end
+		end
+	end
+	return 0
+end
+
+--- The overload a call fits, when its callee carries overloads. A shape matches when the receiver
+--- and every argument fit its parameters and it is not handed more values than it declares; the
+--- most specific match decides the return, so `read("*a")` prefers the `"*a"` shape over a generic
+--- `string` one.
+---@param ctx lye.infer.Context
+---@param node lye.parser.Node
+---@param calleeType lye.doc.Type
+---@param valueOf fun(ctx: lye.infer.Context, idx: integer): lye.doc.Type
+---@return lye.doc.Type? shape
+local function overloadOf(ctx, node, calleeType, valueOf)
+	local shapes = calleeType.overloads
+	if not shapes then return nil end
+	local args = node.args or {}
+	local receiver = node.isMethod and node.target and valueOf(ctx, node.target) or nil
+	-- A method is only called on a value that is there, so an optional receiver is narrowed for
+	-- the shape it is matched against.
+	if receiver then receiver = types.narrowTruthiness(receiver, true) or receiver end
+
+	local best, bestScore
+	for _, shape in ipairs(shapes) do
+		local fits = true
+		local shift = 0
+		local score = 0
+		if receiver then
+			local wanted = shape.params[1]
+			if wanted == nil then
+				shift = 1
+			elseif not overloadMismatch(wanted, receiver) then
+				shift = 1
+				score += specificity(wanted)
+			else
+				fits = false
+			end
+		end
+		if fits then
+			local count = #args + (receiver and shape.params[1] ~= nil and 1 or 0)
+			if not shape.variadic and count > #shape.params then fits = false end
+		end
+		if fits then
+			for index, argIdx in ipairs(args) do
+				local wanted = shape.params[index + shift]
+				if not wanted and shape.variadic and index + shift > #shape.params then
+					wanted = shape.variadic
+				end
+				if wanted then
+					if overloadMismatch(wanted, argumentValue(ctx, argIdx, valueOf)) then
+						fits = false
+						break
+					end
+					score += specificity(wanted)
+				end
+			end
+		end
+		if fits and (not best or score > bestScore) then
+			best, bestScore = shape, score
+		end
+	end
+	return best
+end
+
 local function of(ctx, idx)
 	if not idx then return types.mutable() end
 	local cached = ctx.cache[idx]
@@ -195,6 +315,9 @@ local function of(ctx, idx)
 		if ctx.ctypes then
 			local held = ctx.ctypes(node)
 			if held then
+				-- A call whose result the analyzer worked out is also what a reader asks for at
+				-- this node: `ffi.new("Vec").x` is read through the call, not through a variable.
+				ctx.callTypes[node.index] = held
 				return cache(ctx, idx, held)
 			end
 		end
@@ -203,6 +326,9 @@ local function of(ctx, idx)
 			if argument and argument.kind == "string" and type(argument.value) == "string" then
 				local held = ctx.modules(argument.value)
 				if held then
+					-- A completion or hover after `require("ffi")` asks the call node what it is,
+					-- and `callTypes` is how the analyzer publishes that.
+					ctx.callTypes[node.index] = held
 					return cache(ctx, idx, held)
 				end
 			end
@@ -223,8 +349,14 @@ local function of(ctx, idx)
 		-- A result the generic pass worked out from the arguments beats anything inferred by name.
 		local bound = ctx.callTypes[node.index]
 		local calleeType = not bound and infer.calleeTypeOf(ctx, node)
+		local overload = calleeType and overloadOf(ctx, node, calleeType, of)
 		if bound then
 			result = bound
+		elseif overload then
+			-- The shape this call fits says what it gives back; the primary signature may only be
+			-- able to say `any` because the arguments decide.
+			result = overload.returns or types.ANY_TYPE
+			ctx.callTypes[node.index] = result
 		elseif calleeType and types.isAnyFn(calleeType) then
 			-- A callable that says nothing about itself — a bare `function`, or one whose own type
 			-- has not been worked out yet — returns nothing this round can name. A mutable unknown

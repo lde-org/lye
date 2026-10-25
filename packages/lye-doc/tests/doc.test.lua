@@ -191,6 +191,10 @@ test.it("keeps the members a narrowing rule allows", function()
 	test.equal(doctype.display(doctype.narrowTruthiness(doctype.parse("string?"), true)), "string")
 	test.equal(doctype.display(doctype.narrowTo(doctype.parse("string|number"), "number")), "number")
 	test.equal(doctype.display(doctype.exclude(doctype.parse("string|number"), "string")), "number")
+	test.equal(doctype.display(doctype.narrowTo(doctype.UNKNOWN_TYPE, "table")), "table",
+		"a type test is the information an unknown lacks")
+	test.equal(doctype.display(doctype.narrowTo(doctype.ANY_TYPE, "table")), "table",
+		"and the same for any")
 end)
 
 test.it("narrows to nothing when a rule rules every member out", function()
@@ -333,6 +337,24 @@ test.it("narrows to a class or an alias by the parsed type", function()
 		"Point")
 	test.equal(doctype.display(doctype.excludeType(doctype.union({ point, doctype.NIL_TYPE }), point)),
 		"nil")
+end)
+
+test.it("absorbs a literal into the type it belongs to", function()
+	-- A literal is already a member of its base type, so `20261024 | number` says exactly what
+	-- `number` says. The order it was written in must not matter, and two literals with no base
+	-- beside them keep their exact values.
+	local seed = doctype.numberValue(20261024, "20261024")
+	test.equal(doctype.display(doctype.union({ seed, doctype.NUMBER })), "number")
+	test.equal(doctype.display(doctype.union({ doctype.NUMBER, seed })), "number",
+		"the order it was written in does not matter")
+	local yes = doctype.booleanValue(true)
+	test.equal(doctype.display(doctype.union({ yes, doctype.BOOLEAN })), "boolean")
+	test.equal(doctype.display(doctype.union({ doctype.BOOLEAN, yes })), "boolean")
+	local word = doctype.parse('"seed"')
+	test.equal(doctype.display(doctype.union({ word, doctype.STRING })), "string")
+	test.equal(doctype.display(doctype.union({ doctype.STRING, word })), "string")
+	test.equal(doctype.display(doctype.union({ seed, doctype.parse("string") })), "20261024|string",
+		"a literal with no base of its own keeps its value")
 end)
 
 test.it("reads a field marked optional on its own name", function()

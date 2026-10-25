@@ -131,6 +131,36 @@ test.it("reads a module the engine ships from the definitions", function()
 	test.equal(warm["cdef"].documentation, cold["cdef"].documentation, "down to the documentation")
 end)
 
+test.it("completes a module required by the expression it is", function()
+	-- The type of `require("ffi")` belongs to the call node, not to a local it was assigned to.
+	-- Completion and hover read that node directly, so `require("ffi").` has to offer the same
+	-- fields as `local ffi = require("ffi"); ffi.`.
+	local source = 'require("ffi").'
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/completion",
+		params = {
+			textDocument = { uri = "file:///f.lua" },
+			position = { line = 0, character = #source },
+		},
+	} }, source)
+	local found = {}
+	for _, item in ipairs(results["2"] and results["2"].items or {}) do found[item.label] = item end
+	test.truthy(found.cdef, "a field of the required library")
+	test.truthy(found.new, "and the rest of them")
+
+	local typed = 'require("ffi").C'
+	local narrowed = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/completion",
+		params = {
+			textDocument = { uri = "file:///f.lua" },
+			position = { line = 0, character = #typed },
+		},
+	} }, typed)
+	test.truthy(narrowed["2"] and narrowed["2"].items
+		and narrowed["2"].items[1] and narrowed["2"].items[1].label == "C",
+		"a field prefix filters the same list")
+end)
+
 test.it("offers the definitions' globals beside the names in scope", function()
 	-- Typing `p` has to reach `print`: the definitions declare functions, and their signatures are
 	-- reached through a metatable that `pairs` cannot see through.
@@ -1058,6 +1088,112 @@ test.it("reads a field on a value that may be absent", function()
 	local labels = {}
 	for _, item in ipairs(results["4"] and results["4"].items or {}) do labels[item.label] = true end
 	test.truthy(labels["lower"] and labels["upper"], "and the library is offered after the guard")
+end)
+
+test.it("shows a method's signature, not a local function of the same name", function()
+	-- `handle:read()` is the file method. The local `read` is in scope and spells the same word,
+	-- but it is not what the field resolves to; hover showed its signature instead.
+	local source = table.concat({
+		"---@param path string\n",
+		"---@return string?\n",
+		"local function read(path)\n",
+		"   local handle = io.open(path, \"rb\")\n",
+		"   if not handle then return nil end\n",
+		"   local text = handle:read(\"*a\")\n",
+		"   return text\n",
+		"end\n",
+	}, "")
+	local results = run({
+		request(2, "textDocument/hover", { line = 5, character = 25 }),
+	}, source)
+	local contents = results["2"] and results["2"].contents.value or ""
+	test.truthy(contents:match("handle:read"), "the answer is the file method")
+	test.truthy(contents:match("%*a"), "with the read modes the definitions give it")
+	test.truthy(contents:match("%-> string"), "and the return its mode selects")
+	test.falsy(contents:match("local, declared"), "not the local function of the same spelling")
+end)
+
+test.it("jumps from a method call to the definition it declares", function()
+	-- A method field is not a lexical name, so the jump cannot go through the local `read`; it
+	-- goes to `file:read` in the definitions, or to the method this document declared.
+	local builtin = "local h = assert(io.open(\"x\"))\nh:read(\"*a\")\n"
+	local found = run({ request(2, "textDocument/definition", { line = 1, character = 3 }) }, builtin)
+	local target = found["2"]
+	test.truthy(target and target.uri:match("io%.lua"), "the file method is in the io definitions")
+
+	local own = table.concat({
+		"local T = {}\n",
+		"function T:show() return 1 end\n",
+		"T:show()\n",
+	}, "")
+	local localFound = run({ request(2, "textDocument/definition", { line = 2, character = 3 }) }, own)
+	local localTarget = localFound["2"]
+	test.truthy(localTarget, "a method this document declares is a target")
+	test.equal(localTarget and localTarget.uri, "file:///f.lua")
+	test.equal(localTarget and localTarget.range and localTarget.range.start.line, 1,
+		"and the jump lands on the declaration")
+end)
+
+test.it("reads bit as the bit library, like ffi", function()
+	local source = "local bit = require(\"bit\")\nreturn bit\n"
+	local results = run({ request(2, "textDocument/hover", { line = 0, character = 7 }) }, source)
+	local contents = results["2"] and results["2"].contents.value or ""
+	test.truthy(contents:match("bitlib"), "require(\"bit\") is the bitlib class: " .. contents)
+end)
+
+test.it("offers require paths and the engine's modules", function()
+	local root = PACKAGE_DIR .. "/target/require-completion"
+	os.execute("rm -rf " .. string.format("%q", root) .. " && mkdir -p " .. string.format("%q", root .. "/lib"))
+	local function write(path, text)
+		local handle = assert(io.open(path, "wb"))
+		handle:write(text)
+		handle:close()
+	end
+	write(root .. "/lye.json", '{ "requirePaths": ["./lib/?.lua"] }\n')
+	write(root .. "/lib/thing.lua", "return {}\n")
+	local source = 'local x = require("")\n'
+	local uri = "file://" .. root .. "/main.lua"
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/completion",
+		params = {
+			textDocument = { uri = uri },
+			position = { line = 0, character = 18 },
+		},
+	} }, source, root, uri)
+	local labels = {}
+	for _, item in ipairs(results["2"] and results["2"].items or {}) do labels[item.label] = item end
+	test.truthy(labels["bit"], "the engine's own module")
+	test.truthy(labels["math"], "and another")
+	test.truthy(labels["thing"], "a file a lye.json requirePaths names")
+	test.equal(labels["thing"] and labels["thing"].detail, "require path")
+end)
+
+test.it("narrows the parameter type as the arguments select an overload", function()
+	local source = table.concat({
+		"local h = assert(io.open(\"x\"))\n",
+		"h:read(\n",
+		"h:read(\"*a\")\n",
+	}, "")
+	local open = "h:read("
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/signatureHelp",
+		params = {
+			textDocument = { uri = "file:///f.lua" },
+			position = { line = 1, character = #open },
+		},
+	}, {
+		jsonrpc = "2.0", id = 3, method = "textDocument/signatureHelp",
+		params = {
+			textDocument = { uri = "file:///f.lua" },
+			position = { line = 2, character = 11 },
+		},
+	} }, source)
+	local all = results["2"] and results["2"].signatures and results["2"].signatures[1]
+	local one = results["3"] and results["3"].signatures and results["3"].signatures[1]
+	test.truthy(all and all.label:match("%*a"), "every mode still possible")
+	test.truthy(all and all.label:match("number"), "including a byte count")
+	test.truthy(one and one.label:match("%*a"), "the first argument keeps only its mode")
+	test.truthy(one and one.label:match("%-> string"), "and its return is the overload's")
 end)
 
 return true
