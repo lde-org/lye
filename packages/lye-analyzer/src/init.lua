@@ -1609,6 +1609,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 			if #params > 0 or returned or next(generics) or #predicates > 0 then
 				signatureOfDecl[declaration] = {
 					params = params, returns = returned, generics = generics, predicates = predicates,
+					values = annotationValues(returned),
 				}
 				annotatedBodies[declaration.valueIdx] = true
 			end
@@ -1693,24 +1694,38 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 			isVariadic = true
 			variadic = memo.parse(inlineBody.inlineVariadic, local_) or nil
 		end
-		local returned = signature.returns and signature.returns.type
+		-- Every `---@return` line is a value after the one before it, and a line may itself name
+		-- several after commas. `signature.values` is that list as written; a signature built
+		-- without it still has the first line in `returns`.
+		local written = signature.values
+		local returned
 		-- `---@return T1, T2` and `---@return T...` spread: each returned value is that type.
 		local isSpread = false
-		if returned and returned:sub(-3) == "..." then
-			returned = (returned:sub(1, -4):gsub("%s+$", ""))
-			isSpread = true
+		if not written then
+			returned = signature.returns and signature.returns.type
+			if returned and returned:sub(-3) == "..." then
+				returned = (returned:sub(1, -4):gsub("%s+$", ""))
+				isSpread = true
+			end
+			written = returned and types.splitValues(returned)
+		else
+			local copy = {}
+			for index, text in ipairs(written) do copy[index] = text end
+			written = copy
+			if written[#written] and written[#written]:sub(-3) == "..." then
+				written[#written] = (written[#written]:sub(1, -4):gsub("%s+$", ""))
+				if written[#written] == "" then written[#written] = nil end
+				isSpread = true
+			end
 		end
-		-- `---@return A, B` names two values in order, and the commas inside a signature are not
-		-- separators, which is why this splits at the top level.
-		local written = returned and types.splitValues(returned)
 		local values
 		if written and #written > 1 then
 			values = {}
 			for index, text in ipairs(written) do
 				values[index] = memo.parse(text, local_) or types.UNKNOWN_TYPE
 			end
-			returned = written[1]
 		end
+		if written and written[1] then returned = written[1] end
 		-- A signature that names its parameters but not its return promises nothing about one. A mutable
 		-- unknown says exactly that, and the body's own return is promoted into it in place.
 		local fnType = types.fn(params, (returned and memo.parse(returned, local_)) or types.mutable(),

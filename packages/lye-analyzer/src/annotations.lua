@@ -12,14 +12,26 @@ local memo = require("lye-analyzer.memo")
 local names = require("lye-analyzer.names")
 local targetName = names.targetName
 
---- The values a `@return` names, as text, in order. `---@return A, B` writes two and a single
---- `---@return A` writes one; the description after the type is not part of either.
+--- The values one `@return` line names, as text, in order. A function type has commas of its
+--- own in the values it returns — `fun():integer, V` is one value, not two — while a plain
+--- `---@return A, B` names two.
+---@param annotation lye.doc.Annotation?
+---@return string[]?
+local function returnValues(annotation)
+	local text = annotation and annotation.type
+	if not text then return nil end
+	if text:match("^%s*fu?n%s*[%(<]") or text:match("^%s*function%s*%(") then return { text } end
+	return types.splitValues(text)
+end
+
+--- The values a `@return` name, as text, in order. Several `---@return` lines are one
+--- signature's values in order; the synthetic annotation carries the flattened list.
 ---@param annotation lye.doc.Annotation?
 ---@return string[]?
 local function annotationValues(annotation)
-	local text = annotation and annotation.type
-	if not text then return nil end
-	return types.splitValues(text)
+	if not annotation then return nil end
+	if annotation.values then return annotation.values end
+	return returnValues(annotation)
 end
 
 --- A type arithmetic cannot work on at all. `any`, an unresolved name and a class are not:
@@ -228,7 +240,8 @@ end
 ---@return table<string, string> constraints what a generic name is limited to, by name
 ---@return lye.analyzer.Predicate[] predicates what the call narrows
 local function signatureOf(parsed, file, declaration)
-	local params, returned, generics, constraints, predicates, overloads = {}, nil, {}, {}, {}, {}
+	local params, generics, constraints, predicates, overloads = {}, {}, {}, {}, {}
+	local returns = {}
 	local spanStart = annotationSpan(parsed, declaration)
 	if not spanStart then
 		return params, returned, generics, constraints, predicates, overloads
@@ -281,7 +294,9 @@ local function signatureOf(parsed, file, declaration)
 					negated = negated,
 				}
 			else
-				returned = annotation
+				-- Reading backwards, so each earlier line goes in front of the ones gathered: a
+				-- second `---@return` is another value after the first, not a replacement for it.
+				table.insert(returns, 1, annotation)
 			end
 		elseif annotation.tag == "overload" then
 			-- `---@overload fun(opt?: "collect")` is another shape the call may take, written as a
@@ -292,6 +307,22 @@ local function signatureOf(parsed, file, declaration)
 		elseif annotation.tag == "type" or annotation.tag == "class" then
 			break
 		end
+	end
+	local returned = returns[1]
+	if #returns > 1 then
+		-- One signature can name several values, and `---@return A` followed by `---@return B`
+		-- writes the same two values that `---@return A, B` does. Keep the first line as the
+		-- annotation a caller sees, and carry every value beside it.
+		local values = {}
+		for _, annotation in ipairs(returns) do
+			for _, text in ipairs(returnValues(annotation) or {}) do
+				values[#values + 1] = text
+			end
+		end
+		returned = {
+			tag = "return", type = returns[1].type, typeText = returns[1].typeText,
+			start = returns[1].start, stop = returns[#returns].stop, values = values,
+		}
 	end
 	return params, returned, generics, constraints, predicates, overloads
 end
@@ -347,6 +378,7 @@ end
 
 local annotations = {}
 annotations.annotationValues = annotationValues
+annotations.returnValues = returnValues
 annotations.isNeverNumeric = isNeverNumeric
 annotations.blankBetween = blankBetween
 annotations.annotationSpan = annotationSpan

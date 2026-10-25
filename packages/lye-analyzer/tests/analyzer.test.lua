@@ -493,6 +493,45 @@ test.it("gives each name the value the callee returns at its position", function
 	test.equal(#(result.signatures.inferred.inferredValues or {}), 2, "and the hover has both")
 end)
 
+test.it("reads every `@return` line as another value", function()
+	-- A function returning two values writes two `---@return` lines. The second line adds a
+	-- value after the first; it does not replace it, and it is not read only when the body is
+	-- missing its own returns.
+	local source = table.concat({
+		"---@param x integer\n",
+		"---@param y integer\n",
+		"---@return integer sum the sum of x and y\n",
+		"---@return boolean failed whether there was a failure\n",
+		"local function foo(x, y)\n",
+		"\treturn x + y, false\n",
+		"end\n",
+		"local total, failed = foo(2, 3)\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(typeOf(source, "total"), "number", "the first name takes the first line")
+	test.equal(typeOf(source, "failed"), "boolean", "the second takes the second")
+	test.equal(typeOf(source, "foo"), "fn(number, number) -> number, boolean",
+		"and the signature names both")
+	test.equal(#(result.signatures.foo.values or {}), 2, "the hover has both values")
+
+	-- A definition file is read by the same code, and its functions are reached by name rather
+	-- than through a local: `pcall` has to give both results from its annotations alone.
+	local prelude = analyzer.prelude({
+		defs = table.concat({
+			"---@return boolean ok\n",
+			"---@return any result\n",
+			"function pcall(f) end\n",
+		}, ""),
+	})
+	local called = analyzer.analyze("local ok, value = pcall(function() return 1 end)\n", prelude)
+	for _, variable in ipairs(called.variables) do
+		if variable.name == "ok" or variable.name == "value" then
+			local shown = types.display(analyzer.typeAt(called, variable, #called.parser.source))
+			test.equal(shown, variable.name == "ok" and "boolean" or "any")
+		end
+	end
+end)
+
 test.it("infers what a function returns from its body", function()
 	test.equal(typeOf("local function f() return 1 end", "f"), "fn() -> 1")
 	test.equal(typeOf("local function f(a) if a then return 1 end return \"s\" end", "f"),

@@ -156,6 +156,30 @@ local typing = {}
 	-- built by hand — a test's — has none, and parses as it always did.
 	local parseType = ctx.typeOfText or function(text) return memo.parse(text, resolve) end
 
+	-- A value after the first from a signature that names several. A local's callable already
+	-- carries them, but a definition file's function is reached by name and its signature values
+	-- are the only record of the second and later results.
+	---@param signature lye.analyzer.Signature
+	---@param node lye.parser.Node
+	---@param position integer
+	---@return lye.doc.Type?
+	local function signatureValue(signature, node, position)
+		local written = signature.values and signature.values[position]
+		if not written then return nil end
+		local generics = signature.generics
+		if not generics or not next(generics) then return parseType(written) end
+		local bindings = {}
+		for index, argIdx in ipairs(node.args or {}) do
+			local wanted = signature.params[index]
+			local actual = infer.at(inferCtx, argIdx)
+			if wanted and wanted.type and actual then
+				infer.bind(parseType(wanted.type), actual, generics, bindings)
+			end
+		end
+		local fallback = withGenerics(generics, signature.constraints, resolve)
+		return types.parse(written, function(text) return bindings[text] or fallback(text) end)
+	end
+
 	-- The resolver a generic return is read with at a call: the bindings from that call's
 	-- arguments first, the signature's own limits behind them. The state is what the loop sets,
 	-- so the function is made once rather than per call site — a closure made in the loop stops
@@ -210,11 +234,13 @@ local typing = {}
 					-- end to reach: what this call was bound to is what its second name takes too.
 					if position > 1 and assignment.valueIdx then
 						local node = parsed.nodes[assignment.valueIdx]
-						local signature = node and node.kind == "call" and node.callee
-							and signatures[node.callee]
+						local signature = node and node.kind == "call" and signatureOfCall(node)
 						local returned = signature and signature.returns and signature.returns.type
 						if returned and returned:sub(-3) == "..." then
 							settled = inferCtx.callTypes[node.index] or settled
+						end
+						if signature and (not settled or types.isMutable(settled) or settled.variant == "unknown") then
+							settled = signatureValue(signature, node, position) or settled
 						end
 					end
 					-- The placeholder an assignment started as is shared with everything that read the variable before
@@ -237,11 +263,14 @@ local typing = {}
 				-- `local a, b = unpack(list)` is what the call was bound to as much as the first.
 				if position > 1 and declaration.valueIdx then
 					local node = parsed.nodes[declaration.valueIdx]
-					local signature = node and node.kind == "call" and node.callee
-						and signatures[node.callee]
+					local signature = node and node.kind == "call" and signatureOfCall(node)
 					local returned = signature and signature.returns and signature.returns.type
 					if returned and returned:sub(-3) == "..." then
 						variable.initializer = inferCtx.callTypes[node.index] or variable.initializer
+					end
+					if signature and (not variable.initializer or types.isMutable(variable.initializer)
+						or variable.initializer.variant == "unknown") then
+						variable.initializer = signatureValue(signature, node, position) or variable.initializer
 					end
 				end
 				-- A declared type says what the value is, and the initializer may say what Lua

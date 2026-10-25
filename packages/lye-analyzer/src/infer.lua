@@ -449,7 +449,10 @@ function infer.valuesAt(ctx, idx, position)
 		-- that returns two values is read the same way. A name of the signature's own binds from
 		-- this call, so the second value is as substituted as the first.
 		if calleeType.values then
+			-- A spread gives every value after the last one it names, so a position past the list
+			-- still has the type of that last value rather than nil.
 			local value = calleeType.values[position]
+				or (calleeType.isSpread and calleeType.values[#calleeType.values])
 			if not value then return types.NIL_TYPE end
 			if calleeType.generics and next(calleeType.generics) then
 				local bindings = {}
