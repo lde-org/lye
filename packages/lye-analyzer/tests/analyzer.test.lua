@@ -959,6 +959,32 @@ test.it("narrows an elseif branch by the conditions before it", function()
 	test.equal(typeAtOffset(source, "y", offsetOf(source, "print(y)")), "nil")
 end)
 
+test.it("keeps a discriminated union's comparisons apart across an elseif chain", function()
+	-- A field of a union is every member's value for it, so comparing `node.type` with `"bool"`
+	-- after `"ident"` was ruled out is a test, not a comparison with one impossible value. The
+	-- narrowing itself stays in the branch that made it: the first body is the `ident` member,
+	-- the second the other two, and after the chain the field is all three again.
+	local source = table.concat({
+		'---@type { type: "ident", value: string } | { type: "bool", value: boolean } | { type: "number", value: number }\n',
+		'local node = { type = "ident", value = "x" }\n',
+		'if node.type == "ident" then\n',
+		'\tlocal ident = node.value\n',
+		'elseif node.type == "bool" or node.type == "number" then\n',
+		'\tlocal other = node.value\n',
+		'end\n',
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 0, "the later comparisons are not judged against the first branch")
+	test.equal(typeAtOffset(source, "node", assert(source:find("local ident", 1, true))),
+		'{ type: "ident", value: string }', "the first body keeps the member its condition proved")
+	test.equal(typeAtOffset(source, "node", assert(source:find("local other", 1, true))),
+		'{ type: "bool", value: boolean }|{ type: "number", value: number }',
+		"the later branch keeps only the members its condition allows")
+	test.equal(typeAtOffset(source, "node", #source),
+		'{ type: "bool", value: boolean }|{ type: "ident", value: string }|{ type: "number", value: number }',
+		"and nothing narrows once the chain is over")
+end)
+
 test.it("narrows every else branch of a chain by the conditions before it", function()
 	local source = table.concat({
 		"---@type string|number\n",

@@ -1047,12 +1047,22 @@ end
 ---@return lye.doc.Type
 function types.indexResult(target, field)
 	if target.variant == "unknown" or target.variant == "any" then return types.mutable() end
-	-- A value that may be more than one thing reads the field off whichever member has it, which is
-	-- the only one that can answer: `local raw = onWindows and require("a.windows") or require("a.posix")`
-	-- is a union of two modules, and asking it for a field read as unknown when one of them had it.
+	-- A value that may be more than one thing reads the field off every member that has it, and the
+	-- answer is the union of what they hold: a discriminated union's `type` is every literal its
+	-- members spell, not just the first one's. A member without the field cannot answer, so it adds
+	-- nothing rather than making the read unknown — `local raw = onWindows and require("a.windows")
+	-- or require("a.posix")` is a union of two modules, and one of them lacking a field the other
+	-- has is not a reason to forget the one that does.
 	if target.variant == "union" and field then
-		local found = types.fieldOf(target, field)
-		if found then return found end
+		local parts = {}
+		for _, member in ipairs(target.types) do
+			local found = types.fieldOf(member, field)
+			if not found and member.variant == "object" and member.indexed and member.indexed.key == "string" then
+				found = member.indexed.type
+			end
+			if found then parts[#parts + 1] = found end
+		end
+		if #parts > 0 then return types.union(parts) end
 	end
 	if target.variant == "object" and field then
 		local found = types.fieldOf(target, field)

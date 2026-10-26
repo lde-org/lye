@@ -197,6 +197,18 @@ test.it("keeps the members a narrowing rule allows", function()
 		"and the same for any")
 end)
 
+test.it("reads a field of a union as the union of the fields its members hold", function()
+	-- A discriminant is the field every member holds, and the read has to name all of them:
+	-- taking the first member's value made every comparison against another member's value look
+	-- impossible, which is what broke a chain of `elseif node.type == ...`.
+	local node = doctype.parse('{ type: "ident", value: string } | { type: "bool", value: boolean }'
+		.. ' | { type: "number", value: number }')
+	test.equal(doctype.display(doctype.indexResult(node, "type")), '"bool"|"ident"|"number"')
+	test.equal(doctype.display(doctype.indexResult(node, "value")), "boolean|number|string")
+	test.equal(doctype.display(doctype.indexResult(doctype.parse('{ foo: number } | { bar: string }'), "foo")),
+		"number", "a member without the field adds nothing")
+end)
+
 test.it("narrows to nothing when a rule rules every member out", function()
 	-- A single type the rule removes leaves nothing, and `and nil or type` would hand the
 	-- type back instead of saying so.
