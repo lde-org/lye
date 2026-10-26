@@ -4,34 +4,75 @@
 
 # lye
 
-**An incredibly fast and powerful language server written in and for LuaJIT**
-
-`3.6 ms` to diagnostics, `12.6 MiB` resident, `13.5k` lines of Lua.
+**The LuaJIT-first language server.**
+`4.8 ms` to diagnostics on a 63-line file · `14.6 MiB` resident · one standalone binary.
 
 </div>
 
-## What it is
+`lye` is a language server for [LuaJIT](https://luajit.org): inferred types, completion, hover,
+definitions, references, rename, symbols, signature help, inlay hints, semantic tokens, formatting
+and diagnostics. It is written in LuaJIT: it parses the engine's 3.0 syntax backports and needs no
+Lua runtime, no `lde`, and no packages to install.
 
-`lye` is a language server for [LuaJIT](https://luajit.org): diagnostics, hover with an inferred type,
-go-to-definition, semantic tokens and completion — including LuaJIT's LuaJIT 3.0 syntax backports.
+## Why lye
 
-It is written in the language it serves, compiles to one standalone executable, and needs no Lua, no
-`lde` and no dependencies on the machine that runs it.
+| Capability | lye | LuaLS | EmmyLua-RS |
+|---|:---:|:---:|:---:|
+| LuaJIT FFI: `ffi.cdef` parsed into typed C declarations | ✅ | partial [^5] | — |
+| Generic classes and generic functions | ✅ | partial [^1] | ✅ |
+| Overloads with call-site signature narrowing | ✅ | partial [^2] | ✅ |
+| Type mismatches are LSP Errors by default | ✅ | config [^3] | config [^3] |
+| Dialect plugins: lowering, tokens, types, `require` completion | ✅ | partial [^4] | — |
+| lde `target/` module resolution | ✅ | — | — |
 
-## Features
+[^1]: LuaLS generics — [#1861](https://github.com/LuaLS/lua-language-server/issues/1861).
+[^2]: LuaLS overloads — [#1456](https://github.com/LuaLS/lua-language-server/issues/1456).
+[^3]: Both servers expose configurable diagnostic severities; lye defaults type mismatches to Error.
+[^4]: LuaLS has plugin hooks for text/AST transforms and require resolution, but no unified lower/tokens/types/completion pipeline.
+[^5]: LuaLS parses cdefs through the manual `Lua: Reload luajit ffi meta` command and maps 64-bit scalars to `integer`; lye parses every block automatically and keeps the C types.
 
-- **Types from the code** — inferred, evolved as a name is assigned, narrowed by the conditions above it
-- **Annotations** — LuaLS's `---@` language: classes, generics, literal values, `as`, `never`, consts
-- **`ffi`, properly** — `ffi.cdef` is parsed, so `ffi.new("Vec")` is a `Vec` and `v.nope` is reported
-- **C types that are C types** — arrays are `ffi.array<T, N>` and indexable, pointers are `ffi.ptr<T>`, and a 64-bit scalar is `ffi.size_t` rather than a `number`
-- **Callbacks are typed** — a function cast to a C callback keeps the header's parameter types
-- **`require`, the lde way** — `<package>/target/?.lua`, plus `ffi`, `jit`, `string.buffer` and friends
-- **The standard library** — LuaJIT's and Lua 5.1's, from eighteen definition files
-- **The workspace, resolved** — on startup the whole workspace is read for what it declares, so a type named in a file nothing requires yet is already known, and what a `require` came to is kept between sessions, keyed by the file, the workspace's annotations, the package's links and the documents that were open. A session that agrees on all of those reports on an open file in a fraction of the time the first one took; `LYE_CACHE=off` turns the keeping off
-- **Headless too** — the same binary checks files for CI: `lye --check src/**.lua`, handing each package to a worker process so the batch runs on the machine's cores (`LYE_WORKERS=1` checks in one)
-- **Checked once, remembered** — what a check finds for a file is kept between runs, keyed by the file's own text and by everything it was read against (the batch's annotations, the package's `target/`, and the modules it requires). A tree that has not changed since the last run reports in about a tenth of a second; a file that changed is checked again only where that change can reach. Everything a run keeps lives under `./.lye` beside the project it was called in — `--cache <dir>` or `LYE_CACHE_DIR` says otherwise, `--cold` checks everything again and keeps nothing, and `LYE_CACHE=off` turns the keeping off
+## Types
 
-## Examples
+`lye`'s type system is built for LuaJIT:
+
+- inference from assignments, calls, tables and returns; a local's type evolves as it is reassigned
+- flow narrowing for truthiness, `nil` comparisons, `type(x)` guards, discriminated unions and
+  early returns
+- generic classes and functions with constraints; overloads are checked at the call site and
+  narrowed in signature help
+- LuaLS `---@` annotations: classes, aliases, literal/union/`never`/`const` types, casts and `as`
+- LuaJIT's and Lua 5.1's standard library, from eighteen definition files, drives hover and
+  completion
+- FFI types are ordinary types, not `cdata` boxes
+- type mismatches are LSP **Errors** and fail `lye --check`; they are never downgraded to hints
+
+LuaLS still tracks generics in [#1861](https://github.com/LuaLS/lua-language-server/issues/1861);
+`lye` implements generics and overloads now, and neither competitor makes FFI-derived types
+first-class.
+
+```lua
+---@generic T
+---@param value T
+---@return T
+local function id(value) return value end
+
+---@param n number
+local function takesNumber(n) end
+
+local s = id("lye") -- string
+takesNumber(s)      -- error: takesNumber expects number, got string
+```
+
+## LuaJIT and FFI
+
+The shipped `ffi` plugin parses every `ffi.cdef` block in a file:
+
+- structs, unions, enums, typedefs, function pointers, arrays and bitfields
+- fixed arrays as `ffi.array<T, N>`, scalar pointers as `ffi.ptr<T>`, 64-bit scalars as
+  `ffi.size_t`/`ffi.int64_t`/…, callbacks as `ffi.cb`
+- `ffi.new`, `ffi.cast`, `ffi.typeof`, `ffi.load` and `ffi.C` typed from the file's declarations
+- inline callbacks get the header's parameter types, and their returns are checked
+- semantic tokens colour the C inside the cdef block
 
 ```lua
 local ffi = require("ffi")
@@ -41,82 +82,73 @@ ffi.cdef[[
 	typedef size_t (*write_cb)(char *ptr, size_t size, void *userdata);
 ]]
 
-local v = ffi.new("Vec")      -- v: Vec
+local v = ffi.new("Vec")      -- Vec
 v.x = 1.5                     -- ok
-v.nope = 1                    -- `nope` is not a field of Vec
-
-local size = ffi.new("size_t")
-local wrong = size[1]         -- ffi.size_t cannot be indexed by a number
+v.nope = 1                    -- error: `nope` is not a field of Vec
 
 local write = ffi.cast("write_cb", function(ptr, size, _)
-	return size * 2           -- ptr: ffi.ptr<ffi.char>, size: ffi.size_t, result checked
+	return size * 2           -- ptr: ffi.ptr<ffi.char>, size: ffi.size_t
 end)
+
+local ints = ffi.new("int[4]") -- ffi.array<ffi.int, 4>
+local first = ints[0]          -- ffi.int
 ```
 
-```lua
-local numbers = ffi.new("int[4]")     -- ffi.array<ffi.int, 4>
-local first = numbers[0]              -- ffi.int
+`!ffi` turns it off; the same file still reads as plain Lua.
 
-local curl = ffi.load("curl")         -- the functions this file's cdef declared
-local handle = curl.curl_easy_init()
-curl.curl_easy_send("not a handle", nil, 0)
--- curl.curl_easy_send expects ffi.ptr<ffi.cdata*>, got "not a handle"
+## Speed
+
+Measured on one machine with one harness; medians:
+
+| | lye | LuaLS | EmmyLua-RS |
+|---|---:|---:|---:|
+| keystroke → diagnostics (63-line fixture) | **4.78 ms** | 201.73 ms | 503.37 ms |
+| resident (63-line fixture) | **14.6 MiB** | 35.0 MiB | 66.0 MiB |
+| keystroke → diagnostics (2331-line file) | **82.6 ms** | 207.52 ms | 514.06 ms |
+| resident (2331-line file) | **42.4 MiB** | 47.9 MiB | 76.9 MiB |
+
+## Plugins
+
+A workspace lists plugins in `lye.json` — a path, an installed module name, or `!name` to disable
+a shipped plugin (`patterns`, `formats`, `ffi`):
+
+```json
+{ "plugins": ["./tools/moonscript.lua", "lye-plugin-moonscript", "!patterns"] }
 ```
 
-```lua
----@param name string
----@return string?
-local function greet(name) end
+A plugin answers one or more hooks:
 
-local who = "world"
-local greeting = greet(who)           -- string?
-if greeting then
-	local loud = greeting:upper()     -- string
-end
+| Hook | Adds |
+|---|---|
+| `lower` | edits that turn another language into Lua, with positions mapped back to the original |
+| `tokens` | semantic tokens; a plugin's span wins over the built-in walk |
+| `types` | classes, aliases and providers for calls, fields, parameters and callback returns |
+| `complete` | module names inside `require("...")` |
+
+The built-in `lye-plugin-require` supplies the `require` completion hook. A plugin's
+`extensions = { "moon" }` makes `lye check .` walk a dialect's files; one plugin can carry syntax,
+colour, types and autocomplete. `packages/lye-plugin` documents the interface.
+
+## lde
+
+`lye` is [lde](https://lde.sh)-first. `lde run -C <package>` resolves a module against
+`<package>/target/?.lua` and `<package>/target/?/init.lua`, and `target/` holds a link per
+dependency. `lye` finds the nearest `lde.json`, resolves `require` through the same target layout,
+indexes the types linked into `target/`, and offers those modules in completion — with nothing to
+configure. A document resolves against its own package, so siblings, dependencies and monorepo
+packages all work.
+
+For a project not laid out that way, `lye.json` can name search paths the way `package.path` does:
+
+```json
+{ "requirePaths": ["lib/?.lua", "vendor/?/init.lua"] }
 ```
 
-## Numbers
+## Command line
 
-Measured with `editors/vscode/tests/compare.mjs` on one machine, one fixture, one harness. The
-second pair is a real 2331-line file of another project rather than a fixture written to be easy:
-
-| | lye | LuaLS | EmmyLua |
-|---|---|---|---|
-| keystroke → diagnostics (74-line fixture) | **3.6 ms** | 201.17 ms | 502.55 ms |
-| resident | **12.6 MiB** | 34.9 MiB | 64.6 MiB |
-| keystroke → diagnostics (2331-line file) | **59 ms** | 208.95 ms | 513.05 ms |
-| resident | **41 MiB** | 46.3 MiB | 86.6 MiB |
-
-Runs vary, so read the times as within about a tenth. lye's figures are medians of interleaved runs;
-the other two servers' are as last measured with this same harness on this machine.
-
-Most of the 2331-line file's residency is the JIT. One analysis of a file that size compiles
-thousands of traces and LuaJIT's default cache holds a thousand, so out of the box it flushes and
-refills for as long as the server runs — that is the 98 ms and 31 MiB row. Keeping the traces takes
-the file to 59 ms and 41 MiB.
-
-Semantic tokens come with their own number, since colouring a whole file at once is the request no
-editor batches: on the 2331-line file lye answers 9884 tokens in 34 ms, LuaLS 4089 tokens in
-95.19 ms, EmmyLua 9581 tokens in 7.20 ms.
-
-What a process holds is the runtime and the allocator's high-water mark more than the shape of one
-tree, which is why the memory work went into the collector — `collectgarbage("setpause", 150)` took
-28.4 MiB to 22.3 for one line — rather than into the parser's node tables, which a full ffi arena
-would cut by about a megabyte, 4% of what an editor sees.
-
-`tools/memory.lua` reports where one document's memory goes — 0.79 MiB to lex it, 2.30 MiB to parse
-it (1.20 of that the node tables, 316 bytes a node), 0.87 MiB for the definitions, 3.92 MiB for the
-analysis itself — and `tools/sweep.lua` type-checks this repository with the same analyzer, which is
-what keeps the numbers above honest about the code that produced them.
-
-A session reports its own startup on stderr: `lye timing: initialize=…` and
-`lye timing: workspace-scan=…ms files=…` are always written, and `LYE_TIMING=1` adds a mark per open,
-analysis, keystroke, token build and plugin walk. `tools/latency.mjs` drives the real server over
-stdio and prints those marks beside the editor's phases — `COLD=1` makes every round a first run, and
-`FILE=` opens a typical file rather than the largest. `tools/bench-plugins.lua` times the shipped
-token hooks against the same document with each one off: on the largest source file the three hooks
-answer in 3–4 ms of a 73–93 ms token build, and the spec tables a session keeps per package are a
-few KiB, so the plugin layer is not where a keystroke goes — the analyzer and the parser are.
+`lye check [paths...]` checks a tree in CI, handing each package to a worker (`LYE_WORKERS=1` for
+one). Results are cached under `./.lye`; `--cache <dir>` or `LYE_CACHE_DIR` moves it, `--cold` and
+`LYE_CACHE=off` disable reuse. `lye init` writes `lye.json`.
 
 ## Editors
 
@@ -130,7 +162,6 @@ Run `npm install && npm run package` in `editors/vscode`.
 
 ### Neovim
 
-A minimal configuration would look like this:
 ```lua
 vim.lsp.config("lye", {
   cmd = { "lye", "--stdio" },
@@ -143,44 +174,3 @@ vim.lsp.enable("lye")
 ### Anything else
 
 Speak LSP to `lye --stdio`.
-
-## Plugins
-
-A workspace can add to what lye knows, in a `lye.json` that lists the plugins its files are read
-with — a path for a file of the workspace's own, a name for a module the package installed with
-`lde add`, and `!name` to turn off one lye ships. `lye init` writes the file:
-
-```json
-{ "plugins": ["./tools/moonscript.lua", "lye-plugin-moonscript", "!patterns"] }
-```
-
-A plugin answers one or more of three hooks, and names the files its language is written in. `lower`
-turns a document into Lua — the plugin compiles what it can and says where each piece came from, lye
-reads the result and reports in the original, so a fault inside a synthesized line lands on the line
-the reader wrote, and something like MoonScript gets the analysis lye would give the Lua it compiles
-to. `tokens` adds colours of its own, for a language or a library lye does not know: a plugin's span
-wins over what lye's own walk found, so it can colour `%d` inside a literal without hiding the
-literal. `types` contributes classes, aliases and the types of the calls and fields only it
-understands. `lye check` reads a package through the same plugins, and its walk reaches the files
-they claim — `extensions = { "moon" }` is what makes `lye check .` check a MoonScript project.
-
-lye's own pattern, format and ffi handling are plugins now. The ffi plugin owns the whole dialect:
-it reads every `ffi.cdef` block, contributes the C types it declares and the results of `ffi.new`,
-`ffi.cast`, `ffi.load` and `ffi.C`, and colours the same block. Turn it off with `"!ffi"` and the
-file still reads without that knowledge, which is the point: a plugin can carry a dialect all the
-way through types and colours. `packages/lye-plugin` documents the interface and what each context
-carries; the shipped plugins are the worked examples.
-
-## lde projects
-
-`lde run -C <package>` resolves a module against `<package>/target/?.lua` and
-`<package>/target/?/init.lua`, and `target/` holds a link per dependency. `lye` resolves `require` the
-same way, against the package the document belongs to, so a module of the package itself and a
-sibling package both resolve with nothing to configure.
-
-A project that is not laid out that way can say where its modules are, in a `lye.json` at the package
-or the workspace root, using patterns the way `package.path` writes them:
-
-```json
-{ "requirePaths": ["lib/?.lua", "vendor/?/init.lua"] }
-```
