@@ -11,7 +11,9 @@ local doctype = require("lye-doc.type")
 ---@param source string
 ---@return lye.doc.Namespace
 local function read(source)
-	return classes.read(doc.parse(source))
+	local file = doc.parse(source)
+	---@cast file lye.doc.File
+	return classes.read(file)
 end
 
 --- The fields of a class as `name: type` strings, sorted, so a test can compare them.
@@ -20,8 +22,11 @@ end
 ---@return string[]
 local function fields(namespace, text)
 	local found = classes.fieldsOf(namespace, text)
+	---@cast found table<string, lye.doc.Field>
 	local out = {}
 	for name, field in pairs(found) do
+		---@cast name string
+		---@cast field lye.doc.Field
 		out[#out + 1] = name .. ": " .. field.type
 	end
 	table.sort(out)
@@ -128,6 +133,7 @@ test.it("reads a field's visibility, inline and on its own line", function()
 		"local Account = {}\n",
 	}, ""))
 	local found = classes.fieldsOf(namespace, "Account")
+	---@cast found table<string, lye.doc.Field>
 	test.equal(found.name.visibility, "public")
 	test.equal(found.balance.visibility, "private")
 	test.equal(found.secret.visibility, "protected")
@@ -142,7 +148,9 @@ test.it("carries visibility through extension", function()
 		"---@field name string\n",
 		"local Child = {}\n",
 	}, ""))
-	test.equal(classes.fieldsOf(namespace, "Child").id.visibility, "private")
+	local childFields = classes.fieldsOf(namespace, "Child")
+	---@cast childFields table<string, lye.doc.Field>
+	test.equal(childFields.id.visibility, "private")
 end)
 
 test.it("reads an optional field", function()
@@ -162,6 +170,7 @@ test.it("substitutes the arguments of a generic alias", function()
 	local namespace = read("---@alias ArrayOfNumberLike<T: number> T[]\n")
 	test.equal(namespace.aliases.ArrayOfNumberLike.body, "T[]", "the limit is not part of the body")
 	local resolve = classes.resolver(namespace)
+	---@cast resolve fun(name: string): lye.doc.Type
 	test.equal(doctype.display(resolve("ArrayOfNumberLike<number>")), "number[]")
 	test.equal(doctype.display(resolve("ArrayOfNumberLike<string>")), "string[]")
 	test.equal(doctype.display(resolve("ArrayOfNumberLike")), "unknown[]",
@@ -176,6 +185,7 @@ test.it("reads an alias that names a class declared below it", function()
 		"local Point = {}\n",
 	}, ""))
 	local resolve = classes.resolver(namespace)
+	---@cast resolve fun(name: string): lye.doc.Type
 	test.equal(doctype.display(resolve("Ids")), "Point[]",
 		"the body is resolved where it is used, so a class below it is found")
 end)
@@ -191,12 +201,19 @@ test.it("resolves every name a run of files declares against the whole run", fun
 	-- analysis these types rather than the names alone, so a table built for one is checked
 	-- against what the class says.
 	local point = doc.parse("---@class Point\n---@field x number\nlocal Point = {}\n")
+	---@cast point lye.doc.File
 	local aliases = doc.parse("---@alias Points Point[]\n")
+	---@cast aliases lye.doc.File
 	local declared = classes.declare({ point, aliases })
-	test.equal(declared.Point.variant, "class", "the class is the class")
-	test.equal(doctype.display(declared.Point.fields.x), "number", "with the field it declares")
-	test.equal(declared.Points.type.variant, "class", "and the alias read the other file's class")
-	test.equal(declared.Points.type.name, "Point")
+	---@cast declared table<string, lye.doc.Type>
+	local classType = declared.Point
+	---@cast classType { variant: string, fields: table<string, lye.doc.Type> }
+	test.equal(classType.variant, "class", "the class is the class")
+	test.equal(doctype.display(classType.fields.x), "number", "with the field it declares")
+	local aliasType = declared.Points
+	---@cast aliasType { type: { variant: string, name: string } }
+	test.equal(aliasType.type.variant, "class", "and the alias read the other file's class")
+	test.equal(aliasType.type.name, "Point")
 end)
 
 test.it("keeps the name of a parameter that carries a limit", function()
@@ -205,7 +222,9 @@ test.it("keeps the name of a parameter that carries a limit", function()
 	test.equal(table.concat(namespace.classes.Box.params, ","), "T",
 		"the limit is not part of the parameter's name")
 	local resolve = classes.resolver(namespace)
-	test.equal(doctype.display(resolve("Box<string>").fields.item), "string")
+	local boxType = resolve("Box<string>")
+	---@cast boxType { fields: table<string, lye.doc.Type> }
+	test.equal(doctype.display(boxType.fields.item), "string")
 end)
 
 test.it("reads a class whose name carries the internal marker", function()
@@ -230,6 +249,7 @@ end)
 test.it("substitutes an argument into arithmetic in a type", function()
 	local namespace = read("---@alias F<A, const B: number> { x: A[], y: B + 2 }\n")
 	local resolve = classes.resolver(namespace)
+	---@cast resolve fun(name: string): lye.doc.Type
 	local types = doctype
 	test.equal(types.display(resolve("F<string, 5>")), "{ x: string[], y: 7 }",
 		"the arithmetic is worked out where the type is used")

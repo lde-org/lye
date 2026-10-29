@@ -20,11 +20,19 @@ local timing = require("lye-lsp.timing")
 ---@type { names: table<unknown, string>, tables: table<string, unknown> }?
 local preludeTypes
 
+--- The shape the analyzer's prepared prelude adds to `lye.analyzer.Prelude`.
+---@class lye.ModulesPrelude
+---@field evolved table<string, table<string, unknown>>?
+---@field built table<string, unknown>?
+---@field aliases table<string, unknown>
+---@field returns table<string, unknown>
+
 ---@param prelude table
----@return { names: table<unknown, string>, tables: table<string, unknown> }
 local function namedPreludeTypes(prelude)
 	if preludeTypes then return preludeTypes end
-	local names, tables = {}, {}
+	---@cast prelude lye.ModulesPrelude
+	local names = {} ---@type table<unknown, string>
+	local tables = {} ---@type table<string, unknown>
 	if not prelude then return { names = names, tables = tables } end
 	---@param held unknown
 	---@param name string
@@ -36,11 +44,25 @@ local function namedPreludeTypes(prelude)
 	-- A field's type is what the completion looks a signature up by, so it needs its name most:
 	-- `evolved` is where the definitions' methods were put as they were declared.
 	for className, fields in pairs(prelude.evolved or {}) do
-		for field, held in pairs(fields) do add(held, "field:" .. className .. "." .. field) end
+		---@cast className string
+		---@cast fields table<string, unknown>
+		for field, held in pairs(fields) do
+			---@cast field string
+			add(held, "field:" .. className .. "." .. field)
+		end
 	end
-	for name, alias in pairs(prelude.aliases) do add(alias, "alias:" .. name) end
-	for name, held in pairs(prelude.returns) do add(held, "return:" .. name) end
-	for text, held in pairs(prelude.built or {}) do add(held, "built:" .. text) end
+	for name, alias in pairs(prelude.aliases) do
+		---@cast name string
+		add(alias, "alias:" .. name)
+	end
+	for name, held in pairs(prelude.returns) do
+		---@cast name string
+		add(held, "return:" .. name)
+	end
+	for text, held in pairs(prelude.built or {}) do
+		---@cast text string
+		add(held, "built:" .. text)
+	end
 	preludeTypes = { names = names, tables = tables }
 	return preludeTypes
 end
@@ -49,9 +71,9 @@ end
 --- strings; a recursive class is a cycle, so each table is counted once. The walk is bounded so a
 --- pathological graph cannot make a keystroke pay for the bookkeeping.
 ---@param value unknown
----@return integer
 local function estimateBytes(value)
 	local seen, left = {}, 2048
+	---@param held unknown
 	local function walk(held)
 		if left <= 0 then return 0 end
 		left -= 1
@@ -84,10 +106,9 @@ end
 --- A copy of a type graph whose fields are inserted in a fixed order, so `serial.write` writes the
 --- same bytes for the same structure however the table's hash slots happen to be laid out. Shared
 --- tables and cycles stay shared; named tables are kept, because the writer refers to them.
----@param value unknown
+---@param value any
 ---@param known { names: table<unknown, string>, tables: table<string, unknown> }
 ---@param seen table<table, table>?
----@return unknown
 local function canonical(value, known, seen)
 	if type(value) ~= "table" then return value end
 	if known.names[value] or SINGLETONS[value] then return value end
@@ -119,7 +140,6 @@ end
 --- the same on both sides while keeping shared tables and cyclic classes as the tables they are.
 ---@param held lye.doc.Type?
 ---@param known { names: table<unknown, string>, tables: table<string, unknown> }
----@return string?
 local function typeHash(held, known)
 	if held == false or held == nil then return rapidhash.hex("false") end
 	local text = serial.write(canonical(held, known), known)
@@ -129,6 +149,14 @@ end
 
 --- What one resolved module is kept as: its own text and exported type, what they hash to, and the
 --- requires and declaration names the key depended on, so an unrelated change can leave it alone.
+--- What a caller hands `keep` when part of the record is already known.
+---@class lye.ModuleRecordSeed
+---@field textHash string?
+---@field typeHash string?
+---@field requires table<string, { path: string?, textHash: string?, typeHash: string? }>?
+---@field declarationNames table<string, boolean>?
+---@field key string?
+
 ---@class lye.ModuleRecord
 ---@field text string the source the type was read from
 ---@field textHash string
@@ -166,7 +194,6 @@ Modules.MAX_MODULE_BYTES = MAX_MODULE_BYTES
 
 ---@param lye lye.Server
 ---@param options { maxBytes: integer? }? a budget other than the default, for a test or a host
----@return lye.Modules
 function Modules.new(lye, options)
 	return setmetatable({
 		lye = lye, entries = {}, requiring = {}, blocked = {}, hits = 0, misses = 0, bytes = 0,
@@ -178,7 +205,6 @@ end
 --- Say this entry was just used. One stamp per lookup is all the order needs.
 ---@param self lye.Modules
 ---@param entry lye.ModuleRecord
----@return lye.ModuleRecord
 local function touched(self, entry)
 	self.clock += 1
 	entry.used = self.clock
@@ -218,8 +244,7 @@ end
 ---@param text string
 ---@param held lye.doc.Type?
 ---@param known { names: table<unknown, string>, tables: table<string, unknown> }
----@param record lye.ModuleRecord?
----@return lye.ModuleRecord
+---@param record lye.ModuleRecordSeed?
 function Modules:keep(path, text, held, known, record)
 	local previous = self.entries[path]
 	if previous then self.bytes -= previous.bytes end
@@ -233,6 +258,7 @@ function Modules:keep(path, text, held, known, record)
 		declarationNames = record and record.declarationNames,
 		key = record and record.key,
 		bytes = bytes,
+		used = 0,
 	}
 	self.entries[path] = entry
 	self.bytes += bytes
@@ -270,14 +296,15 @@ end
 --- entries already kept — an analysis of the file being kept has just asked for them — so a key
 --- never pays for a second analysis.
 ---@param self lye.Modules
----@param names table<string, boolean>?
 ---@param from string
----@return table<string, { path: string?, textHash: string?, typeHash: string? }>?
-function Modules:requiresOf(names, from)
+---@param names table<string, boolean>?
+function Modules:requiresOf(from, names)
 	if not names then return nil end
 	local requires = {}
 	for name in pairs(names) do
+		---@cast name string
 		local path = self.lye.declarations:moduleFile(name, from)
+		---@cast path string?
 		local held = path and self.entries[path]
 		local textHash = held and held.textHash
 		if path and not textHash then
@@ -304,7 +331,6 @@ end
 ---@param name string
 ---@param from string? the document the require is written in, which is what says which package it
 --- resolves within
----@return lye.doc.Type?
 ---@param self lye.Modules
 function Modules:type(name, from)
 	local started = timing.detailed() and timing.now() or nil
@@ -330,11 +356,11 @@ end
 --- what lets a later change leave it alone.
 ---@param name string
 ---@param from string?
----@return lye.doc.Type?
 ---@param self lye.Modules
 function Modules:resolve(name, from)
 	local lye = self.lye
 	local path = lye.declarations:moduleFile(name, from)
+	---@cast path string?
 	if not path then return nil end
 	if self.requiring[path] then return nil end
 
@@ -372,11 +398,11 @@ function Modules:resolve(name, from)
 	-- A document that is open has been analysed in full, and that analysis already says what
 	-- `require` of it gives back: reading it again as a module is the same work for the same
 	-- answer, and a monorepo with several files of one package open pays it once per file.
-	local open = document and lye.names[uri]
-	if open and open.module ~= nil then
+	local open = lye.names[uri]
+	if document and open and open.module ~= nil then
 		self:keep(path, written, open.module, known, {
 			textHash = textKey,
-			requires = self:requiresOf(open.requiredModules, uri),
+			requires = self:requiresOf(uri, open.requiredModules),
 			declarationNames = open.declarationNames,
 		})
 		self.hits += 1
@@ -403,10 +429,11 @@ function Modules:resolve(name, from)
 	if entry and entry.key == cache.codeVersion() and entry.text == textKey
 		and type(entry.typeHash) == "string" and (entry.module == false or type(entry.module) == "table") then
 		local negative = entry.module == false
-		if typeHash(negative and false or entry.module, known) == entry.typeHash then
+		local stored = entry.module --[[@as lye.doc.Type? ]]
+		if typeHash(negative and false or stored, known) == entry.typeHash then
 			-- `false` is the answer a module that returns nothing came to: it is kept too, so a
 			-- run after this one is not made to read the file again to learn nothing.
-			local kept = entry.module
+			local kept = stored
 			if negative then kept = nil end
 			self:keep(path, written, kept, known, {
 				textHash = textKey,
@@ -425,7 +452,6 @@ function Modules:resolve(name, from)
 	-- A module reached through `require` is read for its type: its diagnostics belong to its own
 	-- document, which is analysed on its own account when it is open.
 	---@param inner string
-	---@return lye.doc.Type?
 	local function moduleAt(inner) return self:type(inner, uri) end
 	---@param message string
 	local function reportPlugin(message) lye.server:log(message, framework.LOG.warning) end
@@ -434,7 +460,7 @@ function Modules:resolve(name, from)
 	self.requiring[path] = nil
 	local kept = names.module
 	local hash = typeHash(kept, known)
-	local requires = self:requiresOf(names.requiredModules, uri)
+	local requires = self:requiresOf(uri, names.requiredModules)
 	self:keep(path, written, kept, known, {
 		textHash = textKey,
 		typeHash = hash,
@@ -507,14 +533,16 @@ end
 --- a class written in an unsaved buffer is as real to it as one on disk — so an answer kept for a
 --- session is only the answer for a session with the same ones open. Kept until one of them
 --- changes, which is the only thing that can make it say something else.
----@return string
 ---@param self lye.Modules
 function Modules:documentsDigest()
 	if self.openDigest then return self.openDigest end
-	local byUri = self.lye.server.documents and self.lye.server.documents.byUri
+	local documents = self.lye.server.documents
+	local byUri = documents and documents.byUri
 	if not byUri then return "" end
-	local parts = {}
+	local parts = {} ---@type string[]
 	for uri, document in pairs(byUri) do
+		---@cast uri string
+		---@cast document lye.framework.Document
 		parts[#parts + 1] = uri .. "\0" .. rapidhash.hex(document.text or "")
 	end
 	table.sort(parts)

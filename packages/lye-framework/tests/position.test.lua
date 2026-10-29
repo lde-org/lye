@@ -44,7 +44,7 @@ test.it("counts utf-16 code units for multibyte characters", function()
 	local text = "a\195\169b"
 	local index = pos.buildLineIndex(text)
 	test.equal(pos.utf16Length("a\195\169b", 3), 2)
-	test.equal(pos.toPosition(text, index, 4, pos.UTF16), 0, 3)
+	test.equal(pos.toPosition(text, index, 4, pos.UTF16), 0, "line 0")
 	test.equal(pos.toOffset(text, index, 0, 2, pos.UTF16), 4)
 end)
 
@@ -54,7 +54,7 @@ test.it("counts an astral character as two utf-16 units", function()
 	local index = pos.buildLineIndex(text)
 	test.equal(pos.utf16Length(text, #text), 4)
 	test.equal(pos.toOffset(text, index, 0, 3, pos.UTF16), 6)
-	test.equal(pos.toPosition(text, index, 6, pos.UTF16), 0, 3)
+	test.equal(pos.toPosition(text, index, 6, pos.UTF16), 0, "line 0")
 end)
 
 test.it("round-trips a position through both encodings", function()

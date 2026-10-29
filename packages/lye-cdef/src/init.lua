@@ -8,6 +8,12 @@
 
 local cdef = {}
 
+---@class lye.cdef.Token
+---@field kind string one of `name`, `number`, `punct`, `comment`, `eof`
+---@field text string
+---@field start integer
+---@field stop integer
+
 ---@class lye.cdef.Type
 ---@field kind string one of `void`, `bool`, `int`, `float`, `struct`, `union`, `enum`, `function`, `pointer`, `array`, `typedef`
 ---@field name string? the tag or typedef name this type was declared under
@@ -110,7 +116,7 @@ local DOUBLE = {
 local ATTRIBUTE = { ["__attribute__"] = true, ["__declspec"] = true, ["__asm__"] = true }
 
 ---@param text string
----@return { kind: string, text: string, start: integer, stop: integer }[] tokens
+---@return lye.cdef.Token[] tokens
 local function tokenize(text)
 	local tokens, i, n = {}, 1, #text
 	while i <= n do
@@ -141,8 +147,9 @@ local function tokenize(text)
 		elseif at:match("%d") or (at == "." and text:sub(i + 1, i + 1):match("%d")) then
 			-- A number keeps the text it was written with: an array length is read back from it,
 			-- and a hexadecimal one has to be read as what it spells.
-			local number = text:match("^0[xX][%x]+", i) or text:match("^%d+%.?%d*[eE]?[%+%-]?%d*[fFlLuU]*", i)
-				or text:match("^%.%d+[eE]?[%+%-]?%d*[fF]?", i)
+			local number = assert(text:match("^0[xX][%x]+", i)
+				or text:match("^%d+%.?%d*[eE]?[%+%-]?%d*[fFlLuU]*", i)
+				or text:match("^%.%d+[eE]?[%+%-]?%d*[fF]?", i))
 			tokens[#tokens + 1] = { kind = "number", text = number, start = i, stop = i + #number - 1 }
 			i += #number
 		elseif text:sub(i, i + 2) == "..." then
@@ -160,7 +167,7 @@ local function tokenize(text)
 	return tokens
 end
 
----@param tokens table[]
+---@param tokens lye.cdef.Token
 local function numberOf(tokens)
 	local text = tokens.text:gsub("[uUlLfF]+$", "")
 	if text:match("^0[xX]") then return tonumber(text) end
@@ -169,20 +176,21 @@ local function numberOf(tokens)
 end
 
 ---@class lye.cdef.Parser
----@field tokens table[]
+---@field tokens lye.cdef.Token[]
 ---@field at integer
 ---@field namespace lye.cdef.Namespace
+---@field problems lye.cdef.Problem[] what could not be read, so the caller can be told where
+---@field failed boolean? the declaration being read was refused
+---@field isTypedef boolean? the declaration being read introduces a name
 local Parser = {}
 Parser.__index = Parser
 
----@return table
 ---@param self lye.cdef.Parser
 function Parser:peek()
 	return self.tokens[self.at]
 end
 
 ---@param offset integer?
----@return string
 ---@param self lye.cdef.Parser
 function Parser:word(offset)
 	return (self.tokens[self.at + (offset or 0)] or {}).text or ""
@@ -252,10 +260,11 @@ local LEVELS = {
 --- A constant expression, evaluated as it is parsed: array lengths and enum values are numbers a
 --- reader wants, and `1 << 4` is as good as `16`.
 ---@param level integer?
----@return integer?
 ---@param self lye.cdef.Parser
 function Parser:expression(level)
 	level = level or 1
+	---@param self_ lye.cdef.Parser
+	---@return number?
 	local function tighter(self_)
 		if level > #LEVELS then return self_:unary() end
 		return self_:expression(level + 1)
@@ -283,6 +292,7 @@ function Parser:expression(level)
 		elseif matched == "/" then value = value / right
 		elseif matched == "%" then value = value % right end
 	end
+	---@cast value integer?
 	return value
 end
 
@@ -385,7 +395,9 @@ end
 ---@param self lye.cdef.Parser
 function Parser:tagged(tag)
 	self.at += 1
-	local name = self:peek().kind == "name" and self:name() or nil
+	---@type string?
+	local name
+	if self:peek().kind == "name" then name = self:name() end
 	if not self:accept("{") then
 		-- `struct Foo;` declares the name and nothing else, which is how a header hides its layout.
 		-- The same words also spell a reference — `int tcgetattr(int fd, struct termios *t)` — and
@@ -433,7 +445,9 @@ end
 ---@param self lye.cdef.Parser
 function Parser:enumerated()
 	self.at += 1
-	local name = self:peek().kind == "name" and self:name() or nil
+	---@type string?
+	local name
+	if self:peek().kind == "name" then name = self:name() end
 	if not self:accept("{") then
 		local forward = { kind = "enum", name = name }
 		if name then self:define(name, forward) end
@@ -674,7 +688,9 @@ local function isCdata(namespace, type)
 	if resolved.kind == "pointer" then
 		local target = resolved.target
 		while target and target.kind == "typedef" do
-			target = cdef.resolve(namespace, target.name) or target
+			local name = target.name
+			if not name then target = nil break end
+			target = cdef.resolve(namespace, name) or target
 		end
 		return target ~= nil and target.kind == "function"
 	end
@@ -685,7 +701,6 @@ end
 --- declared is no type at all, which is what makes the string form of these calls checkable.
 ---@param namespace lye.cdef.Namespace
 ---@param text string
----@return lye.cdef.Type?
 function cdef.typeOf(namespace, text)
 	local ok, type = pcall(function()
 		local self = setmetatable({ tokens = tokenize(text), at = 1, namespace = namespace }, Parser)
@@ -694,6 +709,7 @@ function cdef.typeOf(namespace, text)
 		return built
 	end)
 	if not ok or not type then return nil end
+	---@cast type lye.cdef.Type
 	return type
 end
 

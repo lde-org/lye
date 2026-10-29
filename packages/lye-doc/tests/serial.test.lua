@@ -7,11 +7,12 @@ local sequel = require("lye-doc.serial")
 
 local types = require("lye-doc.type")
 
----@param value unknown
----@return unknown
+---@param value lye.doc.Type
 local function roundTrip(value)
 	local text = assert(sequel.write(value))
-	return assert(sequel.read(text))
+	local back = assert(sequel.read(text))
+	---@cast back lye.doc.Type
+	return back
 end
 
 test.it("gives back a type as the type it was", function()
@@ -56,6 +57,7 @@ test.it("gives a named table back as the caller's own", function()
 	local known = { names = { [held] = "field:ffi.cdef" }, tables = { ["field:ffi.cdef"] = held } }
 	local holder = types.classType("Holder", {}, { cdef = held }, {}, {})
 	local written = assert(sequel.read(assert(sequel.write(holder, known)), known))
+	---@cast written lye.doc.Type
 	test.equal(written.fields.cdef, held, "the caller's own table")
 	test.equal(sequel.SINGLETONS.void, written.fields.cdef.returns, "beside the singletons it knows")
 end)

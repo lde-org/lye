@@ -9,6 +9,7 @@ local Parser = require("lye-parser")
 local doc = require("lye-doc")
 local fs = require("fs")
 local cache = require("lye-lsp.cache")
+local position = require("lye-framework.position")
 
 local definitions = {}
 
@@ -16,10 +17,18 @@ local definitions = {}
 ---@field uri string
 ---@field start integer
 ---@field stop integer
+---@field name string?
+
+---@class lye.Definitions
+---@field types table<string, lye.DefinitionLocation>
+---@field names table<string, lye.DefinitionLocation>
+---@field fields table<string, lye.DefinitionLocation>
+---@field text table<string, string>
+---@field lines table<string, lye.framework.LineIndex>
+---@field modules table<string, { uri: string, path: string }>
 
 --- Where the definitions are written: beside the entries, under the directory this run keeps
 --- everything in. A client opens them from here, so they are real files, written whole.
----@return string
 local function cacheDir()
 	local path = cache.root() .. "/defs"
 	fs.mkdirAll(path)
@@ -30,12 +39,14 @@ end
 --- an alias by name, a function by the name it is declared under (`math.floor`), and a field by
 --- the class it belongs to (`Point.x`).
 ---@param sources table<string, string> definition text by name
----@return table index
+---@return lye.Definitions index
 function definitions.prepare(sources)
 	local dir = cacheDir()
 	local index = { types = {}, names = {}, fields = {}, text = {}, lines = {}, modules = {} }
 
 	for name, text in pairs(sources) do
+		---@cast name string
+		---@cast text string
 		local path = dir .. "/" .. name .. ".lua"
 		-- Beside the entries and written the same way: a session that already has this text writes
 		-- nothing, and one that has to write cannot be read half way through.
@@ -78,6 +89,7 @@ function definitions.prepare(sources)
 			end
 		end
 		for _, declaration in ipairs(parsed.declarations) do
+			---@cast declaration lye.parser.Declaration
 			if not index.names[declaration.name] then
 				index.names[declaration.name] = {
 					uri = uri, start = declaration.start, stop = declaration.stop,
@@ -89,7 +101,7 @@ function definitions.prepare(sources)
 	return index
 end
 
----@param index table
+---@param index lye.Definitions
 ---@param name string?
 ---@return lye.DefinitionLocation?
 local function locationOf(index, name)
@@ -100,21 +112,21 @@ local function locationOf(index, name)
 end
 
 --- The text of a definition file, and its line index, built when a jump first needs one.
----@param index table
+---@param index lye.Definitions
 ---@param uri string
 ---@return string? text
----@return table? lineIndex
+---@return lye.framework.LineIndex? lineIndex
 function definitions.sourceOf(index, uri)
 	local text = index.text[uri]
 	if not text then return nil end
 	if not index.lines[uri] then
-		index.lines[uri] = require("lye-framework.position").buildLineIndex(text)
+		index.lines[uri] = position.buildLineIndex(text)
 	end
 	return text, index.lines[uri]
 end
 
 --- The builtin a name refers to, when it is one.
----@param index table
+---@param index lye.Definitions
 ---@param name string?
 function definitions.find(index, name)
 	return locationOf(index, name)

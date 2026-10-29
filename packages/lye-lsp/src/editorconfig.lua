@@ -9,7 +9,6 @@ local editorconfig = {}
 
 --- The `.editorconfig` in a directory, or nil.
 ---@param directory string
----@return string?
 local function read(directory)
 	local handle = io.open(directory .. "/.editorconfig", "rb")
 	if not handle then return nil end

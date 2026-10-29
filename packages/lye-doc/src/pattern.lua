@@ -61,7 +61,6 @@ pattern.CALLS = { find = true, match = true, gsub = true }
 --- the captures themselves, and `gsub` a result and a count that are never nil.
 ---@param subject string the field it was called with, `find` or `match`
 ---@param text string the pattern as written
----@return lye.doc.Type[]?
 function pattern.values(subject, text)
 	local types = require("lye-doc.type")
 	if not pattern.CALLS[subject] then return nil end

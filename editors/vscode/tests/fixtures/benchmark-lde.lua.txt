@@ -6,19 +6,16 @@ Vector.__index = Vector
 
 ---@param x number
 ---@param y number
----@return Vector
 function Vector.new(x, y)
 	return setmetatable({ x = x, y = y }, Vector)
 end
 
 ---@param other Vector
----@return Vector
 function Vector:add(other)
 	return Vector.new(self.x + other.x, self.y + other.y)
 end
 
 ---@param names string[]
----@return string
 local function join(names)
 	return table.concat(names, ", ")
 end
@@ -36,7 +33,7 @@ end
 ---@param path string
 ---@return string?
 local function read(path)
-	local handle = io.open(path, "r")
+	local handle = io.open(path)
 	if not handle then
 		error("cannot open " .. path)
 	end
@@ -46,7 +43,6 @@ local function read(path)
 end
 
 ---@param name string?
----@return string
 local function greet(name)
 	assert(name)
 	return string.format("hello %s", name)
@@ -84,7 +80,7 @@ local TINT = 0x336699
 ---@class lde.Compiler
 ---@field spec lde.CompilerSpec
 ---@field state lua.State?
----@field chunk lua.Chunk?
+---@field chunk lua.Chunk # created by `ensure()` before any compile
 local Compiler = {}
 Compiler.__index = Compiler
 
@@ -95,7 +91,6 @@ local lua = require("lua-sys")
 local errorMod = require("lde-core.error")
 
 ---@param spec lde.CompilerSpec
----@return lde.Compiler
 function Compiler.new(spec)
 	return setmetatable({ spec = spec }, Compiler)
 end
@@ -110,7 +105,6 @@ end
 --- Ensure the compiler guest state exists, resolving + building the compiler
 --- package first if needed. Retries once after clearing the cached archive,
 --- in case the first resolution produced a broken install.
----@return lua.State
 function Compiler:ensure()
 	if self.state then return self.state end
 
@@ -160,7 +154,8 @@ end
 function Compiler:hasSource(dir)
 	if not fs.isdir(dir) then return false end
 	for _, rel in ipairs(fs.scan(dir, "**" .. path.separator .. "*" .. self.spec.extension)) do
-		if not self.spec.hasSourceFilter or self.spec.hasSourceFilter(rel) then
+		local filter = self.spec.hasSourceFilter
+		if not filter or filter(rel) then
 			return true
 		end
 	end
@@ -209,10 +204,12 @@ function Compiler:compileDir(srcDir, outDir)
 			local code, err = self:compileSource(source, absSrc)
 			if not code then
 				errorMod.raise("Failed to compile " .. absSrc .. ":\n" .. (err or "unknown error"))
-			end
-			fs.write(outPath, code --[[@as string]])
-			if self.spec.writeExtras then
-				self.spec.writeExtras(outDir, rel, source --[[@as string]])
+			else
+				fs.write(outPath, code)
+				local writeExtras = self.spec.writeExtras
+				if writeExtras then
+					writeExtras(outDir, rel, source)
+				end
 			end
 		else
 			local outPath = path.join(outDir, rel)
@@ -251,7 +248,6 @@ Coverage.__index = Coverage
 
 ---@param prefixes string[] # absolute dirs (with trailing separator) whose files are in scope
 ---@param baseDir  string?   # package dir used to resolve relative chunk names
----@return lde.Coverage
 function Coverage.new(prefixes, baseDir)
 	return setmetatable({ prefixes = prefixes, baseDir = baseDir, hits = {} }, Coverage)
 end
@@ -309,7 +305,6 @@ local function countExecutableLines(src, out)
 	local level ---@type number?
 
 	---@param i number
-	---@return integer
 	local function charAt(i) return i <= len and string.byte(src, i) or -1 end
 
 	-- Level of a long-bracket opener at i ("[" + n*"=" + "["), or nil.
@@ -407,6 +402,8 @@ function Coverage:compute()
 	local files = {}
 	local totalExecutable, totalCovered = 0, 0
 	for file, lines in pairs(self.hits) do
+		---@cast file string
+		---@cast lines table<number, number>
 		local src = fs.read(file)
 		if src then
 			local execLines = {}
@@ -456,7 +453,6 @@ local M = {}
 
 ---@param message string
 ---@param opts { kind?: string, code?: integer, hint?: string }?
----@return lde.Error
 function M.new(message, opts)
 	opts = opts or {}
 	return setmetatable({
@@ -484,7 +480,6 @@ function M.raise(message, opts)
 end
 
 ---@param err any
----@return boolean
 function M.isKnown(err)
 	return type(err) == "table" and getmetatable(err) == Error
 end
@@ -503,7 +498,6 @@ end
 --- Only strip when another chunk frame follows, so a single-frame error (the
 --- real one) keeps its source position.
 ---@param msg string
----@return string
 local function stripLoaderFrame(msg)
 	return (msg:gsub("^%[string \"[^\"]*\"%]:%d+: %[", "%[", 1))
 end
@@ -544,17 +538,28 @@ local fs = require("fs")
 
 local M = {}
 
+---@class lde.FlameNode
+---@field n string
+---@field v number
+---@field c lde.FlameNode[]
+
 --- Build a tree from { "outerFrame;...;innerFrame" = count } folded stacks.
 ---@param stacks table<string, number>
 ---@param rootName string?
 --- Build a tree from { "outerFrame;...;innerFrame" = count } folded stacks.
 function M.buildTree(stacks, rootName)
+	---@type lde.FlameNode
 	local root = { n = rootName or "root", v = 0, c = {} }
 
 	for stackStr, count in pairs(stacks) do
+		---@cast stackStr string
+		---@cast count number
 		root.v += count
+		---@type lde.FlameNode
 		local node = root
 		for frame in stackStr:gmatch("([^;]+)") do
+			---@cast frame string
+			---@type lde.FlameNode?
 			local child
 			for _, c in ipairs(node.c) do
 				if c.n == frame then child = c; break end
@@ -573,14 +578,12 @@ end
 
 --- Minimal JSON encoder for the tree (only needs string keys n, integer v, array c).
 ---@param s string
----@return string
 --- Minimal JSON encoder for the tree (only needs string keys n, integer v, array c).
 local function jsonStr(s)
 	return '"' .. s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
 end
 
----@param node table
----@return string
+---@param node lde.FlameNode
 local function jsonNode(node)
 	local s = '{"n":' .. jsonStr(node.n) .. ',"v":' .. node.v
 	if #node.c > 0 then
@@ -816,7 +819,6 @@ local Lockfile = {}
 Lockfile.__index = Lockfile
 
 ---@param p string
----@return lde.Lockfile?
 function Lockfile.open(p)
 	local content = fs.read(p)
 	if not content then
@@ -868,7 +870,6 @@ end
 --- sorts the keys of tables it hasn't decoded itself, so the hash is stable
 --- regardless of key order in the manifest file.
 ---@param config lde.Package.Config
----@return string
 function Lockfile.manifestHash(config)
 	return util.hash(json.encode({
 		dependencies = config.dependencies or {},
@@ -877,7 +878,6 @@ function Lockfile.manifestHash(config)
 	}))
 end
 
----@return string?
 function Lockfile:getManifestHash()
 	return self.raw.manifestHash
 end
@@ -894,7 +894,6 @@ end
 --- registry requests). Lockfiles written before the hash existed count as
 --- stale so they re-resolve exactly once and are rewritten with a hash.
 ---@param config lde.Package.Config
----@return boolean
 function Lockfile:isStale(config)
 	return self.raw.manifestHash ~= Lockfile.manifestHash(config)
 end
@@ -958,7 +957,6 @@ local function printProfileReport(counts, vmstates, total, cwd)
 
 	local totalMs = total * PROFILER_MS_PER_SAMPLE
 	---@param ms number
-	---@return string
 	local function fmtTime(ms)
 		if ms < 1000 then return string.format("~%dms", ms) end
 		return string.format("~%.1fs", ms / 1000)
@@ -971,7 +969,6 @@ local function printProfileReport(counts, vmstates, total, cwd)
 
 	---@param n number
 	---@param color string
-	---@return string
 	local function bar(n, color)
 		local filled = math.max(0, math.min(BAR_WIDTH, math.floor(n / total * BAR_WIDTH + 0.5)))
 		local s = filled > 0 and ansi.colorize(color, string.rep("█", filled)) or ""
@@ -980,7 +977,6 @@ local function printProfileReport(counts, vmstates, total, cwd)
 	end
 
 	---@param loc string
-	---@return string
 	local function relativize(loc)
 		if cwd and loc:sub(1, #cwd + 1) == cwd .. "/" then
 			loc = loc:sub(#cwd + 2)
@@ -1051,12 +1047,14 @@ local function startProfiler(state)
 
 	-- Strip the name:line suffix that luajit appends in "f;" mode (e.g. "foo:42" → "foo").
 	---@param f string
-	---@return string
 	local function frameName(f)
 		return (f:gsub(":%d+$", ""))
 	end
 
 	lua.profiler.start(state, "fi" .. PROFILER_MS_PER_SAMPLE, function(stack, samples, vmstate)
+		---@cast stack string?
+		---@cast samples number
+		---@cast vmstate string
 		total = total + samples
 		vmstates[vmstate] = (vmstates[vmstate] or 0) + samples
 		if vmstate == "G" or not stack or stack == "" then return end
@@ -1064,6 +1062,7 @@ local function startProfiler(state)
 		-- Accumulate the full stack for flamegraph (clean frame names).
 		local cleanParts = {}
 		for frame in stack:gmatch("([^;]+)") do
+			---@cast frame string
 			local name = frameName(frame)
 			if name ~= "" and name ~= "?" then
 				cleanParts[#cleanParts + 1] = name
@@ -1129,7 +1128,7 @@ end
 
 ---@class lde.ExecuteOptions
 ---@field env          table<string, string>?
----@field args         string[]?  # positional args; args[0] is arg[0] (chunk name / script path)
+---@field args         table<integer, string>?  # positional args; args[0] is arg[0] (chunk name / script path)
 ---@field globals      table<string, any>?
 ---@field packagePath  string?
 ---@field packageCPath string?
@@ -1153,7 +1152,7 @@ local function createState(opts)
 	opts = opts or {}
 
 	-- Change cwd on the host process (guest inherits the same OS environment)
-	local oldCwd
+	local oldCwd ---@type string?
 	if opts.cwd then
 		oldCwd = env.cwd()
 		env.chdir(opts.cwd)
@@ -1163,13 +1162,19 @@ local function createState(opts)
 	local oldEnvVars = {}
 	if opts.env then
 		for k, v in pairs(opts.env) do
+			---@cast k string
+			---@cast v string
 			oldEnvVars[k] = env.var(k)
 			env.set(k, v)
 		end
 	end
 
 	local function cleanup()
-		for k, v in pairs(oldEnvVars) do env.set(k, v) end
+		for k, v in pairs(oldEnvVars) do
+			---@cast k string
+			---@cast v string?
+			env.set(k, v)
+		end
 		if oldCwd then env.chdir(oldCwd) end
 	end
 
@@ -1246,6 +1251,10 @@ local function executeSource(source, chunkName, opts)
 	-- Collect profiling results
 	if stopProfiler then
 		local counts, vmstates, stacks, total = stopProfiler()
+		---@cast counts table<string, number>
+		---@cast vmstates table<string, number>
+		---@cast stacks table<string, number>
+		---@cast total number
 		-- Profiling is explicitly requested via --profile/--flamegraph/--json,
 		-- so its report is always printed (independent of --verbose).
 		if opts.profile then
@@ -1353,7 +1362,7 @@ local function executeLuaCLI(args, opts)
 	end
 	---@type string?
 	local script = args[i]
-	local scriptArgs = {}
+	local scriptArgs = {} ---@type table<integer, string>
 	for j = i + 1, #args do scriptArgs[#scriptArgs + 1] = args[j] end
 	local interactive = script == "-i"
 	if interactive then script = nil end
@@ -1407,7 +1416,8 @@ local function executeLuaCLI(args, opts)
 		else
 			ok, r = pcall(repl.eval, repl)
 		end
-	elseif ok and script then
+	elseif ok and type(script) == "string" then
+		---@cast script string
 		local source, err = fs.read(script)
 		if not source then
 			ok, r = false, "Failed to read " .. script .. ": " .. (err or "unknown error")
@@ -1470,6 +1480,9 @@ local teal = require("lde-core.compiler").new({
 	-- path.join's varargs.
 	outRel = function(rel) return (rel:gsub("%.tl$", ".lua")) end,
 	writeExtras = function(outDir, rel, source)
+		---@cast outDir string
+		---@cast rel string
+		---@cast source string
 		-- Keep the .tl source alongside the compiled .lua so `tl check` can
 		-- resolve this package's modules with full type info (see compileDir).
 		fs.write(path.join(outDir, rel), source)
@@ -1668,7 +1681,6 @@ return M
 ---@param p string
 ---@param srcPrefix string?
 ---@param targetPrefix string?
----@return string
 local function normalizeKey(p, srcPrefix, targetPrefix)
 	if targetPrefix and p:sub(1, #targetPrefix) == targetPrefix then
 		return "src:" .. p:sub(#targetPrefix + 1)
@@ -1765,7 +1777,10 @@ local function run(opts)
 		-- the guest cwd.
 		local boot = state:load(BOOTSTRAP, "@lde-watchrun")
 		local ok, hotState = boot:pcall({
-			abs = function(p) return path.resolve(env.cwd(), p) end,
+			abs = function(p)
+				---@cast p string
+				return path.resolve(env.cwd(), p)
+			end,
 			srcPrefix = opts.srcPrefix,
 			targetPrefix = opts.targetPrefix,
 			entryKey = entryKey,
@@ -1774,6 +1789,7 @@ local function run(opts)
 		if not ok then
 			ansi.printf("{red}Failed to install watch hooks: %s", tostring(hotState))
 			state:close()
+			---@cast state lua.State
 			if cleanup then cleanup() end
 			state, cleanup = nil, nil
 			return false
@@ -1793,12 +1809,14 @@ local function run(opts)
 
 		-- Disables the guest JIT for the whole session (hooks only fire on
 		-- interpreted code) — the price of being able to interrupt the app.
+		---@cast state lua.State
 		state:setHook(hook, "count", HOOK_INTERVAL)
 		return true
 	end
 
 	local function disposeState()
 		if state then
+			---@cast state lua.State
 			state:close()
 			state = nil
 		end
@@ -1810,6 +1828,7 @@ local function run(opts)
 
 	local function runEntry() ---@cast state lua.State
 		local source, chunkName, readErr = runtime.readCompiledFile(opts.entry)
+		---@cast chunkName string?
 		if not source then
 			return "error", readErr
 		end
@@ -2248,25 +2267,29 @@ local SOURCE = [==[
 ---@param state    lua.State
 ---@param reporter lde.TestReporter?
 ---@param host     lde.testHost
----@return fun() runSuite
 local function setup(state, reporter, host)
 	-- Handles (e.g. progress spinners) live entirely host-side: onStart
 	-- stores one per test name, onPass/onFail retrieve it by name.
 	local handles = {}
 
 	local onStart = reporter and reporter.onStart and function(name)
+		---@cast name string
 		handles[name] = reporter.onStart(name)
 		-- no return: a handle cannot cross back into the guest
 	end or nil
 	local onPass = reporter and reporter.onPass and function(name)
+		---@cast name string
 		reporter.onPass(name, handles[name])
 		handles[name] = nil
 	end or nil
 	local onFail = reporter and reporter.onFail and function(name, err)
+		---@cast name string
+		---@cast err string
 		reporter.onFail(name, err, handles[name], host.file)
 		handles[name] = nil
 	end or nil
 	local onSkip = reporter and reporter.onSkip and function(name)
+		---@cast name string
 		reporter.onSkip(name)
 	end or nil
 
@@ -2310,7 +2333,6 @@ end
 
 ---Compute a 64-bit rapidhash of a string, returned as a 16-char lowercase hex string.
 ---@param s string
----@return string
 function util.hash(s)
 	return rapidhash.hex(s)
 end

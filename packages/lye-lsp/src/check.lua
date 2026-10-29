@@ -3,6 +3,7 @@
 local report = require("lye-lsp.report")
 local doc = require("lye-doc")
 local classes = require("lye-doc.class")
+local types = require("lye-doc.type")
 local analyzer = require("lye-analyzer")
 local position = require("lye-framework.position")
 local fs = require("fs")
@@ -25,11 +26,6 @@ local IDENTITY = require("lye-plugin.source").lower("", {})
 --- Whether a file is a definition file: `.d.lua` describes a library the way a `---@meta` file
 --- does, so a check holds it to its annotations rather than to bodies it does not have.
 ---@param path string
----@return boolean
---- Whether a file is a definition file: `.d.lua` describes a library the way a `---@meta` file
---- does, so a check holds it to its annotations rather than to bodies it does not have.
----@param path string
----@return boolean
 local function isDefinitionPath(path)
 	return path:match("%.d%.lua$") ~= nil
 end
@@ -45,25 +41,47 @@ local PRELUDE = analyzer.prelude(require("lye-defs"))
 ---@type { names: table<unknown, string>, tables: table<string, unknown> }?
 local preludeTypes
 
----@return { names: table<unknown, string>, tables: table<string, unknown> }
+--- The shape the analyzer's prepared prelude adds to `lye.analyzer.Prelude`.
+---@class lye.check.Prelude
+---@field evolved table<string, table<string, unknown>>?
+---@field built table<string, unknown>?
+---@field aliases table<string, string>
+---@field returns table<string, lye.doc.Type>
+
 local function namedPreludeTypes()
 	if preludeTypes then return preludeTypes end
-	local names, tables = {}, {}
+	local prelude = PRELUDE --[[@as lye.check.Prelude ]]
+	local names = {} ---@type table<unknown, string>
+	local tables = {} ---@type table<string, unknown>
 	---@param held unknown
 	---@param name string
-	local function add(held, name)
+	local function nameType(held, name)
 		if type(held) ~= "table" or names[held] then return end
 		names[held] = name
 		tables[name] = held
 	end
 	-- A field's type is what a signature is looked up by, so it needs its name most: `evolved` is
 	-- where the definitions' methods were put as they were declared.
-	for className, fields in pairs(PRELUDE.evolved or {}) do
-		for field, held in pairs(fields) do add(held, "field:" .. className .. "." .. field) end
+	for className, fields in pairs(prelude.evolved or {}) do
+		---@cast className string
+		---@cast fields table<string, unknown>
+		for field, held in pairs(fields) do
+			---@cast field string
+			nameType(held, "field:" .. className .. "." .. field)
+		end
 	end
-	for name, alias in pairs(PRELUDE.aliases) do add(alias, "alias:" .. name) end
-	for name, held in pairs(PRELUDE.returns) do add(held, "return:" .. name) end
-	for text, held in pairs(PRELUDE.built or {}) do add(held, "built:" .. text) end
+	for name, alias in pairs(prelude.aliases) do
+		---@cast name string
+		nameType(alias, "alias:" .. name)
+	end
+	for name, held in pairs(prelude.returns) do
+		---@cast name string
+		nameType(held, "return:" .. name)
+	end
+	for text, held in pairs(prelude.built or {}) do
+		---@cast text string
+		nameType(held, "built:" .. text)
+	end
 	preludeTypes = { names = names, tables = tables }
 	return preludeTypes
 end
@@ -83,7 +101,6 @@ local stats = {
 	documents = { parsed = 0, loaded = 0 },
 }
 
----@return lye.check.Stats
 function check.stats()
 	return stats
 end
@@ -95,25 +112,31 @@ end
 -- on a package-heavy project. The key is the text rather than the path because the text is what an
 -- analysis is about; rapidhash reads a megabyte in well under a millisecond, and the same file is
 -- asked for a dozen times here.
-local analysesByText = {}
-local docsByText = {}
+local analysesByText = {} ---@type table<string, lye.analyzer.Result>
+--- A module-only analysis has its diagnostics suppressed. If the same text is later checked as a
+--- file, it must be analysed in full; reusing the module answer would silently lose its findings.
+local moduleOnlyByText = {} ---@type table<string, boolean>
+--- A require cycle asks for a module whose analysis is still in progress. A mutable placeholder
+--- is promoted to the module's real interface when that analysis finishes, so the caller's
+--- `require` value settles instead of staying unknown.
+local cyclePlaceholders = {}
+---@cast cyclePlaceholders table<string, lye.doc.Type>
+local docsByText = {} ---@type table<string, lye.doc.File|false>
 
 -- What a module came to for a `require`, by its text: a module-only analysis, which is a different
 -- thing from `analysesByText` — that one carries the diagnostics of a file being checked, and a
 -- file reached as a dependency first must not be handed those away as its answer. An answer that
 -- is still the answer is also kept between runs, under a key that says what it was read against.
-local interfacesByText = {}
+local interfacesByText = {} ---@type table<string, { type: lye.doc.Type? }>
 
 --- The key a piece of source is cached under.
 ---@param source string
----@return string
 local function textKey(source)
 	return rapidhash.hex(source)
 end
 
 --- The text of a file, or nil when it cannot be read — a missing file and a directory alike.
 ---@param path string
----@return string?
 local function readSource(path)
 	return fs.read(path)
 end
@@ -121,10 +144,9 @@ end
 --- A path as the file system wants it. The walks take a real path and hand back the paths under
 --- it, so a run started in a directory has to say where that directory is before walking it.
 ---@param path string
----@return string
 local function absolute(path)
 	if path:sub(1, 1) == "/" or path:match("^%a:[/\\]") then return path end
-	local cwd = env.cwd()
+	local cwd = env.cwd() --[[@as string ]]
 	local cleaned = path:gsub("/+$", "")
 	if cleaned == "" or cleaned == "." then return cwd end
 	return cwd .. "/" .. (cleaned:gsub("^%./", ""))
@@ -137,7 +159,7 @@ end
 ---@param path string
 ---@return string?
 local function packageOf(path)
-	local at = absolute(path)
+	local at = absolute(path) ---@type string?
 	while at and at ~= "" and at ~= "/" do
 		if fs.exists(at .. "/lde.json") then return at end
 		at = at:match("^(.*)/[^/]+$")
@@ -175,7 +197,7 @@ end
 local function indexRoots(paths)
 	local roots, seen = {}, {}
 	---@param root string?
-	local function add(root)
+	local function addRoot(root)
 		if type(root) ~= "string" or root == "" then return end
 		local held = root:gsub("[/\\]+$", "")
 		if held == "" then held = "/" end
@@ -183,9 +205,9 @@ local function indexRoots(paths)
 		seen[held] = true
 		roots[#roots + 1] = held
 	end
-	add(env.cwd())
-	add(commonRoot(paths))
-	for _, path in ipairs(paths) do add(packageOf(path)) end
+	addRoot(env.cwd())
+	addRoot(commonRoot(paths))
+	for _, path in ipairs(paths) do addRoot(packageOf(path)) end
 	return roots
 end
 
@@ -232,7 +254,10 @@ end
 ---@param record lye.lsp.IndexFile
 ---@return lye.doc.File
 local function annotationDoc(record)
-	return { annotations = record.annotations, isDefinition = record.isDefinition == true }
+	return {
+		annotations = record.annotations --[[@as lye.doc.Annotation[] ]],
+		isDefinition = record.isDefinition == true,
+	}
 end
 
 --- The names the modules linked into a package's `target/` declare. A dependency's class is as
@@ -255,7 +280,7 @@ local function linkedDeclarations(root, cache, paths)
 		-- file under every package that depends on it, so the walk stops at the cap rather than
 		-- reading the closure of every closure; a run whose cache has already listed the farm —
 		-- its digest is taken over the same files — hands the list over instead of walking again.
-		local parsedFiles = {}
+		local parsedFiles = {} ---@type lye.doc.File[]
 		---@param file string
 		local function read(file)
 			if #parsedFiles >= 2000 then return end
@@ -265,15 +290,17 @@ local function linkedDeclarations(root, cache, paths)
 			local parsed = docsByText[key]
 			if parsed == nil then
 				local isOk, one = pcall(doc.parse, source)
+				---@cast one lye.doc.File
 				if isOk then docsByText[key] = one end
 				parsed = isOk and one or nil
 			end
-			if parsed then parsedFiles[#parsedFiles + 1] = parsed end
+			if parsed then parsedFiles[#parsedFiles + 1] = parsed --[[@as lye.doc.File ]] end
 		end
 		if paths then
 			for _, file in ipairs(paths) do read(file) end
 		else
 			for file in fs.scan(target, "**/*.lua", { absolute = true, followSymlinks = true, ignore = ignored }) do
+				---@cast file string
 				read(file)
 			end
 		end
@@ -341,7 +368,6 @@ end
 --- The text key of a file, read and hashed once: what a dependency's text is says whether an
 --- answer that depended on it still holds.
 ---@param path string
----@return string|false
 ---@param self lye.check.Store
 function Store:keyOf(path)
 	local held = self.hashes[path]
@@ -355,15 +381,15 @@ end
 --- Everything linked into a package's `target/`, and the digest of their texts: a change to any
 --- of them changes what a file of that package is read against.
 ---@param owner string
----@return string
 ---@param self lye.check.Store
 function Store:farm(owner)
 	local held = self.farms[owner]
 	if held then return held end
-	local files = {}
+	local files = {} ---@type string[]
 	local target = absolute(owner) .. "/target"
 	if fs.isdir(target) then
 		for file in fs.scan(target, "**/*.lua", { absolute = true, followSymlinks = true, ignore = ignored }) do
+			---@cast file string
 			files[#files + 1] = file
 		end
 		table.sort(files)
@@ -381,7 +407,6 @@ end
 ---@param path string
 ---@param key string
 ---@param owner string?
----@return table?
 ---@param self lye.check.Store
 function Store:hit(path, key, owner)
 	local farm = owner and self:farm(owner) or ""
@@ -430,23 +455,74 @@ local function scopeFor(owner, scopes, elsewhere, store)
 	return scope
 end
 
---- The plugins a package asked for, loaded once per package: `lye.json` beside the package and in
---- the directory the run was started in, the package's answer winning — the way an editor session
---- reads them, so that a file is checked in whatever language its package said it is written in.
---- A plugin named rather than pathed is a module the package installed, which is one lde linked
---- into its `target/`: the same place a `require` finds. A plugin that cannot be loaded goes to the
---- run's error stream, because that is a fault of the run rather than of the file being checked.
-local pluginsByPackage = {}
+--- The plugins each package asked for, by its root — or by the run's own directory when a file
+--- belongs to no package. Loading a plugin compiles the language it reads, so one package's
+--- plugins are loaded once for the whole run.
+local pluginsByPackage = {} ---@type table<string, lye.plugin.Spec[]>
 
 --- The file a module name resolves to inside a package's `target/`, without reading it: lde
 --- links every module a package can reach under that directory, so one rule answers a dependency
 --- and a sibling alike.
+--- The `requirePaths` a directory's `lye.json` names, each resolved the way `package.path`
+--- resolves one: an absolute pattern is left alone, a relative one is read from the directory
+--- that declared it. The same rule `Lye:requirePaths` follows.
+---@param dir string
+---@return string[]
+local function requirePathsOf(dir)
+	local out = {}
+	local written = readSource(dir .. "/lye.json")
+	if type(written) ~= "string" then return out end
+	local ok, config = pcall(json.decode, written)
+	if not ok or type(config) ~= "table" then return out end
+	local patterns = config.requirePaths
+	if type(patterns) ~= "table" then return out end
+	for _, pattern in ipairs(patterns) do
+		---@cast pattern string
+		if type(pattern) == "string" and pattern ~= "" then
+			out[#out + 1] = pattern:sub(1, 1) == "/" and pattern or (dir .. "/" .. pattern)
+		end
+	end
+	return out
+end
+
+--- The name an lde package writes in its `lde.json`, when the package is one.
+---@param owner string?
+---@return string?
+local packageNameCache = {}
+local function packageNameOf(owner)
+	if not owner then return nil end
+	local held = packageNameCache[owner]
+	if held ~= nil then return held or nil end
+	local written = readSource(owner .. "/lde.json")
+	local name
+	if type(written) == "string" then
+		local ok, config = pcall(json.decode, written)
+		if ok and type(config) == "table" then
+			local fields = config --[[@as table<string, string>]]
+			if type(fields.name) == "string" then name = fields.name end
+		end
+	end
+	packageNameCache[owner] = name or false
+	return name
+end
+
 ---@param owner string the package root
 ---@param name string
 ---@return string?
 local function modulePath(owner, name)
 	local base = absolute(owner)
 	local tail = (name:gsub("%.", "/"))
+	-- A project that named its search paths wins: they are what its own `require` reads, and a
+	-- root `lye.json` (a workspace of packages, say) describes the same tree from above.
+	local roots = { base }
+	local cwd = absolute(env.cwd())
+	if cwd ~= base then roots[#roots + 1] = cwd end
+	for _, dir in ipairs(roots) do
+		for _, pattern in ipairs(requirePathsOf(dir)) do
+			local candidate = pattern:gsub("%?", function() return tail end)
+			if fs.exists(candidate) then return candidate end
+		end
+	end
 	for _, candidate in ipairs({
 		base .. "/target/" .. tail .. ".lua",
 		base .. "/target/" .. tail .. "/init.lua",
@@ -462,7 +538,6 @@ end
 --- into its `target/`: the same place a `require` finds. A plugin that cannot be loaded goes to the
 --- run's error stream, because that is a fault of the run rather than of the file being checked.
 ---@param path string
----@return lye.plugin.Spec[]
 local function pluginsFor(path)
 	local owner = packageOf(path)
 	local key = owner or ""
@@ -495,7 +570,7 @@ local function pluginsFor(path)
 	---@param message string
 	local function reportPlugin(message) io.stderr:write("check: " .. message .. "\n") end
 	local specs = plugin.load(entries, owner and absolute(owner) or absolute(env.cwd()),
-		moduleAt, reportPlugin)
+		moduleAt, reportPlugin) --[[@as lye.plugin.Spec[] ]]
 	pluginsByPackage[key] = specs
 	return specs
 end
@@ -505,7 +580,6 @@ end
 --- read the answer from when it was on.
 ---@param path string
 ---@param written string
----@return string
 local function analysisKey(path, written)
 	return textKey(written .. "\0" .. plugin.digest(pluginsFor(path)))
 end
@@ -546,7 +620,6 @@ end
 ---@param path string the file the `require` is written in, which says how the module is held
 ---@param store lye.check.Store
 ---@param owner string the module's package root
----@return string
 local function interfaceKey(key, path, store, owner)
 	return cache.key("interface", key, cache.codeVersion(),
 		tostring(isDefinitionPath(path)), store.annotations, store:farm(owner))
@@ -580,7 +653,6 @@ end
 ---@param owner string
 ---@param written string
 ---@param module lye.doc.Type?
----@return boolean
 local function saveInterface(key, path, store, owner, written, module)
 	return cache.save(interfaceKey(key, path, store, owner), {
 		text = textKey(written), key = cache.codeVersion(), module = module or false,
@@ -589,9 +661,9 @@ end
 
 --- The text of a module the definitions ship, when `name` is one. A definition file that returns
 --- a value is a module `require` may name: `ffi`, `jit`, `string.buffer`, and the test harness.
----@param name string
----@return string?
+---@type table<string, string|false>
 local builtinModules = {}
+---@param name string
 local function builtinModule(name)
 	local held = builtinModules[name]
 	if held ~= nil then return held or nil end
@@ -622,7 +694,6 @@ end
 ---@param scopes table<string, table<string, boolean|lye.doc.Type>>? the scope of each package
 ---@param batch table<string, string>? the files being checked, by their text
 ---@param store lye.check.Store? what the run keeps between runs, whose farm list is reused here
----@return lye.doc.Type?
 local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch, store)
 	local owner = packageOf(path)
 	if not owner then return nil end
@@ -633,6 +704,7 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 	end
 	if not found then found = "<builtin>/" .. name end
 
+	---@cast found string
 	local source = builtin or readSource(found)
 	if type(source) ~= "string" then
 		return nil
@@ -648,12 +720,20 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 		stats.interfaces.hits += 1
 		return cached.type
 	end
-	-- A module that requires its way back here says nothing rather than being read again.
-	if analysing[key] then return nil end
+	-- A module that requires its way back here is still being read: give the caller a placeholder
+	-- that is promoted when the outer analysis finishes, rather than dropping the interface.
+	if analysing[key] then
+		local placeholder = cyclePlaceholders[key]
+		if not placeholder then
+			placeholder = types.mutable()
+			cyclePlaceholders[key] = placeholder
+		end
+		return placeholder
+	end
 
 	-- What an earlier run kept, when nothing the module was read against has changed: the same
 	-- answer two package slices, or two runs, would otherwise pay to work out twice.
-	local ownerOfModule = packageOf(found) or owner
+	local ownerOfModule = packageOf(found --[[@as string ]]) or owner
 	if store then
 		local kept = loadInterface(key, path, store, ownerOfModule, written)
 		if kept then
@@ -682,19 +762,28 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 	if names == nil then
 		stats.analyses += 1
 		names = analyzer.analyze(written, PRELUDE, own, function(inner)
-			return moduleOf(found, inner, modules, analysing, own, scopes, batch, store)
-		end, nil, docsByText[key], batchPath == nil, builtin ~= nil or isDefinitionPath(path),
-			builtin and {} or pluginsFor(found),
+			return moduleOf(found --[[@as string ]], inner, modules, analysing, own, scopes, batch, store)
+		end, nil, docsByText[key] --[[@as lye.doc.File? ]], batchPath == nil, builtin ~= nil or isDefinitionPath(path),
+			builtin and {} or pluginsFor(found --[[@as string ]]),
 			function(message) io.stderr:write("check: " .. message .. "\n") end)
 		analysesByText[key] = names
+		moduleOnlyByText[key] = batchPath == nil
+	end
+	local cycle = cyclePlaceholders[key]
+	if cycle and names.module ~= nil then
+		---@cast cycle lye.doc.Type
+		types.promote(cycle, names.module)
 	end
 	analysing[key] = nil
 	stats.interfaces.misses += 1
 	local held = { type = names.module }
 	modules[key] = held
 	interfacesByText[key] = held
-	if store and saveInterface(key, path, store, ownerOfModule, written, names.module) then
-		stats.interfaces.stored += 1
+	if store then
+		local keptStore = store --[[@as lye.check.Store ]]
+		if saveInterface(key, path, keptStore, ownerOfModule, written, names.module) then
+			stats.interfaces.stored += 1
+		end
 	end
 	return names.module
 end
@@ -750,6 +839,7 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	-- finding is carried back to the file the reader wrote before it is reported or kept.
 	local written, map = lowered(path, source)
 	key = key or analysisKey(path, written)
+	---@cast key string
 
 	-- What a previous run found for this file, when nothing it was read against has changed:
 	-- reported as it stands, with no analysis at all.
@@ -764,24 +854,27 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	-- be followed for as long as the stack lasts, which is the whole run for a package cycle.
 	local analysing = { [key] = true }
 	local names = analysesByText[key]
-	if names == nil then
+	if names == nil or moduleOnlyByText[key] then
 		stats.analyses += 1
 		---@param name string
-		---@return lye.doc.Type?
 		local function moduleFor(name)
 			return moduleOf(path, name, modules or {}, analysing, elsewhere, scopes, batch, store)
 		end
 		---@param message string
 		local function reportPlugin(message) io.stderr:write("check: " .. message .. "\n") end
-		names = analyzer.analyze(written, PRELUDE, elsewhere, moduleFor, nil, docsByText[key],
+		names = analyzer.analyze(written, PRELUDE, elsewhere, moduleFor, nil, docsByText[key] --[[@as lye.doc.File? ]],
 			nil, isDefinitionPath(path), pluginsFor(path), reportPlugin)
 		analysesByText[key] = names
+		moduleOnlyByText[key] = nil
 		-- The full analysis says what `require` of this file gives back as well, and it is the
 		-- richer answer: a module another file reaches afterwards takes it rather than being
 		-- analysed a second time.
 		interfacesByText[key] = { type = names.module }
-		if store and owner and saveInterface(key, path, store, owner, written, names.module) then
-			stats.interfaces.stored += 1
+		if store and owner then
+			local keptStore = store --[[@as lye.check.Store ]]
+			if saveInterface(key, path, keptStore, owner, written, names.module) then
+				stats.interfaces.stored += 1
+			end
 		end
 	end
 	-- A `require` naming a module that is neither linked into the package nor one of the
@@ -791,10 +884,21 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 		if node.kind == "call" and node.callee == "require" and node.args and node.args[1] then
 			local argument = names.parser.nodes[node.args[1]]
 			if argument and argument.kind == "string" and type(argument.value) == "string"
-				and not (owner and modulePath(owner, argument.value))
+				and not modulePath(owner or env.cwd(), argument.value)
 				and not builtinModule(argument.value) then
+				local writtenName = argument.value
+				local suggestion
+				if owner then
+					local package = packageNameOf(owner)
+					if package and package ~= "" and writtenName ~= package then
+						local qualified = package .. "." .. writtenName
+						if modulePath(owner, qualified) then suggestion = qualified end
+					end
+				end
 				names.diagnostics[#names.diagnostics + 1] = {
-					message = string.format("module `%s` is not found", argument.value),
+					message = suggestion
+						and string.format("module `%s` is not found; did you mean `%s`?", writtenName, suggestion)
+						or string.format("module `%s` is not found", writtenName),
 					severity = 1, start = argument.start, stop = argument.stop,
 				}
 			end
@@ -819,7 +923,10 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	table.sort(all, function(a, b) return a.start < b.start end)
 
 	local isOk = reportEntries(reporter, path, source, all)
-	if store then store:keep(path, key, owner, all) end
+	if store then
+		local keeper = store --[[@as lye.check.Store ]]
+		keeper:keep(path, key, owner, all)
+	end
 	return isOk
 end
 
@@ -847,7 +954,7 @@ function check.discover(root)
 	local prefix = (cleaned == "" or cleaned == ".") and "./" or (cleaned:gsub("^%./", "") .. "/")
 	---@param glob string
 	local function scan(glob)
-		for path in fs.scan(base, glob, { ignore = ignored }) do
+		for path in fs.scan(base, glob, { ignore = ignored, absolute = false, followSymlinks = false }) do
 			found[#found + 1] = prefix .. path
 		end
 	end
@@ -867,7 +974,7 @@ end
 function check.extensions(root)
 	local found, seen = {}, {}
 	local base = absolute(root)
-	for path in fs.scan(base, "**/lye.json", { ignore = ignored }) do
+	for path in fs.scan(base, "**/lye.json", { ignore = ignored, absolute = false, followSymlinks = false }) do
 		local file = base .. "/" .. path
 		local written = readSource(file)
 		if type(written) == "string" then
@@ -877,7 +984,6 @@ function check.extensions(root)
 				-- The plugins that file names, loaded the way the package's own check loads them,
 				-- so that the extensions it walks for are the ones its files really have.
 				---@param name string
-				---@return string?
 				local function moduleAt(name) return modulePath(dir, name) end
 				local specs = plugin.load(config.plugins, dir, moduleAt, function() end)
 				for _, spec in ipairs(specs) do
@@ -898,7 +1004,6 @@ end
 --- Whether `path` is a directory. A directory opens as a handle on Linux and then reads as nil,
 --- where an empty file reads as an empty string, which is what tells the two apart.
 ---@param path string
----@return boolean
 local function isDirectory(path)
 	return fs.isdir(path)
 end
@@ -931,8 +1036,32 @@ end
 
 ---@param paths string[]
 ---@param reporter lye.Report?
----@return boolean isOk
 function check.files(paths, reporter)
+	-- `--cold` must not reuse a previous run, but the workers of *this* run still share modules:
+	-- without a common interface cache each of eight workers re-analyses the same libraries.
+	-- A private directory gives the cold path intra-run sharing while keeping nothing afterwards.
+	local previousRoot = cache.root()
+	local runCache
+	if not cache.enabled() then
+		local dir = os.tmpname()
+		os.remove(dir)
+		if os.execute("mkdir -p " .. string.format("%q", dir)) then
+			cache.setRoot(dir)
+			cache.setEnabled(true)
+			runCache = dir
+		end
+	end
+	---@param ok boolean
+	local function finish(ok)
+		if runCache then
+			cache.setEnabled(false)
+			cache.setRoot(previousRoot)
+			os.execute("rm -rf " .. string.format("%q", runCache))
+			runCache = nil
+		end
+		return ok
+	end
+
 	-- Every file in the batch is read first, so a name one of them declares is not a typo in
 	-- another: annotations are workspace-wide even though a document is analysed on its own.
 	-- The annotations themselves are the expensive part of that: an earlier run's declaration
@@ -940,6 +1069,7 @@ function check.files(paths, reporter)
 	-- and only the files the index does not describe are comment-lexed. The records are plain
 	-- tables, so a forked worker inherits them copy-on-write rather than through IPC.
 	local parsedFiles = {}
+	---@cast parsedFiles lye.doc.File[]
 	local sourcesByPath, keysByPath = {}, {}
 	local records = cache.enabled() and indexedFiles(paths) or nil
 	local loaded, parsed = 0, 0
@@ -978,7 +1108,8 @@ function check.files(paths, reporter)
 	reporter = reporter or report.new()
 	-- What an earlier run kept, when this one can read it: everything a file is read against,
 	-- hashed, so an answer that is still the answer is reported without working it out again.
-	local store = cache.enabled() and Store.new(paths, keysByPath, docsByText) or nil
+	local store = nil ---@type lye.check.Store?
+	if cache.enabled() then store = Store.new(paths, keysByPath, docsByText) end
 	if store then
 		local held, missing = {}, false
 		for _, path in ipairs(paths) do
@@ -1004,7 +1135,7 @@ function check.files(paths, reporter)
 					isOk = false
 				end
 			end
-			return isOk
+			return finish(isOk)
 		end
 	end
 
@@ -1036,6 +1167,7 @@ function check.files(paths, reporter)
 	---@param files string[]
 	---@param collector lye.Collector
 	local function checkSlice(files, collector)
+		local keeper = store --[[@as lye.check.Store? ]]
 		local modules, scopes = {}, {}
 		-- The files this slice is checking, by their text: one reached as a module on the way is
 		-- read the way its own check reads it, so it is read once and its findings are kept.
@@ -1046,7 +1178,7 @@ function check.files(paths, reporter)
 		end
 		for _, path in ipairs(files) do
 			local passed, err = checkSource(path, declared, modules, collector, scopes,
-				sourcesByPath[path], keysByPath[path], true, store, batch)
+				sourcesByPath[path], keysByPath[path], true, keeper, batch)
 			if passed ~= true and err then
 				-- A file that cannot be read reports to whoever asked, and the name of the file is
 				-- what that report is about, so it travels with the rest and is said where it is
@@ -1064,7 +1196,7 @@ function check.files(paths, reporter)
 				io.stderr:write(entry.err .. "\n")
 				isOk = false
 			else
-				report.diagnostic(reporter, entry.path, entry.line, entry.column, entry.severity, entry.message)
+				report.diagnostic(reporter, entry.path, entry.line or 1, entry.column or 1, entry.severity, entry.message)
 				-- An unused local is a hint, and a build step that fails on one is a build step
 				-- nobody keeps: it is printed and it does not decide the exit code. A parser
 				-- diagnostic carries no severity, and a syntax error is the loudest thing there is.
@@ -1072,7 +1204,7 @@ function check.files(paths, reporter)
 			end
 		end
 	end
-	return isOk
+	return finish(isOk)
 end
 
 return check

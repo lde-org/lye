@@ -16,7 +16,6 @@ local FIXTURE = TESTS_DIR .. "/fixtures/server.lua"
 
 --- This process's own id. `math.random` alone is not enough: two copies started in the same second
 --- seed it identically, so both would write the same files.
----@return string
 local function processId()
 	local ok, value = pcall(function()
 		local ffi = require("ffi")
@@ -34,7 +33,6 @@ local RUN_TAG = processId() .. "-" .. tostring(os.time()) .. "-" .. tostring(mat
 local CACHE = PACKAGE_DIR .. "/target/session-cache-" .. RUN_TAG
 
 ---@param path string
----@return string
 local function quote(path)
 	return string.format("%q", path)
 end
@@ -76,7 +74,6 @@ local BROKEN = "local x = 1\nlocal = 2\n"
 local VALID = "local x = 1\nlocal y = 2\n"
 
 ---@param value any
----@return string
 local function frame(value)
 	local body = json.encode(value)
 	return "Content-Length: " .. #body .. "\r\n\r\n" .. body
@@ -88,15 +85,16 @@ end
 ---@param root string? a workspace to open, for what a document names without requiring it
 ---@param cache boolean|string? where the session keeps what it works out — the suite's own
 --- directory, one it names, or `false` for none named at all, which leaves the workspace's own
+---@param capabilities table? what the client says it can do, for a dynamic registration
 ---@return table[] frames
 ---@return integer exitCode
-local function run(messages, root, cache)
+local function run(messages, root, cache, capabilities)
 	local handle = assert(io.open(INPUT, "wb"))
 	handle:write(frame({
 		jsonrpc = "2.0",
 		id = 1,
 		method = "initialize",
-		params = { capabilities = {}, rootUri = root and ("file://" .. root) or nil },
+		params = { capabilities = capabilities or {}, rootUri = root and ("file://" .. root) or nil },
 	}))
 	for _, message in ipairs(messages) do
 		handle:write(frame(message))
@@ -147,7 +145,6 @@ end
 
 --- A real session ends with `shutdown` then `exit`, and the exit code proves both arrived.
 ---@param messages table[]
----@return table[]
 local function endingWithShutdown(messages)
 	messages[#messages + 1] = { jsonrpc = "2.0", id = 2, method = "shutdown" }
 	messages[#messages + 1] = { jsonrpc = "2.0", method = "exit" }
@@ -222,9 +219,11 @@ end
 local function publishedDiagnostics(frames)
 	local published = {}
 	for _, message in ipairs(frames) do
+		---@cast message { method: string?, params: { diagnostics: table[] } }
 		if message.method == "textDocument/publishDiagnostics" then
 			local kept = {}
 			for _, entry in ipairs(message.params.diagnostics or {}) do
+				---@cast entry { message: string? }
 				if not (entry.message or ""):match("^unused local") then kept[#kept + 1] = entry end
 			end
 			message.params.diagnostics = kept
@@ -261,6 +260,7 @@ test.it("reads a lowered document, and reports where the reader wrote it", funct
 		if message.id == 7 then answer = message.result end
 	end
 	local data = assert(answer and answer.data, "the token answer")
+	---@cast data integer[]
 	local lines = {}
 	for piece in (source .. "\n"):gmatch("([^\n]*)\n") do lines[#lines + 1] = piece end
 	local seen, marked = {}, {}
@@ -282,6 +282,44 @@ test.it("reads a lowered document, and reports where the reader wrote it", funct
 	end
 	test.equal(table.concat(names, " "), "holding",
 		"the name the plugin coloured, in the reader's own offsets")
+end)
+
+test.it("registers a plugin's file extension dynamically", function()
+	-- A client's document selector is chosen before the server starts, so it cannot know that this
+	-- workspace's plugin turns `.toy` into a document lye reads. The server registers the extension
+	-- with a client that supports dynamic registration; the client then sends those files through
+	-- the same sync and feature handlers as a `.lua` one.
+	local project = TESTS_DIR .. "/fixtures/syntax"
+	local capabilities = {
+		textDocument = {
+			synchronization = { dynamicRegistration = true },
+			hover = { dynamicRegistration = true },
+			completion = { dynamicRegistration = true },
+			semanticTokens = { dynamicRegistration = true },
+		},
+	}
+	local frames = run(endingWithShutdown({
+		{ jsonrpc = "2.0", method = "initialized", params = {} },
+	}), project, nil, capabilities)
+
+	local registration = findMethod(frames, "client/registerCapability")
+	test.truthy(registration, "the extension registration is sent")
+	local byMethod = {}
+	for _, entry in ipairs(registration.params.registrations or {}) do
+		---@cast entry { method: string, registerOptions: table }
+		byMethod[entry.method] = entry.registerOptions
+	end
+	local open = byMethod["textDocument/didOpen"]
+	test.truthy(open, "document sync is registered for the extension")
+	test.equal(open.documentSelector[1].scheme, "file")
+	test.equal(open.documentSelector[1].pattern, "**/*.toy")
+	local change = byMethod["textDocument/didChange"]
+	test.equal(change.syncKind, 2, "the registration keeps the server's incremental sync")
+	test.truthy(byMethod["textDocument/hover"], "hover is registered for the extension")
+	test.truthy(byMethod["textDocument/completion"], "completion is registered for the extension")
+	local tokens = byMethod["textDocument/semanticTokens"]
+	test.truthy(tokens, "semantic tokens are registered for the extension")
+	test.truthy(tokens.legend and tokens.legend.tokenTypes, "with the legend the client needs")
 end)
 
 test.it("answers initialize with a capabilities object", function()
@@ -483,7 +521,9 @@ test.it("reads ffi types only while the ffi plugin is on", function()
 	---@return boolean
 	local function reportsVec(published)
 		for _, message in ipairs(published) do
+			---@cast message { diagnostics: table[] }
 			for _, entry in ipairs(message.diagnostics) do
+				---@cast entry { message: string }
 				if entry.message:match("`nope` is not a field of Vec") then return true end
 			end
 		end
@@ -496,6 +536,49 @@ test.it("reads ffi types only while the ffi plugin is on", function()
 	writeFile(project .. "/lye.json", "{\"plugins\":[]}\n")
 	local on = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project))
 	test.truthy(reportsVec(on), "with it, the member the block never declared is reported")
+	os.execute("rm -rf " .. string.format("%q", project))
+end)
+
+test.it("answers workspace and document pull diagnostics", function()
+	-- An editor asks for diagnostics itself when it supports pull diagnostics: once for the open
+	-- document and once for the whole workspace. The workspace answer has to come from a real
+	-- check of files the server never opened, or a closed file can never appear in the Problems list.
+	local project = WORK .. "/pull"
+	os.execute("rm -rf " .. string.format("%q", project))
+	local broken = "local x = \"s\"\nlocal y = x + 1\nreturn y\n"
+	writeFile(project .. "/broken.lua", broken)
+	writeFile(project .. "/clean.lua", "return 1\n")
+	local brokenUri = "file://" .. project .. "/broken.lua"
+
+	local frames = run(endingWithShutdown({
+		{
+			jsonrpc = "2.0", id = 4, method = "workspace/diagnostic",
+			params = { previousResultIds = {} },
+		},
+		didOpen(broken, brokenUri),
+		{
+			jsonrpc = "2.0", id = 5, method = "textDocument/diagnostic",
+			params = { textDocument = { uri = brokenUri } },
+		},
+	}), project)
+
+	local workspace
+	local document
+	for _, message in ipairs(frames) do
+		if message.id == 4 then workspace = message.result end
+		if message.id == 5 then document = message.result end
+	end
+	test.truthy(workspace, "workspace/diagnostic is answered")
+	local found
+	for _, item in ipairs(workspace.items or {}) do
+		---@cast item { uri: string, items: table[] }
+		if item.uri == brokenUri then found = item end
+	end
+	test.truthy(found, "the unopened broken file is in the workspace answer")
+	test.truthy(#found.items > 0, "with the diagnostic a check found in it")
+	test.truthy(document, "textDocument/diagnostic is answered")
+	test.equal(document.kind, "full")
+	test.truthy(#document.items > 0, "with the open document's diagnostic")
 	os.execute("rm -rf " .. string.format("%q", project))
 end)
 

@@ -22,11 +22,16 @@ Document.__index = Document
 ---@field range lye.framework.Range?
 ---@field text string
 
+---@param uri string
+---@param text string
+---@param version integer?
 function Document.new(uri, text, version)
 	return setmetatable({ uri = uri, text = text, version = version, lineIndex = position.buildLineIndex(text) }, Document)
 end
 
 ---@param self lye.framework.Document
+---@param text string
+---@param version integer?
 function Document:setText(text, version)
 	self.text = text
 	self.version = version
@@ -34,6 +39,8 @@ function Document:setText(text, version)
 end
 
 ---@param self lye.framework.Document
+---@param change lye.framework.Change
+---@param encoding string
 function Document:applyChange(change, encoding)
 	if not change then return end
 
@@ -58,6 +65,7 @@ function Document:applyChange(change, encoding)
 end
 
 ---@class lye.framework.DocumentStore
+---@field byUri table<string, lye.framework.Document>
 local DocumentStore = {}
 DocumentStore.__index = DocumentStore
 
@@ -68,8 +76,7 @@ end
 ---@param self lye.framework.DocumentStore
 ---@param uri string
 ---@param text string
----@param version integer
----@return lye.framework.Document
+---@param version integer?
 function DocumentStore:open(uri, text, version)
 	local document = Document.new(uri, text, version)
 	self.byUri[uri] = document
@@ -84,6 +91,7 @@ function DocumentStore:get(uri)
 end
 
 ---@param self lye.framework.DocumentStore
+---@param uri string
 function DocumentStore:close(uri)
 	self.byUri[uri] = nil
 end
@@ -93,7 +101,6 @@ end
 ---@param changes lye.framework.Change[]
 ---@param encoding string
 ---@param self lye.framework.DocumentStore
----@return lye.framework.Document?
 function DocumentStore:change(uri, version, changes, encoding)
 	local document = self.byUri[uri]
 	if not document then return nil end

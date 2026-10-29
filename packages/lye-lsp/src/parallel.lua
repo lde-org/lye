@@ -37,11 +37,11 @@ do
 end
 
 --- As many processors as the machine will admit to, and 4 when it will not say.
----@return integer
 local function cpuCount()
 	-- _SC_NPROCESSORS_ONLN: 84 on Linux and Android, 58 on the BSDs and macOS.
 	for _, name in ipairs({ 84, 58 }) do
 		local ok, value = pcall(function() return tonumber(ffi.C.sysconf(name)) end)
+		---@cast value integer?
 		if ok and value and value >= 1 then return value end
 	end
 	return 4
@@ -49,19 +49,16 @@ end
 
 --- Whether this machine can fork at all. A caller that does something other than checking files —
 --- building an index, say — asks before it plans for more than one process.
----@return boolean
 function parallel.canFork()
 	return HAS_FORK
 end
 
 --- This process's pid, which names the files a forked worker writes.
----@return integer
 function parallel.pid()
 	return PID
 end
 
 --- As many processors as this machine will admit to.
----@return integer
 function parallel.cores()
 	return cpuCount()
 end
@@ -70,7 +67,6 @@ end
 --- Below a handful of files the processes cost more than they save; `LYE_WORKERS` says otherwise,
 --- and `LYE_WORKERS=1` turns the split off.
 ---@param files integer
----@return integer
 function parallel.workers(files)
 	local wanted = tonumber(os.getenv("LYE_WORKERS") or "")
 	if wanted and wanted >= 1 then return math.max(1, math.min(wanted, files)) end
@@ -99,10 +95,12 @@ end
 
 --- The fields of one record line, split at the tabs that were not escaped.
 ---@param line string
----@return string[]
 local function fieldsOf(line)
-	local fields = {}
-	for field in (line .. "\t"):gmatch("([^\t]*)\t") do fields[#fields + 1] = field end
+	local fields = {} ---@type string[]
+	for field in (line .. "\t"):gmatch("([^\t]*)\t") do
+		---@cast field string
+		fields[#fields + 1] = field
+	end
 	return fields
 end
 
@@ -180,6 +178,7 @@ end
 ---@param pid integer
 local function waitFor(pid)
 	local status = ffi.new("int[1]")
+	---@cast status integer[]
 	while true do
 		local waited = ffi.C.waitpid(pid, status, 0)
 		if waited == pid then
@@ -202,7 +201,6 @@ end
 ---@param workers integer
 ---@param outOf fun(index: integer): string? where each slice's answer is written; the check batch's
 --- own files when a caller does not say
----@return lye.parallel.Slice[]
 local function splitWork(groups, workers, outOf)
 	local total = 0
 	for _, group in ipairs(groups) do total += group.bytes end
@@ -223,7 +221,7 @@ local function splitWork(groups, workers, outOf)
 		if #files > 0 then pieces[#pieces + 1] = { files = files, bytes = bytes } end
 	end
 
-	local slices = {}
+	local slices = {} ---@type lye.parallel.Slice[]
 	for index = 1, workers do
 		slices[index] = { files = {}, bytes = 0, out = outOf and outOf(index) or outPath(index) }
 		-- A file left over from a run this pid happens to repeat would read as this run's result.
@@ -256,7 +254,7 @@ parallel.splitWork = splitWork
 ---@return integer workers how many processes ran a slice
 ---@return integer fellBack how many slices a failed child left to this process
 function parallel.dispatch(slices, work, spawn)
-	spawn = spawn or function() return ffi.C.fork() end
+	spawn = spawn or function() return ffi.C.fork() --[[@as integer? ]] end
 
 	-- Everything this process has buffered goes out before a copy of it exists, so a child that
 	-- writes cannot echo it a second time.
@@ -268,6 +266,7 @@ function parallel.dispatch(slices, work, spawn)
 		local slice = slices[index]
 		if #slice.files == 0 then break end
 		local pid = spawn()
+		---@cast pid integer?
 		if pid == 0 then
 			-- The child. It must not come back: returning would run the rest of this process's
 			-- work a second time, in a process the parent is not watching.
@@ -316,7 +315,8 @@ local function absorb(found, file)
 	handle:close()
 	os.remove(file)
 	for line in text:gmatch("[^\n]+") do
-		local fields = fieldsOf(line)
+		local textLine = line --[[@as string ]]
+		local fields = fieldsOf(textLine)
 		if fields[1] == "d" then
 			add(found, {
 				path = unescaped(fields[2]), line = wholeOf(fields[3]), column = wholeOf(fields[4]),
@@ -334,7 +334,6 @@ end
 ---@param groups lye.parallel.Group[] the files, in the units one process has to hold together
 ---@param workers integer
 ---@param check fun(files: string[], report: lye.Collector) what a worker does with its files
----@return lye.parallel.Found
 function parallel.run(groups, workers, check)
 	local found = {}
 

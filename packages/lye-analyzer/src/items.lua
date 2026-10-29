@@ -43,6 +43,41 @@ local callName, writtenNameOf = names.callName, names.writtenNameOf
 ---@field bodyHash string hash of the body source slice
 ---@field signature lye.analyzer.ItemSignature
 ---@field deps lye.analyzer.ItemDeps
+---@field cache lye.analyzer.ItemCache? what a previous analysis kept for reuse
+
+---@class lye.analyzer.ItemVar
+---@field name string
+---@field rel integer
+---@field declared lye.doc.Type?
+---@field initializer lye.doc.Type
+---@field assignments lye.doc.Type[]
+
+---@class lye.analyzer.ItemFn
+---@field rel integer
+---@field ordinal integer
+---@field type lye.doc.Type
+
+---@class lye.analyzer.ItemSignatureCache
+---@field name string
+---@field rel integer
+---@field inferred lye.doc.Type?
+---@field inferredValues lye.doc.Type[]?
+
+---@class lye.analyzer.ItemDiag
+---@field message string
+---@field relStart integer
+---@field relStop integer
+---@field severity integer
+
+---@class lye.analyzer.ItemCache
+---@field signatureDigest string
+---@field depsHash string
+---@field resultHash string
+---@field variables lye.analyzer.ItemVar[]
+---@field fnTypes lye.analyzer.ItemFn[]
+---@field callTypes lye.analyzer.ItemFn[]
+---@field signatureInferred lye.analyzer.ItemSignatureCache[]
+---@field diagnostics lye.analyzer.ItemDiag[]
 
 ---@class lye.analyzer.ItemTree
 ---@field skeletonHash string non-body source, annotation text and module-level declaration names
@@ -53,7 +88,7 @@ local items = {}
 
 ---@param tokens lye.lexer.Tokens
 ---@param offset integer
----@return integer index of the first token starting at or after the offset
+--- index of the first token starting at or after the offset
 local function tokenAtOrAfter(tokens, offset)
 	local arena, low, high = tokens.arena, 1, tokens.count
 	while low <= high do
@@ -65,7 +100,7 @@ end
 
 ---@param tokens lye.lexer.Tokens
 ---@param offset integer
----@return integer index of the last token starting at or before the offset
+--- index of the last token starting at or before the offset
 local function tokenAtOrBefore(tokens, offset)
 	local arena, low, high, found = tokens.arena, 1, tokens.count, 1
 	while low <= high do
@@ -162,14 +197,12 @@ local function leadingAnnotations(source, list, offset)
 end
 
 ---@param annotation lye.doc.Annotation
----@return string?
 local function annotationType(annotation)
 	return annotation.typeText or annotation.type
 end
 
 ---@param source string
 ---@param annotation lye.doc.Annotation
----@return string
 local function annotationText(source, annotation)
 	return source:sub(annotation.start, annotation.stop)
 end
@@ -242,6 +275,7 @@ local function annotationSignature(source, annotation, name)
 	local inside = (annotationType(annotation) or ""):match("^%s*<([^<>]*)>")
 	if inside then
 		for param in inside:gmatch("[%a_][%w_%.]*") do
+			---@cast param string
 			params[#params + 1] = { name = param }
 			generics[param] = true
 		end
@@ -255,13 +289,11 @@ end
 --- A name as the ID may hold it. Structural IDs are keys, not source, so punctuation a Lua name
 --- can carry (`M:method`, `A.B`) is folded to `_` rather than read back as the separators.
 ---@param name string
----@return string
 local function idName(name)
 	return (name:gsub("[^%w_%.]", "_"))
 end
 
 ---@param uri string
----@return string
 local function moduleNameOf(uri)
 	local name = uri:match("([^/\\]+)%.lua$")
 	return name or "module"
@@ -273,7 +305,6 @@ end
 ---@param source string
 ---@param list lye.doc.Annotation[]
 ---@param offset integer
----@return integer start
 function items.annotationStart(source, list, offset)
 	local leading = leadingAnnotations(source, list, offset)
 	return leading[1] and leading[1].start or offset
@@ -360,7 +391,7 @@ function items.build(source, parsed, annotations, uri)
 	table.sort(spans, function(left, right) return left.start < right.start end)
 
 	---@param node { start: integer, stop: integer }
-	---@return lye.analyzer.Item? the innermost top-level function item holding the node
+	--- the innermost top-level function item holding the node
 	local function ownerOf(node)
 		local low, high, index = 1, #spans, 0
 		while low <= high do
@@ -386,6 +417,7 @@ function items.build(source, parsed, annotations, uri)
 	for _, annotation in ipairs(list) do
 		local tag = annotation.tag
 		if tag == "class" or tag == "alias" then
+			---@cast tag "class"|"alias"
 			local node = { start = annotation.start, stop = annotation.stop }
 			if not ownerOf(node) then
 				local name = annotation.name or (annotation.text or ""):match("^([%w_%.]+)") or tag
@@ -408,7 +440,10 @@ function items.build(source, parsed, annotations, uri)
 
 	-- Names nothing in this file declares are the ones read from the environment: a coarse but
 	-- real answer without resolving every scope.
-	local declaredNames, topDeclarations, moduleTables = {}, {}, {}
+	---@type table<string, boolean>
+	local declaredNames, moduleTables = {}, {}
+	---@type table<string, lye.parser.Declaration>
+	local topDeclarations = {}
 	for _, declaration in ipairs(parsed.declarations) do
 		declaredNames[declaration.name] = true
 		if declaration.depth == 0 then
@@ -421,7 +456,7 @@ function items.build(source, parsed, annotations, uri)
 	end
 
 	---@param node lye.parser.Node
-	---@return lye.analyzer.ItemDeps the function item's deps, or the module's at the top level
+	--- the function item's deps, or the module's at the top level
 	local function depsOf(node)
 		local owner = ownerOf(node)
 		return owner and owner.deps or moduleItem.deps
@@ -435,7 +470,6 @@ function items.build(source, parsed, annotations, uri)
 	table.sort(topList, function(left, right) return left.start < right.start end)
 	---@param from integer
 	---@param to integer
-	---@return lye.parser.Declaration?
 	local function topAt(from, to)
 		local low, high, index = 1, #topList, 0
 		while low <= high do
@@ -506,6 +540,7 @@ function items.build(source, parsed, annotations, uri)
 	---@param item lye.analyzer.Item
 	local function addWriter(tableName, item)
 		if not moduleTables[tableName] then return end
+		---@type table<string, boolean>?
 		local list = writersByTable[tableName]
 		if not list then
 			list = {}

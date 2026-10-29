@@ -10,16 +10,32 @@ local types = require("lye-doc.type")
 -- full of locals nothing reads, so the module is wrapped to keep the diagnostics that are about
 -- types and about names that do not resolve; the unused-local rule is dropped by name, and tested
 -- on its own below.
+--- The analyzer with the unused-local rule dropped, taking the same arguments as `lye.analyze`.
+---@param source string
+---@param prepared lye.analyzer.Prelude?
+---@param elsewhere table<string, boolean|lye.doc.Type>?
+---@param modules (fun(name: string): lye.doc.Type?)?
+---@param resume lye.parser.Resume?
+---@param cachedAnnotations lye.doc.File?
+---@param isModuleOnly boolean?
+---@param isDefinition boolean?
+---@param plugins lye.plugin.Spec[]?
+---@param report fun(message: string)?
+---@param options lye.analyzer.Options?
+local function analyzeSource(source, prepared, elsewhere, modules, resume, cachedAnnotations,
+	isModuleOnly, isDefinition, plugins, report, options)
+	local result = lye.analyze(source, prepared, elsewhere, modules, resume, cachedAnnotations,
+		isModuleOnly, isDefinition, plugins, report, options)
+	local kept = {}
+	for _, entry in ipairs(result.diagnostics) do
+		if not entry.message:match("^unused local") then kept[#kept + 1] = entry end
+	end
+	result.diagnostics = kept
+	return result
+end
+
 local analyzer = {
-	analyze = function(source, ...)
-		local result = lye.analyze(source, ...)
-		local kept = {}
-		for _, entry in ipairs(result.diagnostics) do
-			if not entry.message:match("^unused local") then kept[#kept + 1] = entry end
-		end
-		result.diagnostics = kept
-		return result
-	end,
+	analyze = analyzeSource,
 	prelude = lye.prelude,
 	typeAt = lye.typeAt,
 	lookupAt = lye.lookupAt,
@@ -254,6 +270,8 @@ test.it("gives a parameter the type its @param names", function()
 	local result = analyzer.analyze(source)
 	local at = assert(source:find("print", 1, true))
 	for name, expected in pairs({ name = "string", count = "number" }) do
+		---@cast name string
+		---@cast expected string
 		local variable = assert(analyzer.lookupAt(result, name, at), name)
 		test.equal(types.display(analyzer.typeAt(result, variable, at)), expected)
 		test.equal(variable.declared ~= nil, true, "it comes from the annotation")
@@ -468,7 +486,7 @@ test.it("exports a definition's global table as the class it describes", functio
 	}, "")
 	local prelude = analyzer.prelude({ bit = text })
 	local result = analyzer.analyze(text, prelude, nil, nil, nil, nil, true, true)
-	test.equal(types.display(result.module), "bitlib")
+	test.equal(types.display(assert(result.module)), "bitlib")
 end)
 
 test.it("gives each name the value the callee returns at its position", function()
@@ -864,13 +882,15 @@ end)
 test.it("widens to a union from two different values", function()
 	local source = "local x = 1\nx = \"s\"\nx = true\n"
 	local result = analyzer.analyze(source)
+	---@type lye.analyzer.Variable
 	local variable = result.variables[1]
-	test.equal(types.display(analyzer.typeAt(result, variable, #source)), "1|string|true")
+	local held = analyzer.typeAt(result, variable, #source)
+	---@cast held lye.doc.Type
+	test.equal(types.display(held), "1|string|true")
 end)
 
 ---@param source string
 ---@param needle string
----@return integer
 local function offsetOf(source, needle)
 	local at = assert(source:find(needle, 1, true), needle)
 	return at
@@ -1006,6 +1026,35 @@ test.it("narrows every else branch of a chain by the conditions before it", func
 	test.equal(typeAtOffset(source, "x", offsetOf(source, "print(x)")), "number|string")
 end)
 
+test.it("does not report on code a contradictory if chain proved unreachable", function()
+	-- Both members of the union return from the first chain, so the code below it cannot run.
+	-- The facts left by the chain contradict every member; that used to make the next comparison
+	-- report an impossible value instead of treating the rest of the body as dead.
+	local source = table.concat({
+		'---@class CA\n',
+		'---@field kind "ca"\n',
+		'---@class CB\n',
+		'---@field kind "cb"\n',
+		'---@field n number\n',
+		'---@alias CU CA|CB\n',
+		'---@param c CB\n',
+		'local function takesB(c) end\n',
+		'---@param u CU\n',
+		'local function f(u)\n',
+		'\tif u.kind == "ca" then\n',
+		'\t\treturn\n',
+		'\telseif u.kind == "cb" then\n',
+		'\t\treturn\n',
+		'\tend\n',
+		'\tif u.kind == "ca" then takesB(u) end\n',
+		'\treturn\n',
+		'end\n',
+		'return f\n',
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 0, "the dead comparison and call are not reported")
+end)
+
 test.it("intersects a nested condition with the one around it", function()
 	local source = table.concat({
 		"---@type string|number?\n",
@@ -1128,7 +1177,9 @@ test.it("hard types a function from its own annotations", function()
 	local result = analyzer.analyze(source)
 	local byName = {}
 	for _, variable in ipairs(result.variables) do byName[variable.name] = variable end
-	test.equal(types.display(byName.f.declared), "fn(number) -> string")
+	local f = assert(byName.f)
+	local declared = f.declared --[[@as lye.doc.Type]]
+	test.equal(types.display(declared), "fn(number) -> string")
 	test.equal(types.display(analyzer.typeAt(result, byName.g, #source)), "fn(number) -> string",
 		"the signature travels with the function")
 	test.equal(#result.diagnostics, 1, "assigning a number to a function is an error")
@@ -2278,6 +2329,7 @@ test.it("reports a type name nothing declares", function()
 	test.equal(reported[1], "unknown type `s`")
 
 	---@param source string
+	---@param elsewhere table<string, boolean|lye.doc.Type>?
 	---@return string[]
 	local function unknowns(source, elsewhere)
 		local found = {}
@@ -2502,6 +2554,7 @@ test.it("reads the direction a `---@cast` asserts", function()
 			if one.name == "q" then variable = one end
 		end
 		local at = analyzer.typeAt(result, variable, source:find("local here", 1, true) + 4)
+		---@cast at lye.doc.Type
 		return at and types.display(at) or nil
 	end
 

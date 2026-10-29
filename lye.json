@@ -1,0 +1,10 @@
+{
+  "requirePaths": [
+    "packages/lye-lsp/target/?.lua",
+    "packages/lye-lsp/target/?/init.lua",
+    "packages/lye-analyzer/target/?.lua",
+    "packages/lye-analyzer/target/?/init.lua",
+    "editors/neovim/lua/?.lua",
+    "editors/neovim/lua/?/init.lua"
+  ]
+}

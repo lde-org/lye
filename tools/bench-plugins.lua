@@ -14,15 +14,25 @@
 	same document through the analyzer, which is what the hooks are a fraction of.
 ]]
 
-local analyzer = require("lye-analyzer")
-local types = require("lye-doc.type")
+--- The analyzer's entry points, as root `lye.json` resolves them, which the checker cannot see.
+---@class lye.ToolsAnalyzer
+---@field prelude fun(sources: table<string, string>): lye.analyzer.Prelude
+---@field analyze fun(source: string, prepared: lye.analyzer.Prelude?, elsewhere?: table<string, boolean|lye.doc.Type>?, modules?: table?, resume?: lye.parser.Resume?, cachedAnnotations?: lye.doc.File?, isModuleOnly?: boolean, isDefinition?: boolean, plugins?: lye.plugin.Spec[]?): lye.analyzer.Result
+
+---@class lye.ToolsPlugin
+---@field load fun(entries: string[]?, root: string?, resolve: (fun(name: string): string?)?, report: fun(message: string)): lye.plugin.Spec[]
+---@field lower fun(specs: lye.plugin.Spec[], context: lye.plugin.Context, report: fun(message: string)): lye.plugin.Map
+---@field tokens fun(specs: lye.plugin.Spec[], context: lye.plugin.TokenContext): lye.plugin.Span[]
+
+local analyzer = require("lye-analyzer") --[[@as lye.ToolsAnalyzer]]
+local types = require("lye-doc.type") --[[@as table]]
+local ownerOf = types.ownerOf --[[@as fun(held: lye.doc.Type?): string?]]
 
 local ROUNDS = tonumber(os.getenv("ROUNDS") or "12")
 local ROOT = os.getenv("LYE_ROOT") or "."
-local PRELUDE = analyzer.prelude(require("lye-defs"))
+local PRELUDE = analyzer.prelude(require("lye-defs") --[[@as table<string, string>]])
 
 ---@param path string
----@return string?
 local function read(path)
 	local handle = io.open(path, "rb")
 	if not handle then return nil end
@@ -53,7 +63,7 @@ end
 
 -- The plugin layer is loaded by the analyzer itself now, so its module cost is part of every
 -- analysis rather than an optional extra. What a session keeps per package is the spec tables.
-local plugin = require("lye-plugin")
+local plugin = require("lye-plugin") --[[@as lye.ToolsPlugin]]
 
 ---@param source string
 ---@param names lye.analyzer.Result
@@ -67,7 +77,7 @@ local function contextOf(source, names)
 	-- `string.format`, `string.find` — need no type, and a method call on a receiver does; leaving
 	-- it out understates the method-call share rather than inventing one.
 	context.typeOf = function() return nil end
-	context.ownerOf = types.ownerOf
+	context.ownerOf = ownerOf
 	return context
 end
 
@@ -80,6 +90,7 @@ local GROUPS = {
 	{ name = "none", entries = { "!patterns", "!formats", "!ffi" } },
 }
 
+---@type table<string, lye.plugin.Spec[]>
 local specs = {}
 local specsBefore = heap()
 for _, group in ipairs(GROUPS) do

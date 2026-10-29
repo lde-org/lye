@@ -23,7 +23,6 @@ local MAX_PACKAGES = 32
 --- a builtin is not part of any index.
 ---@param source string
 ---@param offset integer
----@return integer
 local function lineStart(source, offset)
 	local at = offset - 1
 	while at >= 1 do
@@ -36,7 +35,6 @@ end
 --- The line at a start offset, without its indentation.
 ---@param source string
 ---@param at integer
----@return string
 local function lineAt(source, at)
 	local to = source:find("\n", at, true) or (#source + 1)
 	return (source:sub(at, to - 1):gsub("^%s+", ""))
@@ -48,7 +46,6 @@ end
 ---@param source string
 ---@param annotations lye.doc.Annotation[]
 ---@param at integer the index of the class or alias annotation
----@return string
 local function declarationLines(source, annotations, at)
 	local annotation = annotations[at]
 	local declaration = lineStart(source, annotation.start)
@@ -75,7 +72,6 @@ end
 --- become dots. The same transform the workspace walk always applied, so completions do not move.
 ---@param root string
 ---@param path string
----@return string?
 local function moduleName(root, path)
 	local base = root:gsub("[/\\]+$", "")
 	if path:sub(1, #base + 1) ~= base .. "/" then return nil end
@@ -127,7 +123,6 @@ Declarations.__index = Declarations
 
 ---@param lye lye.Server
 ---@param indexes { workspace: fun(root: string): lye.lsp.Index?, package: fun(root: string): lye.lsp.Index? }?
----@return lye.Declarations
 function Declarations.new(lye, indexes)
 	return setmetatable({
 		lye = lye,
@@ -159,6 +154,7 @@ end
 ---@param self lye.Declarations
 function Declarations:mergeLocations()
 	local merged = {}
+	---@param index lye.lsp.Index?
 	local function add(index)
 		if not index then return end
 		for name, held in pairs(index:typeLocations()) do
@@ -172,7 +168,8 @@ function Declarations:mergeLocations()
 	for _, root in ipairs(roots) do
 		-- A root whose names were cleared is read again on the next `package` call; until then
 		-- what its index still remembers was read from a disk that has moved on.
-		if self.lye.packageNames and self.lye.packageNames[root] ~= nil then
+		local names = self.lye.packageNames
+		if names and names[root] ~= nil then
 			add(self.packageIndexes[root])
 		end
 	end
@@ -182,12 +179,11 @@ end
 --- Load the workspace entry, build and write it when there is none, and fill what the session
 --- reads from it. A load that does not have to read anything is the warm start; `lye.known` is
 --- set to nil by the watcher's full invalidation, and that rebuilds rather than trusts.
----@return lye.lsp.Index?
 ---@param self lye.Declarations
 function Declarations:ensureWorkspace()
 	local lye = self.lye
 	lye:useWorkspaceCache()
-	local root = lye.server.rootPath
+	local root = lye.server.rootPath --[[@as string? ]]
 	if not root or root == "" then
 		lye.known = lye.known or {}
 		return self.workspaceIndex
@@ -226,12 +222,12 @@ end
 
 --- The classes and aliases every file in the workspace declares, each resolved to the type it
 --- stands for. Read once from the index: a warm session touches no source file.
----@return table<string, boolean|lye.doc.Type>
 ---@param self lye.Declarations
 function Declarations:workspace()
 	self:ensureWorkspace()
-	self.lye.known = self.lye.known or {}
-	return self.lye.known
+	local known = self.lye.known or {}
+	self.lye.known = known
+	return known
 end
 
 ---@param root string
@@ -246,8 +242,9 @@ function Declarations:touchPackage(root)
 		local dropped = table.remove(order, 1)
 		if dropped ~= root then
 			self.packageIndexes[dropped] = nil
-			self.lye.packageNames[dropped] = nil
-			self.lye.packageDigests[dropped] = nil
+			local names, digests = self.lye.packageNames, self.lye.packageDigests
+			if names then names[dropped] = nil end
+			if digests then digests[dropped] = nil end
 		end
 	end
 end
@@ -314,6 +311,7 @@ function Declarations:moduleNames(prefix, from)
 		local index = self:ensureWorkspace()
 		if index then
 			for path in pairs(index:files()) do
+				---@cast path string
 				local name = moduleName(root, path)
 				if name and name:sub(1, #prefix) == prefix and not seen[name] then
 					seen[name] = true
@@ -327,6 +325,7 @@ function Declarations:moduleNames(prefix, from)
 	-- listed from the definitions. A workspace module of the same name was added first and wins,
 	-- which is the order `require` itself resolves in.
 	for name in pairs(self.lye:definitionIndex().modules) do
+		---@cast name string
 		if name:sub(1, #prefix) == prefix and not seen[name] then
 			seen[name] = true
 			found[#found + 1] = { name = name, detail = "LuaJIT" }
@@ -342,7 +341,6 @@ end
 --- module from — `require("lye-doc.type")` is `packages/lye-doc/src/type.lua` there.
 ---@param name string
 ---@param from string? the document the require is written in
----@return string?
 ---@param self lye.Declarations
 function Declarations:moduleFile(name, from)
 	local root = self.lye.server.rootPath
@@ -350,6 +348,7 @@ function Declarations:moduleFile(name, from)
 	-- A `lye.json` beside a package or workspace adds search paths of its own, in the shape
 	-- `package.path` uses. Asked first, because a project that says where its modules are wins.
 	for _, pattern in ipairs(self.lye:requirePaths(from)) do
+		---@cast pattern string
 		local path = pattern:gsub("%?", (name:gsub("%%.", "/")))
 		local handle = io.open(path, "rb")
 		if handle then
@@ -391,8 +390,8 @@ function Declarations:moduleFile(name, from)
 
 	-- A module the engine ships is not a file in this workspace: `ffi`, `jit` and `string.buffer` name
 	-- the definitions, whose text is written to the cache for a client to open. The workspace is first.
-	local builtin = self.lye:definitionIndex().modules[name]
-	if builtin then return builtin.path end
+	local builtin = self.lye:definitionIndex().modules[name] --[[@as table? ]]
+	if builtin then return builtin.path --[[@as string? ]] end
 end
 
 --- What a document is analysed against, as a cached view: what each open document declared, then
@@ -404,7 +403,6 @@ end
 --- while a closed file's view is a cache entry nothing will ask for. A module URI reached through
 --- `require` is answered and forgotten rather than accumulated for the session's lifetime.
 ---@param uri string? the document the names are for
----@return table<string, boolean|lye.doc.Type>
 ---@param self lye.Declarations
 function Declarations:view(uri)
 	local key = uri or ""
@@ -412,7 +410,7 @@ function Declarations:view(uri)
 	if cached and cached.generation == self.generation then return cached.view end
 	self:ensureWorkspace()
 	local top = self.lye.known or {}
-	local root = uri and self.lye:packageRoot(uri)
+	local root = uri and self.lye:packageRoot(uri) --[[@as string? ]]
 	if root then top = layer(self:package(root), top) end
 	for _, declarations in pairs(self.open) do top = layer(declarations, top) end
 	if uri and self.lye.server.documents and self.lye.server.documents:get(uri) then
@@ -459,7 +457,6 @@ function Declarations:documentClosed(uri)
 end
 
 ---@param change table
----@return string?
 local function pathOfChange(change)
 	local uri = change.uri or change.path
 	if type(uri) ~= "string" then return nil end
@@ -478,7 +475,7 @@ end
 ---@param self lye.Declarations
 function Declarations:watchedFiles(params)
 	local lye = self.lye
-	local root = lye.server.rootPath
+	local root = lye.server.rootPath --[[@as string? ]]
 	if not root or root == "" then return false end
 	root = root:gsub("[/\\]+$", "")
 	local changes = type(params) == "table" and params.changes or nil
@@ -569,16 +566,19 @@ function Declarations:typeLocation(name, uri)
 	local annotations = names and names.doc and names.doc.annotations
 	local text = uri and lye:textOf(uri)
 	if annotations and text then
+		---@cast annotations lye.doc.Annotation[]
+		---@cast text string
+		---@cast uri string
 		for at, annotation in ipairs(annotations) do
 			local isType = annotation.tag == "class" or annotation.tag == "alias"
 			if isType and annotation.name == name then
 				return {
 					location = {
-						uri = uri,
+						uri = uri --[[@as string ]],
 						start = annotation.nameStart or annotation.start,
 						stop = annotation.nameStop or annotation.stop,
 					},
-					lines = declarationLines(text, annotations, at),
+					lines = declarationLines(text --[[@as string ]], annotations, at),
 				}
 			end
 		end
@@ -589,7 +589,7 @@ function Declarations:typeLocation(name, uri)
 	local held = lye.typeLocations and lye.typeLocations[name]
 	if held then return held end
 
-	local index = lye:definitionIndex()
+	local index = lye:definitionIndex() --[[@as lye.Definitions ]]
 	local found = definitionsIndex.find(index, name)
 	if not found then return nil end
 	local source = definitionsIndex.sourceOf(index, found.uri)
@@ -598,6 +598,8 @@ function Declarations:typeLocation(name, uri)
 	local lines = { lineAt(source, lineStart(source, found.start)) }
 	local fields = {}
 	for fieldName, where in pairs(index.fields) do
+		---@cast fieldName string
+		---@cast where lye.DefinitionLocation
 		if fieldName:sub(1, #name + 1) == name .. "." then fields[#fields + 1] = where end
 	end
 	table.sort(fields, function(left, right) return left.start < right.start end)
@@ -615,6 +617,8 @@ end
 ---@param self lye.Declarations
 function Declarations:targetOfType(name, uri)
 	local lye = self.lye
+	---@param documentUri string
+	---@param names lye.analyzer.Result?
 	local function inDocument(documentUri, names)
 		for _, annotation in ipairs(names and names.doc and names.doc.annotations or {}) do
 			local isType = annotation.tag == "class" or annotation.tag == "alias"
@@ -634,12 +638,14 @@ function Declarations:targetOfType(name, uri)
 	local mine = inDocument(uri, lye.names[uri])
 	if mine then return mine end
 	for otherUri, names in pairs(lye.names) do
+		---@cast otherUri string
+		---@cast names lye.analyzer.Result
 		if otherUri ~= uri then
 			local found = inDocument(otherUri, names)
 			if found then return found end
 		end
 	end
-	return definitionsIndex.find(lye:definitionIndex(), name)
+	return definitionsIndex.find(lye:definitionIndex() --[[@as lye.Definitions ]], name)
 end
 
 --- What the scans and the view hold, for `LYE_TIMING=1`. `index` is the time spent reading and
@@ -658,6 +664,7 @@ function Declarations:stats()
 	for _ in pairs(self.open) do open += 1 end
 	local built, loaded, files, reads, spent = 0, 0, 0, 0, 0
 	local workers, fellBack = 0, 0
+	---@param index lye.lsp.Index?
 	local function add(index)
 		if not index then return end
 		local held = index:stats()

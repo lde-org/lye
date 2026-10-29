@@ -46,7 +46,7 @@ function toy.tokens(context)
 	local from = 1
 	while true do
 		local start, stop, name = context.source:find("let%s+([%a_][%w_]*)", from)
-		if not start then break end
+		if not start or not stop or not name then break end
 		-- The name itself, which is where the match's capture begins. The offsets are the
 		-- document's own, which is the text this hook colours: what it knows is the language it
 		-- lowered from, and that is the one the reader is looking at.

@@ -29,17 +29,64 @@ local SOURCE = table.concat({
 }, "")
 
 ---@param value any
----@return string
 local function frame(value)
 	local body = json.encode(value)
 	return "Content-Length: " .. #body .. "\r\n\r\n" .. body
 end
 
+---@class lye.test.Hover
+---@field value string
+
+---@class lye.test.Item
+---@field label string
+---@field detail string
+---@field documentation string?
+---@field kind integer?
+
+---@class lye.test.Signature
+---@field label string
+
+---@class lye.test.Position
+---@field line integer
+---@field character integer
+
+---@class lye.test.Range
+---@field start lye.test.Position
+---@field ["end"] lye.test.Position
+
+---@class lye.test.Highlight
+---@field range lye.test.Range
+
+---@class lye.test.Inlay
+---@field label string
+---@field position lye.test.Position
+
+---@class lye.test.Edit
+---@field newText string
+---@field range lye.test.Range
+
+---@class lye.test.Symbol
+---@field name string
+---@field kind integer?
+---@field range lye.test.Range
+---@field children lye.test.Symbol[]?
+
+---@class lye.test.RunResult
+---@field contents lye.test.Hover
+---@field data integer[]
+---@field items lye.test.Item[]
+---@field signatures lye.test.Signature[]
+---@field uri string
+---@field range lye.test.Range
+
+---@class lye.test.WireMessage
+---@field id integer|string?
+---@field result lye.test.RunResult
+
 ---@param requests table[]
 ---@param source string?
 ---@param root string? a workspace to open, when what is being tested is where a `require` looks
 ---@param uri string? the document to open, for the same reason
----@return table<string, any> byId
 local function run(requests, source, root, uri)
 	uri = uri or "file:///f.lua"
 	local handle = assert(io.open(INPUT, "wb"))
@@ -69,13 +116,16 @@ local function run(requests, source, root, uri)
 	local output = pipe:read("*a")
 	pipe:close()
 
-	local byId, i = {}, 1
+	---@type table<string, lye.test.RunResult>
+	local byId = {}
+	local i = 1
 	while true do
 		local _, stop = output:find("\r\n\r\n", i, true)
 		if not stop then break end
 		local length = tonumber(output:sub(i, stop - 4):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
 		if not length then break end
 		local message = json.decode(output:sub(stop + 1, stop + length))
+		---@cast message lye.test.WireMessage
 		if message.id ~= nil then byId[tostring(message.id)] = message.result end
 		i = stop + 1 + length
 	end
@@ -105,6 +155,7 @@ test.it("reads a module the engine ships from the definitions", function()
 	-- written where a client can open it. `jit` is both that and a global.
 	local source = 'local ffi = require("ffi")\nffi.cdef("int x;")\nffi.\n'
 	---@return table<string, any>
+	---@return table<string, lye.test.Item>
 	local function labels()
 		local results = run({ {
 			jsonrpc = "2.0", id = 2, method = "textDocument/completion",
@@ -113,11 +164,13 @@ test.it("reads a module the engine ships from the definitions", function()
 				position = { line = 2, character = 4 },
 			},
 		} }, source)
+		---@type table<string, lye.test.Item>
 		local found = {}
 		for _, item in ipairs(results["2"].items or {}) do found[item.label] = item end
 		return found
 	end
 
+	---@type table<string, lye.test.Item>
 	local cold = labels()
 	test.truthy(cold["cdef"], "a field of the ffi library")
 	test.truthy(cold["new"], "and another")
@@ -126,6 +179,7 @@ test.it("reads a module the engine ships from the definitions", function()
 
 	-- The second session reads the definitions' answer from what the first one kept, and the
 	-- signature has to be reached through the very type the definitions built for it.
+	---@type table<string, lye.test.Item>
 	local warm = labels()
 	test.equal(warm["cdef"].detail, cold["cdef"].detail, "the kept answer says the same thing")
 	test.equal(warm["cdef"].documentation, cold["cdef"].documentation, "down to the documentation")
@@ -306,6 +360,7 @@ test.it("answers for a dotted type name as one name", function()
 	test.truthy(typed and typed.uri and typed.uri:match("jit%.util%.lua"),
 		"and so does the type jump: " .. json.encode(typed or {}))
 	local highlights = results["4"] or {}
+	---@cast highlights lye.test.Highlight[]
 	test.truthy(#highlights > 0, "the highlight covers the name")
 	test.equal(highlights[1].range["end"].character - highlights[1].range.start.character, 14,
 		"the whole of `jit.funcinfo.c`, not one of its parts")
@@ -424,6 +479,7 @@ test.it("keeps an inlay hint short", function()
 	}, "")
 	local results = run({ request(2, "textDocument/inlayHint", { line = 0, character = 0 }) }, source)
 	local hints = results["2"]
+	---@cast hints lye.test.Inlay[]
 	local labels = {}
 	for _, hint in ipairs(hints) do labels[#labels + 1] = hint.label end
 	-- The table's own shape is dropped rather than cut: see the test above. The other two are
@@ -564,6 +620,7 @@ test.it("continues an alias when a new line is started in one", function()
 			params = { textDocument = { uri = "file:///f.lua" }, position = { line = 2, character = 0 }, ch = "\n" } },
 	}, source)
 	local edits = results["2"]
+	---@cast edits lye.test.Edit[]
 	test.equal(#edits, 1, "the line being written gets one edit, not an indentation as well")
 	test.equal(edits[1].newText, "--- | ")
 	test.equal(edits[1].range.start.line, 2)
@@ -635,6 +692,7 @@ test.it("formats the way the project's editorconfig asks", function()
 			params = { textDocument = { uri = uri }, options = { tabSize = 4, insertSpaces = true } } },
 	}, source, project, uri)
 	local edits = results["2"] or {}
+	---@cast edits lye.test.Edit[]
 	local replaced, deleted = {}, 0
 	for _, edit in ipairs(edits) do
 		if edit.newText == "" then
@@ -654,7 +712,6 @@ end)
 ---@param data table the answer's five numbers per token
 ---@param text string the document
 ---@param kind integer the kind to collect
----@return string
 local function marked(data, text, kind)
 	local lines = {}
 	for piece in (text .. "\n"):gmatch("([^\n]*)\n") do lines[#lines + 1] = piece end
@@ -746,6 +803,7 @@ end)
 test.it("lists the declarations in a document", function()
 	local results = run({ request(2, "textDocument/documentSymbol") })
 	local symbols = results["2"]
+	---@cast symbols lye.test.Symbol[]
 	test.truthy(symbols, "documentSymbol should answer")
 
 	local names = {}
@@ -765,7 +823,9 @@ end)
 
 test.it("spans a symbol over its own name", function()
 	local results = run({ request(2, "textDocument/documentSymbol") })
-	for _, symbol in ipairs(results["2"]) do
+	local symbols = results["2"]
+	---@cast symbols lye.test.Symbol[]
+	for _, symbol in ipairs(symbols) do
 		if symbol.name == "x" then
 			test.equal(symbol.range.start.line, 0)
 			test.equal(symbol.range.start.character, 6)
@@ -824,14 +884,17 @@ end)
 
 test.it("nests the declarations inside their enclosing function", function()
 	local results = run({ request(2, "textDocument/documentSymbol") })
+	local symbols = results["2"]
+	---@cast symbols lye.test.Symbol[]
+	---@type table<string, lye.test.Symbol>
 	local byName = {}
-	for _, symbol in ipairs(results["2"]) do byName[symbol.name] = symbol end
+	for _, symbol in ipairs(symbols) do byName[symbol.name] = symbol end
 
-	test.equal(#results["2"], 2, "a local and a function are the top level")
+	test.equal(#symbols, 2, "a local and a function are the top level")
 	test.truthy(byName.x, "the top level local should be a root")
 
-	local children = byName.greet.children
-	test.truthy(children, "the function should have children")
+	local children = byName.greet.children or {}
+	test.truthy(#children > 0, "the function should have children")
 	local childNames = {}
 	for _, child in ipairs(children) do childNames[child.name] = true end
 	test.truthy(childNames.name, "the parameter belongs to the function")
@@ -950,6 +1013,7 @@ test.it("hints an inferred name and leaves the function it is written in alone",
 		params = { textDocument = { uri = "file:///f.lua" }, range = whole },
 	}
 	local hints = run({ request2 }, source)["2"]
+	---@cast hints lye.test.Inlay[]
 	local where = {}
 	for _, hint in ipairs(hints) do where[#where + 1] = hint.label .. " on line " .. hint.position.line end
 	test.equal(#hints, 1, table.concat(where, ", "))

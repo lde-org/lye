@@ -25,11 +25,38 @@
 	are the memory numbers for the same work the timing numbers are about.
 ]]
 
-local ffi = require("ffi")
-local lexer = require("lye-lexer")
-local parser = require("lye-parser")
-local analyzer = require("lye-analyzer")
-local serial = require("lye-doc.serial")
+-- The packages through root `lye.json`, which the checker does not follow.
+---@class lye.MemoryLexer
+---@field tokenize fun(source: string): lye.lexer.Tokens
+
+---@class lye.MemoryParsed
+---@field parse fun(self: lye.MemoryParsed): lye.parser.Result
+
+---@class lye.MemoryParser
+---@field new fun(source: string): lye.MemoryParsed
+
+---@class lye.MemoryAnalyzer
+---@field prelude fun(sources: table<string, string>): lye.analyzer.Prelude
+---@field analyze fun(source: string, prepared?: lye.analyzer.Prelude, elsewhere?: table<string, boolean|lye.doc.Type>?, modules?: table?, resume?: lye.parser.Resume?, cachedAnnotations?: lye.doc.File?, isModuleOnly?: boolean): lye.analyzer.Result
+
+---@class lye.MemorySerial
+---@field write fun(value: unknown): string?
+---@field read fun(bytes: string): unknown?
+
+---@class lye.MemoryIndexEntry
+---@field files table<string, boolean>?
+
+---@class lye.MemoryIndex
+---@field new fun(options: table): lye.MemoryIndex
+---@field load fun(self: lye.MemoryIndex, root: string): lye.MemoryIndexEntry?
+---@field build fun(self: lye.MemoryIndex, root: string): lye.MemoryIndexEntry?
+---@field save fun(self: lye.MemoryIndex, built: lye.MemoryIndexEntry): boolean?
+
+local ffi = require("ffi") --[[@as table]]
+local lexer = require("lye-lexer") --[[@as lye.MemoryLexer]]
+local parser = require("lye-parser") --[[@as lye.MemoryParser]]
+local analyzer = require("lye-analyzer") --[[@as lye.MemoryAnalyzer]]
+local serial = require("lye-doc.serial") --[[@as lye.MemorySerial]]
 
 local SCRIPT = debug.getinfo(1, "S").source:sub(2)
 local TOOLS = assert(SCRIPT:match("^(.*)/[^/]+$"))
@@ -42,10 +69,9 @@ if ROOT:sub(1, 1) ~= "/" then
 	end
 end
 
-local PATH = os.getenv("FILE") or ROOT .. "/editors/vscode/tests/fixtures/benchmark-lde.lua"
+local PATH = os.getenv("FILE") or ROOT .. "/editors/vscode/tests/fixtures/benchmark-lde.lua.txt"
 
 ---@param path string
----@return string?
 local function read(path)
 	local handle = io.open(path, "rb")
 	if not handle then return nil end
@@ -55,20 +81,25 @@ local function read(path)
 end
 
 --- The process id, for the `ps` fallback. `cache.lua` reads it the same way.
-pcall(ffi.cdef, [[int getpid(void);]])
+local cdef = ffi.cdef --[[@as fun(declaration: string)]]
+local C = ffi.C --[[@as table]]
+pcall(cdef, [[int getpid(void);]])
 local PID
 do
-	local ok, value = pcall(function() return tonumber(ffi.C.getpid()) end)
+	local ok, value = pcall(function()
+		local getpid = C.getpid --[[@as fun(): integer]]
+		return tonumber(getpid())
+	end)
 	if ok and value then PID = value end
 end
 
 --- The process's resident set in KiB: what the machine has to keep, rather than what the collector
 --- is tracking. `/proc` is the answer on Linux; `ps` is the fallback elsewhere.
----@return number?
 local function processRss()
-	local status = io.open("/proc/self/status", "r")
+	local status = io.open("/proc/self/status", "rb")
 	if status then
 		for line in status:lines() do
+			---@cast line string
 			local kib = line:match("^VmRSS:%s*(%d+)%s*kB")
 			if kib then
 				status:close()
@@ -78,7 +109,7 @@ local function processRss()
 		status:close()
 	end
 	if not PID then
-		local stat = io.open("/proc/self/stat", "r")
+		local stat = io.open("/proc/self/stat", "rb")
 		if stat then
 			local text = stat:read("*a")
 			stat:close()
@@ -129,7 +160,6 @@ local function cost(label, drop)
 end
 
 ---@param path string
----@return boolean
 local function exists(path)
 	local handle = io.open(path, "rb")
 	if handle then handle:close() end
@@ -153,11 +183,11 @@ local parsed = parser.new(source):parse()
 local afterParse, rssParse = stage("parse", afterLex, rssLex)
 print(string.format("%-22s %7d", "  nodes", #parsed.nodes))
 
-local PRELUDE = analyzer.prelude(require("lye-defs"))
+local PRELUDE = analyzer.prelude(require("lye-defs") --[[@as table<string, string>]])
 local afterPrelude, rssPrelude = stage("definitions", afterParse, rssParse)
 
 local names = analyzer.analyze(source, PRELUDE)
-local afterAnalyze, rssAnalyze = stage("analyse", afterPrelude, rssPrelude)
+stage("analyse", afterPrelude, rssPrelude)
 print(string.format("%-22s %7d variables, %d diagnostics", "  ", #names.variables, #names.diagnostics))
 
 -- The workspace index: an entry for this root and this code version is a load; building one is a
@@ -165,7 +195,8 @@ print(string.format("%-22s %7d variables, %d diagnostics", "  ", #names.variable
 -- `lye-lsp.index` when it is there, and says so when it is not — the module is the lane's own, and
 -- a benchmark that guessed at its methods would measure the guess.
 local indexFile = ROOT .. "/packages/lye-lsp/src/index.lua"
-local hasIndex, Index = pcall(require, "lye-lsp.index")
+local hasIndex, rawIndex = pcall(require, "lye-lsp.index")
+local Index = rawIndex --[[@as lye.MemoryIndex]]
 if not exists(indexFile) then
 	print(string.format("%-22s %s", "index load",
 		"skipped (packages/lye-lsp/src/index.lua is absent; A2 has not landed)"))
@@ -174,21 +205,25 @@ elseif not hasIndex or type(Index) ~= "table" or type(Index.new) ~= "function" t
 	print(string.format("%-22s %s", "index load", "skipped (lye-lsp.index did not load: " .. tostring(Index) .. ")"))
 	print(string.format("%-22s %s", "index build", "skipped (same)"))
 else
-	local okNew, index = pcall(Index.new, {
+	local okNew, rawNew = pcall(Index.new, {
 		log = function(message) print(string.format("%-22s %s", "  index", message)) end,
 	})
+	local index = rawNew --[[@as lye.MemoryIndex?]]
 	if not okNew then
 		print(string.format("%-22s %s", "index load", "skipped (Index.new failed: " .. tostring(index) .. ")"))
 		print(string.format("%-22s %s", "index build", "skipped (same)"))
 	else
+		local instance = index --[[@as lye.MemoryIndex]]
 		local was, wasRss = heap(), processRss()
 		local started = os.clock()
-		local okLoad, loaded = pcall(function() return index:load(ROOT) end)
+		local okLoad, rawLoaded = pcall(function() return instance:load(ROOT) end)
+		local loaded = rawLoaded --[[@as lye.MemoryIndexEntry?]]
 		local loadMs = (os.clock() - started) * 1000
 		if not okLoad then
 			print(string.format("%-22s %s", "index load", "skipped (load failed: " .. tostring(loaded) .. ")"))
 			loaded = nil
 		elseif loaded then
+			---@cast loaded lye.MemoryIndexEntry
 			local files = 0
 			for _ in pairs(loaded.files or {}) do files = files + 1 end
 			local afterLoad = stage("index load", was, wasRss)
@@ -201,19 +236,23 @@ else
 
 		local buildWas, buildRss = heap(), processRss()
 		local buildStarted = os.clock()
-		local okBuild, built = pcall(function() return index:build(ROOT) end)
+		local okBuild, rawBuilt = pcall(function() return instance:build(ROOT) end)
+		local built = rawBuilt --[[@as lye.MemoryIndexEntry?]]
 		local buildMs = (os.clock() - buildStarted) * 1000
 		if not okBuild then
 			print(string.format("%-22s %s", "index build", "skipped (build failed: " .. tostring(built) .. ")"))
 			built = nil
 		else
+			---@cast built lye.MemoryIndexEntry
 			local afterBuild = stage("index build", buildWas, buildRss)
 			local files = 0
 			for _ in pairs(built.files or {}) do files = files + 1 end
 			print(string.format("%-22s %7.1f ms, %d files, %.2f MiB held", "  ", buildMs, files,
 				(afterBuild - buildWas) / 1024))
 			if os.getenv("INDEX_SAVE") == "1" then
-				local okSaved, saved = pcall(function() return index:save(built) end)
+				local okSaved, saved = pcall(function() return instance:save(built) end)
+				---@cast okSaved boolean
+				---@cast saved boolean?
 				print(string.format("%-22s %s", "  index saved", okSaved and saved and "yes" or "no"))
 			end
 		end

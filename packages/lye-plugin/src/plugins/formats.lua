@@ -36,6 +36,7 @@ local function conversions(content)
 		local percent = content:find("%", at, true)
 		if not percent then break end
 		local spec = content:match(SPECIFIER, percent)
+		---@cast spec string?
 		if spec then
 			marks[#marks + 1] = { start = percent, stop = percent + #spec - 1 }
 			at = percent + #spec
@@ -64,7 +65,8 @@ function formats.tokens(context)
 			local owner
 			if field then
 				if node.isMethod then
-					owner = context.ownerOf(context.typeOf(node.target))
+					local subject = node.target
+					if subject then owner = context.ownerOf(context.typeOf(subject)) end
 				else
 					local base = target and target.target and parsed.nodes[target.target]
 					owner = base and base.callee
@@ -76,16 +78,20 @@ function formats.tokens(context)
 			local argument = index and parsed.nodes[node.args[index] or 0]
 			local from = argument and argument.kind == "string"
 				and cdef.textStart(text, argument.start, argument.stop)
+			---@cast from integer?
 			-- Only where the literal reads as it was written: an escape inside it moves every offset
 			-- after it, and marking the wrong bytes is worse than marking none.
-			local plain = from and text:sub(from, argument.stop - 1) == argument.value
-			if plain then
-				for _, mark in ipairs(conversions(argument.value)) do
-					local first, last = from + mark.start - 1, from + mark.stop - 1
-					local sameLine = not text:find("\n", first, true) or text:find("\n", first, true) > last
-					if sameLine and not map:rangeIsWritten(first, last) then
-						local at, stop = map:toOriginalRange(first, last)
-						spans[#spans + 1] = { from = at, to = stop, type = "regexp" }
+			if from then
+				local plain = text:sub(from, argument.stop - 1) == argument.value
+				if plain then
+					for _, mark in ipairs(conversions(argument.value)) do
+						local first, last = from + mark.start - 1, from + mark.stop - 1
+						local sameLine = not text:find("\n", first, true)
+							or text:find("\n", first, true) > last
+						if sameLine and not map:rangeIsWritten(first, last) then
+							local at, stop = map:toOriginalRange(first, last)
+							spans[#spans + 1] = { from = at, to = stop, type = "regexp" }
+						end
 					end
 				end
 			end

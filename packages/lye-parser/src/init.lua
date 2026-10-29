@@ -6,13 +6,7 @@ local newTable = require("table.new")
 
 ---@alias lye.parser.Qualifier "local"|"global"|"field"|"param"|"loop"|"label"
 
----@alias lye.parser.NodeKind
-
----@class lye.parser.Diagnostic
----@field message string
----@field start integer
----@field stop integer
----@field statementStart integer? the byte the top-level statement that reported it began at
+---@alias lye.parser.NodeKind string
 
 ---@class lye.parser.Node
 ---@field kind lye.parser.NodeKind
@@ -22,6 +16,7 @@ local newTable = require("table.new")
 ---@field stop integer
 ---@field depth integer scope nesting, 0 at the top level
 ---@field isFunction boolean?
+---@field isVariadic boolean? the function declares `...`
 ---@field op string? the operator, for a binary or unary node
 ---@field left integer? operand index, for a binary node
 ---@field right integer? operand index, for a binary node
@@ -31,7 +26,9 @@ local newTable = require("table.new")
 ---@field callee string? the name a call invokes
 ---@field args integer[]? the argument node indices of a call
 ---@field params lye.parser.Declaration[]? the parameters a function node declares, `self` first
----@field value string|number|boolean? what a literal node stands for, or the value index of an assignment
+---@field value string|number|boolean? what a literal node stands for
+---@field valueIdx integer? the expression index an assignment or declaration gives its name
+---@field isConst boolean? the name is a `const` binding
 ---@field children integer[]? the nodes inside this one, by arena index
 ---@field targets integer[]? every assignment target, for an assignment node
 ---@field targetValues integer[]? every assigned value, for an assignment node
@@ -49,10 +46,10 @@ local newTable = require("table.new")
 ---@field alternative integer? the else expression index of a ternary
 ---@field anchorIdx integer? token index of the statement opening a declaration
 ---@field inlineGenerics table? inline generic names on a function
----@field inlineVariadic boolean? the function declares an inline variadic parameter
+---@field inlineVariadic string? the inline variadic type text, when the function declares one
 ---@field inlineVariadicStart integer? byte an inline variadic starts at
 ---@field inlineVariadicStop integer? byte an inline variadic stops at
----@field inlineReturns integer? number of inline returns
+---@field inlineReturns string? the inline return type text
 ---@field inlineReturnsStart integer? byte inline returns start at
 ---@field inlineReturnsStop integer? byte inline returns stop at
 
@@ -68,6 +65,11 @@ local newTable = require("table.new")
 ---@field anchorIdx integer? token index of the statement opening the declaration
 ---@field position integer? which name of its statement this is, 1 for the first
 ---@field valuePosition integer? which value of its initializer this name takes, 1 unless the last expression gives several
+---@field isConst boolean? the name is a `const` binding
+---@field inlineOptional boolean? a parameter a caller may leave out, written `name?`
+---@field inlineType string? the type written where the name is
+---@field inlineTypeStart integer? byte the inline type starts at
+---@field inlineTypeStop integer? byte the inline type stops at
 
 --- A scope is guarded by a condition when the block only runs under one, as `if`/`while`
 --- bodies do.
@@ -78,6 +80,15 @@ local newTable = require("table.new")
 ---@field branch string? "then"|"elseif"|"else"|"do"|"body"
 ---@field conditionIdx integer? arena index of the expression guarding this block
 
+--- A problem reported about a file, whether the parser found it or a check over the parse did.
+--- The parser's own reports carry the statement they belong to; a checker's carry a severity.
+---@class lye.parser.Problem
+---@field message string
+---@field start integer
+---@field stop integer
+---@field statementStart integer?
+---@field severity integer?
+
 ---@class lye.parser.Result
 ---@field root integer index of the chunk node, which contains everything
 ---@field scopes lye.parser.Scope[]
@@ -87,8 +98,11 @@ local newTable = require("table.new")
 ---@field tokens lye.lexer.Tokens
 ---@field nodes lye.parser.Node[]
 ---@field declarations lye.parser.Declaration[]
----@field diagnostics lye.parser.Diagnostic[]
+---@field diagnostics lye.parser.Problem[]
 ---@field resumeStats lye.parser.ResumeStats how much of the parse came from a previous one
+---@field source string the text the tree was read from
+---@field tableFieldValues table<integer, table>
+---@field tableIndexes table<integer, integer[]> positional element indices per table literal
 
 ---@class lye.parser.ResumeStats
 ---@field nodes integer nodes kept from the previous parse, 0 for a full parse
@@ -105,7 +119,7 @@ local newTable = require("table.new")
 ---@field KEYWORDS table<string, boolean>? the same set, for lookup
 ---@field UNARY string[]? the operators that take one operand
 ---@field BINARY string[][] those that take two, grouped by precedence
----@field BINARY_LEVEL table<integer, string[]>? those operators grouped by precedence
+---@field BINARY_LEVEL table<string, integer>? each operator's precedence level
 ---@field COMPOUND table<string, boolean>? the assignments that also compute: `+=`, `..=`
 ---@field source string
 ---@field tokens lye.lexer.Tokens
@@ -113,23 +127,44 @@ local newTable = require("table.new")
 ---@field texts string[]
 ---@field tokenCount integer
 ---@field index integer
----@field diagnostics lye.parser.Diagnostic[]
+---@field diagnostics lye.parser.Problem[]
 ---@field nodes lye.parser.Node[]
 ---@field declarations lye.parser.Declaration[]
 ---@field depth integer
 ---@field scopes string[][]
 ---@field count_ integer how many nodes have been emitted, which the next one's index is
----@field tableFieldValues table<integer, table>?
+---@field tableFieldValues table<integer, table>
 ---@field lastKind string?
 ---@field lastFields table<string, string>? the field kinds of the table just read
 ---@field lastDeclaration integer?
+---@field building integer[]
+---@field definition boolean? the file describes a library rather than an implementation
 ---@field statementStart integer? the byte the top-level statement now being parsed began at
 ---@field scopeStarts lye.parser.Frame[]
 ---@field scopes_ lye.parser.Scope[]
 ---@field tableFields table<integer, table<string, string>> field kinds per table literal
 ---@field tableIndexes table<integer, integer[]> positional element indices per table literal
 ---@field byKind table<string, lye.parser.Node[]> every node, listed under its kind, in emission order
+---@field resumeStats lye.parser.ResumeStats how much of the parse came from a previous one
+---@field lastLiteral integer? the last literal node emitted
+---@field rootIdx integer? the chunk node the parse produced
+---@field parseIf fun(self: lye.parser.Parser): void
+---@field parseDoBlock fun(self: lye.parser.Parser): void
+---@field parseWhile fun(self: lye.parser.Parser): void
+---@field parseRepeat fun(self: lye.parser.Parser): void
+---@field parseFor fun(self: lye.parser.Parser): void
+---@field parseFunctionName fun(self: lye.parser.Parser): string?, lye.lexer.ffi.token?, boolean?
+---@field parseFunctionStatement fun(self: lye.parser.Parser): void
+---@field parseLocal fun(self: lye.parser.Parser, start: integer)
+---@field parseConst fun(self: lye.parser.Parser, start: integer)
+---@field parseReturn fun(self: lye.parser.Parser): void
+---@field parseExpressionStatement fun(self: lye.parser.Parser): void
+---@field parseStatement fun(self: lye.parser.Parser): boolean?
+---@field parseBlock fun(self: lye.parser.Parser): void
+---@field parseExpression fun(self: lye.parser.Parser, allowTernaryColon?: boolean): integer
+---@field declare fun(self: lye.parser.Parser, name: string, qualifier: lye.parser.Qualifier, token: lye.lexer.ffi.token, isFunction: boolean?, position: integer?): lye.parser.Declaration
 local Parser = {}
+---@cast Parser lye.parser.Parser
 Parser.KIND = lexer.KIND
 
 --- What a kind with no nodes of its own answers with, so callers never test for nil.
@@ -191,13 +226,11 @@ end
 ---@field nodes lye.parser.Node[]
 ---@field declarations lye.parser.Declaration[]
 ---@field scopes lye.parser.Scope[]
----@field diagnostics lye.parser.Diagnostic[] the parser's problems wholly before the resume point
+---@field diagnostics lye.parser.Problem[] the parser's problems wholly before the resume point
 ---@field tableFields table
 ---@field tableFieldValues table
 ---@field tableIndexes table
 
----@param source string
----@param resume lye.parser.Resume? a parse to carry on from, when the text before it is unchanged
 --- Whether a source marks itself a definition file. `---@meta` says the file describes a library
 --- rather than running, and such a file writes its types where a reader sees them:
 --- `function f(n: number)`, `function f<T: number>(x: T): string`.
@@ -217,6 +250,9 @@ local function marksDefinition(source, tokens)
 	return false
 end
 
+---@param source string
+---@param resume lye.parser.Resume? a parse to carry on from, when the text before it is unchanged
+---@param definition boolean? the source is a library definition
 function Parser.new(source, resume, definition)
 	local tokens
 	if resume then
@@ -269,6 +305,7 @@ function Parser.new(source, resume, definition)
 		definition = definition == true or marksDefinition(source, tokens),
 	}, Parser)
 	if not resume then return self end
+	---@cast resume lye.parser.Resume
 
 	-- The same nodes at the same indices spanning the same bytes, which is what lets the passes
 	-- above reuse what they worked out for them.
@@ -316,8 +353,10 @@ end
 ---@param offset integer the byte the change starts at
 ---@return lye.parser.Resume?
 function Parser.resumeAt(parsed, offset)
+	---@type lye.parser.Node[]
 	local nodes = parsed.nodes
 	local chunk = nodes[parsed.root]
+	---@type integer[]?
 	local statements = chunk and chunk.children
 	if not statements then return nil end
 
@@ -330,6 +369,7 @@ function Parser.resumeAt(parsed, offset)
 	-- have read it.
 	-- A nested statement is met part-way through the block holding it and that state is gone, and
 	-- the chunk's children are not all statements, so the depth is what says which are.
+	---@type lye.parser.Node?
 	local first
 	for _, childIdx in ipairs(statements) do
 		local node = nodes[childIdx]
@@ -355,6 +395,7 @@ function Parser.resumeAt(parsed, offset)
 				-- The statement that began at `owner` is the cut. A statement that only recovered
 				-- emits no node of its own, and there is no boundary to trust there: the parse is
 				-- redone whole instead.
+				---@type lye.parser.Node?
 				local target
 				for _, childIdx in ipairs(statements) do
 					local node = nodes[childIdx]
@@ -416,18 +457,18 @@ function Parser.resumeAt(parsed, offset)
 	if found > 1 and parsed.tokens.arena[found - 1].stop >= first.start then return nil end
 
 	-- The lists a parse builds run to the end of the file, so keeping them whole would count the
-	-- suffix twice.
-	---@param list table[]
-	---@return table[]
-	local function before(list)
-		local held = {}
-		for _, entry in ipairs(list or {}) do
-			if (entry.start or 0) < first.start then held[#held + 1] = entry end
-		end
-		return held
+	-- suffix twice. What lies wholly before the cut is text that did not move, so it is kept.
+	---@type lye.parser.Declaration[]
+	local declarations = {}
+	for _, entry in ipairs(parsed.declarations) do
+		if entry.start < first.start then declarations[#declarations + 1] = entry end
+	end
+	---@type lye.parser.Scope[]
+	local scopes = {}
+	for _, entry in ipairs(parsed.scopes) do
+		if entry.start < first.start then scopes[#scopes + 1] = entry end
 	end
 	---@param keyed table<integer, unknown>
-	---@return table<integer, unknown>
 	local function indexed(keyed)
 		local held = {}
 		for key, value in pairs(keyed or {}) do
@@ -439,8 +480,8 @@ function Parser.resumeAt(parsed, offset)
 	return {
 		kind = "statement",
 		from = first.start, tokenIndex = found, nodeCount = keep, chunkIndex = parsed.root,
-		tokens = parsed.tokens, nodes = nodes, declarations = before(parsed.declarations),
-		scopes = before(parsed.scopes), diagnostics = carried,
+		tokens = parsed.tokens, nodes = nodes, declarations = declarations,
+		scopes = scopes, diagnostics = carried,
 		tableFields = indexed(parsed.tableFields),
 		tableFieldValues = indexed(parsed.tableFieldValues), tableIndexes = indexed(parsed.tableIndexes),
 	}
@@ -455,28 +496,24 @@ end
 --- A token's text lives beside the arena, keyed by the token's own index, so a reader holding
 --- a token needs nothing else.
 ---@param token lye.lexer.ffi.token
----@return string
 ---@param self lye.parser.Parser
 function Parser:text(token)
 	return self.texts[token.index]
 end
 
 ---@param token lye.lexer.ffi.token
----@return string
 ---@param self lye.parser.Parser
 function Parser:variant(token)
 	return lexer.variantOf(token)
 end
 
 ---@param token lye.lexer.ffi.token?
----@return boolean
 ---@param self lye.parser.Parser
 function Parser:isEof(token)
 	return not token or token.kind == lexer.KIND.eof
 end
 
 ---@param ahead integer
----@return lye.lexer.ffi.token
 ---@param self lye.parser.Parser
 function Parser:peekAt(ahead)
 	return self.arena[self.index + ahead - 1] or self.arena[self.tokenCount]
@@ -553,6 +590,8 @@ function Parser:checkAny(candidates)
 end
 
 ---@param self lye.parser.Parser
+---@param token lye.lexer.ffi.token
+---@param message string
 function Parser:report(token, message)
 	if #self.diagnostics >= Parser.MAX_DIAGNOSTICS then return end
 	-- Which statement reported it, so a resume can tell a problem of the kept text from one the
@@ -567,7 +606,8 @@ end
 ---@param self lye.parser.Parser
 function Parser:expect(text)
 	if self:accept(text) then return true end
-	self:report(self:peek(), string.format("expected '%s'", text))
+	local token = assert(self:peek())
+	self:report(token, string.format("expected '%s'", text))
 	return false
 end
 
@@ -587,7 +627,6 @@ end
 ---@param child1 integer? idx of a node this one contains, which is re-parented to it
 ---@param child2 integer?
 ---@param child3 integer?
----@return integer idx
 ---@param self lye.parser.Parser
 function Parser:emit(kind, start, stop, node, child1, child2, child3)
 	self.count_ = self.count_ + 1
@@ -674,14 +713,11 @@ end
 
 --- An identifier. `goto` counts, because LuaJIT keeps it a soft keyword: it only starts a
 --- statement when a name follows, so anywhere a name is expected it is a name.
----@return string?
----@return lye.lexer.ffi.token?
 --- Whether a token is a name a reader may write. `const` and `continue` are words this parser
 --- knows — a `const` parameter and a `continue` statement — but Lua has neither, so both are
 --- ordinary identifiers wherever a name is wanted: `{ const = true }` is a table, and reading the
 --- first field as something else left the rest of the table parsed as statements.
 ---@param token lye.lexer.ffi.token
----@return boolean
 ---@param self lye.parser.Parser
 function Parser:isName(token)
 	if token.kind == lexer.KIND.name then return true end
@@ -691,8 +727,10 @@ function Parser:isName(token)
 end
 
 ---@param self lye.parser.Parser
+---@return string?
+---@return lye.lexer.ffi.token?
 function Parser:parseName()
-	local token = self:peek()
+	local token = assert(self:peek())
 	if self:isName(token) then
 		self:advance()
 		return self.texts[token.index], token
@@ -702,6 +740,9 @@ function Parser:parseName()
 end
 
 ---@param self lye.parser.Parser
+---@param index integer
+---@param kind string?
+---@param valueIdx integer?
 function Parser:setInitializer(index, kind, valueIdx)
 	local declaration = self.declarations[index]
 	if not declaration then return end
@@ -709,13 +750,13 @@ function Parser:setInitializer(index, kind, valueIdx)
 	declaration.valueIdx = valueIdx
 end
 
+---@param self lye.parser.Parser
 ---@param name string
 ---@param qualifier lye.parser.Qualifier
 ---@param token lye.lexer.ffi.token
 ---@param isFunction boolean?
----@param position integer? which name of its statement this is, so a `---@type A, B` above two names is read one type per name
+---@param position integer? which name of its statement this is, so a type naming `A, B` above two names is read one type per name
 ---@return lye.parser.Declaration
----@param self lye.parser.Parser
 function Parser:declare(name, qualifier, token, isFunction, position)
 	local declaration = {
 		name = name,
@@ -738,6 +779,8 @@ function Parser:declare(name, qualifier, token, isFunction, position)
 end
 
 ---@param self lye.parser.Parser
+---@param start integer
+---@param conditionIdx integer?
 function Parser:pushScope(start, conditionIdx)
 	assert(start, "pushScope needs the scope's start offset")
 	self.depth += 1
@@ -746,6 +789,8 @@ function Parser:pushScope(start, conditionIdx)
 end
 
 ---@param self lye.parser.Parser
+---@param stop integer
+---@param kind string?
 function Parser:popScope(stop, kind)
 	self.scopes[#self.scopes] = nil
 	local frame = self.scopeStarts[#self.scopeStarts]
@@ -759,7 +804,6 @@ function Parser:popScope(stop, kind)
 	self.depth -= 1
 end
 
----@return boolean
 ---@param self lye.parser.Parser
 function Parser:isBlockEnd()
 	local token = self:peek()
@@ -771,7 +815,6 @@ end
 --- index reads walks those rather than every node in the document.
 ---@param parsed lye.parser.Result
 ---@param kind lye.parser.NodeKind
----@return lye.parser.Node[]
 function Parser.nodesOf(parsed, kind)
 	return parsed.byKind[kind] or EMPTY_NODES
 end

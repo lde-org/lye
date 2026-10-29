@@ -32,7 +32,6 @@ local function write(path, content)
 end
 
 ---@param path string
----@return string?
 local function read(path)
 	local handle = io.open(path, "rb")
 	if not handle then return nil end
@@ -42,7 +41,6 @@ local function read(path)
 end
 
 ---@param path string
----@return boolean
 local function exists(path)
 	local handle = io.open(path, "rb")
 	if handle then handle:close() end
@@ -78,7 +76,6 @@ local function check()
 end
 
 ---@param output string
----@return string findings without the summary line the check ends with
 local function findings(output)
 	return (output:gsub("\nlye: %d+ files checked[^\n]*\n?$", ""))
 end
@@ -94,7 +91,6 @@ end
 
 --- The version directory an entry lives under, which is the one a build of other code would use.
 ---@param entry string
----@return string dir
 local function versionOf(entry)
 	return assert(entry:match("^(.*)/[^/]+$"))
 end
@@ -103,7 +99,6 @@ local baseline
 local baseStatus
 
 --- Wipe the cache, check once, and keep what a clean run says: every case compares against this.
----@return string[] entries
 local function reset()
 	remove(CACHE)
 	remove(MARKER)

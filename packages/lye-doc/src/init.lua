@@ -12,14 +12,18 @@ local doc = {}
 ---@alias lye.doc.Tag
 ---| "type"|"param"|"return"|"class"|"field"|"alias"|"cast"|"as"|"generic"
 ---| "overload"|"deprecated"|"meta"|"diagnostic"|"async"|"nodiscard"|"operator"|"unknown"
+---| "enum"|"package"|"private"|"protected"|"public"|"version"|"see"
 
 ---@class lye.doc.Annotation
 ---@field tag lye.doc.Tag
 ---@field text string the annotation body, after the tag
 ---@field name string? the identifier it names, for tags that take one
 ---@field type string? the declared type, where the tag takes one
+---@field typeText string? the type text before it is parsed
+---@field values string[]? every value a `@return` names
 ---@field extras table<string, string>? trailing `key value` pairs, as in `---@param x string # note`
 ---@field comment string?
+---@field visibility string? what a member annotation says about who may read it
 ---@field start integer byte offset of the comment
 ---@field stop integer
 ---@field nameStart integer? byte offset of the name, so an editor can mark it as one
@@ -29,6 +33,7 @@ local doc = {}
 
 ---@class lye.doc.File
 ---@field annotations lye.doc.Annotation[]
+---@field isDefinition boolean? the file declares a library rather than an implementation
 
 -- Tags this reader understands, and whether they name an identifier.
 local TAGS = {
@@ -40,6 +45,7 @@ local TAGS = {
 	["public"] = false, ["nodiscard"] = true, ["version"] = false, ["see"] = false,
 }
 
+---@param text string
 local function trim(text)
 	return (text:gsub("^%s+", ""):gsub("%s+$", ""))
 end
@@ -101,6 +107,7 @@ local function splitParams(text)
 	return "", text
 end
 
+---@param text string
 local function cutType(text)
 	text = trim(text)
 	local conditional = text:find("%f[%w_]extends%f[^%w_]") ~= nil
@@ -232,7 +239,7 @@ local function parse(comment, start, stop)
 		-- left the real field named `private` with the type `name`.
 		for _, visibility in ipairs({ "private", "protected", "public" }) do
 			local after = rest:match("^" .. visibility .. "%s+(.*)$")
-			if after then
+			if type(after) == "string" then
 				annotation.visibility = visibility
 				rest = after
 				break
@@ -314,6 +321,21 @@ local function parse(comment, start, stop)
 	return annotation
 end
 
+--- Whether the byte at `at` in a line sits inside a backtick code span, in which case a tag
+--- written there is a quotation rather than an annotation.
+---@param line string
+---@param at integer
+local function quotedAt(line, at)
+	local count, from = 0, 1
+	while true do
+		local found = line:find("`", from, true)
+		if not found or found >= at then break end
+		count += 1
+		from = found + 1
+	end
+	return count % 2 == 1
+end
+
 --- Read a source's annotations: what each one says, and where the parts of it are written.
 ---@param source string
 ---@param tokens lye.lexer.Tokens? the tokens of this source, when the caller already has them
@@ -321,11 +343,13 @@ end
 function doc.parse(source, tokens)
 	assert(type(source) == "string", "doc.parse expects a string")
 
+	---@type lye.doc.Annotation[]
 	local annotations = {}
 	-- The body of an alias may be written a member per line — `---@alias X` and then `--- | "a"` —
 	-- which is the spelling LuaLS uses and the one this package's own annotations use. A line
 	-- holding nothing but a `|` continues the alias above it, and the members are joined with the
 	-- bars they were written with, so the body that comes out is the one a single line would give.
+	---@type lye.doc.Annotation?
 	local continued = nil
 	-- The parser lexes the same text on its way to a tree, and a caller that has done so already
 	-- hands the tokens over rather than paying for a second pass over every byte.
@@ -356,10 +380,19 @@ function doc.parse(source, tokens)
 				if at and not line:sub(1, at - 1):match("^%s*$") and not line:sub(1, at - 1):match("^%s*%-%-%-?%s*$") then
 					at = nil
 				end
+				---@type lye.doc.Annotation?
 				local last = nil
 				while at do
 					local nextAt = line:find(doc.TAG_PATTERN, at + 4)
+					-- A description may quote a tag — ``the first `---@return` type`` — and what is
+					-- inside a code span is prose about the spelling, not a tag of its own. Reading
+					-- it as one put it in the line's run of annotations, and a class owns nothing
+					-- past a `@return`: every field written below the sentence was dropped.
+					while nextAt and quotedAt(line, nextAt) do
+						nextAt = line:find(doc.TAG_PATTERN, nextAt + 4)
+					end
 					local piece = line:sub(at, nextAt and nextAt - 1 or #line)
+					---@type lye.doc.Annotation?
 					local found = parse(piece, index + at - 1, index + at - 1 + #piece - 1)
 					if found then
 						annotations[#annotations + 1] = found
@@ -377,6 +410,7 @@ function doc.parse(source, tokens)
 					while bracketed do
 						local close = line:find("]]", bracketed, true)
 						if not close then break end
+						---@type lye.doc.Annotation?
 						local found = parse(line:sub(bracketed, close + 1),
 							index + bracketed - 1, index + close)
 						if found then annotations[#annotations + 1] = found end

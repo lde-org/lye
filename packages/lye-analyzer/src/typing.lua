@@ -12,6 +12,8 @@ local annotations = require("lye-analyzer.annotations")
 local kindToType = annotations.kindToType
 local pattern = require("lye-doc.pattern")
 local withGenerics = annotations.withGenerics
+---@type fun(parsed: lye.parser.Result, kind: lye.parser.NodeKind): lye.parser.Node[]
+local nodesOf = require("lye-parser").nodesOf
 
 --- Everything the rounds share, built by `analyzer.analyze` after the signatures are known.
 ---@class lye.analyzer.TypingContext
@@ -24,13 +26,34 @@ local withGenerics = annotations.withGenerics
 ---@field typeOfText fun(text: string): lye.doc.Type? a written type, parsed once per document
 ---@field fieldReturns table<lye.doc.Type, lye.doc.Type>
 ---@field loopOf fun(variable: lye.analyzer.Variable): lye.parser.Node?
----@field signatureOfCall fun(node: lye.parser.Node): lye.doc.Type?
+---@field signatureOfCall fun(node: lye.parser.Node): lye.analyzer.Signature?, lye.doc.Type?, boolean
 ---@field returnsOf table<integer, lye.parser.Node[]> the `return`s of each body, by node index
----@field bodyOwner table<lye.parser.Node, lye.parser.Declaration> the declaration each body implements
+---@field bodyOwner table<integer, lye.parser.Declaration> the declaration each body implements
 ---@field annotatedBodies table<integer, boolean> the bodies whose declaration was annotated
----@field signatureOfDecl table<integer, lye.doc.Type> the signature each declaration was read as
+---@field signatureOfDecl table<lye.parser.Declaration, lye.analyzer.Signature> the signature each declaration was read as
+---@field lookupIn fun(scope: lye.analyzer.Scope, name: string, offset: integer): lye.analyzer.Variable?
+---@field scopeAt fun(self: lye.analyzer.Result, offset: integer): lye.analyzer.Scope
+---@field checkMetatable fun(self: lye.analyzer.Result, parsed: lye.parser.Result, metatable: lye.doc.Type?, held: lye.doc.Type?, nodeIdx: integer)
 
 local typing = {}
+
+--- Whether a type is the narrowed shape of an unknown — the truthy or non-nil set — rather than
+--- something the value is known to be. That is what a placeholder becomes under an `if`, so it
+--- says nothing yet: the name it was read from may settle into a list, a class or a string, and
+--- storing the narrowing makes the guess permanent.
+---@param held lye.doc.Type
+---@return boolean
+local function narrowedUnknown(held)
+	if held == types.truthyUnknown() or held == types.nonNilUnknown() then return true end
+	if held.variant == "union" then
+		for _, member in ipairs(held.types) do
+			if member == types.truthyUnknown() or member == types.nonNilUnknown() then
+				return true
+			end
+		end
+	end
+	return false
+end
 
 
 	--- What a function's body gives back, value by value: the first is the union of the first value
@@ -41,11 +64,11 @@ local typing = {}
 	--- crosses back into C, so the same question is asked of it here.
 	---@param ctx lye.analyzer.TypingContext
 	---@param index integer
-	---@return lye.doc.Type[] values
 	function typing.inferredValuesOf(ctx, index)
 	local parsed = ctx.parsed
 	local inferCtx = ctx.inferCtx
 	local returnsOf = ctx.returnsOf
+		---@type lye.doc.Type[]
 		local values = {}
 		local statements = returnsOf[index] or {}
 		local body = parsed.nodes[index].body
@@ -53,22 +76,20 @@ local typing = {}
 		-- the body has `return` statements, their values are the answer: the block's type is the
 		-- last statement, which for `local function inner…; return inner` is the unknown the
 		-- declaration was being worked out from, and that would absorb every value returned.
-		if body and #statements == 0 then
-			local held = infer.at(inferCtx, body)
-			if held then values[1] = held end
+		if body ~= nil and #statements == 0 then
+			values[1] = infer.at(inferCtx, body)
 		end
 		for _, statement in ipairs(statements) do
 			for position, valueIdx in ipairs(statement.children or {}) do
 				local valueType = infer.at(inferCtx, valueIdx)
-				if valueType then
-					-- A union, not a combination: the value at this position is one of what the
-					-- body returns there, so a `return decoded` whose type is not known yet leaves
-					-- the position unknown rather than reading as the nil of the `return nil` above
-					-- it — `decodeJson` returns a table or says why not, and only the "why not" was
-					-- ever seen.
-					values[position] = values[position]
-						and types.union({ values[position], valueType }) or valueType
-				end
+				-- A union, not a combination: the value at this position is one of what the
+				-- body returns there, so a `return decoded` whose type is not known yet leaves
+				-- the position unknown rather than reading as the nil of the `return nil` above
+				-- it — `decodeJson` returns a table or says why not, and only the "why not" was
+				-- ever seen.
+				local already = values[position]
+				values[position] = already ~= nil
+					and types.union({ already, valueType }) or valueType
 			end
 		end
 		return values
@@ -104,12 +125,12 @@ local typing = {}
 		-- collected and cleared in one walk: a parameter handed a dozen arguments would otherwise
 		-- walk the arena once per argument.
 		local forgotten = {}
+		---@param name string
 		local function forget(name) forgotten[name] = true end
 
 		--- A literal handed to a parameter says the family it belongs to, not one value a dozen
 		--- call sites would union into: `f(1); f(2)` makes the parameter a number.
 		---@param held lye.doc.Type
-		---@return lye.doc.Type
 		local function widen(held)
 			if held.variant == "number" and held.value ~= nil then return types.NUMBER end
 			if held.variant == "boolean" and held.value ~= nil then return types.BOOLEAN end
@@ -138,7 +159,9 @@ local typing = {}
 
 		---@param held lye.doc.Type
 		local function offer(held)
-			if not held or types.isOpaque(held) or types.isMutable(held) then return nil end
+			if not held or types.isOpaque(held) or types.isMutable(held) or narrowedUnknown(held) then
+				return nil
+			end
 			return held
 		end
 
@@ -186,7 +209,7 @@ local typing = {}
 
 		-- What callers pass. A call written to the declaration's own name gives the parameter the
 		-- argument at its position; a receiver written with `:` leaves the first parameter alone.
-		for _, node in ipairs(parsed.byKind and parsed.byKind.call or {}) do
+		for _, node in ipairs(nodesOf(parsed, "call")) do
 			if not (reused and reused(node.start, node.stop)) and node.callee then
 				local variable = lookupIn(scopeAt(self, node.start), node.callee, node.start)
 				local bodyIdx = variable and variable.declaration.valueIdx
@@ -197,27 +220,27 @@ local typing = {}
 					for index, argIdx in ipairs(node.args or {}) do
 						local param = params[index + shift]
 						local target = param and self.byStart[param.start]
-						local actual = target and infer.at(inferCtx, argIdx)
-						actual = offer(actual)
-						if target and actual and not target.declaredExplicit
-							and (only == nil or only[target]) then
+						if target ~= nil and (only == nil or only[target]) then
+							local actual = offer(infer.at(inferCtx, argIdx))
 							local held = target.declared
-							if not held or held.variant == "any" or types.isMutable(held) then
-								if held ~= actual then changed = true end
-								target.declared = widen(actual)
-								target.pending = true
-								forget(target.name)
-							elseif simpleType(held) and simpleType(actual) then
-								actual = widen(actual)
-								-- A union of what callers pass is useful for numbers and strings and
-								-- explosive for two classes: the first class a parameter is handed
-								-- is its type, and a later argument is checked against it.
-								local combined = types.combine(held, actual)
-								if types.display(combined) ~= types.display(held) then
-									target.declared = combined
+							if actual ~= nil and not target.declaredExplicit then
+								if held == nil or held.variant == "any" or types.isMutable(held) then
+									if held ~= actual then changed = true end
+									target.declared = widen(actual)
 									target.pending = true
-									changed = true
 									forget(target.name)
+								elseif held ~= nil and simpleType(held) and simpleType(actual) then
+									local widened = widen(actual)
+									-- A union of what callers pass is useful for numbers and strings and
+									-- explosive for two classes: the first class a parameter is handed
+									-- is its type, and a later argument is checked against it.
+									local combined = types.combine(held, widened)
+									if types.display(combined) ~= types.display(held) then
+										target.declared = combined
+										target.pending = true
+										changed = true
+										forget(target.name)
+									end
 								end
 							end
 						end
@@ -231,28 +254,36 @@ local typing = {}
 		for _, variable in ipairs(self.variables) do
 			if variable.qualifier == "param" and not variable.declaredExplicit
 				and (only == nil or only[variable]) then
-				local owner = variable.declaration and self.byStart[variable.declaration.start]
 				-- The function that declares the parameter is the one whose span holds it and
 				-- whose own parameters include it.
+				---@type lye.parser.Node?
 				local functionNode
-				for _, node in ipairs(parsed.byKind and parsed.byKind["function"] or {}) do
+				for _, node in ipairs(nodesOf(parsed, "function")) do
 					for _, param in ipairs(node.params or {}) do
 						if param == variable.declaration then functionNode = node break end
 					end
 					if functionNode then break end
 				end
-				if functionNode then
-					local held
+				if functionNode ~= nil then
+					---@type lye.doc.Type?
+					local bodyType
 					for _, node in ipairs(parsed.nodes) do
 						if node.start >= functionNode.start and node.stop <= functionNode.stop then
 							local found = fromBody(node, variable.name, functionNode)
-							if found then held = held and types.combine(held, found) or found end
+							if found ~= nil then
+								if bodyType ~= nil then
+									bodyType = types.combine(bodyType, found)
+								else
+									bodyType = found
+								end
+							end
 						end
 					end
-					if held and not variable.declaredExplicit then
-						if variable.declared.variant == "any" or types.isMutable(variable.declared)
-							or variable.declared.variant == "unknown" then
-							variable.declared = held
+					local declared = variable.declared
+					if bodyType ~= nil and not variable.declaredExplicit and declared ~= nil then
+						if declared.variant == "any" or types.isMutable(declared)
+							or declared.variant == "unknown" then
+							variable.declared = bodyType
 							variable.pending = true
 							changed = true
 							forget(variable.name)
@@ -271,7 +302,7 @@ local typing = {}
 		end
 		-- The callable a function stands for keeps the parameters this pass learned, so a call
 		-- through a name sees `fn(number)`, not the `fn(any)` the body was typed with.
-		for _, node in ipairs(parsed.byKind and parsed.byKind["function"] or {}) do
+		for _, node in ipairs(nodesOf(parsed, "function")) do
 			local declaration = ctx.bodyOwner and ctx.bodyOwner[node.index]
 			local method = declaration and declaration.name:find(":", 1, true)
 			local fnType = inferCtx.fnTypes[node.index]
@@ -304,7 +335,6 @@ local typing = {}
 	--- asked instead, which is what makes `for _, name in ipairs(names)` a string.
 	---@param ctx lye.analyzer.TypingContext
 	---@param node lye.parser.Node
-	---@return lye.doc.Type?
 	function typing.iteratedValueOf(ctx, node)
 	local parsed = ctx.parsed
 	local inferCtx = ctx.inferCtx
@@ -312,16 +342,40 @@ local typing = {}
 		local call = iterator and parsed.nodes[iterator]
 		if not call or call.kind ~= "call" or not call.callee then return nil end
 		if call.callee ~= "ipairs" and call.callee ~= "pairs" and call.callee ~= "next" then return nil end
-		local walked = call.args and call.args[1] and infer.at(inferCtx, call.args[1])
+		local argIdx = call.args and call.args[1]
+		if not argIdx then return nil end
+		-- The field read was cached before the value it reads was known. Ask again, rather than
+		-- keeping the placeholder the first pass stored, and put the placeholder back when this
+		-- pass still cannot answer.
+		local cached = inferCtx.cache[argIdx]
+		inferCtx.cache[argIdx] = nil
+		local argNode = parsed.nodes[argIdx]
+		if argNode and argNode.kind == "index" and argNode.target then
+			inferCtx.cache[argNode.target] = nil
+		end
+		local walked = infer.at(inferCtx, argIdx)
+		if walked.variant == "unknown" and cached then inferCtx.cache[argIdx] = cached end
 		if not walked then return nil end
+		-- A narrowing of an unknown says nothing about what the walked value holds: `local names =
+		-- targets; if names then for _, name in ipairs(names)` narrowed the placeholder the local
+		-- started as, and answering from it made the loop's second name a string. The claim is
+		-- made again after refinement, when the local has settled.
+		if narrowedUnknown(walked) then return nil end
 		-- A list or an index signature says what it holds; a table of named fields is what `pairs`
 		-- walks, and its values are what the second name gets.
 		local held = types.indexResult(walked, nil)
 		if held and held.variant ~= "unknown" and held.variant ~= "any" then return held end
-		if walked.variant == "object" and next(walked.fields) then
+		---@type table<string, lye.doc.Type>?
+		local fields = walked.variant == "object" and walked.fields or nil
+		if fields ~= nil and next(fields) then
+			---@type lye.doc.Type?
 			local union
-			for _, field in pairs(walked.fields) do
-				union = union and types.combine(union, field) or field
+			for _, field in pairs(fields) do
+				if union ~= nil then
+					union = types.combine(union, field)
+				else
+					union = field
+				end
 			end
 			return union
 		end
@@ -331,7 +385,6 @@ local typing = {}
 	--- type nothing is known about, and the permissive `any` an unannotated `@return` gives. All
 	--- three are read before what they depend on was typed, and all three can change.
 	---@param held lye.doc.Type
-	---@return boolean
 	local function unsettled(held)
 		return types.isMutable(held) or held.variant == "unknown" or held.variant == "any"
 	end
@@ -363,7 +416,7 @@ local typing = {}
 	--- Type every variable from the arena. Run until it settles: a call can be met before
 	--- its callee's `@return` is known, which leaves a mutable unknown for `refine` to
 	--- promote in place, so one pass is not enough on its own.
-	---@param ctx lye.analyzer.TypingContext
+	---@param ctx lye.analyzer.WorkingTypingContext
 	---@param only table<lye.analyzer.Variable, boolean>? the names a later pass has to read again
 	---@param reused fun(start: integer, stop: integer): boolean? whether a span belongs to an item
 	--- whose cached result is being reused — its nodes are not typed and its diagnostics are copied
@@ -373,7 +426,7 @@ local typing = {}
 	-- Every function body has a callable before the walk asks for one. Inference makes these
 	-- lazily, and a callback written straight into a call may only be reached at a point after
 	-- the loop over bodies, which left its result `any` for every check that read the call.
-	for _, node in ipairs(parsed.byKind and parsed.byKind["function"] or {}) do
+	for _, node in ipairs(nodesOf(parsed, "function")) do
 		local called = inferCtx.fnTypes[node.index]
 		if not called then
 			called = types.fn({}, types.mutable(), node.isVariadic == true)
@@ -409,10 +462,10 @@ local typing = {}
 			end
 		end
 	end
-	for _, node in ipairs(parsed.byKind and parsed.byKind.literal or {}) do
+	for _, node in ipairs(nodesOf(parsed, "literal")) do
 		if node.text == "..." then
 			local owner
-			for _, body in ipairs(parsed.byKind and parsed.byKind["function"] or {}) do
+			for _, body in ipairs(nodesOf(parsed, "function")) do
 				if body.start <= node.start and body.stop >= node.stop
 					and (not owner or body.start > owner.start) then
 					owner = body
@@ -427,7 +480,6 @@ local typing = {}
 	-- A written type, read once per document where the analysis gave a cache for it: a context
 	-- built by hand — a test's — has none, and parses as it always did.
 	---@param text string
-	---@return lye.doc.Type?
 	local function parseOne(text) return memo.parse(text, resolve) end
 	local parseType = ctx.typeOfText or parseOne
 
@@ -435,7 +487,6 @@ local typing = {}
 	--- replaced after a later pass bound a generic, every read of it cached the old answer.
 	---@param name string
 	---@param idx integer?
-	---@return boolean
 	local function readsName(name, idx)
 		local node = idx and parsed.nodes[idx]
 		if not node then return false end
@@ -452,7 +503,6 @@ local typing = {}
 	---@param signature lye.analyzer.Signature
 	---@param node lye.parser.Node
 	---@param position integer
-	---@return lye.doc.Type?
 	local function signatureValue(signature, node, position)
 		local written = signature.values and signature.values[position]
 		if not written then return nil end
@@ -463,6 +513,7 @@ local typing = {}
 			local wanted = signature.params[index]
 			local actual = infer.at(inferCtx, argIdx)
 			if wanted and wanted.type and actual then
+				---@cast actual lye.doc.Type
 				infer.bind(parseType(wanted.type), actual, generics, bindings)
 			end
 		end
@@ -475,38 +526,63 @@ local typing = {}
 	-- so the function is made once rather than per call site — a closure made in the loop stops
 	-- the loop from compiling.
 	local bindingsNow, fallbackNow
+	---@param text string
 	local function boundResolver(text)
 		local held = bindingsNow and bindingsNow[text]
 		if held then return held end
 		return fallbackNow and fallbackNow(text) or nil
 	end
-		-- A loop declares its own control variables: a numeric `for` counts, and a generic `for` takes its
-		-- first name from what the iterator yields. The pass runs twice, so the slot is claimed either way.
-			local claimed = {}
+	-- A loop declares its own control variables: a numeric `for` counts, and a generic `for` takes its
+	-- first name from what the iterator yields. The pass runs twice, so the slot is claimed either way.
+	-- The table a generic `for` walks may not be typed yet on the first pass; the claim is made again
+	-- after refinement, when the field it reads has settled.
+	local function claimLoopVariables()
+		---@type table<integer, integer>
+		local claimed = {}
 		for _, variable in ipairs(self.variables) do
-			local node = variable.qualifier == "loop"
-				and not (reused and reused(variable.start, variable.stop or variable.start))
-				and loopOf(variable)
+			---@type lye.parser.Node?
+			local loopNode
+			if variable.qualifier == "loop"
+				and not (reused and reused(variable.start, variable.stop or variable.start)) then
+				loopNode = loopOf(variable)
+			end
 			-- Two names are typed: the first takes the iterator's value, the second what the table it walks
 			-- holds. A third is left alone, because Lua's `for` makes no promise about it.
-			if node and (claimed[node.index] or 0) < 2 then
-				local position = (claimed[node.index] or 0) + 1
-				claimed[node.index] = position
-				if not variable.declared then
-					if node.isNumeric then
-						variable.declared = types.NUMBER
-					elseif position == 1 then
-						local first = node.children and node.children[1]
-						local held = first and infer.at(inferCtx, first)
-						if held and types.isFn(held) then variable.declared = held.returns end
-					else
-						variable.declared = typing.iteratedValueOf(ctx, node)
+			if loopNode ~= nil then
+				-- Read once here: a nil check does not narrow a name again in a later `elseif`.
+				local owner = loopNode
+				local claims = claimed[owner.index] or 0
+				local isNumeric = owner.isNumeric
+				local children = owner.children
+				if claims < 2 then
+					local position = claims + 1
+					claimed[owner.index] = position
+					local current = variable.declared
+					if not current or current.variant == "unknown" or types.isMutable(current) then
+						---@type lye.doc.Type?
+						local wanted
+						if isNumeric then
+							wanted = types.NUMBER
+						elseif position == 1 then
+							if children ~= nil then
+								local yielded = infer.at(inferCtx, children[1])
+								if types.isFn(yielded) then wanted = yielded.returns end
+							end
+						else
+							wanted = typing.iteratedValueOf(ctx, owner)
+						end
+						if wanted ~= nil and wanted.variant ~= "unknown"
+							and not types.isMutable(wanted) then
+							variable.declared = wanted
+						end
 					end
 				end
 			end
 		end
+	end
+	claimLoopVariables()
 
-			-- Assignments are typed before initializers, and both re-run to the fixpoint, so
+		-- Assignments are typed before initializers, and both re-run to the fixpoint, so
 		-- `local y = x` sees what `x` was assigned above it rather than what it started as.
 		for _, variable in ipairs(self.variables) do
 			-- A standard library constant is not this document's to type, and a later pass reads
@@ -519,6 +595,7 @@ local typing = {}
 				for _, assignment in ipairs(variable.assignments) do
 					local position = assignment.valueIdx == declaration.valueIdx
 						and initialPosition or (assignment.valuePosition or 1)
+					---@type lye.doc.Type
 					local settled = infer.valuesAt(inferCtx, assignment.valueIdx, position)
 					-- `---@return T...` gives every value after the ones it names, so there is no
 					-- end to reach: what this call was bound to is what its second name takes too.
@@ -529,18 +606,21 @@ local typing = {}
 						if returned and returned:sub(-3) == "..." then
 							settled = inferCtx.callTypes[node.index] or settled
 						end
-						if signature and (not settled or types.isMutable(settled) or settled.variant == "unknown") then
+						if signature and (types.isMutable(settled)
+							or settled.variant == "unknown") then
 							settled = signatureValue(signature, node, position) or settled
 						end
 					end
 					-- The placeholder an assignment started as is shared with everything that read the variable before
 					-- it was typed. Filling it in where the answer arrives keeps those reads from staying unknown.
-					if types.isMutable(assignment.type) and settled then types.promote(assignment.type, settled) end
+					if types.isMutable(assignment.type) and settled ~= nil then
+						types.promote(assignment.type, settled)
+					end
 					assignment.type = settled
 					-- What a later pass is for: this value was read before what it depends on was
 					-- known — a callee written below, a `@return` not yet read — and only the names
 					-- holding one of those have to be read again.
-					if settled and unsettled(settled) then
+					if settled ~= nil and unsettled(settled) then
 						variable.pending = true
 						ctx.pending = true
 					end
@@ -579,6 +659,7 @@ local typing = {}
 		-- returns nothing. Annotations are left alone, so a `@return` can be compared later.
 		-- Innermost function bodies first: `inner` returns the value `outer` hands back, and a
 		-- body read before the one it declares saw the unknown the declaration started as.
+		---@type integer[]
 		local functionIndexes = {}
 		for index in pairs(inferCtx.fnTypes) do functionIndexes[#functionIndexes + 1] = index end
 		table.sort(functionIndexes, function(left, right)
@@ -655,7 +736,8 @@ local typing = {}
 		-- number and `unpack(t)` is whatever `t` holds.
 		for _, node in ipairs(parsed.nodes) do
 			if not (reused and reused(node.start, node.stop)) then
-			local signature = node.kind == "call" and signatureOfCall(node)
+			---@type lye.analyzer.Signature?
+			local signature = node.kind == "call" and signatureOfCall(node) or nil
 			-- A metatable is a relationship of the value it is set on rather than a replacement for its type,
 			-- but a class used as one is how a Lua object is written, so `setmetatable({}, Point)` is a `Point`.
 			if node.kind == "call" and node.args then
@@ -664,8 +746,8 @@ local typing = {}
 				-- The field the call reads is what `subject` was, taken straight rather than written out
 				-- with its owner: building `string.find` to throw the owner away was a string per call.
 				local target = node.target and parsed.nodes[node.target]
-				local subject = node.field or (target and target.field)
-				local argument = pattern.CALLS[subject or ""]
+				local subject = node.field or (target and target.field) or ""
+				local argument = pattern.CALLS[subject]
 				local patternIdx = argument and node.args[node.isMethod and 1 or 2]
 				local literal = patternIdx and parsed.nodes[patternIdx]
 				if literal and literal.kind == "string" and type(literal.value) == "string" then
@@ -684,21 +766,25 @@ local typing = {}
 			-- a named generic function binds its own. The first pass read the callback before its
 			-- body was typed; this is where the result is bound again once the body settled.
 			if node.kind == "call" then
-				local signature, calleeType = signatureOfCall(node)
-				if not signature and calleeType and calleeType.generics and next(calleeType.generics) then
+				local callSignature = signatureOfCall(node)
+				---@type lye.doc.Type?
+				local callee = callSignature == nil and infer.calleeTypeOf(inferCtx, node) or nil
+				if callee ~= nil and types.isFn(callee)
+					and callee.generics and next(callee.generics) then
+					---@type table<string, lye.doc.Type>
 					local bindings = {}
 					-- A method's own parameters leave the receiver out; a plain library
 					-- function written `gsub(s, pattern, …)` keeps it in first. Arity decides.
-					local shift = (#calleeType.params == #(node.args or {}) + 1) and 1 or 0
+					local shift = (#callee.params == #(node.args or {}) + 1) and 1 or 0
 					for index, argIdx in ipairs(node.args or {}) do
-						local wanted = calleeType.params[index + shift]
+						local wanted = callee.params[index + shift]
 						local actual = infer.at(inferCtx, argIdx)
 						if wanted and actual then
-							infer.bind(wanted, actual, calleeType.generics, bindings)
+							infer.bind(wanted, actual, callee.generics, bindings)
 						end
 					end
 					if next(bindings) then
-						local bound = types.substitute(calleeType.returns, bindings)
+						local bound = types.substitute(callee.returns, bindings)
 						local cached = inferCtx.cache[node.index]
 						if bound and (not cached or types.display(cached) ~= types.display(bound)) then
 							inferCtx.callTypes[node.index] = bound
@@ -737,24 +823,31 @@ local typing = {}
 				local bindings = {}
 				for index, argIdx in ipairs(node.args or {}) do
 					local wanted = signature.params[index]
-					if wanted and wanted.type then
-						infer.bind(parseType(wanted.type), infer.at(inferCtx, argIdx),
+					local actual = infer.at(inferCtx, argIdx)
+					if wanted and wanted.type and actual then
+						infer.bind(parseType(wanted.type), actual,
 							signature.generics, bindings)
 					end
 				end
 				if returned then
-					local bare = returned:sub(-3) == "..." and (returned:sub(1, -4):gsub("%s+$", "")) or returned
+					---@type string
+					local genericText = returned
+					if returned:sub(-3) == "..." then
+						genericText = (returned:sub(1, -4):gsub("%s+$", ""))
+					end
 					-- A binding from the arguments beats the name's own limit, which is what is
 					-- left when nothing was bound: `math.max(1, 2)` is a number either way.
 					local fallback = withGenerics(signature.generics, signature.constraints, resolve)
 					bindingsNow, fallbackNow = bindings, fallback
-					local bound = types.parse(bare, boundResolver)
+					local substituted = types.parse(genericText, boundResolver)
 					bindingsNow, fallbackNow = nil, nil
 					-- What was cached before the binding was known has to be recomputed.
-					if bound then
+					if substituted then
 						local cached = inferCtx.cache[node.index]
-						if cached and types.isMutable(cached) then types.promote(cached, bound) end
-						inferCtx.callTypes[node.index] = bound
+						if cached and types.isMutable(cached) then
+							types.promote(cached, substituted)
+						end
+						inferCtx.callTypes[node.index] = substituted
 						inferCtx.cache[node.index] = nil
 					end
 				end
@@ -780,16 +873,59 @@ local typing = {}
 			if spread and not declaration.valueIdx then variable.initializer = spread end
 		end
 			infer.refine(inferCtx, returns)
+			-- Refine may have replaced the cached answer of an assignment's value after the
+			-- assignment was typed. Only a narrowed placeholder is stale here; rewriting every
+			-- settled assignment would disturb multi-value positions and call results.
+			local assignmentsChanged = false
+			for _, variable in ipairs(self.variables) do
+				for _, assignment in ipairs(variable.assignments) do
+					if narrowedUnknown(assignment.type) then
+						local cached = assignment.valueIdx and infer.valuesAt(inferCtx,
+							assignment.valueIdx, assignment.valuePosition or 1)
+						if cached and cached.variant ~= "unknown" and not types.isMutable(cached) then
+							assignmentsChanged = true
+							assignment.type = cached
+						end
+					end
+				end
+			end
+			-- Return expressions were inferred before that refresh too. Read them again now that
+			-- the names they depend on have their final values.
+			if assignmentsChanged then
+				for index in pairs(inferCtx.fnTypes) do
+					---@cast index integer
+					local body = parsed.nodes[index].body
+					if body ~= nil then inferCtx.cache[body] = nil end
+					for _, statement in ipairs(ctx.returnsOf[index] or {}) do
+						for _, valueIdx in ipairs(statement.children or {}) do
+							inferCtx.cache[valueIdx] = nil
+						end
+					end
+					local fnType = inferCtx.fnTypes[index]
+					local values = typing.inferredValuesOf(ctx, index)
+					if values[1] then
+						fnType.returns = values[1]
+						fnType.values = values
+					end
+				end
+			end
+			-- The table a generic `for` walks may only have become knowable once the names it reads
+			-- settled; its loop variables are claimed again here.
+			claimLoopVariables()
 			-- A call typed before its callee's body settled still holds the unknown the first
 			-- pass cached, while the callable now names a result. Rebind those calls, and let the
 			-- caller type the declarations reading them once more.
-			for _, node in ipairs(parsed.byKind and parsed.byKind.call or {}) do
+			for _, node in ipairs(nodesOf(parsed, "call")) do
 				local cached = inferCtx.cache[node.index]
 				if cached and (types.isMutable(cached) or cached.variant == "unknown") then
+					---@type lye.doc.Type?
 					local calleeType = infer.calleeTypeOf(inferCtx, node)
+					---@type lye.doc.Type?
 					local known = inferCtx.callTypes[node.index]
-						or (calleeType and types.isFn(calleeType) and calleeType.returns)
-					if known and known.variant ~= "unknown" and not types.isMutable(known) then
+					if known == nil and calleeType ~= nil and types.isFn(calleeType) then
+						known = calleeType.returns
+					end
+					if known ~= nil and known.variant ~= "unknown" and not types.isMutable(known) then
 						inferCtx.cache[node.index] = known
 						ctx.callsChanged = true
 						for _, variable in ipairs(self.variables) do
@@ -818,7 +954,7 @@ local typing = {}
 	---@param reused fun(start: integer, stop: integer): boolean?
 	---@return boolean changed
 	function typing.contextualize(ctx, only, reused)
-		local parsed, self, inferCtx, resolve = ctx.parsed, ctx.self, ctx.inferCtx, ctx.resolve
+		local parsed, self, inferCtx = ctx.parsed, ctx.self, ctx.inferCtx
 		local changed = false
 
 		--- The callable member of an expected type: many callbacks are written optional, and a
@@ -861,24 +997,26 @@ local typing = {}
 		-- A function written as a result is typed by the result the enclosing declaration
 		-- promised: `---@return fun(text: string)` over `return function(text) … end` gives
 		-- `text` its string even though no call hands the literal its signature.
-		for _, node in ipairs(parsed.byKind and parsed.byKind["return"] or {}) do
+		for _, node in ipairs(nodesOf(parsed, "return")) do
 			local valueIdx = node.children and node.children[1]
 			local value = valueIdx and parsed.nodes[valueIdx]
 			if value and value.kind == "function" and not (reused and reused(value.start, value.stop)) then
 				local owner
-				for _, fn in ipairs(parsed.byKind and parsed.byKind["function"] or {}) do
+				for _, fn in ipairs(nodesOf(parsed, "function")) do
 					if fn.start <= node.start and fn.stop >= node.stop
 						and (not owner or fn.start > owner.start) then
 						owner = fn
 					end
 				end
 				local fnType = owner and inferCtx.fnTypes[owner.index]
-				local expected = fnType and callableOf(fnType.returns)
-				if expected then apply(value, expected) end
+				---@type lye.doc.Type?
+				local expected
+				if fnType ~= nil then expected = callableOf(fnType.returns) end
+				if expected ~= nil then apply(value, expected) end
 			end
 		end
 
-		for _, node in ipairs(parsed.byKind and parsed.byKind.call or {}) do
+		for _, node in ipairs(nodesOf(parsed, "call")) do
 			if not (reused and reused(node.start, node.stop)) then
 				-- Only a call that has a function body written into it has anything to type here.
 				-- Walking every call for a callback that is not there was most of a full check.
@@ -891,6 +1029,7 @@ local typing = {}
 					end
 				end
 				if not hasBody then goto continue_call end
+				---@type lye.doc.Type?
 				local calleeType = infer.calleeTypeOf(inferCtx, node)
 				if calleeType and types.isFn(calleeType) then
 					local params = calleeType.params or {}
@@ -899,17 +1038,21 @@ local typing = {}
 					-- repl)`); a method declared on a class already leaves it out.
 					local shift = 0
 					if node.isMethod then
+						---@type lye.doc.Type?
 						local receiver = node.target and infer.at(inferCtx, node.target)
 						local first = params[1]
 						if first and receiver and types.satisfies(receiver, first) then shift = 1 end
 					end
+					---@type table<string, lye.doc.Type>
 					local bindings = {}
-					if calleeType.generics and next(calleeType.generics) then
+					---@type table<string, boolean>?
+					local generics = calleeType.generics
+					if generics ~= nil and next(generics) then
 						for index, argIdx in ipairs(node.args or {}) do
 							local wanted = params[index + shift] or calleeType.variadic
 							local actual = infer.at(inferCtx, argIdx)
 							if wanted and actual then
-								infer.bind(wanted, actual, calleeType.generics, bindings)
+								infer.bind(wanted, actual, generics, bindings)
 							end
 						end
 					end
@@ -929,6 +1072,29 @@ local typing = {}
 					end
 				end
 				::continue_call::
+			end
+		end
+		-- A table annotated with a shape gives its function fields the field's signature:
+		-- `---@type Def local def = { impl = function(x) ... end }` types `x` from `Def.impl`.
+		for _, variable in ipairs(self.variables) do
+			local declared = variable.declared
+			local valueIdx = variable.declaration.valueIdx
+			local value = valueIdx and parsed.nodes[valueIdx]
+			if declared and value and value.kind == "table" then
+				local fields = parsed.tableFieldValues and parsed.tableFieldValues[value.index]
+				---@cast fields table<string, integer>?
+				for field, fieldIdx in pairs(fields or {}) do
+					---@cast field string
+					local functionNode = parsed.nodes[fieldIdx]
+					---@type lye.doc.Type?
+					local expected = types.fieldOf(declared, field)
+					---@type lye.doc.Type?
+					local callable = expected and callableOf(expected)
+					if functionNode and functionNode.kind == "function" and callable then
+						---@cast callable lye.doc.Type
+						apply(functionNode, callable)
+					end
+				end
 			end
 		end
 		return changed

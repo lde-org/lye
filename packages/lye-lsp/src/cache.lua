@@ -27,18 +27,18 @@ do
 	if ok then PID = tonumber(value) or 0 end
 end
 
-local version
+local version = nil ---@type string?
 local rootDir
-local enabled
-local named
+local enabled = nil ---@type boolean?
+local named = nil ---@type string?
 
 --- The version an entry was written by: every source file of the packages whose code decides what
 --- an analysis finds, hashed together, with the definitions they are read through.
----@return string
 local function codeVersion()
 	if version then return version end
 
-	local parts = {}
+	local parts = {} ---@type string[]
+	---@param path string
 	local function addFile(path)
 		local text = fs.read(path)
 		if type(text) == "string" then parts[#parts + 1] = rapidhash.hex(text) end
@@ -54,19 +54,24 @@ local function codeVersion()
 		require("lye-lexer").tokenize,
 		require("lye-cdef").parse,
 		require("lye-plugin").types,
-		require("lye-lsp.check").files,
+		cache.load,
 	}
 	for _, fn in ipairs(sources) do
 		local source = fn and debug.getinfo(fn, "S").source
 		local at = source and source:sub(1, 1) == "@" and source:sub(2) or nil
 		local dir = at and at:match("^(.*)/[^/]+$")
 		if dir and fs.isdir(dir) then
-			for path in fs.scan(dir, "**/*.lua", { absolute = true }) do addFile(path) end
+			for path in fs.scan(dir, "**/*.lua", { absolute = true, followSymlinks = false, ignore = function() return false end }) do
+				---@cast path string
+				addFile(path)
+			end
 		end
 	end
 
-	local defined = {}
+	local defined = {} ---@type string[]
 	for name, text in pairs(require("lye-defs")) do
+		---@cast name string
+		---@cast text string
 		defined[#defined + 1] = name .. "=" .. tostring(text)
 	end
 	table.sort(defined)
@@ -79,7 +84,6 @@ end
 
 --- Whether this run keeps a cache at all. `LYE_CACHE=off` says no, and so does a caller that
 --- wants a cold run out of a cache that is already there.
----@return boolean
 function cache.enabled()
 	if enabled ~= nil then return enabled end
 	local set = os.getenv("LYE_CACHE")
@@ -102,14 +106,12 @@ end
 --- Whether a directory has already been named, by a caller or by `LYE_CACHE_DIR`. The language
 --- server asks before it points the cache at the workspace it was handed: a run that named one has
 --- said where it wants everything, and the server is not the one to overrule it.
----@return boolean
 function cache.named()
 	return named ~= nil or (os.getenv("LYE_CACHE_DIR") or "") ~= ""
 end
 
 --- The directory everything this run keeps goes under: what a caller named, else `LYE_CACHE_DIR`,
 --- else `.lye` in the working directory — the project a check was called in.
----@return string
 function cache.root()
 	if named then return named end
 	local set = os.getenv("LYE_CACHE_DIR")
@@ -129,10 +131,10 @@ local function directory()
 end
 
 ---@param key string
----@return string?
 local function pathOf(key)
 	local dir = directory()
-	return dir and (dir .. "/" .. key .. ".entry")
+	if not dir then return nil end
+	return dir .. "/" .. key .. ".entry"
 end
 
 --- The entry written under `key`, or nil when there is none (or it cannot be read). `known` is the
@@ -140,7 +142,6 @@ end
 --- identity has to come back as the very table it was.
 ---@param key string
 ---@param known { tables: table<string, unknown> }?
----@return table?
 function cache.load(key, known)
 	if not cache.enabled() then return nil end
 	local path = pathOf(key)
@@ -172,7 +173,6 @@ end
 ---@param key string
 ---@param value table
 ---@param known { names: table<unknown, string> }? the caller's own tables, written by name
----@return boolean
 function cache.save(key, value, known)
 	if not cache.enabled() then return false end
 	local path = pathOf(key)
@@ -185,7 +185,6 @@ end
 --- A key from the parts that make an entry what it is: the text it is about, and what it was read
 --- against. Two runs that agree on every part read the same entry.
 ---@param ... string
----@return string
 function cache.key(...)
 	local count = select("#", ...)
 	if count == 0 then return rapidhash.hex("") end

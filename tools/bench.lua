@@ -5,11 +5,12 @@
 	    lde run -C packages/lye-lsp tools/bench.lua <file.lua> ...
 ]]
 
-local analyzer = require("lye-analyzer")
-local PRELUDE = analyzer.prelude(require("lye-defs"))
+local analyzer = require("lye-analyzer") --[[@as table]]
+local prelude = analyzer.prelude --[[@as fun(sources: table<string, string>): lye.analyzer.Prelude]]
+local analyze = analyzer.analyze --[[@as fun(source: string, prepared: lye.analyzer.Prelude?): lye.analyzer.Result]]
+local PRELUDE = prelude(require("lye-defs") --[[@as table<string, string>]])
 
 ---@param path string
----@return string? text
 local function read(path)
 	local handle = io.open(path, "rb")
 	if not handle then return nil end
@@ -45,10 +46,10 @@ for _, target in ipairs(targets) do
 	local best = math.huge
 	for _ = 1, ROUNDS do
 		local started = os.clock()
-		analyzer.analyze(target.text, PRELUDE)
+		analyze(target.text, PRELUDE)
 		local taken = (os.clock() - started) * 1000
 		if taken < best then best = taken end
 	end
-	local lines = select(2, target.text:gsub("\n", "\n"))
+	local lines = select(2, target.text:gsub("\n", "\n")) or 0
 	print(string.format("%-46s %6d %9.2f %9.2f", target.path, lines, best, best * 1000 / math.max(lines, 1)))
 end

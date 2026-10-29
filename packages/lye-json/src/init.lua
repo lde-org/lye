@@ -4,15 +4,14 @@
 ]]
 
 ---@class lye.json.null
----@return string
 local function nullToString() return "json.null" end
 local NULL = setmetatable({}, { __tostring = nullToString })
 
 local json = {}
 json.null = NULL
 
-local ARRAY_MT = { __json = "array" }
-local OBJECT_MT = { __json = "object" }
+local ARRAY_MT = { lyeJson = "array" }
+local OBJECT_MT = { lyeJson = "object" }
 
 ---@param t table?
 function json.array(t)
@@ -49,15 +48,13 @@ end
 ---@param pos integer?
 ---@param src string
 ---@param what string
----@return integer
 local function need(pos, src, what)
 	return pos or fail(#src + 1, what)
 end
 
----@param buf table
+---@param buf string[]
 ---@param n integer
 ---@param cp integer
----@return integer
 local function put(buf, n, cp)
 	if cp < 0x80 then
 		buf[n + 1] = char(cp)
@@ -76,7 +73,6 @@ local function put(buf, n, cp)
 	return n + 1
 end
 
-local decodeString
 ---@param src string
 ---@param quote integer
 ---@param seg integer
@@ -84,7 +80,9 @@ local decodeString
 ---@return string
 ---@return integer
 local function decodeEscapes(src, quote, seg, i)
-	local buf, n = {}, 0
+	local buf = {}
+	---@cast buf string[]
+	local n = 0
 	while true do
 		local c = byte(src, i)
 		if not c then fail(quote, "unterminated string") end
@@ -129,7 +127,7 @@ end
 ---@param i integer
 ---@return string
 ---@return integer
-function decodeString(src, i)
+local function decodeString(src, i)
 	local nxt = find(src, SPEC, i + 1)
 	if not nxt then fail(i, "unterminated string") end
 	if byte(src, nxt) == 34 then return sub(src, i + 1, nxt - 1), nxt + 1 end
@@ -278,7 +276,6 @@ function decodeValue(src, i)
 end
 
 ---@param src string
----@return any
 function json.decode(src)
 	assert(type(src) == "string", "json.decode expects a string")
 	local value, i = decodeValue(src, 1)
@@ -296,6 +293,7 @@ function json.tryDecode(src)
 	return nil, tostring(value)
 end
 
+---@param s string
 local function encodeString(s)
 	if not find(s, '[%c"\\\127]') then return '"' .. s .. '"' end
 	return '"' .. s:gsub('[%c"\\\127]', function(c)
@@ -303,6 +301,7 @@ local function encodeString(s)
 	end) .. '"'
 end
 
+---@param n number
 local function encodeNumber(n)
 	assert(n == n and n ~= math.huge and n ~= -math.huge, "cannot encode non-finite number as JSON: " .. tostring(n))
 	-- LSP fields typed `integer` must not serialize as `1.0`.
@@ -311,8 +310,6 @@ local function encodeNumber(n)
 	end
 	return format("%.14g", n)
 end
-
-local encodeValue
 
 ---@param t table
 ---@return boolean
@@ -330,8 +327,7 @@ local function isArray(t)
 end
 
 ---@param value any
----@return string
-function encodeValue(value)
+local function encodeValue(value)
 	local t = type(value)
 	if value == nil or value == NULL then return "null" end
 	if t == "boolean" then return value ? "true" : "false" end
@@ -355,6 +351,7 @@ function encodeValue(value)
 	return "{" .. table.concat(parts, ",") .. "}"
 end
 
+---@param value any
 function json.encode(value)
 	return encodeValue(value)
 end

@@ -45,6 +45,7 @@ table.sort(OPERATORS, function(a, b) return #a > #b or (#a == #b and a < b) end)
 
 --- Operators grouped by their first byte, longest first within a group, so a scan compares
 --- against a handful of candidates instead of all of them.
+---@type table<integer, { text: string, len: integer, second: integer? }[]>
 local SYMBOLS_BY_FIRST = {}
 for _, symbol in ipairs(OPERATORS) do
 	local first = symbol:byte(1)
@@ -81,7 +82,7 @@ end
 ---@class lye.lexer.Lexer
 ---@field source string
 ---@field pos integer
----@field arena lye.lexer.ffi.token[]
+---@field arena lye.lexer.ffi.token[] the FFI array of tokens, indexed like a list
 ---@field texts string[]
 ---@field capacity integer
 ---@field count integer
@@ -104,7 +105,12 @@ end
 local function grow(self)
 	local capacity = self.capacity * 2
 	local arena = ffi.new("lye_token[?]", capacity + 1)
-	ffi.copy(arena, self.arena, (self.count + 1) * ffi.sizeof("lye_token"))
+	-- The arena is FFI memory holding structs; the field type is the token list an index reads,
+	-- which is the only shape the checker can spell for an array whose elements are structs.
+	---@cast arena ffi.cdata*
+	local old = self.arena
+	---@cast old ffi.cdata*
+	ffi.copy(arena, old, (self.count + 1) * ffi.sizeof("lye_token"))
 	self.arena, self.capacity = arena, capacity
 end
 
@@ -392,8 +398,8 @@ function Lexer:tokenize()
 		elseif byteAt == 58 and nextByte == 58 and scanLabel(self, self.pos) then
 			elseif byteAt == 91 then
 			local start = self.pos
-			local level, stop = scanLongBracket(self, start)
-			if level then
+			local _, stop = scanLongBracket(self, start)
+			if stop then
 				self.pos = stop + 1
 				emit(self, KIND.string, start, stop, 0)
 			else
@@ -455,10 +461,15 @@ function lexer.resume(source, from, prefix)
 	-- arena. Size it from the tokens that survive instead.
 	if keep > self.capacity then
 		self.capacity = keep
-		self.arena = ffi.new("lye_token[?]", keep + 1)
+		local arena = ffi.new("lye_token[?]", keep + 1)
+		---@cast arena lye.lexer.ffi.token[]
+		self.arena = arena
 	end
 	-- `ffi.copy` counts from the start of the array and index 0 is unused, so one slot more.
-	ffi.copy(self.arena, prefix.arena, (keep + 1) * ffi.sizeof("lye_token"))
+	local arena, kept = self.arena, prefix.arena
+	---@cast arena ffi.cdata*
+	---@cast kept ffi.cdata*
+	ffi.copy(arena, kept, (keep + 1) * ffi.sizeof("lye_token"))
 	for index = 1, keep do self.texts[index] = prefix.texts[index] end
 	self.count = keep
 	local problems = {}
@@ -491,7 +502,10 @@ function lexer.comments(source)
 	assert(type(source) == "string", "lexer.comments expects a string")
 
 	local len = #source
-	local arena, texts = {}, {}
+	---@type lye.lexer.ffi.token[]
+	local arena = {}
+	---@type string[]
+	local texts = {}
 	local count, pos = 0, 1
 
 	while pos <= len do
@@ -545,7 +559,7 @@ function lexer.comments(source)
 		end
 	end
 
-	return { count = count, arena = arena, texts = texts }
+	return { count = count, arena = arena, texts = texts, problems = {} }
 end
 
 return lexer

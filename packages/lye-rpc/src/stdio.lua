@@ -51,14 +51,14 @@ stdio.Chunk = Chunk
 local function grow(chunk)
 	local capacity = chunk.capacity * 2
 	local buf = ffi.new("char[?]", capacity)
+	---@cast buf ffi.cdata*
 	ffi.copy(buf, chunk.buf, chunk.n)
 	chunk.buf, chunk.capacity = buf, capacity
 end
 
 --- Only a read that returns nothing at all is the end of the stream, so a short read is
 --- handled where it happens rather than being mistaken for one.
----@param chunk table
----@return integer
+---@param chunk lye.rpc.Chunk
 function stdio.read(chunk)
 	if chunk.n == chunk.capacity then grow(chunk) end
 	local got = tonumber(C.read(0, chunk.buf + chunk.n, chunk.capacity - chunk.n)) or 0
@@ -67,15 +67,14 @@ function stdio.read(chunk)
 	return got
 end
 
----@param chunk table
+---@param chunk lye.rpc.Chunk
 ---@param from integer
 ---@param to integer
----@return string
 function stdio.slice(chunk, from, to)
 	return ffi.string(chunk.buf + (from - 1), to - from + 1)
 end
 
----@param chunk table
+---@param chunk lye.rpc.Chunk
 ---@param n integer
 function stdio.consume(chunk, n)
 	if n <= 0 then return end
@@ -87,6 +86,7 @@ function stdio.consume(chunk, n)
 	chunk.n -= n
 end
 
+---@param s string
 function stdio.write(s)
 	local len, sent = #s, 0
 	while sent < len do
@@ -96,6 +96,7 @@ function stdio.write(s)
 	end
 end
 
+---@param code integer
 function stdio.exit(code)
 	C.exit(code)
 end

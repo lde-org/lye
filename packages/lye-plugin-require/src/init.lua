@@ -28,20 +28,17 @@ local BUILTIN = {
 
 --- A directory whose name starts with a dot is never a place a module lives.
 ---@param name string
----@return boolean
 local function ignored(name)
 	return name:sub(1, 1) == "."
 end
 
 ---@param root string
----@return string
 local function trimmed(root)
 	return (root:gsub("[/\\]+$", ""):gsub("/%./", "/"):gsub("//+", "/"))
 end
 
 --- The module name a path relative to a search root writes, with `/init` folded into its parent.
 ---@param relative string
----@return string
 local function moduleName(relative)
 	return (relative:gsub("%.lua$", ""):gsub("/init$", ""):gsub("[/\\]", "."))
 end
@@ -83,7 +80,10 @@ local function scan(root, mode, detail, out, seen)
 				keep = relative:sub(-4) == ".lua"
 				name = keep and moduleName(relative) or nil
 			end
-			if keep and name then add(out, seen, name, path, detail) end
+			if keep and name then
+				---@cast name string
+				add(out, seen, name, path, detail)
+			end
 		end
 	end
 end
@@ -144,7 +144,6 @@ end
 
 ---@param left lye.plugin.Completion
 ---@param right lye.plugin.Completion
----@return boolean
 local function byName(left, right)
 	return left.name < right.name
 end

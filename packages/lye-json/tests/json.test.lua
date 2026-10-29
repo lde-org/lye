@@ -2,6 +2,10 @@ local test = require("lde-test")
 local json = require("lye-json")
 local null = json.null
 
+-- A decoded value: the decoder hands back whatever the JSON said, so a test names the table shape
+-- it reads rather than the decoder guessing one.
+---@alias lye.test.Json table
+
 test.it("decodes primitives", function()
 	test.equal(json.decode("null"), null)
 	test.equal(json.decode("true"), true)
@@ -15,6 +19,7 @@ end)
 
 test.it("decodes nested structures", function()
 	local v = json.decode('{"a":[1,2,{"b":null}],"c":{}}')
+	---@cast v lye.test.Json
 	test.equal(v.a[1], 1)
 	test.equal(v.a[2], 2)
 	test.equal(v.a[3].b, null)
@@ -31,6 +36,7 @@ end)
 
 test.it("keeps array order and 1-based indexing", function()
 	local v = json.decode("[10,20,30]")
+	---@cast v lye.test.Json
 	test.equal(#v, 3)
 	test.equal(v[1], 10)
 	test.equal(v[3], 30)
@@ -38,6 +44,7 @@ end)
 
 test.it("handles whitespace and CRLF between tokens", function()
 	local v = json.decode('{\r\n\t"a" : 1 ,\r\n\t"b" : [ 2 ]\r\n}')
+	---@cast v lye.test.Json
 	test.equal(v.a, 1)
 	test.equal(v.b[1], 2)
 end)
@@ -81,6 +88,7 @@ test.it("decodes a realistic initialize request", function()
 		},"clientInfo":{"name":"Neovim","version":"0.10.0"},
 		"workspaceFolders":[{"uri":"file:///home/u/proj","name":"proj"}]}}
 	]])
+	---@cast msg lye.test.Json
 	test.equal(msg.jsonrpc, "2.0")
 	test.equal(msg.id, 1)
 	test.equal(msg.method, "initialize")
@@ -153,6 +161,7 @@ test.it("round-trips a document change notification", function()
 	}
 	local encoded = json.encode(original)
 	local decoded = json.decode(encoded)
+	---@cast decoded lye.test.Json
 	test.equal(decoded.params.textDocument.uri, "file:///a.lua")
 	test.equal(decoded.params.contentChanges[1].text, "local")
 	test.equal(decoded.params.contentChanges[1]["range"]["end"].character, 5)
@@ -160,6 +169,8 @@ test.it("round-trips a document change notification", function()
 	-- randomises string hash seeds, so two structurally identical tables can encode
 	-- with different key order and the assertion becomes flaky across runs.
 	-- Assert the shape instead.
+	---@param t table
+	---@return integer
 	local function keycount(t)
 		local n = 0
 		for _ in pairs(t) do n = n + 1 end
@@ -178,6 +189,7 @@ test.it("round-trips a document change notification", function()
 	-- *array element order* survive, which is what the assertions above check, plus
 	-- this re-decode:
 	local again = json.decode(json.encode(decoded))
+	---@cast again lye.test.Json
 	test.equal(again.params.contentChanges[1]["range"]["start"].line, 0)
 	test.equal(again.params.contentChanges[1].text, "local")
 	test.equal(keycount(again), keycount(original))
@@ -194,6 +206,7 @@ test.it("round-trips an empty diagnostics array", function()
 	-- The clear-diagnostics message: pushing [] must survive round trip as [].
 	local msg = { uri = "file:///a.lua", diagnostics = json.array() }
 	local back = json.decode(json.encode(msg))
+	---@cast back lye.test.Json
 	test.equal(#back.diagnostics, 0)
 	test.equal(json.encode(back.diagnostics), "[]")
 end)

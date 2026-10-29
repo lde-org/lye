@@ -6,11 +6,23 @@ local test = require("lde-test")
 local doc = require("lye-doc")
 local doctype = require("lye-doc.type")
 
+--- Parse a type that is written in a test and must be one: every text here is a type, so the
+--- optional `nil` `doctype.parse` returns for an empty one would only be a lie about the fixture.
+---@param text string
+---@param resolve? fun(text: string): lye.doc.Type?
+local function parse(text, resolve)
+	local held = doctype.parse(text, resolve)
+	---@cast held lye.doc.Type
+	return held
+end
+
 ---@param source string
 ---@param tag string
 ---@return lye.doc.Annotation?
 local function annotation(source, tag)
-	return doc.first(doc.parse(source), tag)
+	local file = doc.parse(source)
+	---@cast file lye.doc.File
+	return doc.first(file, tag)
 end
 
 test.it("reads an index signature as a key type and a value type", function()
@@ -20,7 +32,7 @@ test.it("reads an index signature as a key type and a value type", function()
 	local found = annotation(source, "field")
 	test.equal(found.name, "[integer]")
 	test.equal(found.type, "string")
-	test.equal(source:sub(found.nameStart, found.nameStop), "[integer]", "the span is the key")
+	test.equal(source:sub(assert(found.nameStart), assert(found.nameStop)), "[integer]", "the span is the key")
 end)
 
 test.it("says a file is a definition when it carries ---@meta", function()
@@ -103,7 +115,7 @@ test.it("cuts the prose written after a parameter's type", function()
 	test.equal(found.type, "string")
 	test.equal(found.typeStop, source:find("string", 1, true) + #"string" - 1,
 		"the span still ends on the `g` of `string`")
-	test.equal(source:sub(found.typeStart, found.typeStop), "string")
+	test.equal(source:sub(assert(found.typeStart), assert(found.typeStop)), "string")
 end)
 
 test.it("keeps a spaced union whole", function()
@@ -128,7 +140,7 @@ test.it("handles a nullable parameter name", function()
 	test.equal(found.name, "a", "the optional marker is not part of the name")
 	-- The marker moves to the type: an optional parameter may be nil.
 	test.equal(found.type, "string?")
-	test.equal(doctype.satisfies(doctype.parse("nil"), doctype.parse(found.type)), true)
+	test.equal(doctype.satisfies(parse("nil"), parse(assert(found.type))), true)
 end)
 
 test.it("reads class, field and alias tags", function()
@@ -153,47 +165,51 @@ end)
 
 test.it("reports spans that point at the annotation", function()
 	local source = "---@type string\nlocal x = 5"
-	local found = doc.first(doc.parse(source), "type")
+	local file = doc.parse(source)
+	---@cast file lye.doc.File
+	local found = doc.first(file, "type")
 	test.equal(source:sub(found.start, found.stop), "---@type string")
 end)
 
 test.it("reads annotations from inside a block comment", function()
 	-- Multi-line offsets are easy to get wrong, so the span is checked exactly.
 	local source = "--[[\n---@type number\n]]\nlocal x = 1"
-	local found = doc.first(doc.parse(source), "type")
+	local file = doc.parse(source)
+	---@cast file lye.doc.File
+	local found = doc.first(file, "type")
 	test.truthy(found)
 	test.equal(source:sub(found.start, found.stop), "---@type number")
 end)
 
 test.it("accepts a value whose type matches", function()
-	test.equal(doctype.satisfies(doctype.parse("string"), doctype.parse("string")), true)
-	test.equal(doctype.satisfies(doctype.parse("number"), doctype.parse("number")), true)
-	test.equal(doctype.satisfies(doctype.parse("table"), doctype.parse("table")), true)
-	test.equal(doctype.satisfies(doctype.parse("nil"), doctype.parse("number?")), true)
+	test.equal(doctype.satisfies(parse("string"), parse("string")), true)
+	test.equal(doctype.satisfies(parse("number"), parse("number")), true)
+	test.equal(doctype.satisfies(parse("table"), parse("table")), true)
+	test.equal(doctype.satisfies(parse("nil"), parse("number?")), true)
 end)
 
 test.it("rejects a value whose type cannot fit", function()
-	test.equal(doctype.satisfies(doctype.parse("number"), doctype.parse("string")), false)
-	test.equal(doctype.satisfies(doctype.parse("number"), doctype.parse("boolean")), false)
-	test.equal(doctype.satisfies(doctype.parse("nil"), doctype.parse("string")), false)
-	test.equal(doctype.satisfies(doctype.parse("string"), doctype.parse("number?")), false)
-	test.equal(doctype.satisfies(doctype.parse("number"), doctype.parse("table")), false)
+	test.equal(doctype.satisfies(parse("number"), parse("string")), false)
+	test.equal(doctype.satisfies(parse("number"), parse("boolean")), false)
+	test.equal(doctype.satisfies(parse("nil"), parse("string")), false)
+	test.equal(doctype.satisfies(parse("string"), parse("number?")), false)
+	test.equal(doctype.satisfies(parse("number"), parse("table")), false)
 end)
 
 test.it("decides a union by its members", function()
-	test.equal(doctype.satisfies(doctype.parse("number"), doctype.parse("string|number")), true)
-	test.equal(doctype.satisfies(doctype.parse("string"), doctype.parse("string|number")), true)
-	test.equal(doctype.satisfies(doctype.parse("boolean"), doctype.parse("string|number")), false)
-	test.equal(doctype.satisfies(doctype.parse("nil"), doctype.parse("string|number|nil")), true)
+	test.equal(doctype.satisfies(parse("number"), parse("string|number")), true)
+	test.equal(doctype.satisfies(parse("string"), parse("string|number")), true)
+	test.equal(doctype.satisfies(parse("boolean"), parse("string|number")), false)
+	test.equal(doctype.satisfies(parse("nil"), parse("string|number|nil")), true)
 end)
 
 test.it("keeps the members a narrowing rule allows", function()
-	test.equal(doctype.display(doctype.narrowTruthiness(doctype.parse("string?"), true)), "string")
-	test.equal(doctype.display(doctype.narrowTo(doctype.parse("string|number"), "number")), "number")
-	test.equal(doctype.display(doctype.exclude(doctype.parse("string|number"), "string")), "number")
-	test.equal(doctype.display(doctype.narrowTo(doctype.UNKNOWN_TYPE, "table")), "table",
+	test.equal(doctype.display(doctype.narrowTruthiness(parse("string?"), true) --[[@as lye.doc.Type]]), "string")
+	test.equal(doctype.display(doctype.narrowTo(parse("string|number"), "number") --[[@as lye.doc.Type]]), "number")
+	test.equal(doctype.display(doctype.exclude(parse("string|number"), "string") --[[@as lye.doc.Type]]), "number")
+	test.equal(doctype.display(doctype.narrowTo(doctype.UNKNOWN_TYPE, "table") --[[@as lye.doc.Type]]), "table",
 		"a type test is the information an unknown lacks")
-	test.equal(doctype.display(doctype.narrowTo(doctype.ANY_TYPE, "table")), "table",
+	test.equal(doctype.display(doctype.narrowTo(doctype.ANY_TYPE, "table") --[[@as lye.doc.Type]]), "table",
 		"and the same for any")
 end)
 
@@ -201,30 +217,35 @@ test.it("reads a field of a union as the union of the fields its members hold", 
 	-- A discriminant is the field every member holds, and the read has to name all of them:
 	-- taking the first member's value made every comparison against another member's value look
 	-- impossible, which is what broke a chain of `elseif node.type == ...`.
-	local node = doctype.parse('{ type: "ident", value: string } | { type: "bool", value: boolean }'
+	local node = parse('{ type: "ident", value: string } | { type: "bool", value: boolean }'
 		.. ' | { type: "number", value: number }')
-	test.equal(doctype.display(doctype.indexResult(node, "type")), '"bool"|"ident"|"number"')
-	test.equal(doctype.display(doctype.indexResult(node, "value")), "boolean|number|string")
-	test.equal(doctype.display(doctype.indexResult(doctype.parse('{ foo: number } | { bar: string }'), "foo")),
-		"number", "a member without the field adds nothing")
+	local heldType = doctype.indexResult(node, "type")
+	---@cast heldType lye.doc.Type
+	test.equal(doctype.display(heldType), '"bool"|"ident"|"number"')
+	local heldValue = doctype.indexResult(node, "value")
+	---@cast heldValue lye.doc.Type
+	test.equal(doctype.display(heldValue), "boolean|number|string")
+	local heldFoo = doctype.indexResult(parse('{ foo: number } | { bar: string }'), "foo")
+	---@cast heldFoo lye.doc.Type
+	test.equal(doctype.display(heldFoo), "number", "a member without the field adds nothing")
 end)
 
 test.it("narrows to nothing when a rule rules every member out", function()
 	-- A single type the rule removes leaves nothing, and `and nil or type` would hand the
 	-- type back instead of saying so.
-	test.equal(doctype.exclude(doctype.parse("number"), "number"), nil)
-	test.equal(doctype.exclude(doctype.parse("string|number"), "number|string"), nil)
-	test.equal(doctype.narrowTo(doctype.parse("string"), "number"), nil)
-	test.equal(doctype.narrowNil(doctype.parse("string"), true), nil)
+	test.equal(doctype.exclude(parse("number"), "number"), nil)
+	test.equal(doctype.exclude(parse("string|number"), "number|string"), nil)
+	test.equal(doctype.narrowTo(parse("string"), "number"), nil)
+	test.equal(doctype.narrowNil(parse("string"), true), nil)
 end)
 
 test.it("reads a function signature", function()
-	test.equal(doctype.display(doctype.parse("fn(a: number, b: string) -> boolean")),
+	test.equal(doctype.display(parse("fn(a: number, b: string) -> boolean")),
 		"fn(number, string) -> boolean")
-	test.equal(doctype.display(doctype.parse("fn() -> nil")), "fn() -> nil")
-	test.equal(doctype.display(doctype.parse("fn(a?: number) -> nil")), "fn(number?) -> nil")
-	test.equal(doctype.display(doctype.parse("fn(a: number, ...) -> nil")), "fn(number, ...) -> nil")
-	test.equal(doctype.display(doctype.parse("fun(a: number): string")), "fn(number) -> string",
+	test.equal(doctype.display(parse("fn() -> nil")), "fn() -> nil")
+	test.equal(doctype.display(parse("fn(a?: number) -> nil")), "fn(number?) -> nil")
+	test.equal(doctype.display(parse("fn(a: number, ...) -> nil")), "fn(number, ...) -> nil")
+	test.equal(doctype.display(parse("fun(a: number): string")), "fn(number) -> string",
 		"the spelling LuaLS uses reads the same")
 end)
 
@@ -232,49 +253,49 @@ test.it("reads the marker and the bar after a signature as the return they follo
 	-- Both follow the return type, so both belong to it: a resolver that returns `Type?` returns
 	-- one, and is not a function that may be absent. What may be absent is written without a
 	-- return at all, which is the `fun()?` a parameter takes.
-	test.equal(doctype.display(doctype.parse("fun(text: string): string?")), "fn(string) -> string?")
-	test.equal(doctype.display(doctype.parse("fun(text: string): string|nil")), "fn(string) -> string?",
+	test.equal(doctype.display(parse("fun(text: string): string?")), "fn(string) -> string?")
+	test.equal(doctype.display(parse("fun(text: string): string|nil")), "fn(string) -> string?",
 		"the two spellings are one type")
-	test.equal(doctype.display(doctype.parse("fun(text: string): string[]")), "fn(string) -> string[]")
-	test.equal(doctype.display(doctype.parse("fun()?")), "(fn() -> any)?",
+	test.equal(doctype.display(parse("fun(text: string): string[]")), "fn(string) -> string[]")
+	test.equal(doctype.display(parse("fun()?")), "(fn() -> any)?",
 		"with no return written the marker is the function's own")
-	test.equal(doctype.display(doctype.parse("fun()[]")), "(fn() -> any)[]",
+	test.equal(doctype.display(parse("fun()[]")), "(fn() -> any)[]",
 		"and a list of them is bracketed so it does not read as a function returning a list")
-	local declared = doctype.parse("fun(text: string): string?")
-	local inferred = doctype.parse("fun(text: string): string|nil")
+	local declared = parse("fun(text: string): string?")
+	local inferred = parse("fun(text: string): string|nil")
 	test.equal(doctype.satisfies(inferred, declared), true)
 	test.equal(doctype.satisfies(declared, inferred), true, "and either satisfies the other")
 end)
 
 test.it("treats a bare function as any signature", function()
-	local signature = doctype.parse("fn(a: number) -> string")
-	test.equal(doctype.display(doctype.parse("function")), "function")
+	local signature = parse("fn(a: number) -> string")
+	test.equal(doctype.display(parse("function")), "function")
 	test.equal(doctype.satisfies(doctype.FUNCTION, signature), true,
 		"a function literal says nothing about its parameters, so it fits")
 	test.equal(doctype.satisfies(doctype.NUMBER, signature), false, "a number is not callable")
 end)
 
 test.it("compares two signatures by parameters and return", function()
-	local wants = doctype.parse("fn(a: number) -> string")
-	test.equal(doctype.satisfies(doctype.parse("fn(a: number) -> string"), wants), true)
-	test.equal(doctype.satisfies(doctype.parse("fn(a: string) -> string"), wants), false,
+	local wants = parse("fn(a: number) -> string")
+	test.equal(doctype.satisfies(parse("fn(a: number) -> string"), wants), true)
+	test.equal(doctype.satisfies(parse("fn(a: string) -> string"), wants), false,
 		"a parameter is contravariant: it has to accept what the constraint passes")
-	test.equal(doctype.satisfies(doctype.parse("fn(a: number) -> number"), wants), false,
+	test.equal(doctype.satisfies(parse("fn(a: number) -> number"), wants), false,
 		"a return is covariant")
-	test.equal(doctype.satisfies(doctype.parse("fn(a: number, b: string) -> string"), wants), false,
+	test.equal(doctype.satisfies(parse("fn(a: number, b: string) -> string"), wants), false,
 		"a parameter the constraint does not pass has to be optional")
-	test.equal(doctype.satisfies(doctype.parse("fn() -> string"), wants), true,
+	test.equal(doctype.satisfies(parse("fn() -> string"), wants), true,
 		"and a callable that ignores the argument still takes it")
-	test.equal(doctype.satisfies(doctype.parse("fn(a: number, ...) -> string"), wants), true,
+	test.equal(doctype.satisfies(parse("fn(a: number, ...) -> string"), wants), true,
 		"a variadic accepts the constraint's arguments")
 end)
 
 test.it("claims a number only when both operands are numbers", function()
-	local number, any = doctype.parse("number"), doctype.parse("any")
+	local number, any = parse("number"), parse("any")
 	test.equal(doctype.display(doctype.binaryResult("*", number, number)), "number")
 	test.equal(doctype.display(doctype.binaryResult("*", any, number)), "unknown",
 		"an `any` could be a table with a metamethod, so the result is not a number")
-	test.equal(doctype.display(doctype.binaryResult("*", doctype.parse("string"), number)), "unknown")
+	test.equal(doctype.display(doctype.binaryResult("*", parse("string"), number)), "unknown")
 end)
 
 test.it("treats C numeric types and their single pointer marker as numbers", function()
@@ -289,65 +310,65 @@ test.it("treats C numeric types and their single pointer marker as numbers", fun
 end)
 
 test.it("never reports against a wildcard or an unresolved type", function()
-	test.equal(doctype.satisfies(doctype.parse("number"), doctype.parse("any")), true)
-	test.equal(doctype.satisfies(doctype.parse("number"), doctype.parse("unknown")), true)
-	test.equal(doctype.satisfies(doctype.parse("unknown"), doctype.parse("number")), true)
+	test.equal(doctype.satisfies(parse("number"), parse("any")), true)
+	test.equal(doctype.satisfies(parse("number"), parse("unknown")), true)
+	test.equal(doctype.satisfies(parse("unknown"), parse("number")), true)
 	-- An unresolved name is not a wildcard: it does not fit `number`. What keeps it quiet is
 	-- that inference yields `unknown` for anything it cannot type, and nothing is reported
 	-- against an unknown.
-	test.equal(doctype.satisfies(doctype.parse("unknown"), doctype.parse("my.Class")), true)
-	test.equal(doctype.mismatch(doctype.parse("my.Class"), doctype.parse("unknown"), "x"), nil,
+	test.equal(doctype.satisfies(parse("unknown"), parse("my.Class")), true)
+	test.equal(doctype.mismatch(parse("my.Class"), parse("unknown"), "x"), nil,
 		"nothing is reported against an unknown")
-	test.equal(doctype.mismatch(doctype.parse("number"), doctype.parse("unknown"), "x"), nil)
+	test.equal(doctype.mismatch(parse("number"), parse("unknown"), "x"), nil)
 end)
 
 test.it("describes a mismatch in the message", function()
-	local message = doctype.mismatch(doctype.parse("string"), doctype.parse("number"), "x")
+	local message = doctype.mismatch(parse("string"), parse("number"), "x")
 	test.truthy(message)
 	test.truthy(message:match("string"))
 	test.truthy(message:match("number"))
-	test.equal(doctype.mismatch(doctype.parse("string"), doctype.parse("string"), "x"), nil)
+	test.equal(doctype.mismatch(parse("string"), parse("string"), "x"), nil)
 end)
 
 test.it("keeps an optional name unknown rather than making it nil", function()
 	-- `---@param v? T` on a name nothing is known about says the value may be anything, nil
 	-- included: collapsing it to nil would report every argument passed to it.
 	local unknown = function() return doctype.UNKNOWN_TYPE end
-	test.equal(doctype.display(doctype.parse("T?", unknown)), "unknown")
-	test.equal(doctype.display(doctype.parse("number?", unknown)), "number?")
-	test.equal(doctype.display(doctype.parse("T[]?", unknown)), "unknown[]?")
-	test.equal(doctype.display(doctype.parse("nil|string[]")), "string[]?",
+	test.equal(doctype.display(parse("T?", unknown)), "unknown")
+	test.equal(doctype.display(parse("number?", unknown)), "number?")
+	test.equal(doctype.display(parse("T[]?", unknown)), "unknown[]?")
+	test.equal(doctype.display(parse("nil|string[]")), "string[]?",
 		"a suffix belongs to its own member rather than to the union")
 end)
 
 test.it("takes any container for a table", function()
 	-- The standard library writes `table` where it does not care what is inside.
-	test.equal(doctype.satisfies(doctype.parse("string[]"), doctype.TABLE), true)
-	test.equal(doctype.satisfies(doctype.parse("{ a: number }"), doctype.TABLE), true)
-	test.equal(doctype.satisfies(doctype.parse("string"), doctype.TABLE), false)
-	test.equal(doctype.satisfies(doctype.parse("nil|string[]"), doctype.TABLE), false,
+	test.equal(doctype.satisfies(parse("string[]"), doctype.TABLE), true)
+	test.equal(doctype.satisfies(parse("{ a: number }"), doctype.TABLE), true)
+	test.equal(doctype.satisfies(parse("string"), doctype.TABLE), false)
+	test.equal(doctype.satisfies(parse("nil|string[]"), doctype.TABLE), false,
 		"every member of a union has to fit")
 end)
 
 test.it("reads never as the type that has no value", function()
-	local never = doctype.parse("never")
+	local never = parse("never")
 	test.equal(doctype.display(never), "never")
-	test.equal(doctype.satisfies(never, doctype.parse("number")), true,
+	test.equal(doctype.satisfies(never, parse("number")), true,
 		"a call that never returns has no value to be wrong")
-	test.equal(doctype.satisfies(doctype.parse("number"), never), false,
+	test.equal(doctype.satisfies(parse("number"), never), false,
 		"and nothing is a value that cannot exist")
-	test.equal(doctype.display(doctype.union({ never, doctype.parse("number") })), "number",
+	test.equal(doctype.display(doctype.union({ never, parse("number") })), "number",
 		"a member that cannot exist adds nothing to what a value may be")
-	test.equal(doctype.display(doctype.parse("never|string")), "string")
+	test.equal(doctype.display(parse("never|string")), "string")
 end)
 
 test.it("narrows to a class or an alias by the parsed type", function()
 	-- A predicate names a type its writer chose: `x is Point` has to narrow to the class, which a
 	-- name parsed without a resolver cannot reach.
 	local point = doctype.classType("Point", nil, { x = doctype.NUMBER })
-	test.equal(doctype.display(doctype.narrowToType(doctype.union({ point, doctype.NIL_TYPE }), point)),
+	test.equal(doctype.display(doctype.narrowToType(doctype.union({ point, doctype.NIL_TYPE }), point) --[[@as lye.doc.Type]]),
 		"Point")
-	test.equal(doctype.display(doctype.excludeType(doctype.union({ point, doctype.NIL_TYPE }), point)),
+	test.equal(doctype.display(doctype.excludeType(doctype.union({ point, doctype.NIL_TYPE }), point) --[[@as lye.doc.Type]]),
 		"nil")
 end)
 
@@ -362,10 +383,10 @@ test.it("absorbs a literal into the type it belongs to", function()
 	local yes = doctype.booleanValue(true)
 	test.equal(doctype.display(doctype.union({ yes, doctype.BOOLEAN })), "boolean")
 	test.equal(doctype.display(doctype.union({ doctype.BOOLEAN, yes })), "boolean")
-	local word = doctype.parse('"seed"')
+	local word = parse('"seed"')
 	test.equal(doctype.display(doctype.union({ word, doctype.STRING })), "string")
 	test.equal(doctype.display(doctype.union({ doctype.STRING, word })), "string")
-	test.equal(doctype.display(doctype.union({ seed, doctype.parse("string") })), "20261024|string",
+	test.equal(doctype.display(doctype.union({ seed, parse("string") })), "20261024|string",
 		"a literal with no base of its own keeps its value")
 end)
 
@@ -374,7 +395,7 @@ test.it("reads a field marked optional on its own name", function()
 	-- both. The marker used to end up inside the type — the field printed as `kind: ?: string` and
 	-- stayed required — so every call passing a table without it was reported as a disagreement.
 	local function field(text, name)
-		local parsed = doctype.parse(text, function(called)
+		local parsed = parse(text, function(called)
 			if called == "string" then return doctype.STRING end
 		end)
 		return (parsed.fields or {})[name]
@@ -392,25 +413,26 @@ end)
 test.it("takes a bare table for any shape it could hold", function()
 	-- `table` is the `any` of tables: nothing was said about what is in one, so it fits a shape, a
 	-- list or a map. It fits nothing that is not a table, which is the whole difference from `any`.
-	test.equal(doctype.satisfies(doctype.TABLE, doctype.parse("{ a: number }")), true)
-	test.equal(doctype.satisfies(doctype.TABLE, doctype.parse("table<string, number>")), true)
-	test.equal(doctype.satisfies(doctype.TABLE, doctype.parse("string[]")), true)
-	test.equal(doctype.satisfies(doctype.TABLE, doctype.parse("string")), false)
-	test.equal(doctype.satisfies(doctype.TABLE, doctype.parse("number")), false)
+	test.equal(doctype.satisfies(doctype.TABLE, parse("{ a: number }")), true)
+	test.equal(doctype.satisfies(doctype.TABLE, parse("table<string, number>")), true)
+	test.equal(doctype.satisfies(doctype.TABLE, parse("string[]")), true)
+	test.equal(doctype.satisfies(doctype.TABLE, parse("string")), false)
+	test.equal(doctype.satisfies(doctype.TABLE, parse("number")), false)
 end)
 
 test.it("reads a method written without its receiver as one written with it", function()
 	-- A class field spells the receiver out — `fun(self: P, label: string): boolean` — while the
 	-- body declared `function p:set(label)` takes it from the caller, so a table holding that body
 	-- is a P.
-	local P = doctype.classType("P", {}, {
-		set = doctype.parse("fun(self: P, label: string): boolean", function(name)
+	local P
+	P = doctype.classType("P", {}, {
+		set = parse("fun(self: P, label: string): boolean", function(name)
 			if name == "P" then return P end
 		end),
 	})
-	local value = doctype.object({ set = doctype.parse("fn(label: string) -> boolean") })
+	local value = doctype.object({ set = parse("fn(label: string) -> boolean") })
 	test.equal(doctype.satisfies(value, P), true)
-	local wrong = doctype.object({ set = doctype.parse("fn(label: number) -> boolean") })
+	local wrong = doctype.object({ set = parse("fn(label: number) -> boolean") })
 	test.equal(doctype.satisfies(wrong, P), false, "the parameters still have to fit")
 end)
 
@@ -424,7 +446,7 @@ test.it("narrows every member of a union to the value the branch holds", functio
 end)
 
 test.it("brackets a union an array display holds", function()
-	local element = doctype.union({ doctype.parse("{ a: number }"), doctype.parse("{ b: string }") })
+	local element = doctype.union({ parse("{ a: number }"), parse("{ b: string }") })
 	test.equal(doctype.display(doctype.array(element)), "({ a: number }|{ b: string })[]")
 	test.equal(doctype.display(doctype.object({}, { key = "integer", type = element })),
 		"({ a: number }|{ b: string })[]", "a table of elements reads as the list it is")

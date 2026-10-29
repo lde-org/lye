@@ -31,14 +31,16 @@ end
 local function fixture(files)
 	os.execute("rm -rf " .. string.format("%q", ROOT) .. " && mkdir -p " .. string.format("%q", ROOT))
 	write(ROOT .. "/lde.json", "{ \"name\": \"cache-fixture\", \"version\": \"0.1.0\" }\n")
-	for relative, content in pairs(files) do write(ROOT .. "/" .. relative, content) end
+	for relative, content in pairs(files) do
+		---@cast relative string
+		write(ROOT .. "/" .. relative, content)
+	end
 end
 
 ---@param paths string[] what to check, relative to the fixture
 ---@param cache boolean|string? read and write the cache — `true` for the suite's own directory, a
 --- string for that one — rather than turning it off
 ---@param extra string? further options for the command line
----@return string output
 local function check(paths, cache, extra)
 	local named = {}
 	for _, relative in ipairs(paths) do named[#named + 1] = string.format("%q", ROOT .. "/" .. relative) end
@@ -58,7 +60,6 @@ end
 
 --- How many entries a directory holds, wherever the version directory under it is.
 ---@param dir string
----@return integer
 local function entries(dir)
 	local pipe = assert(io.popen(string.format("find %q -name '*.entry' 2>/dev/null | wc -l", dir)))
 	local count = tonumber(pipe:read("*a")) or 0
@@ -67,7 +68,6 @@ local function entries(dir)
 end
 
 ---@param output string
----@return string findings without the summary line the check ends with
 local function findings(output)
 	return (output:gsub("\nlye: %d+ files checked[^\n]*\n?$", ""))
 end
@@ -118,7 +118,6 @@ end
 --- The findings of a probe run, without its counters: two runs that found the same thing say the
 --- same thing.
 ---@param output string
----@return string
 local function beforeProbe(output)
 	return (output:match("^(.-)CHECK ") or output)
 end

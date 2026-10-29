@@ -16,7 +16,6 @@ local targetName = names.targetName
 --- own in the values it returns — `fun():integer, V` is one value, not two — while a plain
 --- `---@return A, B` names two.
 ---@param annotation lye.doc.Annotation?
----@return string[]?
 local function returnValues(annotation)
 	local text = annotation and annotation.type
 	if not text then return nil end
@@ -27,7 +26,6 @@ end
 --- The values a `@return` name, as text, in order. Several `---@return` lines are one
 --- signature's values in order; the synthetic annotation carries the flattened list.
 ---@param annotation lye.doc.Annotation?
----@return string[]?
 local function annotationValues(annotation)
 	if not annotation then return nil end
 	if annotation.values then return annotation.values end
@@ -38,7 +36,6 @@ end
 --- whatever they hold may have a metamethod, which is what makes `cdata + 1` and a vector class
 --- work, so nothing is claimed about them.
 ---@param type lye.doc.Type
----@return boolean
 local function isNeverNumeric(type)
 	if type.variant == "union" then
 		if #type.types == 0 then return false end
@@ -51,7 +48,7 @@ local function isNeverNumeric(type)
 		and type.variant ~= "extern" and type.variant ~= "class"
 end
 
----@param kind string
+---@param kind string?
 ---@param returns table<string, lye.doc.Type>?
 local function kindToType(kind, returns)
 	if kind == "string" then return types.STRING end
@@ -74,7 +71,7 @@ end
 local function collectAssignments(parsed)
 	local found = {}
 	for _, node in ipairs(parsed.nodes) do
-		if node.kind == "assignment" and node.value then
+		if node.kind == "assignment" and node.valueIdx then
 			local names = node.targets
 			if names then
 				for index, target in ipairs(names) do
@@ -82,7 +79,7 @@ local function collectAssignments(parsed)
 					if name then
 						found[#found + 1] = {
 							name = name, at = node.start,
-							valueIdx = node.targetValues and node.targetValues[index] or node.value,
+							valueIdx = node.targetValues and node.targetValues[index] or node.valueIdx,
 							valuePosition = node.targetPositions and node.targetPositions[index] or 1,
 						}
 					end
@@ -90,7 +87,7 @@ local function collectAssignments(parsed)
 			else
 				local name = targetName(parsed, node.target)
 				if name then
-					found[#found + 1] = { name = name, at = node.start, valueIdx = node.value }
+					found[#found + 1] = { name = name, at = node.start, valueIdx = node.valueIdx }
 				end
 			end
 		end
@@ -108,7 +105,6 @@ end
 --- very read the fact was gathered for.
 ---@param fact lye.analyzer.Narrowing
 ---@param offset integer
----@return boolean
 local function factHolds(fact, offset)
 	if offset < fact.start then return false end
 	if fact.disturbance and offset >= fact.disturbance and offset <= (fact.disturbanceStop or 0) then
@@ -122,7 +118,6 @@ end
 ---@param source string?
 ---@param stop integer
 ---@param start integer
----@return boolean
 local function blankBetween(source, stop, start)
 	if not source then return false end
 	local between = source:sub(stop + 1, start - 1)
@@ -223,7 +218,6 @@ end
 ---@param parsed lye.parser.Result
 ---@param from integer
 ---@param to integer
----@return boolean
 local function sameLine(parsed, from, to)
 	local source = parsed.source
 	return source == nil or not source:sub(from, to):find("\n", 1, true)
@@ -241,10 +235,11 @@ end
 ---@return lye.analyzer.Predicate[] predicates what the call narrows
 local function signatureOf(parsed, file, declaration)
 	local params, generics, constraints, predicates, overloads = {}, {}, {}, {}, {}
+	---@type lye.doc.Annotation[]
 	local returns = {}
 	local spanStart = annotationSpan(parsed, declaration)
 	if not spanStart then
-		return params, returned, generics, constraints, predicates, overloads
+		return params, nil, generics, constraints, predicates, overloads
 	end
 
 	-- Annotations are in source order, so the ones in the block end where the declaration starts.
@@ -337,7 +332,6 @@ end
 ---@param preserve boolean? keep a generic as the type variable it is rather than as its limit,
 --- for the signature a declaration itself carries: a caller binds its own copy of `T`, while a
 --- call site with nothing to offer still checks against the constraint.
----@return fun(text: string): lye.doc.Type?
 local function withGenerics(generics, constraints, resolve, preserve)
 	if not generics or not next(generics) then return resolve end
 	return function(text)
@@ -358,7 +352,6 @@ end
 ---@param params lye.doc.Annotation[]?
 ---@param name string
 ---@param resolve fun(text: string): lye.doc.Type?
----@return lye.doc.Type?
 local function paramTypeOf(params, name, resolve)
 	if not params then return nil end
 	for _, annotation in ipairs(params) do

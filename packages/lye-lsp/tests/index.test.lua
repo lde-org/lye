@@ -41,7 +41,10 @@ end
 ---@param files table<string, string> by relative path under the fixture root
 local function fixture(files)
 	reset()
-	for relative, content in pairs(files) do write(ROOT .. "/" .. relative, content) end
+	for relative, content in pairs(files) do
+		---@cast relative string
+		write(ROOT .. "/" .. relative, content)
+	end
 end
 
 --- An index that counts what it reads, so a warm start can be shown to touch no source.
@@ -51,6 +54,7 @@ local function counted()
 	local reads = 0
 	local index = Index.new({
 		read = function(path)
+			---@cast path string
 			reads += 1
 			return fs.read(path)
 		end,
@@ -62,7 +66,6 @@ end
 ---@param left unknown
 ---@param right unknown
 ---@param seen table<table, table>?
----@return boolean
 local function same(left, right, seen)
 	if left == right then return true end
 	if type(left) ~= "table" or type(right) ~= "table" then return false end
@@ -89,7 +92,6 @@ end
 --- the same root produce the same text, whatever order their tables were filled in. A forked build
 --- returns its records through a file, so this is also what a probe run in another process prints.
 ---@param entry lye.lsp.IndexEntry
----@return string
 local function canonical(entry)
 	local parts = { "digest=" .. entry.annotationsDigest }
 	if entry.linkDigest then parts[#parts + 1] = "link=" .. entry.linkDigest end
@@ -387,7 +389,7 @@ end)
 test.it("an explicit cap is reported with what it left behind", function()
 	fixture({})
 	for number = 1, 12 do write(ROOT .. "/f" .. number .. ".lua", "return " .. number .. "\n") end
-	local notes = {}
+	local notes = {} ---@type string[]
 	local index = Index.new({ log = function(note) notes[#notes + 1] = note end })
 	local entry = index:build(ROOT, { max = 10 })
 	test.equal(test.count(entry.files), 10, "the cap is the index's")
@@ -459,6 +461,7 @@ test.it("an entry whose digest does not describe its files is not trusted", func
 	test.truthy(cold:save(cold:build(ROOT)))
 	local key = cold:key(ROOT)
 	local entry = assert(cache.load(key))
+	---@cast entry lye.lsp.IndexEntry
 	entry.annotationsDigest = "a digest of something else"
 	test.truthy(cache.save(key, entry))
 
@@ -535,7 +538,6 @@ local function writeProbe()
 end
 
 ---@param env string
----@return string?
 local function probe(env)
 	local out = PACKAGE_DIR .. "/target/index-parallel-probe.out"
 	os.remove(out)

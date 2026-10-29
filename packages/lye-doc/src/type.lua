@@ -9,25 +9,27 @@ local types = {}
 
 --- A type table, discriminated by `variant`.
 ---@alias lye.doc.Type
----| { variant: "number" }
+---| { variant: "number", value: number?, text: string? }
+---| { variant: "integer", value: number?, text: string? }
 ---| { variant: "string" }
----| { variant: "boolean" }
+---| { variant: "boolean", value: boolean? }
 ---| { variant: "nil" }
+---| { variant: "void" }
 ---| { variant: "table" }
 ---| { variant: "fn", params: lye.doc.Type[], returns: lye.doc.Type, isVariadic: boolean?, variadic: lye.doc.Type?, values: lye.doc.Type[]?, overloads: lye.doc.Type[]?, generics: table<string, boolean>?, constraints: table<string, string>?, isMethod: boolean?, isSpread: boolean? }
 ---| { variant: "any" }
----| { variant: "unknown" }
+---| { variant: "unknown", isMutable: boolean? }
 ---| { variant: "extern", name: string }
----| { variant: "array", type: lye.doc.Type }
----| { variant: "object", fields: table<string, lye.doc.Type> }
----| { variant: "union", types: lye.doc.Type[] }
----| { variant: "intersection", types: lye.doc.Type[] }
+---| { variant: "array", type: lye.doc.Type, indexed: { key: string, type: lye.doc.Type }? }
+---| { variant: "object", fields: table<string, lye.doc.Type>, indexed: { key: string, type: lye.doc.Type }?, metatable: lye.doc.Type? }
+---| { variant: "union", types: lye.doc.Type[], aliasName: string? }
+---| { variant: "intersection", types: lye.doc.Type[], aliasName: string? }
 ---| { variant: "keyof", type: lye.doc.Type }
 ---| { variant: "indexed", object: lye.doc.Type, key: lye.doc.Type }
 ---| { variant: "conditional", check: lye.doc.Type, extends: lye.doc.Type, thenType: lye.doc.Type, elseType: lye.doc.Type }
 ---| { variant: "mapped", key: string, source: lye.doc.Type, value: lye.doc.Type }
 ---| { variant: "template", parts: (string|lye.doc.Type)[] }
----| { variant: "class", name: string, args: lye.doc.Type[], fields: table<string, lye.doc.Type>, parents: lye.doc.Type[] }
+---| { variant: "class", name: string, args: lye.doc.Type[], fields: table<string, lye.doc.Type>, parents: lye.doc.Type[], indexed: { key: string, type: lye.doc.Type }?, metatable: lye.doc.Type?, visibility: table<string, string>? }
 ---| { variant: "never" }
 
 types.UNKNOWN = "unknown"
@@ -62,9 +64,9 @@ function types.mutable()
 	return { variant = "unknown", isMutable = true }
 end
 
----@param type lye.doc.Type
+---@param type lye.doc.Type?
 function types.isMutable(type)
-	return type.isMutable == true
+	return type ~= nil and type.isMutable == true
 end
 
 --- Promote a mutable unknown to a known type, in the same table, so every holder sees it.
@@ -74,6 +76,7 @@ end
 ---@return boolean
 function types.promote(target, actual)
 	if not types.isMutable(target) then return false end
+	if displayCache then displayCache = {} end
 	if actual.variant == "unknown" then return false end
 	target.variant = actual.variant
 	target.isMutable = nil
@@ -82,7 +85,6 @@ function types.promote(target, actual)
 end
 
 ---@param name string
----@return lye.doc.Type
 function types.base(name) return make(name) end
 
 types.NUMBER = make("number")
@@ -107,7 +109,6 @@ end
 
 --- The number a type is, when it is one number rather than any.
 ---@param type lye.doc.Type?
----@return number? value
 function types.numericValue(type)
 	return type and type.variant == "number" and type.value or nil
 end
@@ -124,11 +125,11 @@ types.NEVER = make("never")
 --- that may be absent still names what it is where it is one — which is the case a `?.` is written
 --- for — so a union answers with the first of its members that names something.
 ---@param held lye.doc.Type?
----@return string?
 function types.ownerOf(held)
 	if not held then return nil end
 	if held.variant == "union" then
 		for _, member in ipairs(held.types) do
+			---@type string?
 			local owner = types.ownerOf(member)
 			if owner then return owner end
 		end
@@ -138,7 +139,10 @@ function types.ownerOf(held)
 	if held.variant == "string" then return "string" end
 	-- A value written as a string literal is a string: `("a b"):gsub("%s+", "-")` reads `string`'s
 	-- fields the same way a variable holding one does, and the literal is not a class to be named.
-	if held.variant == "extern" and held.name and held.name:match("^[\"']") then return "string" end
+	if held.variant == "extern" then
+		local name = held.name
+		if name and name:match("^[\"']") then return "string" end
+	end
 end
 
 --- A class this file declares. It is nominal: `Foo<number>` is not `Foo<string>`, and a class
@@ -251,7 +255,6 @@ end
 --- `number` parsed from text and the `types.NUMBER` singleton answer the same question.
 ---@param held lye.doc.Type
 ---@param base lye.doc.Type
----@return boolean
 local function isLiteralBase(held, base)
 	if base == types.NUMBER then return held.variant == "number" and held.value == nil end
 	if base == types.BOOLEAN then return held.variant == "boolean" and held.value == nil end
@@ -262,18 +265,21 @@ end
 --- Flatten nested unions and drop duplicates. An unknown member absorbs the whole union,
 --- since `string | unknown` tells us no more than the unknown did.
 ---@param members lye.doc.Type[]
----@return lye.doc.Type
 function types.union(members)
 	for _, member in ipairs(members) do
 		if member.variant == "unknown" or member.variant == "any" then return member end
 	end
 
-	local flat, seen = {}, {}
-	local function add(member)
+	---@type lye.doc.Type[]
+	local flat = {}
+	---@type table<string, boolean>
+	local seen = {}
+	---@param member lye.doc.Type
+	local function addMember(member)
 		-- A named union is a type in its own right: `lye.doc.Type?` has to stay a name beside
 		-- nil, rather than expanding the alias body into this union and losing what it is called.
 		if member.variant == "union" and not member.aliasName then
-			for _, inner in ipairs(member.types) do add(inner) end
+			for _, inner in ipairs(member.types) do addMember(inner) end
 			return
 		end
 		-- A member that cannot exist adds nothing to the set of what a value may be.
@@ -284,7 +290,7 @@ function types.union(members)
 			flat[#flat + 1] = member
 		end
 	end
-	for _, member in ipairs(members) do add(member) end
+	for _, member in ipairs(members) do addMember(member) end
 
 	-- A literal is a value of its base type, so a union that names both is the base:
 	-- `20261024 | number` is number, `true | boolean` is boolean, `"s" | string` is string. Only the
@@ -320,10 +326,14 @@ end
 ---@param members lye.doc.Type[]
 ---@return lye.doc.Type
 function types.intersection(members)
-	local flat, seen = {}, {}
-	local function add(member)
+	---@type lye.doc.Type[]
+	local flat = {}
+	---@type table<string, boolean>
+	local seen = {}
+	---@param member lye.doc.Type
+	local function addMember(member)
 		if member.variant == "intersection" then
-			for _, inner in ipairs(member.types) do add(inner) end
+			for _, inner in ipairs(member.types) do addMember(inner) end
 			return
 		end
 		if member.variant == "never" then
@@ -338,7 +348,7 @@ function types.intersection(members)
 			flat[#flat + 1] = member
 		end
 	end
-	for _, member in ipairs(members) do add(member) end
+	for _, member in ipairs(members) do addMember(member) end
 	if #flat == 0 then return types.UNKNOWN_TYPE end
 	if #flat == 1 then return flat[1] end
 	return make("intersection", { types = flat })
@@ -347,7 +357,6 @@ end
 --- Whether a type still contains a name nothing has resolved: a generic variable, or a name a
 --- file did not declare. A conditional or a mapped shape waits for that name.
 ---@param type lye.doc.Type?
----@return boolean
 function types.isSymbolic(type)
 	if not type then return true end
 	if type.variant == "extern" then
@@ -374,7 +383,6 @@ end
 --- The keys of a value, as the union of the names it holds. An unresolved name keeps the
 --- operation for the substitution that gives it a class.
 ---@param type lye.doc.Type
----@return lye.doc.Type
 function types.keyof(type)
 	if type.variant == "union" then
 		local members = {}
@@ -382,8 +390,13 @@ function types.keyof(type)
 		return types.union(members)
 	end
 	if type.variant == "object" or type.variant == "class" then
+		---@type table<string, lye.doc.Type>
+		local fields = type.fields or {}
 		local keys = {}
-		for name in pairs(type.fields or {}) do keys[#keys + 1] = types.stringValue(name) end
+		for name in pairs(fields) do
+			---@cast name string
+			keys[#keys + 1] = types.stringValue(name)
+		end
 		if type.indexed and type.indexed.key == "string" then
 			keys[#keys + 1] = types.STRING
 		end
@@ -399,7 +412,6 @@ end
 --- operation, the way `keyof` does.
 ---@param object lye.doc.Type
 ---@param key lye.doc.Type
----@return lye.doc.Type
 function types.indexedAccess(object, key)
 	if key.variant == "union" then
 		local members = {}
@@ -408,6 +420,7 @@ function types.indexedAccess(object, key)
 		end
 		return types.union(members)
 	end
+	---@type string?
 	local name
 	if key.variant == "extern" and type(key.name) == "string" then
 		local first, last = key.name:sub(1, 1), key.name:sub(-1)
@@ -433,7 +446,6 @@ end
 ---@param key string
 ---@param source lye.doc.Type
 ---@param value lye.doc.Type
----@return lye.doc.Type
 function types.mapped(key, source, value)
 	if types.isSymbolic(source) then
 		return make("mapped", { key = key, source = source, value = value })
@@ -460,25 +472,32 @@ end
 --- when every part is known. It is a string either way; a template that names a generic stays a
 --- template until the substitution arrives.
 ---@param parts (string|lye.doc.Type)[]
----@return lye.doc.Type
 function types.template(parts)
 	local text, symbolic = "", false
 	for _, part in ipairs(parts) do
-		if _G.type(part) == "string" then
+		if type(part) == "string" then
 			text = text .. part
-		elseif part.variant == "number" and part.value ~= nil then
-			text = text .. tostring(part.value)
-		elseif part.variant == "boolean" and part.value ~= nil then
-			text = text .. tostring(part.value)
-		elseif part.variant == "extern" and part.name then
-			local first, last = part.name:sub(1, 1), part.name:sub(-1)
-			if (first == '"' or first == "'") and last == first then
-				text = text .. part.name:sub(2, -2)
-			else
-				symbolic = true
-			end
 		else
-			symbolic = true
+			local handled = false
+			if part.variant == "number" and part.value ~= nil then
+				text = text .. tostring(part.value)
+				handled = true
+			end
+			if part.variant == "boolean" and part.value ~= nil then
+				text = text .. tostring(part.value)
+				handled = true
+			end
+			if part.variant == "extern" then
+				local name = part.name
+				if name then
+					local first, last = name:sub(1, 1), name:sub(-1)
+					if (first == '"' or first == "'") and last == first then
+						text = text .. name:sub(2, -2)
+						handled = true
+					end
+				end
+			end
+			if not handled then symbolic = true end
 		end
 	end
 	if not symbolic then return types.stringValue(text) end
@@ -490,7 +509,6 @@ end
 ---@param extends lye.doc.Type
 ---@param thenType lye.doc.Type
 ---@param elseType lye.doc.Type
----@return lye.doc.Type
 function types.conditional(check, extends, thenType, elseType)
 	if not types.isSymbolic(check) and not types.isSymbolic(extends) then
 		return types.satisfies(check, extends) and thenType or elseType
@@ -562,7 +580,6 @@ local fits
 ---@param owner lye.doc.Type the class the field belongs to
 ---@param depth integer
 ---@param seen table<lye.doc.Type, table<lye.doc.Type, boolean>>
----@return boolean
 local function methodFits(have, wanted, owner, depth, seen)
 	if not types.isFn(have) then return false end
 	-- A field written optional is that signature with `nil` beside it, and a body that is a callable
@@ -584,7 +601,6 @@ end
 
 ---@param type lye.doc.Type
 ---@param constraint lye.doc.Type
----@return boolean
 function types.satisfies(type, constraint)
 	return fits(type, constraint, 0, {})
 end
@@ -609,15 +625,17 @@ function types.missingRequiredFields(constraint, actual)
 	return missing
 end
 
----@param candidate table?
+---@param candidate lye.doc.Type?
 local function isCNumber(candidate)
-	local name = candidate and candidate.name
-	if name == "ffi.cnum" or name == "ffi.cnum*" then return true end
-	local parents = candidate and candidate.parents
-	if parents then
-		for _, parent in ipairs(parents) do
-			name = parent.name
-			if name == "ffi.cnum" or name == "ffi.cnum*" then return true end
+	if not candidate then return false end
+	if candidate.variant == "class" then
+		local name = candidate.name
+		if name == "ffi.cnum" or name == "ffi.cnum*" then return true end
+		for _, parent in ipairs(candidate.parents or {}) do
+			if parent.variant == "class" then
+				local parentName = parent.name
+				if parentName == "ffi.cnum" or parentName == "ffi.cnum*" then return true end
+			end
 		end
 	end
 	return false
@@ -629,7 +647,6 @@ end
 ---@param constraint lye.doc.Type
 ---@param depth integer
 ---@param seen table<lye.doc.Type, table<lye.doc.Type, boolean>>
----@return boolean
 function fits(type, constraint, depth, seen)
 	if depth >= MAX_COMPARE_DEPTH then return true end
 	-- Two recursive types — a class holding itself, an alias whose body names it — would otherwise
@@ -971,6 +988,7 @@ end
 --- narrowing: `if y then` on `string|nil` leaves `string` in the branch.
 ---@param type lye.doc.Type
 ---@param wantTruthy boolean
+---@return lye.doc.Type?
 function types.narrowTruthiness(type, wantTruthy)
 	if type.variant == "any" then return type end
 	if type.variant == "unknown" then
@@ -993,6 +1011,7 @@ function types.narrowTruthiness(type, wantTruthy)
 		-- Each member is narrowed by the same question, so a plain `boolean` in a union becomes the
 		-- value the branch holds — `false` on the falsy side — rather than staying a whole boolean
 		-- that a later `or` cannot tell apart from its truthy half.
+		---@type lye.doc.Type?
 		local one = types.narrowTruthiness(member, wantTruthy)
 		if one then
 			kept[#kept + 1] = one
@@ -1012,6 +1031,7 @@ end
 --- Keep only the members that are nil, or only those that are not.
 ---@param type lye.doc.Type
 ---@param wantNil boolean
+---@return lye.doc.Type?
 function types.narrowNil(type, wantNil)
 	if type.variant == "any" then return type end
 	if type.variant == "unknown" then
@@ -1033,14 +1053,14 @@ end
 --- test asserts. A name that resolves to nothing keeps the type unchanged rather than emptying it.
 ---@param type lye.doc.Type
 ---@param wanted lye.doc.Type?
+---@return lye.doc.Type?
 function types.narrowToType(type, wanted)
 	if not wanted then return type end
 	-- `type(x) == "table"` is exactly the information an unknown or `any` lacks, so the test
 	-- replaces it with the type it names instead of letting `satisfies` accept the unknown as-is.
 	if type.variant == "any" or type.variant == "unknown" then return wanted end
-	if type.variant == "boolean" and type.value == nil and wanted.variant == "boolean"
-		and wanted.value ~= nil then
-		return wanted
+	if type.variant == "boolean" and type.value == nil and wanted.variant == "boolean" then
+		if wanted.value ~= nil then return wanted end
 	end
 	if type.variant ~= "union" then
 		return types.satisfies(type, wanted) and type or nil
@@ -1078,6 +1098,7 @@ end
 --- Keep only the members that do not fit a type.
 ---@param type lye.doc.Type
 ---@param unwanted lye.doc.Type?
+---@return lye.doc.Type?
 function types.excludeType(type, unwanted)
 	if not unwanted then return type end
 	if type.variant == "any" then return type end
@@ -1165,7 +1186,8 @@ end
 ---@param field string
 ---@param wanted lye.doc.Type
 local function couldBeDiscriminant(member, field, wanted)
-	local held = member.variant == "object" and member.fields[field] or nil
+	local held = (member.variant == "object" or member.variant == "class")
+		and member.fields[field] or nil
 	if not held then
 		-- A class is built at runtime, so a field it does not name may still be there; an
 		-- object literal says what it holds and nothing else.
@@ -1210,27 +1232,21 @@ end
 --- than an approximation of it.
 ---@param a number
 ---@param b number
----@return number
 local function add(a, b) return a + b end
 ---@param a number
 ---@param b number
----@return number
 local function subtract(a, b) return a - b end
 ---@param a number
 ---@param b number
----@return number
 local function multiply(a, b) return a * b end
 ---@param a number
 ---@param b number
----@return number
 local function divide(a, b) return a / b end
 ---@param a number
 ---@param b number
----@return number
 local function modulo(a, b) return a % b end
 ---@param a number
 ---@param b number
----@return number
 local function power(a, b) return a ^ b end
 
 local ARITHMETIC_RESULT = {
@@ -1271,7 +1287,7 @@ function types.binaryResult(op, left, right)
 		local isAnd = op == "and" or op == "&&"
 		-- An `any` on the left answers with itself: nothing can be said about which side it takes,
 		-- so combining it with the right side lets the right side stand for the answer.
-		if left.variant == "any" or left.variant == "unknown" then return left end
+		if left.variant == "any" then return left end
 		local known = types.truthiness(left)
 		if known ~= nil then
 			if isAnd == known then return right end
@@ -1280,12 +1296,14 @@ function types.binaryResult(op, left, right)
 		-- Nothing is known about which side answers, and the union of both operands is not the answer
 		-- either: `a` cannot be here twice. `x and x.field` is the field or nothing.
 		if isAnd then
+			---@type lye.doc.Type?
 			local absent = types.narrowTruthiness(left, false)
 			-- When the right side already covers what the left is when it is absent — a `boolean`
 			-- covers the `false` a boolean becomes — the answer is just the right side.
 			if not absent or types.satisfies(absent, right) then return right end
 			return types.combine(absent, right)
 		end
+		---@type lye.doc.Type?
 		local present = types.excludeType(left, types.NIL_TYPE)
 		if present then present = types.excludeType(present, types.booleanValue(false)) end
 		if not present then return right end
@@ -1334,6 +1352,7 @@ end
 
 --- The metamethod Lua consults for an operator. The engine asks for these by name, and a table
 --- that defines one changes what the operator does with it.
+---@type table<string, string>
 local METAMETHODS = {
 	["+"] = "__add", ["-"] = "__sub", ["*"] = "__mul", ["/"] = "__div", ["%"] = "__mod",
 	["^"] = "__pow", [".."] = "__concat", ["=="] = "__eq", ["<"] = "__lt", ["<="] = "__le",
@@ -1357,7 +1376,6 @@ end
 
 --- The metatable a type carries, when it carries one.
 ---@param type lye.doc.Type?
----@return lye.doc.Type?
 function types.metatableOf(type)
 	return type and type.metatable
 end
@@ -1389,8 +1407,10 @@ function types.fieldOf(type, name)
 	local depth = 0
 	while type and depth < 8 do
 		if type.variant == "intersection" then
+			---@type lye.doc.Type[]
 			local parts = {}
 			for _, member in ipairs(type.types) do
+				---@type lye.doc.Type?
 				local found = types.fieldOf(member, name)
 				if found then parts[#parts + 1] = found end
 			end
@@ -1399,25 +1419,39 @@ function types.fieldOf(type, name)
 		end
 		if type.variant == "union" then
 			for _, member in ipairs(type.types) do
+				---@type lye.doc.Type?
 				local found = types.fieldOf(member, name)
 				if found then return found end
 			end
 			return nil
 		end
-		local carried = type.fields and type.fields[name]
-		if carried then return carried end
+		if type.variant == "object" or type.variant == "class" then
+			---@type table<string, lye.doc.Type>
+			local fields = type.fields
+			if fields then
+				local carried = fields[name]
+				if carried then return carried end
+			end
 
-		local metatable = type.metatable
-		if not metatable then return nil end
-		local index = metatable.fields and metatable.fields.__index
-		if index == nil then
-			type = metatable
-		elseif types.isFn(index) then
-			return index.returns
+			local metatable = type.metatable
+			if not metatable then return nil end
+			local index
+			if metatable.variant == "object" or metatable.variant == "class" then
+				---@type table<string, lye.doc.Type>
+				local indexFields = metatable.fields
+				if indexFields then index = indexFields.__index end
+			end
+			if index == nil then
+				type = metatable
+			elseif index.variant == "fn" then
+				return index.returns
+			else
+				type = index
+			end
+			depth = depth + 1
 		else
-			type = index
+			return nil
 		end
-		depth = depth + 1
 	end
 	return nil
 end
@@ -1444,13 +1478,16 @@ function types.indexResult(target, field)
 	if target.variant == "unknown" or target.variant == "any" then return types.mutable() end
 	if target.variant == "intersection" then
 		if field then
+			---@type lye.doc.Type[]
 			local parts = {}
 			for _, member in ipairs(target.types) do
+				---@type lye.doc.Type?
 				local found = types.fieldOf(member, field)
 				if found then parts[#parts + 1] = found end
 			end
 			return #parts > 0 and types.intersection(parts) or types.mutable()
 		end
+		---@type lye.doc.Type[]
 		local parts = {}
 		for _, member in ipairs(target.types) do
 			parts[#parts + 1] = types.indexResult(member, field)
@@ -1464,8 +1501,10 @@ function types.indexResult(target, field)
 	-- or require("a.posix")` is a union of two modules, and one of them lacking a field the other
 	-- has is not a reason to forget the one that does.
 	if target.variant == "union" and field then
+		---@type lye.doc.Type[]
 		local parts = {}
 		for _, member in ipairs(target.types) do
+			---@type lye.doc.Type?
 			local found = types.fieldOf(member, field)
 			if not found and member.variant == "object" and member.indexed and member.indexed.key == "string" then
 				found = member.indexed.type
@@ -1474,7 +1513,22 @@ function types.indexResult(target, field)
 		end
 		if #parts > 0 then return types.union(parts) end
 	end
+	-- `values or {}` is the common way to walk an optional list. The empty table adds no
+	-- element type, so the union's answer is what its array members hold.
+	if target.variant == "union" and not field then
+		---@type lye.doc.Type[]
+		local parts = {}
+		for _, member in ipairs(target.types) do
+			---@type lye.doc.Type
+			local found = types.indexResult(member, nil)
+			if found.variant ~= "unknown" and found.variant ~= "any" then
+				parts[#parts + 1] = found
+			end
+		end
+		if #parts > 0 then return types.union(parts) end
+	end
 	if target.variant == "object" and field then
+		---@type lye.doc.Type?
 		local found = types.fieldOf(target, field)
 		if found then return found end
 		-- A string index signature answers for a name as well as for a key: `table<string, integer>`
@@ -1589,10 +1643,10 @@ end
 --- nothing writes to. The first answer is kept for the same text; the keys are weak, so the text
 --- of an annotation that left the document is collected rather than kept for the life of the
 --- process. `false` records an answer that was nil, which a table cannot hold.
+---@type table<string, false|integer>
 local typeEnds = setmetatable({}, { __mode = "k" })
 
 ---@param text string
----@return integer? stop
 local function typeEnd(text)
 	local held = typeEnds[text]
 	if held ~= nil then
@@ -1694,6 +1748,7 @@ local function fnParamsScan(text)
 	return openAt, closeAt, declared
 end
 
+---@type table<string, false|{ openAt: integer, closeAt: integer?, declared: string? }>
 local fnShapes = setmetatable({}, { __mode = "k" })
 
 --- The parentheses and declared names of a signature, scanned once per text.
@@ -1705,10 +1760,10 @@ local function fnParams(text)
 	local held = fnShapes[text]
 	if held ~= nil then
 		if held == false then return nil end
-		return held[1], held[2], held[3]
+		return held.openAt, held.closeAt, held.declared
 	end
 	local openAt, closeAt, declared = fnParamsScan(text)
-	fnShapes[text] = openAt and { openAt, closeAt, declared } or false
+	fnShapes[text] = openAt and { openAt = openAt, closeAt = closeAt, declared = declared } or false
 	return openAt, closeAt, declared
 end
 
@@ -1726,7 +1781,7 @@ end
 --- `fn(a: number, b: string) -> boolean`, and the `fun(a): boolean` spelling LuaLS uses.
 --- A parameter may be named or not, may be optional, and `...` stands for the rest.
 ---@param text string
----@param resolve fun(text: string): lye.doc.Type? a class or alias, where the annotations declare one
+---@param resolve (fun(text: string): lye.doc.Type?)? a class or alias, where the annotations declare one
 local function parseFn(text, resolve)
 	local openAt, closeAt, declared = fnParams(text)
 	if not openAt then return nil end
@@ -1790,6 +1845,7 @@ end
 local function foldExpressionScan(text)
 	local rest = (text:gsub("^%s+", ""):gsub("%s+$", ""))
 
+	---@return string? kind
 	---@return number|string? value
 	local function operand()
 		local number = rest:match("^%-?%d[%d%.]*")
@@ -1812,7 +1868,9 @@ local function foldExpressionScan(text)
 	if length then
 		rest = length
 		local kind, value = operand()
-		if kind == "string" and rest:match("^%s*$") then return "number", #value end
+		if kind == "string" and type(value) == "string" and rest:match("^%s*$") then
+			return "number", #value
+		end
 		return nil
 	end
 
@@ -1841,6 +1899,7 @@ local function foldExpressionScan(text)
 	return kind, value
 end
 
+---@type table<string, false|{ kind: string, value: number|string? }>
 local foldedExpressions = setmetatable({}, { __mode = "k" })
 
 --- An expression of literals, worked out once per text: the same type text is read at every call
@@ -1852,10 +1911,10 @@ local function foldExpression(text)
 	local held = foldedExpressions[text]
 	if held ~= nil then
 		if held == false then return nil end
-		return held[1], held[2]
+		return held.kind, held.value
 	end
 	local kind, value = foldExpressionScan(text)
-	foldedExpressions[text] = kind and { kind, value } or false
+	foldedExpressions[text] = kind and { kind = kind, value = value } or false
 	return kind, value
 end
 
@@ -1999,7 +2058,6 @@ end
 
 ---@param type lye.doc.Type
 ---@param bindings table<string, lye.doc.Type>
----@return lye.doc.Type
 function types.substitute(type, bindings)
 	return substituted(type, bindings, {})
 end
@@ -2039,7 +2097,7 @@ end
 --- this conditional is not one of theirs.
 ---@param text string
 ---@return string? check
----@return string? extends
+---@return string? extendsText
 ---@return string? thenText
 ---@return string? elseText
 local function conditionalParts(text)
@@ -2084,6 +2142,9 @@ local function conditionalParts(text)
 		(text:sub(colon + 1):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+---@param text string?
+---@param resolve (fun(text: string): lye.doc.Type?)?
+---@return lye.doc.Type?
 function types.parse(text, resolve)
 	local trimmed = (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	if trimmed == "" then return nil end
@@ -2104,9 +2165,13 @@ function types.parse(text, resolve)
 	-- conditional until a substitution supplies it.
 	local checkText, extendsText, thenText, elseText = conditionalParts(trimmed)
 	if checkText and extendsText and thenText and elseText then
+		---@type lye.doc.Type?
 		local check = types.parse(checkText, resolve)
+		---@type lye.doc.Type?
 		local wanted = types.parse(extendsText, resolve)
+		---@type lye.doc.Type?
 		local thenType = types.parse(thenText, resolve)
+		---@type lye.doc.Type?
 		local elseType = types.parse(elseText, resolve)
 		if check and wanted and thenType and elseType then
 			return types.conditional(check, wanted, thenType, elseType)
@@ -2118,8 +2183,10 @@ function types.parse(text, resolve)
 	-- one member belongs to that member alone. Each is read on its own from here.
 	local members = splitTopLevel(trimmed, 124)
 	if #members > 1 then
+		---@type lye.doc.Type[]
 		local parsed = {}
 		for _, member in ipairs(members) do
+			---@type lye.doc.Type?
 			local one = types.parse(member, resolve)
 			if one then parsed[#parsed + 1] = one end
 		end
@@ -2129,8 +2196,10 @@ function types.parse(text, resolve)
 	-- Intersection binds tighter than union, so `A | B & C` is A or (B and C).
 	local parts = splitTopLevel(trimmed, 38)
 	if #parts > 1 then
+		---@type lye.doc.Type[]
 		local parsed = {}
 		for _, part in ipairs(parts) do
+			---@type lye.doc.Type?
 			local one = types.parse(part, resolve)
 			if one then parsed[#parsed + 1] = one end
 		end
@@ -2301,6 +2370,12 @@ end
 --- printed by printing what it holds, so the walk stops where it came in — a class already
 --- being written is printed as its name.
 local displaying = {}
+--- The display cache is enabled only across the checks phase, after typing has settled the
+--- type tables. `promote` clears it because a promoted type changes what it renders as.
+---@type table<lye.doc.Type, string>?
+local displayCache
+function types.enableDisplayCache() displayCache = {} end
+function types.disableDisplayCache() displayCache = nil end
 
 ---@param type lye.doc.Type
 ---@return string
@@ -2309,7 +2384,6 @@ local displaying = {}
 --- error; the name or the first part of it is.
 local MAX_DESCRIBE = 220
 ---@param type lye.doc.Type
----@return string
 function types.describe(type)
 	local text = types.display(type)
 	if #text > MAX_DESCRIBE then return text:sub(1, MAX_DESCRIBE - 1) .. "…" end
@@ -2317,24 +2391,28 @@ function types.describe(type)
 end
 
 ---@param type lye.doc.Type
----@return string
 function types.display(type)
+	if displayCache then
+		local cached = displayCache[type]
+		if cached then return cached end
+	end
 	if displaying[type] then
 		return type.variant == "class" and type.name or type.variant
 	end
 	displaying[type] = true
 	local shown = types.displayOf(type)
 	displaying[type] = nil
+	if displayCache then displayCache[type] = shown end
 	return shown
 end
 
 ---@param type lye.doc.Type
----@return string
 function types.displayOf(type)
 	-- An alias is its name where a reader is concerned. The body remains the type every check
 	-- uses; only the rendering stops at the name, which is what keeps a recursive alias such as
 	-- `lye.doc.Type` from expanding into the union of its own members.
-	if type.aliasName then return type.aliasName end
+	local aliasName = type.aliasName
+	if aliasName then return aliasName end
 	if type.variant == "intersection" then
 		local parts = {}
 		for _, member in ipairs(type.types) do
@@ -2470,7 +2548,6 @@ end
 --- Whether a value is one the analysis cannot see into: `any` it was handed, or a value nothing
 --- is known about. A mutable unknown is a placeholder rather than an answer, and is not one.
 ---@param type lye.doc.Type?
----@return boolean
 function types.isOpaque(type)
 	if not type then return false end
 	if type.variant == "any" then return true end
@@ -2519,6 +2596,7 @@ local function opaqueWhere(declared, actual, seen, depth)
 	if (declared.variant == "object" or declared.variant == "class")
 		and (actual.variant == "object" or actual.variant == "class") then
 		for name, wanted in pairs(declared.fields or {}) do
+			---@cast name string
 			local have = actual.fields and actual.fields[name]
 			if have then
 				local found, at = opaqueWhere(wanted, have, seen, depth + 1)

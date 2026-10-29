@@ -57,10 +57,10 @@ end
 --- The index of the last edit whose replacement covers an offset of the lowered text.
 ---@param self lye.plugin.Map
 ---@param offset integer
----@return integer? index
 local function editCovering(self, offset)
 	local edits, starts = self.edits, self.starts
 	local low, high = 1, #edits
+	---@type integer?
 	local found
 	while low <= high do
 		local mid = math.floor((low + high) / 2)

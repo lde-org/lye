@@ -48,6 +48,7 @@ function Connection.new()
 end
 
 ---@param self lye.rpc.Connection
+---@param handler fun(connection: lye.rpc.Connection, message: lye.rpc.Message)
 function Connection:setHandler(handler)
 	self.handler = handler
 end
@@ -96,7 +97,6 @@ function Connection:readHeaders()
 end
 
 ---@param self lye.rpc.Connection
----@return lye.rpc.Message? message
 function Connection:readMessage()
 	local headers, headerBytes = self:readHeaders()
 	if not headers then return nil end
@@ -106,6 +106,8 @@ function Connection:readMessage()
 	local length = tonumber(headers["content-length"])
 	local bodyEnd = length and headerBytes + length
 	assert(bodyEnd, "lye-rpc: message header has no Content-Length")
+	---@cast headerBytes integer
+	---@cast bodyEnd integer
 
 	while self.chunk.n < bodyEnd do
 		assert(stdio.read(self.chunk) ~= stdio.EOF, "lye-rpc: stream ended inside a message body")
@@ -115,21 +117,24 @@ function Connection:readMessage()
 	stdio.consume(self.chunk, bodyEnd)
 
 	local isOk, message = pcall(decode, body)
-	if isOk then return message end
+	if isOk then return message --[[@as lye.rpc.Message ]] end
 	if self.onParseError then self.onParseError(tostring(message)) end
 end
 
+---@param message table
 local function write(message)
 	local body = encode(message)
 	stdio.write("Content-Length: " .. #body .. "\r\n\r\n" .. body)
 end
 
 ---@param self lye.rpc.Connection
+---@param id integer|string|lye.json.null|nil
+---@param result any
 function Connection:respond(id, result)
 	write({ jsonrpc = "2.0", id = id, result = result == nil ? json.null : result })
 end
 
----@param id integer|string
+---@param id integer|string|lye.json.null|nil
 ---@param code integer
 ---@param message string
 ---@param data any
@@ -139,11 +144,16 @@ function Connection:respondError(id, code, message, data)
 end
 
 ---@param self lye.rpc.Connection
+---@param method string
+---@param params any
 function Connection:notify(method, params)
 	write({ jsonrpc = "2.0", method = method, params = params })
 end
 
 ---@param self lye.rpc.Connection
+---@param method string
+---@param params any
+---@return integer
 function Connection:request(method, params)
 	self.nextId += 1
 	write({ jsonrpc = "2.0", id = self.nextId, method = method, params = params })
@@ -163,12 +173,13 @@ function Connection:listen()
 	local didParseError = false
 	self:setParseErrorHandler(function(err)
 		didParseError = true
-		self:respondError(json.null, rpc.ERROR.parseError, err)
+		self:respondError(json.null --[[@as lye.json.null ]], rpc.ERROR.parseError, err)
 	end)
 
 	while true do
 		didParseError = false
 		local isOk, message = pcall(self.readMessage, self)
+		---@cast message lye.rpc.Message?
 		assert(isOk, message)
 		if message == nil and not didParseError then return end
 
@@ -189,6 +200,7 @@ function Connection:listen()
 	end
 end
 
+---@param code integer
 function rpc.exit(code)
 	stdio.exit(code)
 end

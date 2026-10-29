@@ -21,8 +21,6 @@ local INPUT = PACKAGE_DIR .. "/target/memory-test-input.bin"
 local STDERR = PACKAGE_DIR .. "/target/memory-test-stderr.txt"
 local CACHE = PACKAGE_DIR .. "/target/memory-test-cache"
 
-local MIB = 1024 * 1024
-
 test.it("steps at 2 MiB of growth, collects fully at 8 MiB, and always on a close", function()
 	local function decide(grown, force)
 		return Lye.gcDecision(grown * 1024, force)
@@ -71,7 +69,6 @@ test.it("reports the resident set and the heap from the running process", functi
 end)
 
 ---@param value any
----@return string
 local function frame(value)
 	local body = json.encode(value)
 	return "Content-Length: " .. #body .. "\r\n\r\n" .. body

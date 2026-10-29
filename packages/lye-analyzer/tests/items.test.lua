@@ -14,7 +14,6 @@ local URI = "file:///tmp/items.lua"
 
 ---@param source string
 ---@param options table?
----@return lye.analyzer.Result
 local function analyze(source, options)
 	return lye.analyze(source, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 		options and { uri = URI, incremental = true, counters = options.counters,

@@ -8,10 +8,18 @@
 
 local test = require("lde-test")
 local lexer = require("lye-lexer")
-local Parser = require("lye-parser")
+
+--- The module is published under its own name only from inside the package, so the test file
+--- describes the interface it is handed: `new` builds a parser and `parse` returns its result.
+---@class lye.parser.TestInstance : lye.parser.Parser
+---@field parse fun(self: lye.parser.TestInstance): lye.parser.Result
+
+---@class lye.parser.TestModule
+---@field new fun(source: string, resume: lye.parser.Resume?, definition: boolean?): lye.parser.TestInstance
+
+local Parser = require("lye-parser") --[[@as lye.parser.TestModule]]
 
 ---@param source string
----@return boolean
 local function engineAccepts(source)
 	local fn = loadstring(source)
 	return fn ~= nil
@@ -346,6 +354,7 @@ test.it("reads a parameter list a comment is written inside", function()
 		end
 		test.truthy(fn, "the function was read: " .. source)
 		for _, param in ipairs(fn.params or {}) do
+			---@cast param { name: string }
 			test.truthy(param.name == "a" or param.name == "b" or param.name == "x",
 				"the parameter is the name, not the comment: " .. tostring(param.name))
 		end
@@ -367,11 +376,14 @@ test.it("reads the types a definition file writes inline", function()
 
 	local bodies = {}
 	for _, node in ipairs(parsed.nodes) do
+		---@cast node lye.parser.Node
 		if node.kind == "function" then bodies[#bodies + 1] = node end
 	end
-	test.equal(bodies[1].params[1].inlineType, "number")
+	local firstParams = assert(bodies[1].params)
+	local secondParams = assert(bodies[2].params)
+	test.equal(firstParams[1].inlineType, "number")
 	test.equal(bodies[1].inlineReturns, nil)
-	test.equal(bodies[2].params[1].inlineType, "T")
+	test.equal(secondParams[1].inlineType, "T")
 	test.equal(bodies[2].inlineGenerics, "<T: number>")
 	test.equal(bodies[2].inlineReturns, "string")
 	test.equal(bodies[3].isVariadic, true)

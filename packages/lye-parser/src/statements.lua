@@ -2,9 +2,9 @@
 	Statement grammar, including error recovery.
 ]]
 
-local Parser = require("lye-parser")
+local Parser = require("lye-parser") --[[@as lye.parser.Parser]]
 
-local KIND = Parser.KIND
+local KIND = Parser.KIND --[[@as table<string, integer>]]
 
 local statements = {}
 
@@ -38,6 +38,8 @@ function statements.parseIf(self)
 end
 
 ---@param self lye.parser.Parser
+---@param start integer?
+---@param conditionIdx integer?
 function statements.parseDoBlock(self, start, conditionIdx)
 	start = start or self:peek().start
 	self:expect("do")
@@ -79,7 +81,11 @@ function statements.parseFor(self)
 	-- The control variables belong to the loop rather than to the body, so they carry their own
 	-- kind: a numeric `for` counts, and a generic one takes what its expressions yield.
 	local name, token = self:parseName()
-	if name then self:declare(name, "loop", token) end
+	if name then
+		---@cast name string
+		---@cast token lye.lexer.ffi.token
+		self:declare(name, "loop", token)
+	end
 
 	local values, isNumeric = {}, false
 	if self:accept("=") then
@@ -91,7 +97,11 @@ function statements.parseFor(self)
 	else
 		while self:accept(",") do
 			local extra, extraToken = self:parseName()
-			if extra then self:declare(extra, "loop", extraToken) end
+			if extra then
+				---@cast extra string
+				---@cast extraToken lye.lexer.ffi.token
+				self:declare(extra, "loop", extraToken)
+			end
 		end
 		self:expect("in")
 		repeat
@@ -115,6 +125,9 @@ end
 ---@return lye.lexer.ffi.token? token
 ---@return boolean isMethod
 ---@param self lye.parser.Parser
+---@return string? name
+---@return lye.lexer.ffi.token? token
+---@return boolean? isMethod
 function statements.parseFunctionName(self)
 	local name, token = self:parseName()
 	if not name then return nil, token, false end
@@ -146,6 +159,8 @@ function statements.parseFunctionStatement(self)
 
 	local name, token, isMethod = self:parseFunctionName()
 	if name and token then
+		---@cast name string
+		---@cast token lye.lexer.ffi.token
 		self:declare(name, name:find("[%.:]") and "field" or "global", token, true)
 	end
 	local declarationIdx = self.lastDeclaration
@@ -158,12 +173,17 @@ function statements.parseFunctionStatement(self)
 end
 
 ---@param self lye.parser.Parser
+---@param start integer
 function statements.parseLocal(self, start)
 	local startIdx = self.index
 	self:expect("local")
 	if self:accept("function") then
 		local name, token = self:parseName()
-		if name then self:declare(name, "local", token, true) end
+		if name then
+			---@cast name string
+			---@cast token lye.lexer.ffi.token
+			self:declare(name, "local", token, true)
+		end
 		local declarationIdx = self.lastDeclaration
 		if declarationIdx then self.declarations[declarationIdx].anchorIdx = startIdx end
 		-- The declaration has to be remembered before the body is parsed: parsing it declares the
@@ -181,6 +201,8 @@ function statements.parseLocal(self, start)
 		local name, token = self:parseName()
 		lastToken = token
 		if name then
+			---@cast name string
+			---@cast token lye.lexer.ffi.token
 			local declaration = self:declare(name, "local", token, nil, count + 1)
 			-- `local held: number = 1` writes the type where the name is.
 			if self.definition then
@@ -203,6 +225,7 @@ function statements.parseLocal(self, start)
 
 	-- The initializer expressions become this statement's children, listed explicitly.
 	local valueIdxs = {}
+	---@cast valueIdxs integer[]
 	if self:accept("=") then
 		-- Fewer values than names is legal (`local a, b = 1`), so stop at the last one.
 		-- With no declaration at all, `first` is nil and there is nothing to backfill.
@@ -241,6 +264,7 @@ function statements.parseLocal(self, start)
 end
 
 ---@param self lye.parser.Parser
+---@param start integer
 function statements.parseConst(self, start)
 	local startIdx = self.index
 	self:expect("const")
@@ -248,6 +272,8 @@ function statements.parseConst(self, start)
 	repeat
 		local name, token = self:parseName()
 		if name then
+			---@cast name string
+			---@cast token lye.lexer.ffi.token
 			self:declare(name, "local", token, nil, count + 1)
 			-- The name is held, so nothing may write it again and its type is what it was given.
 			self.declarations[self.lastDeclaration].isConst = true
@@ -280,6 +306,7 @@ function statements.parseReturn(self)
 	-- The returned expressions are linked to the statement, so a reader can ask what a function
 	-- returns without searching the arena for what follows it.
 	local valueIdxs = {}
+	---@cast valueIdxs integer[]
 	if not self:isBlockEnd() and not self:check(";") then
 		repeat
 			valueIdxs[#valueIdxs + 1] = self:parseExpression()
@@ -321,7 +348,7 @@ function statements.parseExpressionStatement(self)
 		local lastTarget, lastValue = target, valueIdxs and valueIdxs[#valueIdxs] or firstValue
 		if targets == nil and valueIdxs == nil then
 			self:emit("assignment", start, self.arena[self.index - 1].stop,
-				{ target = lastTarget, value = lastValue, anchorIdx = anchorIdx }, lastTarget, lastValue)
+				{ target = lastTarget, valueIdx = lastValue, anchorIdx = anchorIdx }, lastTarget, lastValue)
 			return
 		end
 		-- A name past the last expression takes its value at that position in it, the way a name
@@ -341,7 +368,7 @@ function statements.parseExpressionStatement(self)
 		self:emit("assignment", start, self.arena[self.index - 1].stop,
 			{
 				target = lastTarget, targets = allTargets, targetValues = values,
-				targetPositions = positions, value = lastValue, anchorIdx = anchorIdx,
+				targetPositions = positions, valueIdx = lastValue, anchorIdx = anchorIdx,
 			},
 			lastTarget, lastValue)
 		return
@@ -351,7 +378,7 @@ function statements.parseExpressionStatement(self)
 		self:advance()
 		local valueIdx = self:parseExpression()
 		self:emit("assignment", start, self.arena[self.index - 1].stop,
-			{ target = target, value = valueIdx, anchorIdx = anchorIdx }, target, valueIdx)
+			{ target = target, valueIdx = valueIdx, anchorIdx = anchorIdx }, target, valueIdx)
 	end
 end
 
@@ -428,7 +455,12 @@ function statements.parseStatement(self)
 		local name = text:match("^::%s*([_%a][_%w]*)")
 		if name then
 			local offset = text:find(name, 1, true)
-			self:declare(name, "label", { start = token.start + offset - 1, stop = token.start + offset + #name - 2 })
+			local labelToken = {
+				start = token.start + offset - 1,
+				stop = token.start + offset + #name - 2,
+			}
+			---@cast labelToken lye.lexer.ffi.token
+			self:declare(name, "label", labelToken)
 		end
 		self:emit("label", token.start, token.stop)
 		return true

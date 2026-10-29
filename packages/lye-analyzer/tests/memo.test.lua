@@ -20,7 +20,6 @@ local URI = "file:///tmp/memo.lua"
 
 ---@param source string
 ---@param options table?
----@return lye.analyzer.Result
 local function analyze(source, options)
 	options = options or {}
 	return lye.analyze(source, options.prepared, options.elsewhere, options.modules,
@@ -31,7 +30,6 @@ end
 
 --- The answers a reader can see, as text: every diagnostic, every signature and the module.
 ---@param result lye.analyzer.Result
----@return string
 local function answer(result)
 	local parts = {}
 	for _, entry in ipairs(result.diagnostics or {}) do
@@ -119,6 +117,8 @@ local CORPUS = {
 
 test.it("keeps the answer of a warm analysis identical to the cold one", function()
 	for name, source in pairs(CORPUS) do
+		---@cast name string
+		---@cast source string
 		local cold = answer(analyze(source))
 		for round = 1, 3 do
 			local warm = analyze(source)
@@ -140,6 +140,7 @@ end)
 test.it("reads a namespace once per annotation digest", function()
 	local source = CORPUS.class
 	local annotations = doc.parse(source)
+	---@cast annotations lye.doc.File
 	local prepared = lye.prelude({ ["defs.lua"] = "---@meta\n---@class Point\nlocal Point = {}\n" })
 	local first = memo.namespace(annotations, "digest-a", prepared)
 	local second, reused = memo.namespace(annotations, "digest-a", prepared)
@@ -160,16 +161,19 @@ end)
 
 test.it("keeps one analysis's evolved class out of the next", function()
 	local annotations = doc.parse("---@class Widget\nlocal Widget = {}\n---@class Gadget\nlocal Gadget = {}\n")
+	---@cast annotations lye.doc.File
 	local first = memo.namespace(annotations, "evolve-digest", nil)
 	local method = types.fn({}, types.NUMBER, false)
 	doc.classes.evolve(first, "Widget", "size", method)
 	local firstType = doc.classes.resolver(first)("Widget")
-	test.equal(types.display(types.fieldOf(firstType, "size")), "fn() -> number", "the method is on this analysis's class")
+	local sizeField = types.fieldOf(firstType, "size")
+	---@cast sizeField lye.doc.Type
+	test.equal(types.display(sizeField), "fn() -> number", "the method is on this analysis's class")
 
 	local second = memo.namespace(annotations, "evolve-digest", nil)
 	local secondType = doc.classes.resolver(second)("Widget")
 	test.equal(types.fieldOf(secondType, "size"), nil, "the next analysis's class never grew the method")
-	test.equal(types.display(secondType), "Widget", "it is still the declared Widget")
+	test.equal(types.display(assert(secondType)), "Widget", "it is still the declared Widget")
 end)
 
 test.it("rebuilds when the annotations, definitions or plugins change", function()
@@ -218,9 +222,12 @@ test.it("reuses a namespace a plugin did not write, and copies one it did", func
 	-- And the shared namespace the first document read has no Contributed class to give another
 	-- analysis: the contribution wrote into a copy.
 	local annotations = doc.parse(without)
+	---@cast annotations lye.doc.File
 	local namespace, reused = memo.namespace(annotations, "plugin-copy-digest", nil)
 	test.falsy(reused, "the first read of this digest is a read")
-	test.equal(doc.classes.read(doc.parse(without)).classes.Contributed, nil, "nothing contributed is in the document's own classes")
+	local ownFile = doc.parse(without)
+	---@cast ownFile lye.doc.File
+	test.equal(doc.classes.read(ownFile).classes.Contributed, nil, "nothing contributed is in the document's own classes")
 	test.equal(namespace.classes.Contributed, nil, "and the shared read has no Contributed")
 end)
 
@@ -237,10 +244,10 @@ test.it("writes the same bytes for two analyses of one text", function()
 		"return { id = echo, read = read }\n",
 	}, "")
 	---@param text string
-	---@return string
 	local function cold(text)
-		return serial.write(lye.analyze(text, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		local written = serial.write(lye.analyze(text, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 			{ uri = URI, incremental = false }).module)
+		return assert(written)
 	end
 	local first = cold(source)
 	local second = cold(source)

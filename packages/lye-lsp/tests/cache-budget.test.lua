@@ -36,7 +36,6 @@ local function resultOf(text, nodeCount, tokenCount)
 end
 
 ---@param value any
----@return string
 local function canonical(value)
 	local kind = type(value)
 	if kind == "table" then
@@ -63,7 +62,7 @@ local LINE = string.rep("x", 56)
 local LARGE = string.rep(LINE .. "\n", 2000)
 
 test.it("estimates each part with the documented constants and counts them once", function()
-	local cache = AnalysisCache.new({})
+	local cache = AnalysisCache.new({} --[[@as lye.Server ]])
 	local text = string.rep("a", 100)
 	cache:store("file:///one", resultOf(text, 3, 7), view(text), 1)
 
@@ -79,7 +78,7 @@ test.it("estimates each part with the documented constants and counts them once"
 end)
 
 test.it("does not evict while an analysis is landing; the budget is enforced once, at the idle point", function()
-	local cache = AnalysisCache.new({})
+	local cache = AnalysisCache.new({} --[[@as lye.Server ]])
 	for index = 1, 4 do
 		cache:store("file:///large-" .. index, resultOf(LARGE, 2000, 2000), view(LARGE), index)
 	end
@@ -100,7 +99,7 @@ test.it("does not evict while an analysis is landing; the budget is enforced onc
 end)
 
 test.it("keeps the current document when it alone is larger than the budget", function()
-	local cache = AnalysisCache.new({})
+	local cache = AnalysisCache.new({} --[[@as lye.Server ]])
 	cache.maxBytes = 1
 	cache:store("file:///huge", resultOf(LARGE, 2000, 2000), view(LARGE), 1)
 	cache:evict()
@@ -111,7 +110,7 @@ test.it("keeps the current document when it alone is larger than the budget", fu
 end)
 
 test.it("holds at most four analyses however small they are", function()
-	local cache = AnalysisCache.new({})
+	local cache = AnalysisCache.new({} --[[@as lye.Server ]])
 	cache.maxBytes = 1e12
 	for index = 1, 6 do
 		local text = "return " .. index .. "\n"
@@ -135,7 +134,7 @@ local function analyze(source)
 end
 
 --- The problems an analysis reports, parser and annotation ones alike.
----@param names table
+---@param names lye.analyzer.Result
 ---@return table[]
 local function diagnosticsOf(names)
 	local out = {}
@@ -153,7 +152,7 @@ test.it("re-analyses an evicted document to the same diagnostics", function()
 	local names = analyze(source)
 	local expected = canonical(diagnosticsOf(names))
 
-	local cache = AnalysisCache.new({})
+	local cache = AnalysisCache.new({} --[[@as lye.Server ]])
 	cache.maxBytes = 1
 	cache:store("file:///broken", names, view(source), 1)
 	-- A second, smaller document becomes current; the budget cannot hold both, so the first is a

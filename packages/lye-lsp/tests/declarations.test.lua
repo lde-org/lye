@@ -47,7 +47,10 @@ end
 local function fixture(files, dirs)
 	freshCache()
 	reset(dirs)
-	for relative, content in pairs(files) do write(ROOT .. "/" .. relative, content) end
+	for relative, content in pairs(files) do
+		---@cast relative string
+		write(ROOT .. "/" .. relative, content)
+	end
 end
 
 --- A real server facade over the fixture, with an index factory that counts reads so a warm
@@ -61,6 +64,7 @@ local function session(open)
 	local function provider()
 		return Index.new({
 			read = function(path)
+				---@cast path string
 				reads += 1
 				return fs.read(path)
 			end,
@@ -74,7 +78,7 @@ local function session(open)
 				return open and open[uri] and { uri = uri } or nil
 			end,
 		},
-	})
+	} --[[@as lye.framework.Server ]])
 	local declarations = Declarations.new(lye, { workspace = provider, package = provider })
 	lye.declarations = declarations
 	return declarations, lye, function() return reads end
@@ -84,7 +88,6 @@ end
 ---@param left unknown
 ---@param right unknown
 ---@param seen table<table, table>?
----@return boolean
 local function same(left, right, seen)
 	if left == right then return true end
 	if type(left) ~= "table" or type(right) ~= "table" then return false end
@@ -183,16 +186,16 @@ test.it("a watcher event updates one source file and drops a removed one's types
 		changes = { { uri = "file://" .. ROOT .. "/src/point.lua", type = 2 } },
 	}), "a source event is handled")
 	test.equal(reads() - readBefore, 1, "only the reported file was read")
-	test.truthy(lye.known.Added, "the new class is in the workspace")
-	test.truthy(lye.typeLocations.Added, "and its type location is there")
+	test.truthy(assert(lye.known).Added, "the new class is in the workspace")
+	test.truthy(assert(lye.typeLocations).Added, "and its type location is there")
 	test.truthy(lye.annotationsDigest ~= before, "the annotations digest moved")
 
 	os.remove(ROOT .. "/src/alias.lua")
 	test.truthy(declarations:watchedFiles({
 		changes = { { uri = "file://" .. ROOT .. "/src/alias.lua", type = 3 } },
 	}), "a removal is handled")
-	test.falsy(lye.known.NumberLike, "the removed file declared nothing now")
-	test.falsy(lye.typeLocations.NumberLike, "and its type location does not linger")
+	test.falsy(assert(lye.known).NumberLike, "the removed file declared nothing now")
+	test.falsy(assert(lye.typeLocations).NumberLike, "and its type location does not linger")
 end)
 
 test.it("a watcher event updates the package its target link belongs to", function()
@@ -206,19 +209,19 @@ test.it("a watcher event updates the package its target link belongs to", functi
 	local declarations, lye = session()
 	declarations:workspace()
 	declarations:package(ROOT)
-	test.truthy(lye.packageNames[ROOT].First, "the package reads what it links")
-	test.falsy(lye.known.First, "the workspace does not read a link")
-	local before = lye.packageDigests[ROOT]
+	test.truthy(assert(lye.packageNames)[ROOT].First, "the package reads what it links")
+	test.falsy(assert(lye.known).First, "the workspace does not read a link")
+	local before = assert(lye.packageDigests)[ROOT]
 	test.truthy(before and before ~= "", "the package has a links digest")
 
 	write(ROOT .. "/.deps/dep.lua", "---@class First\n---@class Extra\nreturn {}\n")
 	test.truthy(declarations:watchedFiles({
 		changes = { { uri = "file://" .. link, type = 2 } },
 	}), "a target event is handled by the package")
-	test.truthy(lye.packageNames[ROOT].Extra, "the package followed the file behind the link")
-	test.truthy(lye.packageDigests[ROOT] ~= before, "and its links digest moved")
-	test.truthy(lye.typeLocations.Extra, "the new type is written somewhere")
-	test.falsy(lye.known.Extra, "the workspace entry did not move")
+	test.truthy(assert(lye.packageNames)[ROOT].Extra, "the package followed the file behind the link")
+	test.truthy(assert(lye.packageDigests)[ROOT] ~= before, "and its links digest moved")
+	test.truthy(assert(lye.typeLocations).Extra, "the new type is written somewhere")
+	test.falsy(assert(lye.known).Extra, "the workspace entry did not move")
 end)
 
 test.it("a corrupt or truncated entry is built again", function()
@@ -231,7 +234,7 @@ test.it("a corrupt or truncated entry is built again", function()
 	local second, secondLye = session()
 	second:workspace()
 	test.equal(second:stats().built, 1, "a corrupt entry is a miss")
-	test.truthy(secondLye.known.Point, "and the build answers")
+	test.truthy(assert(secondLye.known).Point, "and the build answers")
 
 	local text = assert(fs.read(path))
 	test.truthy(#text > 20)
@@ -239,7 +242,7 @@ test.it("a corrupt or truncated entry is built again", function()
 	local third, thirdLye = session()
 	third:workspace()
 	test.equal(third:stats().built, 1, "half an entry is a miss")
-	test.truthy(thirdLye.known.Point, "and the build answers")
+	test.truthy(assert(thirdLye.known).Point, "and the build answers")
 end)
 
 test.it("a root with more than 2000 files is indexed through the facade", function()
@@ -251,7 +254,7 @@ test.it("a root with more than 2000 files is indexed through the facade", functi
 	fixture(files, { "src" })
 	local declarations, lye = session()
 	declarations:workspace()
-	test.truthy(lye.known.C2001, "the last file's class is declared")
+	test.truthy(assert(lye.known).C2001, "the last file's class is declared")
 	test.equal(declarations:stats().files, 2001, "every file is in the index")
 end)
 
@@ -277,9 +280,9 @@ test.it("a view reads the open document, then the package, then the workspace", 
 	declarations:documentChanged(uri)
 	local after = declarations:view(uri)
 	test.falsy(after.OnlyOpen, "the open document's layer is gone")
-	test.equal(after.Point, lye.packageNames[ROOT].Point, "the package's declaration is next")
-	test.truthy(after.Point ~= lye.known.Point, "and it is not the workspace's")
-	test.equal(after.Shared, lye.packageNames[ROOT].Shared, "the package beats the workspace")
+	test.equal(after.Point, assert(lye.packageNames)[ROOT].Point, "the package's declaration is next")
+	test.truthy(after.Point ~= assert(lye.known).Point, "and it is not the workspace's")
+	test.equal(after.Shared, assert(lye.packageNames)[ROOT].Shared, "the package beats the workspace")
 	test.truthy(rawequal(after, declarations:view(uri)), "a stable generation answers the same view")
 	declarations:documentChanged(uri)
 	test.falsy(rawequal(after, declarations:view(uri)), "a new generation answers a new view")
@@ -306,7 +309,10 @@ test.it("module names come from the index manifest in the old layout", function(
 	test.equal(foo[1].name, "foo", "a leading src is dropped")
 
 	local all = {}
-	for _, found in ipairs(declarations:moduleNames("")) do all[found.name] = true end
+	for _, found in ipairs(declarations:moduleNames("")) do
+		---@cast found { name: string }
+		all[found.name] = true
+	end
 	test.falsy(all.ignored, "target and hidden files are not modules")
 	test.truthy(all.src, "a root src init file keeps the exact transform")
 end)
@@ -329,11 +335,11 @@ test.it("a source event invalidates every loaded package and reads it again", fu
 		"the dependency is linked")
 
 	local uri = "file://" .. ROOT .. "/src/main.lua"
-	local declarations, lye, reads = session({ [uri] = true })
+	local declarations, lye = session({ [uri] = true })
 	declarations:workspace()
 	declarations:package(ROOT)
-	test.truthy(lye.packageNames[ROOT].First, "the package reads what it links")
-	test.truthy(lye.typeLocations.First, "and its type is written somewhere")
+	test.truthy(assert(lye.packageNames)[ROOT].First, "the package reads what it links")
+	test.truthy(assert(lye.typeLocations).First, "and its type is written somewhere")
 	local view = declarations:view(uri)
 	test.truthy(declarations.views[uri], "the open document's view is cached")
 
@@ -341,19 +347,19 @@ test.it("a source event invalidates every loaded package and reads it again", fu
 	-- about which package's answer moved: all of them are read again on their next ask.
 	write(ROOT .. "/.deps/dep.lua", "---@class First\n---@class Second\nreturn {}\n")
 	local cleared = 0
-	lye.modules = { clear = function() cleared += 1 end }
+	lye.modules = { clear = function() cleared += 1 end } --[[@as lye.Modules ]]
 	test.truthy(declarations:watchedFiles({
 		changes = { { uri = "file://" .. ROOT .. "/src/main.lua", type = 2 } },
 	}), "the source event is handled")
-	test.equal(lye.packageNames[ROOT], nil, "the loaded package's names are dropped")
-	test.equal(lye.packageDigests[ROOT], nil, "and so is its link digest")
-	test.falsy(lye.typeLocations.First, "its old type locations are not merged in")
+	test.equal(assert(lye.packageNames)[ROOT], nil, "the loaded package's names are dropped")
+	test.equal(assert(lye.packageDigests)[ROOT], nil, "and so is its link digest")
+	test.falsy(assert(lye.typeLocations).First, "its old type locations are not merged in")
 	test.equal(cleared, 1, "the module cache is cleared, since declarations it read changed")
 	test.equal(declarations.views[uri], nil, "and every cached view is dropped")
 
 	local rebuilt = declarations:package(ROOT)
 	test.truthy(rebuilt.Second, "the package is read again from disk")
-	test.truthy(lye.typeLocations.Second, "and its new type is located")
+	test.truthy(assert(lye.typeLocations).Second, "and its new type is located")
 	test.truthy(declarations:view(uri) ~= view, "the next view is built anew")
 end)
 

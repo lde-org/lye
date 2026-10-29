@@ -8,6 +8,7 @@ local types = require("lye-doc.type")
 local pattern = require("lye-doc.pattern")
 
 local infer = {}
+local nodesOf = require("lye-parser").nodesOf
 
 ---@class lye.infer.Context
 ---@field parser lye.parser.Result
@@ -18,11 +19,12 @@ local infer = {}
 ---@field mutables integer[] the nodes whose cached type is a placeholder still, in cache order
 ---@field fnTypes table<integer, lye.doc.Type> one callable per function node, filled from its body
 ---@field callTypes table<integer, lye.doc.Type> what a generic call was bound to, by node
----@field callValues table<integer, lye.doc.Type[]>? every value a call gives, when more than its signature says
+---@field callValues table<integer, lye.doc.Type[]> every value a call gives, when more than its signature says
 ---@field building table<integer, boolean> the nodes being typed now, so a self-reach ends
 ---@field modules fun(name: string): lye.doc.Type? what `require("name")` is, when the caller can say
 ---@field ctypes fun(node: lye.parser.Node): lye.doc.Type? what a call naming a C type is worth
----@field varargAt table<integer, lye.doc.Type>? the `...` type of each literal `...`, by node index
+---@field varargAt table<integer, lye.doc.Type> the `...` type of each literal `...`, by node index
+---@field casts table<integer, lye.doc.Type|{ exclude: lye.doc.Type }>? an inline cast written beside an expression, by node index
 
 local KNOWN = {
 	number = true, string = true, literal = true, table = true, ["function"] = true,
@@ -33,7 +35,6 @@ local KNOWN = {
 --- of the value, and only some of those kinds are types: a field holding a call or a sum is a
 --- node whose type typing works out separately, so it stays unknown here.
 ---@param kind string
----@return lye.doc.Type
 local function literalType(kind)
 	if kind == "string" then return types.STRING end
 	if kind == "number" then return types.NUMBER end
@@ -53,7 +54,6 @@ end
 ---@param base lye.doc.Type
 ---@param field string?
 ---@param start integer
----@return lye.doc.Type?
 local function stringFieldOf(ctx, base, field, start)
 	if not field or not ctx.typeOfName or not types.mayBe(base, "string") then return nil end
 	local library = ctx.typeOfName("string", start)
@@ -66,7 +66,6 @@ end
 ---@param ctx lye.infer.Context
 ---@param idx integer
 ---@param value lye.doc.Type
----@return lye.doc.Type
 local function cache(ctx, idx, value)
 	ctx.cache[idx] = value
 	if value.isMutable then
@@ -94,7 +93,6 @@ end
 --- Whether an argument cannot be the shape a chosen overload names.
 ---@param wanted lye.doc.Type
 ---@param actual lye.doc.Type
----@return string? mismatch
 local function overloadMismatch(wanted, actual)
 	if wanted.variant == "union" then
 		for _, member in ipairs(wanted.types) do
@@ -115,7 +113,6 @@ end
 ---@param ctx lye.infer.Context
 ---@param idx integer
 ---@param valueOf fun(ctx: lye.infer.Context, idx: integer): lye.doc.Type
----@return lye.doc.Type
 local function argumentValue(ctx, idx, valueOf)
 	local node = ctx.parser.nodes[idx]
 	if node and node.kind == "string" then
@@ -152,17 +149,22 @@ local function overloadOf(ctx, node, calleeType, valueOf)
 	local shapes = calleeType.overloads
 	if not shapes then return nil end
 	local args = node.args or {}
-	local receiver = node.isMethod and node.target and valueOf(ctx, node.target) or nil
+	local receiver
+	if node.isMethod and node.target then receiver = valueOf(ctx, node.target) end
 	-- A method is only called on a value that is there, so an optional receiver is narrowed for
 	-- the shape it is matched against.
-	if receiver then receiver = types.narrowTruthiness(receiver, true) or receiver end
+	if receiver ~= nil then
+		---@cast receiver lye.doc.Type
+		receiver = types.narrowTruthiness(receiver, true) or receiver
+	end
 
 	local best, bestScore
 	for _, shape in ipairs(shapes or {}) do
 		local fits = true
 		local shift = 0
 		local score = 0
-		if receiver then
+		if receiver ~= nil then
+			---@cast receiver lye.doc.Type
 			local wanted = shape.params[1]
 			if wanted == nil then
 				shift = 1
@@ -174,7 +176,7 @@ local function overloadOf(ctx, node, calleeType, valueOf)
 			end
 		end
 		if fits then
-			local count = #args + (receiver and shape.params[1] ~= nil and 1 or 0)
+			local count = #args + (receiver ~= nil and shape.params[1] ~= nil and 1 or 0)
 			if not shape.variadic and count > #shape.params then fits = false end
 		end
 		if fits then
@@ -183,7 +185,8 @@ local function overloadOf(ctx, node, calleeType, valueOf)
 				if not wanted and shape.variadic and index + shift > #shape.params then
 					wanted = shape.variadic
 				end
-				if wanted then
+				if wanted ~= nil then
+					---@cast wanted lye.doc.Type
 					if overloadMismatch(wanted, argumentValue(ctx, argIdx, valueOf)) then
 						fits = false
 						break
@@ -201,7 +204,6 @@ end
 
 ---@param ctx lye.infer.Context
 ---@param idx integer?
----@return lye.doc.Type
 local function of(ctx, idx)
 	if not idx then return types.mutable() end
 	local cached = ctx.cache[idx]
@@ -212,17 +214,21 @@ local function of(ctx, idx)
 
 	-- A cast written beside the expression stands for it: `f --[[@as Vec]].x` reads `f` as a Vec,
 	-- which is the only way to say what a value is where nothing declares it.
-	local cast = ctx.casts and ctx.casts[idx]
-	if cast then
-		if cast.exclude then
+	local casts = ctx.casts
+	local cast = casts and casts[idx]
+	if casts ~= nil and cast ~= nil then
+		---@cast cast lye.doc.Type|{ exclude: lye.doc.Type }
+		local exclude = cast.exclude
+		if exclude ~= nil then
 			-- `x ---@cast x -T` keeps what the expression already was, without T. Read by asking
 			-- for the expression's own type with the cast set aside, which is why it is removed
 			-- for the call and put back after: asking again would find the cast and not end.
-			ctx.casts[idx] = nil
+			casts[idx] = nil
 			local held = of(ctx, idx)
-			ctx.casts[idx] = cast
-			cast = types.excludeType(held, cast.exclude) or held
+			casts[idx] = cast
+			cast = types.excludeType(held, exclude) or held
 		end
+		---@cast cast lye.doc.Type
 		return cache(ctx, idx, cast)
 	end
 
@@ -232,7 +238,7 @@ local function of(ctx, idx)
 	if kind == "number" then
 		-- A literal is the number it spells: `local n = 2149` is 2149, which fits `number`
 		-- wherever a number is wanted and reads back as what was written.
-		result = node.value and types.numberValue(node.value, node.text) or types.NUMBER
+		result = type(node.value) == "number" and types.numberValue(node.value, node.text) or types.NUMBER
 	elseif kind == "string" then
 		result = types.STRING
 	elseif kind == "literal" then
@@ -258,7 +264,12 @@ local function of(ctx, idx)
 		local elementType
 		for _, elementIdx in ipairs(elements or {}) do
 			local one = of(ctx, elementIdx)
-			elementType = elementType and types.combine(elementType, one) or one
+			if elementType ~= nil then
+				---@cast elementType lye.doc.Type
+				elementType = types.combine(elementType, one)
+			else
+				elementType = one
+			end
 		end
 
 		local kinds = ctx.parser.tableFields[node.index]
@@ -266,7 +277,12 @@ local function of(ctx, idx)
 			-- `{}` has no shape *yet*, and the shape it grows belongs to this literal alone: a
 			-- module is written `local M = {}` and given its fields below, so the type cannot be
 			-- the shared `table` every other literal would then be given fields on.
-			result = elementType and types.array(elementType) or types.object({})
+			if elementType ~= nil then
+				---@cast elementType lye.doc.Type
+				result = types.array(elementType)
+			else
+				result = types.object({})
+			end
 		else
 			local values = ctx.parser.tableFieldValues[node.index]
 			local fields = {}
@@ -274,7 +290,12 @@ local function of(ctx, idx)
 				-- The value itself when the parser kept its node, so a field holding a name or a
 				-- nested table is that type rather than the kind of thing it looked like.
 				local valueIdx = values and values[name]
-				fields[name] = valueIdx and of(ctx, valueIdx) or literalType(fieldKind)
+				if valueIdx ~= nil then
+					---@cast valueIdx integer
+					fields[name] = of(ctx, valueIdx)
+				else
+					fields[name] = literalType(fieldKind)
+				end
 			end
 			result = types.object(fields, elementType and { key = "integer", type = elementType } or nil)
 		end
@@ -311,9 +332,11 @@ local function of(ctx, idx)
 		local base = of(ctx, node.target)
 		local target = node.target and ctx.parser.nodes[node.target]
 		local baseName = node.isDynamic ~= true and target and target.callee or nil
-		result = node.isDynamic ~= true and stringFieldOf(ctx, base, node.field, node.start)
-			or ctx.typeOfField and ctx.typeOfField(base, baseName, node.field, node.start)
-			or types.indexResult(base, node.field)
+		local field = node.field
+		---@cast field string
+		result = node.isDynamic ~= true and stringFieldOf(ctx, base, field, node.start)
+			or ctx.typeOfField and ctx.typeOfField(base, baseName, field, node.start)
+			or types.indexResult(base, field)
 		-- A `?.` read of a value that may be nil is that value's field or nil: it does not fail,
 		-- so the result is optional the way the access is.
 		if node.isSafe then result = types.union({ result, types.NIL_TYPE }) end
@@ -373,6 +396,7 @@ local function of(ctx, idx)
 				end
 			end
 			if index then
+				---@type integer?
 				local source
 				if index >= 1 then
 					source = node.args[1 + index]
@@ -384,7 +408,8 @@ local function of(ctx, idx)
 					local position = count + index + 1
 					if position >= 1 then source = node.args[1 + position] end
 				end
-				if source then
+				if source ~= nil then
+					---@cast source integer
 					local sourceNode = ctx.parser.nodes[source]
 					result = sourceNode and sourceNode.kind == "call"
 						and infer.valuesAt(ctx, source, 1) or of(ctx, source)
@@ -505,7 +530,6 @@ end
 --- The type of the expression at an arena index.
 ---@param ctx lye.infer.Context
 ---@param idx integer?
----@return lye.doc.Type
 function infer.at(ctx, idx)
 	return of(ctx, idx)
 end
@@ -518,7 +542,6 @@ end
 ---@param ctx lye.infer.Context
 ---@param idx integer?
 ---@param position integer which value is wanted, 1 for the first
----@return lye.doc.Type
 function infer.valuesAt(ctx, idx, position)
 	if position <= 1 then return of(ctx, idx) end
 	local node = idx and ctx.parser.nodes[idx]
@@ -612,12 +635,14 @@ end
 
 --- Match a written type against the type of the argument it was given, recording what each
 --- generic name holds. This is what turns `---@param item T` and `id(5)` into `T = number`.
----@param pattern lye.doc.Type the parameter's type, as written
----@param actual lye.doc.Type the argument's type
+---@param pattern lye.doc.Type? the parameter's type, as written
+---@param actual lye.doc.Type? the argument's type
 ---@param generics table<string, boolean> the names the function declares
 ---@param bindings table<string, lye.doc.Type> what has been learned, filled in place
 function infer.bind(pattern, actual, generics, bindings)
 	if not pattern or not actual then return end
+	pattern = pattern --[[@as lye.doc.Type]]
+	actual = actual --[[@as lye.doc.Type]]
 	if pattern.variant == "union" then
 		-- `---@param metatable? T` writes the type variable as one member of a union. A member
 		-- that already accepts the argument decides it, and only when none does is the variable
@@ -630,7 +655,10 @@ function infer.bind(pattern, actual, generics, bindings)
 				return
 			end
 		end
-		if variable then infer.bind(variable, actual, generics, bindings) end
+		if variable ~= nil then
+			---@cast variable lye.doc.Type
+			infer.bind(variable, actual, generics, bindings)
+		end
 		return
 	end
 	if pattern.variant == "extern" and generics[pattern.name] ~= nil then
@@ -684,6 +712,21 @@ function infer.isResolved(ctx, idx)
 	return cached ~= nil and cached.variant ~= "unknown"
 end
 
+--- Whether a cached type is the narrowed shape of an unknown — the truthy or non-nil set — which
+--- is not a placeholder itself, so promoting a placeholder never reaches it, even though it was
+--- worked out from one.
+---@param held lye.doc.Type
+---@return boolean
+local function narrowedUnknown(held)
+	if held == types.truthyUnknown() or held == types.nonNilUnknown() then return true end
+	if held.variant == "union" then
+		for _, member in ipairs(held.types) do
+			if member == types.truthyUnknown() or member == types.nonNilUnknown() then return true end
+		end
+	end
+	return false
+end
+
 --- Promote anything still unknown that a known type now contradicts. A mutable unknown is a
 --- promise that a later pass may learn more, so this is where that promise is kept.
 ---@param ctx lye.infer.Context
@@ -729,16 +772,61 @@ function infer.refine(ctx, returns)
 		end
 	end
 
+	-- `held and held.field` caches the truthy narrowing of the unknown while `held` was still a
+	-- placeholder, and that narrowing is not itself a placeholder: the promotion never reaches it,
+	-- and `self.doc and self.doc.annotations` kept an unknown element type long after `self.doc`
+	-- settled. Read again in arena order, so what a node was built from is fresh first.
+	for _, node in ipairs(parser.nodes) do
+		local cached = ctx.cache[node.index]
+		if cached and not types.isMutable(cached) and narrowedUnknown(cached) then
+			ctx.cache[node.index] = nil
+			ctx.cache[node.index] = of(ctx, node.index)
+		end
+	end
+
 	-- A field read while the value it read was unsettled was cached without the narrowing the
 	-- conditions around it ask for: `{ archive = dir }` under `if dir then` kept a `string?` even
 	-- after `dir` settled. Each field is read again, into the same table so everything else
 	-- written to it stays.
 	local tableFieldValues = parser.tableFieldValues
-	for _, node in ipairs(parser.byKind and parser.byKind.table or {}) do
+	---@type lye.parser.Node[]
+	local tableNodes = nodesOf(parser, "table")
+	-- The parent links, indexed once for the whole refinement. Building this inside the table
+	-- loop made the replacement for the ancestor walk more expensive than the walk.
+	local children = {}
+	---@cast children table<integer, integer[]>
+	for _, child in ipairs(parser.nodes) do
+		local parent = child.parent
+		if parent then
+			local list = children[parent]
+			if not list then list = {}; children[parent] = list end
+			list[#list + 1] = child.index
+		end
+	end
+	for _, node in ipairs(tableNodes) do
 		local cached = ctx.cache[node.index]
 		if cached and not types.isMutable(cached) and cached.variant == "object" then
 			local values = tableFieldValues and tableFieldValues[node.index]
+			---@cast values table<string, integer>?
 			if values then
+				-- Clearing the value node alone is not enough: the answer was built from nodes
+				-- below it, and a read cached while the name it reads was still a placeholder is
+				-- not itself a placeholder — `{ a = xs and xs[1] }` kept the truthy narrowing of
+				-- the placeholder for `xs` after `xs` was typed as a list. Every node inside the
+				-- value is read again, so the field is worked out from what its parts are now.
+				local refresh = {}
+				for _, valueIdx in pairs(values) do refresh[valueIdx] = true end
+				-- Clear only the descendants of the values that changed. Scanning every arena
+				-- node and walking each one's ancestor chain made this O(nodes x fields x depth)
+				-- for every table literal.
+				local stack = {}
+				for valueIdx in pairs(refresh) do stack[#stack + 1] = valueIdx end
+				while #stack > 0 do
+					local index = stack[#stack]
+					stack[#stack] = nil
+					ctx.cache[index] = nil
+					for _, child in ipairs(children[index] or {}) do stack[#stack + 1] = child end
+				end
 				for name, valueIdx in pairs(values) do
 					ctx.cache[valueIdx] = nil
 					local fresh = of(ctx, valueIdx)

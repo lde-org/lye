@@ -137,7 +137,6 @@ end
 ---@param uri string
 ---@param text string the text the next analysis will read
 ---@param lowered boolean the view is a plugin's lowering of the document
----@return { from: integer, prefix: integer, suffix: integer }?
 ---@param self lye.AnalysisCache
 function AnalysisCache:span(uri, text, lowered)
 	if lowered then
@@ -156,7 +155,6 @@ end
 --- The annotations already parsed for exactly this text, or nil when the text has moved on.
 ---@param uri string
 ---@param text string
----@return lye.doc.File?
 ---@param self lye.AnalysisCache
 function AnalysisCache:annotationsFor(uri, text)
 	local held = self.annotations[uri]

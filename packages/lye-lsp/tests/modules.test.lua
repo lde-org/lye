@@ -40,6 +40,7 @@ local function prepare(files)
 	cache.setEnabled(true)
 	local paths = {}
 	for name, content in pairs(files) do
+		---@cast name string
 		paths[name] = ROOT .. "/" .. name .. ".lua"
 		write(paths[name], content)
 	end
@@ -96,7 +97,6 @@ end
 ---@param modules lye.Modules
 ---@param path string
 ---@param text string
----@return string
 local function keyOf(lye, modules, path, text)
 	local uri = "file://" .. path
 	local owner = lye:packageRoot(uri)

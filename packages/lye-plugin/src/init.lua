@@ -32,6 +32,7 @@ local plugin = {}
 --- The plugins lye ships, by the name a workspace writes them with. Required rather than found by
 --- name at runtime: a bundler follows a `require` it can see, and a module loaded from a string
 --- built here is a file the compiled binary would not carry.
+---@type table<string, lye.plugin.Hooks>
 local SHIPPED = {
 	patterns = require("lye-plugin.plugins.patterns"),
 	formats = require("lye-plugin.plugins.formats"),
@@ -96,6 +97,7 @@ local SHIPPED_ORDER = { "patterns", "formats", "ffi" }
 ---@field from integer byte offset into `context.source`, 1-based
 ---@field to integer byte offset one past the last byte
 ---@field type string a token type from the legend: `regexp`, `property`, `number`, `keyword`, …
+---@field modifiers integer? token modifiers, as a bit set
 
 --- A module a plugin offers inside a `require("...")`: the name written there, and where it comes
 --- from when the plugin found a file for it.
@@ -142,7 +144,7 @@ local SHIPPED_ORDER = { "patterns", "formats", "ffi" }
 ---@param path string
 ---@param name string
 ---@param report fun(message: string)
----@return table? hooks
+---@return lye.plugin.Hooks?
 local function loadFile(path, name, report)
 	local chunk, err = loadfile(path)
 	if not chunk then
@@ -206,7 +208,6 @@ end
 ---@param hooks table
 ---@param name string
 ---@param report fun(message: string)
----@return lye.plugin.Spec
 function plugin.spec(hooks, name, report)
 	return protect(hooks, name, nil, report)
 end
@@ -245,6 +246,7 @@ function plugin.load(entries, root, resolve, report)
 	local function add(name, path)
 		if seen[name] then return end
 		seen[name] = true
+		---@type lye.plugin.Hooks?
 		local hooks = SHIPPED[name]
 		if path then
 			hooks = loadFile(path, name, report)
@@ -410,7 +412,6 @@ end
 ---@type table<lye.plugin.Spec[], string>
 local digests = setmetatable({}, { __mode = "k" })
 ---@param specs lye.plugin.Spec[]?
----@return string
 function plugin.digest(specs)
 	local held = specs and digests[specs]
 	if held then return held end

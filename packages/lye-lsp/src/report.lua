@@ -40,6 +40,7 @@ local PAINT = {
 ---@return boolean
 function report.terminal()
 	local ok, isTerminal = pcall(function() return ffi.C.isatty(1) ~= 0 end)
+	---@cast isTerminal boolean
 	return ok and isTerminal or false
 end
 

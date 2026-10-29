@@ -21,13 +21,17 @@ local memo = {}
 
 local NONE = {}
 
+---@class lye.analyzer.MemoSlot
+---@field texts table<string, lye.doc.Type|false> the texts it already answered, `false` for one nothing stands for
+---@field counters table<string, number>? where its hit and miss counts go
+
 --- Per-resolver state: the texts it already answered, and where its counters go. The resolver is
 --- made by one analysis and dies with it, so the weak key gives the memo the analysis's lifetime.
----@type table<function, { texts: table<string, lye.doc.Type|false>, counters: table? }>
+---@type table<function, lye.analyzer.MemoSlot>
 local slots = setmetatable({}, { __mode = "k" })
 
 ---@param resolve function
----@return table
+---@return lye.analyzer.MemoSlot
 local function slotOf(resolve)
 	local slot = slots[resolve]
 	if not slot then
@@ -48,10 +52,17 @@ function memo.parse(text, resolve)
 	local slot = slotOf(resolve)
 	local held = slot.texts[text]
 	if held ~= nil then
-		if slot.counters then slot.counters.typeHits += 1 end
-		return held or nil
+		local counters = slot.counters
+		if counters ~= nil then
+			counters.typeHits = (counters.typeHits or 0) + 1
+		end
+		if held == false then return nil end
+		return held
 	end
-	if slot.counters then slot.counters.typeMisses += 1 end
+	local counters = slot.counters
+	if counters ~= nil then
+		counters.typeMisses = (counters.typeMisses or 0) + 1
+	end
 	local parsed = types.parse(text, resolve)
 	slot.texts[text] = parsed or false
 	return parsed
@@ -60,7 +71,7 @@ end
 --- Attach the counters a resolver's memo reports to. The resolver is the memo's key, so call this
 --- with the function the parse sites use.
 ---@param resolve function
----@param counters table?
+---@param counters table<string, number>?
 function memo.bind(resolve, counters)
 	slotOf(resolve).counters = counters
 end

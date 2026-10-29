@@ -35,6 +35,8 @@ local isNeverNumeric, callLabel = annotations.isNeverNumeric, annotations.callLa
 ---@field lookupIn fun(scope: lye.analyzer.Scope, name: string, offset: integer): lye.analyzer.Variable?
 ---@field typeAt fun(self: lye.analyzer.Result, variable: lye.analyzer.Variable, offset: integer): lye.doc.Type
 ---@field declaredField fun(held: lye.doc.Type, field: string): lye.doc.Type?
+---@field assignments { name: string, at: integer, valueIdx: integer, valuePosition: integer? }[]
+---@field reusedSpan fun(from: integer, to: integer): boolean?
 ---@field arithmetic table<string, boolean>
 
 local checks = {}
@@ -45,7 +47,6 @@ local checks = {}
 ---@param ctx lye.analyzer.CheckContext
 ---@param start integer
 ---@param stop integer
----@return boolean
 local function reused(ctx, start, stop)
 	return ctx.reusedSpan ~= nil and ctx.reusedSpan(start, stop) == true
 end
@@ -65,6 +66,8 @@ local function anyFunctionHints(ctx)
 		-- `function` itself is the answer, not the question: the name stands for the same callable
 		-- and is what a reader of the hint is being asked to write.
 		if not text or not start or text == "function" then return end
+		---@cast start integer
+		---@cast stop integer
 		-- Only the spelling: `Foo` where `---@alias Foo fun(...):...` says the same callable is a
 		-- name for it, and the name is what the reader is owed. The check is also what keeps this
 		-- cheap — the annotations of a document are mostly names and literals.
@@ -105,6 +108,11 @@ end
 
 ---@param ctx lye.analyzer.CheckContext
 local function returnHints(ctx)
+	-- Explicit return annotations are public API documentation. Flagging every one as redundant
+	-- made a fully documented library impossible to check cleanly; keep the maintainer audit
+	-- available, but do not put it in the default diagnostic stream. The inferred values below
+	-- are still recorded: hover and signature help read them.
+	local wantHints = os.getenv("LYE_REDUNDANT_RETURNS") == "1"
 	local parsed, self = ctx.parsed, ctx.self
 	local signatures = ctx.signatures
 	local resolve = ctx.resolve
@@ -115,6 +123,7 @@ local function returnHints(ctx)
 	-- not a line to drop: the second moves up into its place and every caller then reads the wrong
 	-- value, which is what deleting the `---@return string` above `---@return number excluded` did
 	-- to `makeMainLua`.
+	---@type integer[]
 	local written = {}
 	for _, annotation in ipairs(self.doc and self.doc.annotations or {}) do
 		if annotation.tag == "return" then written[#written + 1] = annotation.start end
@@ -134,10 +143,12 @@ local function returnHints(ctx)
 	local previous
 	for _, declaration in ipairs(parsed.declarations) do
 		---@type lye.analyzer.Signature?
-		local signature = declaration.name and signatures[declaration.name]
+		local signature
+		if declaration.name then signature = signatures[declaration.name] end
 		-- A signature keyed by a name belongs to the declaration it was read from: another
 		-- declaration that happens to use the same name does not get to settle its return.
 		local owned = signature ~= nil and signature.declaration == declaration
+		---@cast signature lye.analyzer.Signature
 		local annotation = owned and signature.returns
 		local held = annotation and annotation.type and memo.parse(annotation.type, resolve)
 		if owned and declaration.valueIdx
@@ -148,6 +159,7 @@ local function returnHints(ctx)
 			-- it, not only the value a call in an expression is worth.
 			if not signature.values then signature.inferredValues = values end
 		end
+		if wantHints then
 		-- An annotation that says exactly what the body says is a line kept in step with the code
 		-- for nothing. A hint rather than a warning, since a written signature is often what a
 		-- reader wants. Only a lone one: with a second line below it, the line is a position. The
@@ -163,10 +175,15 @@ local function returnHints(ctx)
 		local single = not generic and annotation and annotation.type
 			and #types.splitValues(annotation.type) == 1
 			and returnsWritten(declaration, previous) == 1
-		if single and held and inferred and held.variant == inferred.variant
-			and types.display(held) == types.display(inferred)
-			and not reused(ctx, annotation.start, annotation.stop) then
-			diagnostic.add(self, string.format("`---@return %s` says what the body already infers", annotation.type), annotation.start, annotation.stop, 3)
+		if single and held and inferred then
+			---@cast held lye.doc.Type
+			---@cast inferred lye.doc.Type
+			if held.variant == inferred.variant
+				and types.display(held) == types.display(inferred)
+				and not reused(ctx, annotation.start, annotation.stop) then
+				diagnostic.add(self, string.format("`---@return %s` says what the body already infers", annotation.type), annotation.start, annotation.stop, 3)
+			end
+		end
 		end
 		previous = declaration
 	end
@@ -200,26 +217,34 @@ local function declaredMismatches(ctx)
 		-- the type it happens to have — often a loop's own index — is not a promise to check against.
 		-- A parameter has no initializer to compare with: the type it declares is its value, and
 		-- the placeholder beside it is the typing pass's, not a written one.
-		if variable.declared and variable.qualifier ~= "param" and not variable.name:match("^_")
+		local declared = variable.declared
+		if declared ~= nil and variable.qualifier ~= "param" and not variable.name:match("^_")
 			and not reused(ctx, variable.declaration.start, variable.declaration.stop or variable.declaration.start) then
+			---@cast declared lye.doc.Type
 			local declaration = variable.declaration
 			-- A `:` method's body carries `self` as its first parameter while the annotation that
 			-- describes it leaves the receiver implicit. Line the two up before comparing them, or
 			-- every correctly written method is a function with one parameter too many.
+			local declaredParams = types.isFn(declared) and #declared.params or 0
+			---@param held lye.doc.Type
 			local function withoutReceiver(held)
-				if declaration.name:find(":", 1, true) and types.isFn(held) and #held.params > 0 then
+				-- The body of a method may or may not carry `self` in its inferred type, depending on
+				-- how the function expression was read. Strip a leading receiver only when the value
+				-- really has one more parameter than the annotation.
+				if declaration.name:find(":", 1, true) and types.isFn(held)
+					and #held.params > declaredParams then
 					local params = {}
 					for index = 2, #held.params do params[#params + 1] = held.params[index] end
 					return types.fn(params, held.returns, held.isVariadic, held.isSpread, held.variadic)
 				end
 				return held
 			end
-			local message = types.strictMismatch(variable.declared, withoutReceiver(variable.initializer), variable.name)
+			local message = types.strictMismatch(declared, withoutReceiver(variable.initializer), variable.name)
 			if message then
 				diagnostic.add(self, message, declaration.start, declaration.stop)
 			end
 			for _, assignment in ipairs(variable.assignments) do
-				local assigned = types.strictMismatch(variable.declared, withoutReceiver(assignment.type), variable.name)
+				local assigned = types.strictMismatch(declared, withoutReceiver(assignment.type), variable.name)
 				if assigned then
 					local value = parsed.nodes[assignment.valueIdx]
 					diagnostic.add(self, assigned, value and value.start or assignment.at,
@@ -245,7 +270,6 @@ local function fieldWrites(ctx)
 	local declaredField = ctx.declaredField
 	---@param held lye.doc.Type
 	---@param base string?
-	---@return boolean
 	local function buildsItsOwnClass(held, base)
 		-- A class is named with its namespace, and the table it is built on carries the last part of that
 		-- name. Either spelling counts.
@@ -256,10 +280,22 @@ local function fieldWrites(ctx)
 	-- to be the function that field says it is: what was written does not fit what the type said.
 	for _, node in ipairs(parsed.nodes) do
 		if not reused(ctx, node.start, node.stop) then
-		local target = node.kind == "assignment" and parsed.nodes[node.target]
-		local field = target and target.kind == "index" and target.field
-		local base = field and writtenNameOf(parsed, target.target)
-		local held = base and receiverTypeOf(base, node.start)
+		---@type lye.parser.Node?
+		local target
+		if node.kind == "assignment" then target = parsed.nodes[node.target] end
+		---@type string?
+		local field
+		if target ~= nil and target.kind == "index" then field = target.field end
+		---@type string?
+		local base
+		if field ~= nil then
+			base = writtenNameOf(parsed, target.target)
+			---@cast base string?
+		end
+		---@type lye.doc.Type?
+		local held
+		if base ~= nil then held = receiverTypeOf(base, node.start) end
+		---@cast field string
 		-- Only a class says what its fields are; a table built field by field is typed by what was put
 		-- into it. `Foo.__index = Foo` is how a class is built, so the metatable keys are left alone.
 		local metatable = type(field) == "string" and field:sub(1, 2) == "__"
@@ -268,6 +304,7 @@ local function fieldWrites(ctx)
 		local newindex = held and types.metamethod(held, "__newindex")
 		-- Where the write lands: the value itself, the `__newindex` table when the value does not
 		-- carry the field, and nowhere at all when a `__newindex` function computes the write.
+		---@type lye.doc.Type?
 		local destination
 		if held and held.variant == "class" then
 			destination = held
@@ -282,14 +319,15 @@ local function fieldWrites(ctx)
 			end
 		end
 		if held and held.variant == "class" and not metatable and not declaredHere(held, field)
-			and not buildsItsOwnClass(held, base) and destination then
+			and not buildsItsOwnClass(held, base) and destination ~= nil then
+			---@cast destination lye.doc.Type
 			local wanted = declaredField(destination, field)
-			local value = parsed.nodes[node.value]
+			local value = parsed.nodes[node.valueIdx]
 			if not wanted then
 				diagnostic.add(self, string.format("`%s` is not a field of %s", field,
 						destination.name or types.display(destination)), target.start, target.stop)
 			elseif value then
-				local actual = infer.at(inferCtx, node.value)
+				local actual = infer.at(inferCtx, node.valueIdx)
 				if value.kind == "function" then
 					-- A bare `function` value says nothing about its parameters, so the signature is read off the
 					-- body: the parameters it declares and what it hands back.
@@ -347,7 +385,8 @@ local function metatableChecks(ctx)
 					local declaration = enclosing and bodyOwner[enclosing.index]
 					local inside = declaration and declaration.name:match("^([%w_%.]+)%s*[%.:]")
 					local allowed = inside == targetType.name
-					if not allowed and visibility == "protected" and inside then
+					if not allowed and visibility == "protected" and inside ~= nil then
+						---@cast inside string
 						local ownType = resolve(inside)
 						allowed = ownType ~= nil and types.satisfies(ownType, targetType)
 					end
@@ -370,12 +409,14 @@ local function deadCode(ctx)
 	local parsed, self = ctx.parsed, ctx.self
 	local inferCtx = ctx.inferCtx
 	local scopeAt = ctx.scopeAt
+	---@type table<lye.analyzer.Scope, lye.parser.Node[]>
 	local dead = {}
 	-- The chunk's statements are listed by the parser, so the walk is over statements rather than
 	-- over every node in the document, and the scope is asked once per statement.
 	for _, index in ipairs(parsed.topLevel) do
 		local node = parsed.nodes[index]
 		local scope = scopeAt(self, node.start)
+		---@type lye.parser.Node[]?
 		local list = dead[scope]
 		if not list then
 			list = {}
@@ -391,7 +432,7 @@ local function deadCode(ctx)
 		if node.kind == "call" then
 			call = node
 		elseif node.kind == "local" or node.kind == "assignment" then
-			local valueIdx = node.value or (node.children and node.children[#node.children])
+			local valueIdx = node.valueIdx or (node.children and node.children[#node.children])
 			local value = valueIdx and parsed.nodes[valueIdx]
 			if not value or value.kind ~= "call" then return nil end
 			call = value
@@ -404,7 +445,10 @@ local function deadCode(ctx)
 
 	for _, list in pairs(dead) do
 		table.sort(list, startsBefore)
-		local stopped, stopping = false, nil
+		---@type string?
+		local stopped
+		---@type lye.parser.Node?
+		local stopping
 		for _, node in ipairs(list) do
 			if not reused(ctx, node.start, node.stop) then
 			-- What cannot run is what comes *after* the call that never comes back. The call itself is
@@ -412,9 +456,13 @@ local function deadCode(ctx)
 			-- holds over the same span — so being a different node is not enough: the statement has to
 			-- begin past the end of the one that stopped. Reading it by node identity reported the
 			-- `error(...)` call as the thing that could not run, which is the opposite of true.
-			if stopped and node.start > stopping.stop then
-				diagnostic.add(self, string.format("%s never returns, so this cannot run", stopped), node.start, node.stop, 1)
-				break
+			if stopped ~= nil and stopping ~= nil then
+				---@cast stopped string
+				---@cast stopping lye.parser.Node
+				if node.start > stopping.stop then
+					diagnostic.add(self, string.format("%s never returns, so this cannot run", stopped), node.start, node.stop, 1)
+					break
+				end
 			end
 			stopped = neverStatement(node)
 			stopping = stopped and node or nil
@@ -434,17 +482,19 @@ local function arithmeticChecks(ctx)
 	for _, node in ipairs(parsed.nodes) do
 		if not reused(ctx, node.start, node.stop) then
 		if node.kind == "binary" and ARITHMETIC[node.op] then
+			local op = node.op
+			---@cast op string
 			local left = infer.at(inferCtx, node.left)
 			local right = infer.at(inferCtx, node.right)
 			-- A type that answers this operator with a metamethod decides what the operands may be, so the
 			-- metamethod's parameters are what is checked.
-			local metamethod = left and right and types.metamethodFor(node.op, left, right)
+			local metamethod = left and right and types.metamethodFor(op, left, right)
 			if metamethod then
 				for position, operandIdx in ipairs({ node.left, node.right }) do
 					local operand = parsed.nodes[operandIdx]
 					local wanted = metamethod.params[position]
 					local actual = position == 1 and left or right
-					if operand and wanted and actual and types.mismatch(wanted, actual, node.op) then
+					if operand and wanted and actual and types.mismatch(wanted, actual, op) then
 						diagnostic.add(self, string.format("'%s' takes %s on the %s, but this is %s", node.op,
 								types.display(wanted), position == 1 and "left" or "right",
 								types.display(actual)), operand.start, operand.stop, 1)
@@ -507,6 +557,7 @@ local function globalNames(ctx)
 	-- The document's own signatures are iterated here; the definitions' names are the list the
 	-- prelude kept, because the table itself is reached through this one rather than copied.
 	for name in pairs(signatures) do
+		---@cast name string
 		if not name:find("[%.:]") then globals[name] = true end
 	end
 	for _, variable in ipairs(self.variables) do
@@ -549,6 +600,7 @@ end
 --- A name that is not one is a typo nothing else catches: the annotation is read, the parameter it
 --- was meant for keeps whatever it would have had, and every call is then checked against a
 --- signature describing a parameter the body does not have.
+---@param ctx lye.analyzer.CheckContext
 local function paramNames(ctx)
 	local parsed, self = ctx.parsed, ctx.self
 	for _, declaration in ipairs(parsed.declarations) do
@@ -578,6 +630,7 @@ local function paramNames(ctx)
 	end
 end
 
+---@param ctx lye.analyzer.CheckContext
 local function unusedLocals(ctx)
 	for _, variable in ipairs(ctx.self.variables) do
 		local unused = variable.qualifier == "local" and #variable.references == 0
@@ -595,12 +648,14 @@ local function unusedLocals(ctx)
 	-- into C, so a body that gives the wrong thing is reported against the signature it was cast to.
 end
 
+---@param ctx lye.analyzer.CheckContext
 local function callbackReturns(ctx)
 	local parsed, self = ctx.parsed, ctx.self
 	local callbackReturns = ctx.callbackReturns
 	local inferredReturnOf = ctx.inferredReturnOf
 	local annotatedBodies = ctx.annotatedBodies
 	for index, promised in pairs(callbackReturns) do
+		---@cast index integer
 		local node = parsed.nodes[index]
 		if node and not reused(ctx, node.start, node.stop) then
 		local inferred = inferredReturnOf(index)
@@ -618,6 +673,7 @@ local function callbackReturns(ctx)
 		elseif gives and promised.variant ~= "nil" and promised.variant ~= "void" then
 			-- A callback the C says returns nothing may still return a value: the engine discards
 			-- it, so there is nothing to be wrong about.
+			---@cast inferred lye.doc.Type
 			local message = types.strictMismatch(promised, inferred, "the result")
 			if message then
 				self.diagnostics[#self.diagnostics + 1] = {
@@ -638,25 +694,62 @@ end
 
 --- What this file gives a caller: a top-level `return { ... }` is what a module is, and its type
 --- is what `require("this.file")` means elsewhere. Read after typing, so its names are settled.
+---@param ctx lye.analyzer.CheckContext
 local function moduleExport(ctx)
 	for _, node in ipairs(ctx.parsed.byKind["return"] or {}) do
 		-- Top level means the scope it is written in is the file's own: `parent` says which node was
 		-- being built, which a statement inside a function body also answers with the root.
 		if node.kind == "return" and ctx.scopeAt(ctx.self, node.start) == ctx.self.root and not ctx.self.module then
-			local first = node.children and node.children[1]
-			if first then
+			---@type integer[]?
+			local children = node.children
+			local firstIdx
+			if children ~= nil then
+				---@cast children integer[]
+				firstIdx = children[1]
+			end
+			if firstIdx ~= nil then
+				---@cast firstIdx integer
 				-- A definition file returns the table it declares, and that table is the class the
 				-- annotations describe: `bit = {}` followed by `return bit` is `bitlib`. The
 				-- analyzer's own typing of a global declaration is an object it grows from
 				-- assignments, not the class, so the definitions' answer is asked first.
-				local firstNode = ctx.parsed.nodes[first]
-				local name = firstNode and firstNode.kind == "prefix" and firstNode.callee
+				local firstNode = ctx.parsed.nodes[firstIdx]
+				---@type string?
+				local name
+				if firstNode ~= nil and firstNode.kind == "prefix" then name = firstNode.callee end
 				-- Only a definition file's global backing table is the class: a document's own
 				-- `local bit = {}` shadows the library and must answer as the value it built.
 				local className = ctx.self.isDefinition and name
 					and ctx.prepared and ctx.prepared.globals and ctx.prepared.globals[name]
 				local classType = className and ctx.resolve(className)
-				ctx.self.module = classType or infer.at(ctx.inferCtx, first)
+				local held = classType or infer.at(ctx.inferCtx, firstIdx)
+				-- A function written onto the table carries its annotation on the declaration, not
+				-- in the callable the body built. The table the body grew holds the inferred one,
+				-- and a caller requiring this file read the body's type as the contract: a
+				-- `---@return boolean` over a body returning `1 + 1` became `2` on the other side.
+				if classType == nil and name ~= nil and held ~= nil and held.variant == "object" then
+					---@cast name string
+					---@cast held lye.doc.Type
+					local fields, rewritten = {}, false
+					for field, fieldType in pairs(held.fields) do
+						---@cast field string
+						fields[field] = fieldType
+						local signature = ctx.signatures[name .. "." .. field]
+							or ctx.signatures[name .. ":" .. field]
+						local declaration = signature and signature.declaration
+						local variable = declaration and ctx.byDeclaration[declaration]
+						local declared = variable and variable.declared
+						if declared ~= nil then
+							---@cast declared lye.doc.Type
+							if types.isFn(declared) then
+								fields[field] = declared
+								rewritten = true
+							end
+						end
+					end
+					if rewritten then held = types.object(fields, held.indexed) end
+				end
+				ctx.self.module = held
 			end
 		end
 end
@@ -669,9 +762,9 @@ checks.moduleExport = moduleExport
 --- operation either, so indexing it, operating on it or passing it to a concrete parameter is a
 --- use the analysis cannot check. Returning or storing it is not.
 ---@param held lye.doc.Type?
----@return boolean
 local function settledUnknown(held)
 	if not held then return false end
+	---@cast held lye.doc.Type
 	if held.variant == "union" then
 		for _, member in ipairs(held.types) do
 			if settledUnknown(member) then return true end
@@ -679,7 +772,9 @@ local function settledUnknown(held)
 		return false
 	end
 	if held.variant == "any" then return true end
-	return held.variant == "unknown" and not types.isMutable(held)
+	if held.variant ~= "unknown" then return false end
+	---@cast held lye.doc.Type
+	return not types.isMutable(held)
 end
 
 --- The values a type can be when it is written as one or more string literals, or nil when it
@@ -690,7 +785,6 @@ end
 local function literalStrings(held)
 	if not held then return nil end
 	---@param member lye.doc.Type
-	---@return string?
 	local function one(member)
 		if member.variant ~= "extern" or type(member.name) ~= "string" then return nil end
 		local first, last = member.name:sub(1, 1), member.name:sub(-1)
@@ -727,9 +821,14 @@ local function comparisonChecks(ctx)
 				literal, other, otherIdx = right, left, node.left
 			end
 			if literal and literal.value and other and otherIdx then
+				---@cast literal lye.parser.Node
+				---@cast other lye.parser.Node
+				---@cast otherIdx integer
 				local allowed = literalStrings(infer.at(inferCtx, otherIdx))
 				if allowed then
-					local written = types.display(types.stringValue(literal.value))
+					local value = literal.value
+					---@cast value string
+					local written = types.display(types.stringValue(value))
 					if not allowed[written] then
 						local message = other.kind == "call" and other.callee == "type"
 							and string.format("%s is not a type `type` can return", written)
@@ -759,7 +858,6 @@ end
 
 --- Whether every value of a type is nil, so an access cannot be guarded by a value being there.
 ---@param held lye.doc.Type?
----@return boolean
 local function isNil(held)
 	return held ~= nil and (held.variant == "nil" or held.variant == "void")
 end
@@ -798,17 +896,20 @@ local function nilReads(ctx)
 	-- point: `self.cache = self.cache or {}` is how a lazy field is opened, and the declared `?`
 	-- describes the value before the write. This is flow-insensitive — it asks whether a non-nil
 	-- write happened anywhere above — which is what keeps the lazy-field idiom out of the report.
+	---@type table<string, { at: integer, valueIdx: integer? }[]>
 	local assigned = {}
 	for _, node in ipairs(parsed.nodes) do
 		if node.kind == "assignment" then
 			local name = names.writtenNameOf(parsed, node.target)
-			if name then
+			---@cast name string?
+			if name ~= nil then
+				---@type { at: integer, valueIdx: integer? }[]?
 				local list = assigned[name]
 				if not list then
 					list = {}
 					assigned[name] = list
 				end
-				list[#list + 1] = { at = node.start, valueIdx = node.value }
+				list[#list + 1] = { at = node.start, valueIdx = node.valueIdx }
 			end
 		end
 	end
@@ -817,7 +918,9 @@ local function nilReads(ctx)
 	local function writtenNonNil(node)
 		local target = node.target and parsed.nodes[node.target]
 		local name = target and names.writtenNameOf(parsed, node.target)
-		for _, write in ipairs(name and assigned[name] or {}) do
+		---@cast name string?
+		local writes = assigned[name] or {}
+		for _, write in ipairs(writes) do
 			if write.at < node.start and write.valueIdx then
 				local held = infer.at(inferCtx, write.valueIdx)
 				if held and not mayBeNil(held) and not types.isOpaque(held) then return true end
@@ -869,6 +972,17 @@ local function fieldKnown(member, field)
 		if member.fields[field] then return true end
 		return (member.indexed and member.indexed.key == "string") == true
 	end
+	if member.variant == "class" then
+		if member.fields[field] then return true end
+		-- An index signature or a metatable can answer a name the class did not declare.
+		if (member.indexed and member.indexed.key == "string") or member.metatable then return nil end
+		-- A class with no fields at all is a marker or a build target; leave it open. One with a
+		-- declared shape is a promise, and a write to a missing field is already reported.
+		local count = 0
+		for _ in pairs(member.fields) do count += 1 end
+		if count > 0 then return false end
+		return nil
+	end
 	return nil
 end
 
@@ -876,7 +990,6 @@ end
 --- type descriptions are wide tagged unions; a missing-field report there is a narrowing question,
 --- not a shape question, and it is left to the branch checks.
 ---@param member lye.doc.Type
----@return boolean
 local function simpleShape(member)
 	if member.variant ~= "object" or member.fields.variant then return false end
 	local count = 0
@@ -886,8 +999,9 @@ end
 
 --- A field read on a shape that never declared it is a mistake, and so is a read on a union where
 --- only some members have the field: `u.a` on `{ a: number } | { b: string }` gives `number` for a
---- value that may be the other shape. A class is left alone because a method may add a field at
---- runtime, and a bare `table` says nothing about its members.
+--- value that may be the other shape. A class is checked through the fields its type already has;
+--- a method declared in another file may not be in this file's class type, so a colon call is left
+--- alone. A bare `table` says nothing about its members.
 ---@param ctx lye.analyzer.CheckContext
 local function missingFieldReads(ctx)
 	local parsed, self, inferCtx = ctx.parsed, ctx.self, ctx.inferCtx
@@ -898,37 +1012,46 @@ local function missingFieldReads(ctx)
 			local isWrite = parent and parent.kind == "assignment" and parent.target == node.index
 			if not isWrite then
 				local target = infer.at(inferCtx, node.target)
-				if target and not types.isOpaque(target) and not types.isUnknownShape(target) then
+				local field = node.field
+				---@cast field string
+				if target ~= nil and not types.isOpaque(target) and not types.isUnknownShape(target) then
+					---@cast target lye.doc.Type
 					local has, missing, checkable = false, false, true
-					if target.variant == "union" then
+					local isUnion = target.variant == "union"
+					if isUnion then
 						for _, member in ipairs(target.types) do
-							if member.variant ~= "object" and member.variant ~= "class"
-								and member.variant ~= "nil" then
+							if member.variant == "class" then
+								-- A class can grow a field from a method at runtime, and a union read
+								-- is a discriminant question for the branch checks, not a shape check.
+								checkable = false
+								break
+							end
+							if member.variant ~= "object" and member.variant ~= "nil" then
 								-- A union of callable, array, conditional, extern and object members
 								-- is a description of a value, not a shape: the field may belong to
 								-- whichever member the branch narrowed to.
 								checkable = false
 								break
 							end
-							if not simpleShape(member) and member.variant ~= "class" and member.variant ~= "nil" then
+							if not simpleShape(member) and member.variant ~= "nil" then
 								checkable = false
 								break
 							end
 						end
 					end
-					if checkable and target.variant == "union" then
+					if checkable and isUnion then
 						for _, member in ipairs(target.types) do
-							local known = fieldKnown(member, node.field)
+							local known = fieldKnown(member, field)
 							if known == true then has = true elseif known == false then missing = true end
 						end
 					else
-						local known = fieldKnown(target, node.field)
-						if known == false and simpleShape(target) then missing = true end
+						local known = fieldKnown(target, field)
+						if known == false and (simpleShape(target) or target.variant == "class") then missing = true end
 					end
 					if missing and has then
 						diagnostic.add(self, string.format("`%s` is not a field of every member of this union",
 							node.field), node.start, node.stop, 1)
-					elseif missing and target.variant == "object" then
+					elseif missing and (target.variant == "object" or target.variant == "class") then
 						diagnostic.add(self, string.format("`%s` is not a field of %s",
 							node.field, types.display(target)), node.start, node.stop, 1)
 					end
@@ -948,7 +1071,9 @@ local function unknownUses(ctx)
 	if ctx.self.isDefinition then return end
 	local parsed, inferCtx, self = ctx.parsed, ctx.inferCtx, ctx.self
 
-	local function report(node, message)
+	---@param node lye.parser.Node
+	---@param message string
+	local function reportUnknown(node, message)
 		if reused(ctx, node.start, node.stop) then return end
 		diagnostic.add(self, message, node.start, node.stop, 1)
 	end
@@ -969,7 +1094,7 @@ local function unknownUses(ctx)
 	for _, node in ipairs(parsed.nodes) do
 		if node.kind == "index" and node.target then
 			if settledUnknown(typeOfNode(node.target)) then
-				report(node, "cannot index a value of unknown type")
+				reportUnknown(node, "cannot index a value of unknown type")
 			end
 		elseif node.kind == "call" then
 			local targetNode = node.target and parsed.nodes[node.target]
@@ -980,17 +1105,17 @@ local function unknownUses(ctx)
 			if field then
 				-- A field call reads a method from the value it targets.
 				if settledUnknown(typeOfNode(node.target)) then
-					report(node, "cannot index a value of unknown type")
+					reportUnknown(node, "cannot index a value of unknown type")
 				end
 			elseif not known and node.target then
 				-- A call with no field and no signature calls the value itself: `v()` where `v` is
 				-- an unknown is a use; `ipairs(...)` is a declared function and is not.
 				if settledUnknown(typeOfNode(node.target)) then
-					report(node, "cannot call a value of unknown type")
+					reportUnknown(node, "cannot call a value of unknown type")
 				end
 			elseif not known and node.callee then
 				if settledUnknown(infer.calleeTypeOf(inferCtx, node)) then
-					report(node, "cannot call a value of unknown type")
+					reportUnknown(node, "cannot call a value of unknown type")
 				end
 			end
 		elseif node.kind == "binary" then
@@ -1001,12 +1126,12 @@ local function unknownUses(ctx)
 				and node.op ~= "!=" then
 				if settledUnknown(typeOfNode(node.left))
 					or settledUnknown(typeOfNode(node.right)) then
-					report(node, string.format("cannot use an unknown value with `%s`", node.op or "an operator"))
+					reportUnknown(node, string.format("cannot use an unknown value with `%s`", node.op or "an operator"))
 				end
 			end
 		elseif node.kind == "unary" then
 			if node.op ~= "not" and settledUnknown(typeOfNode(node.operand)) then
-				report(node, string.format("cannot use an unknown value with `%s`", node.op or "an operator"))
+				reportUnknown(node, string.format("cannot use an unknown value with `%s`", node.op or "an operator"))
 			end
 		end
 	end

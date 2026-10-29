@@ -9,7 +9,6 @@
 --- table that is filled in a union with what was put in it.
 ---@param parsed lye.parser.Result
 ---@param targetIdx integer?
----@return string?
 local function targetName(parsed, targetIdx)
 	local node = targetIdx and parsed.nodes[targetIdx]
 	if not node then return nil end
@@ -21,7 +20,6 @@ end
 --- index is not a name, and says nothing about which table a function is written for.
 ---@param parsed lye.parser.Result
 ---@param idx integer?
----@return string?
 local function writtenNameOf(parsed, idx)
 	local node = idx and parsed.nodes[idx]
 	if not node then return nil end

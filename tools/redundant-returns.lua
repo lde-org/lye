@@ -10,9 +10,21 @@
 		LYE_ROOT=$PWD WRITE=1 lde run -C packages/lye-lsp ../../tools/redundant-returns.lua
 ]]
 
-local analyzer = require("lye-analyzer")
-local doc = require("lye-doc")
-local classes = require("lye-doc.class")
+-- The packages through root `lye.json`, which the checker does not follow.
+---@class lye.ReturnsDoc
+---@field parse fun(source: string, tokens?: lye.lexer.Tokens): lye.doc.File
+
+---@class lye.ReturnsClasses
+---@field read fun(file: lye.doc.File): lye.doc.Namespace
+---@field resolver fun(namespace: lye.doc.Namespace): fun(name: string): lye.doc.Type?
+
+---@class lye.ReturnsAnalyzer
+---@field prelude fun(sources: table<string, string>): lye.analyzer.Prelude
+---@field analyze fun(source: string, prepared?: lye.analyzer.Prelude, elsewhere?: table<string, boolean|lye.doc.Type>?): lye.analyzer.Result
+
+local analyzer = require("lye-analyzer") --[[@as lye.ReturnsAnalyzer]]
+local doc = require("lye-doc") --[[@as lye.ReturnsDoc]]
+local classes = require("lye-doc.class") --[[@as lye.ReturnsClasses]]
 
 local ROOT = os.getenv("LYE_ROOT") or "/home/once/Projects/Personal/lye/"
 if ROOT:sub(-1) ~= "/" then ROOT = ROOT .. "/" end
@@ -28,13 +40,15 @@ local paths = {}
 for _, root in ipairs(roots) do
 	local pipe = io.popen(string.format(
 		"find %q -name '*.lua' -not -path '*/target/*' -not -path '*/src/meta/*' 2>/dev/null", root))
-	for line in pipe:lines() do paths[#paths + 1] = line end
+	for line in pipe:lines() do
+		---@cast line string
+		paths[#paths + 1] = line
+	end
 	pipe:close()
 end
 table.sort(paths)
 
 ---@param path string
----@return string
 local function read(path)
 	local handle = assert(io.open(path, "rb"))
 	local text = handle:read("*a")
@@ -55,7 +69,7 @@ for _, path in ipairs(paths) do
 	end
 end
 
-local PRELUDE = analyzer.prelude(require("lye-defs"))
+local PRELUDE = analyzer.prelude(require("lye-defs") --[[@as table<string, string>]])
 local total, filesTouched = 0, 0
 
 for _, path in ipairs(paths) do

@@ -18,7 +18,8 @@
 	],
 	"main": "./dist/extension.js",
 	"activationEvents": [
-		"onLanguage:lua"
+		"onLanguage:lua",
+		"workspaceContains:**/lye.json"
 	],
 	"contributes": {
 		"languages": [

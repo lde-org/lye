@@ -19,14 +19,12 @@ local lexer = require("lye-lexer")
 --- `loadstring` returns a function *or* nil plus a message, so the result must be
 --- tested for nil-ness directly rather than compared.
 ---@param source string
----@return boolean
 local function engineAccepts(source)
 	local fn = loadstring(source)
 	return fn ~= nil
 end
 
 ---@param source string
----@return boolean
 local function lexes(source)
 	local isOk = pcall(lexer.tokenize, source)
 	return isOk
@@ -37,27 +35,27 @@ end
 ---@return string[]
 local function problemsOf(source)
 	local problems, messages = lexer.tokenize(source).problems, {}
-	for _, problem in ipairs(problems or {}) do messages[#messages + 1] = problem.message end
+	for _, problem in ipairs(problems or {}) do
+		---@cast problem lye.lexer.Problem
+		messages[#messages + 1] = problem.message
+	end
 	return messages
 end
 
 ---@param tokens lye.lexer.Tokens
 ---@param index integer
----@return lye.lexer.ffi.token
 local function at(tokens, index)
 	return tokens.arena[index]
 end
 
 ---@param tokens lye.lexer.Tokens
 ---@param index integer
----@return string
 local function textAt(tokens, index)
 	return tokens.texts[index]
 end
 
 ---@param tokens lye.lexer.Tokens
 ---@param index integer
----@return string
 local function variantAt(tokens, index)
 	return lexer.variantOf(tokens.arena[index])
 end
@@ -94,7 +92,6 @@ local function variants(source)
 end
 
 ---@param source string
----@return string
 local function variantString(source)
 	return table.concat(variants(source), " ")
 end
@@ -143,11 +140,13 @@ test.it("reads every number form the engine accepts", function()
 		{ "0x.8p1", 1 }, { "0x1p-4", 0.0625 }, { "12345678901234", 12345678901234 },
 	}
 	for _, form in ipairs(forms) do
-		local tokens = lexer.tokenize(form[1])
-		test.equal(variantAt(tokens, 1), "number", form[1])
-		test.equal(at(tokens, 1).extra, form[2], form[1])
-		test.equal(textAt(tokens, 1), form[1], form[1])
-		test.equal(at(tokens, 1).stop, #form[1], form[1])
+		local text = form[1]
+		---@cast text string
+		local tokens = lexer.tokenize(text)
+		test.equal(variantAt(tokens, 1), "number", text)
+		test.equal(at(tokens, 1).extra, form[2], text)
+		test.equal(textAt(tokens, 1), text, text)
+		test.equal(at(tokens, 1).stop, #text, text)
 	end
 end)
 

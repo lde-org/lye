@@ -23,6 +23,8 @@ server.METHOD = {
 	didClose = "textDocument/didClose",
 	didSave = "textDocument/didSave",
 	publishDiagnostics = "textDocument/publishDiagnostics",
+	diagnostic = "textDocument/diagnostic",
+	workspaceDiagnostic = "workspace/diagnostic",
 	logMessage = "window/logMessage",
 	hover = "textDocument/hover",
 	definition = "textDocument/definition",
@@ -65,7 +67,6 @@ server.LOG = {
 }
 
 ---@param params table
----@return string
 local function negotiateEncoding(params)
 	local offered = params.capabilities?.general?.positionEncodings
 	if type(offered) ~= "table" or #offered == 0 then return position.UTF16 end
@@ -95,6 +96,8 @@ end
 local Server = {}
 Server.__index = Server
 
+---@param connection lye.rpc.Connection
+---@param options { name: string?, version: string? }?
 function Server.new(connection, options)
 	local caps = { textDocumentSync = { openClose = true, change = 2 } }
 	return setmetatable({ connection = connection, documents = DocumentStore.new(), capabilities = caps, encoding = position.UTF16, isInitialized = false, isShutdown = false, handlers = {}, answered = {}, pending = {}, clientCapabilities = {}, options = options or {} }, Server)
@@ -115,6 +118,8 @@ function Server:handlerFor(method)
 end
 
 ---@param self lye.framework.Server
+---@param key string
+---@param value any
 function Server:capability(key, value)
 	self.capabilities[key] = value
 end
@@ -126,17 +131,24 @@ local function isRequest(message)
 end
 
 ---@param self lye.framework.Server
+---@param id integer|string|lye.json.null|nil
+---@param result any
 function Server:respond(id, result)
 	self.answered[id] = true
 	self.connection:respond(id, result)
 end
 
 ---@param self lye.framework.Server
+---@param id integer|string|lye.json.null|nil
+---@param code integer
+---@param message string
 function Server:respondError(id, code, message)
 	self.connection:respondError(id, code, message)
 end
 
 ---@param self lye.framework.Server
+---@param method string
+---@param params any
 function Server:notify(method, params)
 	self.connection:notify(method, params)
 end
@@ -201,12 +213,14 @@ function Server:onShutdown()
 end
 
 ---@param self lye.framework.Server
+---@param params { textDocument: { uri: string, text: string, version: integer? } }
 function Server:onDidOpen(params)
 	local item = params.textDocument
 	if item then self.documents:open(item.uri, item.text, item.version) end
 end
 
 ---@param self lye.framework.Server
+---@param params { textDocument: { uri: string, version: integer? }, contentChanges: lye.framework.Change[]? }
 function Server:onDidChange(params)
 	local item = params.textDocument
 	if not item then return end
@@ -214,13 +228,14 @@ function Server:onDidChange(params)
 end
 
 ---@param self lye.framework.Server
+---@param params { textDocument: { uri: string } }
 function Server:onDidClose(params)
 	local item = params.textDocument
 	if item then self.documents:close(item.uri) end
 end
 
 ---@param self lye.framework.Server
----@param message table
+---@param message lye.rpc.Message
 function Server:handle(message)
 	local method = message.method
 	if not method then

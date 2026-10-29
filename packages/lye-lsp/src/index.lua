@@ -107,6 +107,9 @@ local sep = string.sub(package.config, 1, 1)
 ---@field kind_ "workspace"|"package"
 ---@field read fun(path: string): string?
 ---@field stat fun(path: string): fs.Stat?
+---@field entry_ lye.lsp.IndexEntry? the entry last adopted
+---@field typeLocations_ table<string, lye.lsp.IndexType>? where each type the entry declares is written
+---@field stats_ { index: number, built: integer, loaded: integer, files: integer, reads: integer, workers: integer, fellBack: integer }
 local Index = {}
 Index.__index = Index
 Index.SCHEMA = SCHEMA
@@ -114,14 +117,12 @@ Index.SCHEMA = SCHEMA
 --- A root as a key and an entry name it: no trailing separator, so two spellings of one directory
 --- share one entry.
 ---@param root string
----@return string
 local function normalize(root)
 	local trimmed = root:gsub("[/\\]+$", "")
 	return trimmed == "" and root or trimmed
 end
 
 ---@param name string
----@return boolean
 local function isHidden(name)
 	return name:sub(1, 1) == "."
 end
@@ -130,14 +131,12 @@ end
 --- without reading the text, which is the whole cost the load is avoiding.
 ---@param record lye.lsp.IndexFile
 ---@param held fs.Stat
----@return boolean
 local function isCurrent(record, held)
 	return record.size == tonumber(held.size) and record.mtime == tonumber(held.modifyTime)
 end
 
 ---@param source string
 ---@param offset integer
----@return integer
 local function lineStart(source, offset)
 	local at = offset - 1
 	while at >= 1 do
@@ -150,7 +149,6 @@ end
 --- The line at a start offset, without its indentation.
 ---@param source string
 ---@param at integer
----@return string
 local function lineAt(source, at)
 	local to = source:find("\n", at, true) or (#source + 1)
 	return (source:sub(at, to - 1):gsub("^%s+", ""))
@@ -159,9 +157,8 @@ end
 --- The lines that declare a class or an alias: the comment above it, its own line, and the fields
 --- written under it. The annotation above the comment is another type's business.
 ---@param source string
----@param annotations lye.lsp.IndexAnnotation[]
+---@param annotations lye.doc.Annotation[]
 ---@param at integer
----@return string
 local function declarationLines(source, annotations, at)
 	local annotation = annotations[at]
 	local declaration = lineStart(source, annotation.start)
@@ -189,7 +186,7 @@ end
 ---@param into table<string, lye.lsp.IndexType>
 ---@param path string
 ---@param source string
----@param annotations lye.lsp.IndexAnnotation[]
+---@param annotations lye.doc.Annotation[]
 local function collectTypes(into, path, source, annotations)
 	for index, annotation in ipairs(annotations) do
 		local isType = annotation.tag == "class" or annotation.tag == "alias"
@@ -219,7 +216,6 @@ end
 --- computed, so a module read against this workspace is only reused for a workspace that declares
 --- the same things.
 ---@param entry lye.lsp.IndexEntry
----@return string
 local function digestOf(entry)
 	local parts = {}
 	for _, path in ipairs(pathsOf(entry)) do
@@ -234,7 +230,6 @@ end
 --- What a package's links are: each path and the hash of the text behind it. A module cache keys
 --- on this, so a change to any linked file is a different set of links.
 ---@param entry lye.lsp.IndexEntry
----@return string
 local function linkDigestOf(entry)
 	local parts = {}
 	for _, path in ipairs(pathsOf(entry)) do
@@ -244,17 +239,17 @@ local function linkDigestOf(entry)
 end
 
 ---@param entry lye.lsp.IndexEntry
----@return table<string, boolean|lye.doc.Type>
 local function knownOf(entry)
-	local files = {}
+	local files = {} ---@type lye.doc.File[]
 	for _, path in ipairs(pathsOf(entry)) do
-		files[#files + 1] = { annotations = entry.files[path].annotations }
+		files[#files + 1] = {
+			annotations = entry.files[path].annotations --[[@as lye.doc.Annotation[] ]],
+		}
 	end
 	return classes.declare(files)
 end
 
 ---@param entry lye.lsp.IndexEntry
----@return table<string, lye.lsp.IndexType>
 local function typesOf(entry)
 	local into = {}
 	for _, path in ipairs(pathsOf(entry)) do
@@ -265,24 +260,28 @@ local function typesOf(entry)
 	return into
 end
 
----@param entry unknown
+---@param entry table?
 ---@param root string
 ---@return boolean
 local function isValidEntry(entry, root)
 	if type(entry) ~= "table" then return false end
-	if entry.schema ~= SCHEMA then return false end
-	if entry.root ~= root then return false end
-	if entry.codeVersion ~= cache.codeVersion() then return false end
-	if type(entry.annotationsDigest) ~= "string" then return false end
-	if entry.linkDigest ~= nil and type(entry.linkDigest) ~= "string" then return false end
-	if entry.known ~= nil and type(entry.known) ~= "table" then return false end
-	if type(entry.files) ~= "table" then return false end
-	for path, record in pairs(entry.files) do
-		if type(path) ~= "string" or type(record) ~= "table" then return false end
-		if type(record.hash) ~= "string" then return false end
-		if type(record.size) ~= "number" or type(record.mtime) ~= "number" then return false end
-		if type(record.annotations) ~= "table" or type(record.types) ~= "table" then return false end
-		if record.isDefinition ~= nil and type(record.isDefinition) ~= "boolean" then return false end
+	local raw = entry --[[@as table ]]
+	if raw.schema ~= SCHEMA then return false end
+	if raw.root ~= root then return false end
+	if raw.codeVersion ~= cache.codeVersion() then return false end
+	if type(raw.annotationsDigest) ~= "string" then return false end
+	if raw.linkDigest ~= nil and type(raw.linkDigest) ~= "string" then return false end
+	if raw.known ~= nil and type(raw.known) ~= "table" then return false end
+	local files = raw.files
+	if type(files) ~= "table" then return false end
+	for path, record in pairs(files) do
+		---@cast path string
+		local held = record --[[@as table ]]
+		if type(path) ~= "string" or type(held) ~= "table" then return false end
+		if type(held.hash) ~= "string" then return false end
+		if type(held.size) ~= "number" or type(held.mtime) ~= "number" then return false end
+		if type(held.annotations) ~= "table" or type(held.types) ~= "table" then return false end
+		if held.isDefinition ~= nil and type(held.isDefinition) ~= "boolean" then return false end
 	end
 	return true
 end
@@ -293,7 +292,6 @@ end
 --- split from cutting a package across processes.
 ---@param root string
 ---@param path string
----@return string
 local function packageOf(root, path)
 	local prefix = root .. "/"
 	if path:sub(1, #prefix) ~= prefix then return root end
@@ -328,9 +326,11 @@ end
 ---@param root string
 ---@param paths string[]
 ---@param sizes table<string, integer>
----@return lye.parallel.Group[]
 local function groupsOf(root, paths, sizes)
-	local groups, at = {}, {}
+	local groups = {}
+	---@cast groups lye.parallel.Group[]
+	local at = {}
+	---@cast at table<string, lye.parallel.Group>
 	for _, path in ipairs(paths) do
 		local owner = packageOf(root, path)
 		local group = at[owner]
@@ -367,7 +367,6 @@ end
 ---@param slice lye.parallel.Slice
 ---@param files table<string, lye.lsp.IndexFile>
 ---@param reads integer
----@return boolean
 local function writeShard(slice, files, reads)
 	local text = serial.write({ files = files, paths = slice.files, reads = reads })
 	if not text then return false end
@@ -406,7 +405,6 @@ local function countFiles(entry)
 end
 
 ---@param options lye.lsp.IndexOptions?
----@return lye.lsp.Index
 function Index.new(options)
 	options = options or {}
 	return setmetatable({
@@ -423,8 +421,9 @@ end
 ---@param note string
 ---@param self lye.lsp.Index
 function Index:notice(note)
-	if self.options.log then
-		self.options.log(note)
+	local log = self.options.log
+	if log then
+		log(note)
 		return
 	end
 	io.stderr:write("lye index: " .. note .. "\n")
@@ -435,7 +434,6 @@ end
 --- index and a package index of the same directory do not overwrite each other.
 ---@param root string
 ---@param kind "workspace"|"package"?
----@return string
 ---@param self lye.lsp.Index
 function Index:key(root, kind)
 	root = normalize(root)
@@ -446,7 +444,6 @@ function Index:key(root, kind)
 end
 
 ---@param opts { max: integer? }?
----@return integer?
 ---@param self lye.lsp.Index
 function Index:cap(opts)
 	local max = (opts and opts.max) or self.options.max
@@ -462,14 +459,12 @@ end
 ---@param root string
 ---@param kind "workspace"|"package"
 ---@param max integer?
----@return string[]
 ---@param self lye.lsp.Index
 function Index:scan(root, kind, max)
 	local dir = kind == "package" and (root .. sep .. "target") or root
-	local paths = {}
+	local paths = {} ---@type string[]
 	if not fs.isdir(dir) then return paths end
 	---@param name string
-	---@return boolean
 	local function workspaceIgnore(name) return isHidden(name) or name == "target" end
 	local ignore = kind == "package" and isHidden or workspaceIgnore
 	for path in fs.scan(dir, "**/*.lua", {
@@ -477,6 +472,7 @@ function Index:scan(root, kind, max)
 		followSymlinks = kind == "package",
 		ignore = ignore,
 	}) do
+		---@cast path string
 		paths[#paths + 1] = path
 	end
 	table.sort(paths)
@@ -501,6 +497,7 @@ function Index:record(path)
 	local isOk, parsed = pcall(doc.parse, source)
 	local record = { hash = rapidhash.hex(source), annotations = {}, types = {} }
 	if isOk then
+		---@cast parsed lye.doc.File
 		record.isDefinition = parsed.isDefinition
 		for _, annotation in ipairs(parsed.annotations) do
 			record.annotations[#record.annotations + 1] = {
@@ -542,7 +539,6 @@ end
 --- benchmark forks on file count alone, and so does `LYE_INDEX_PARALLEL=1` — the escape hatch for a
 --- workspace where this measurement does not hold.
 ---@param opts lye.lsp.IndexOptions
----@return integer
 ---@param self lye.lsp.Index
 function Index:parallelBytes(opts)
 	local least = opts.minBytes
@@ -559,7 +555,7 @@ end
 --- measured byte gate.
 ---@param paths string[]
 ---@param opts lye.lsp.IndexOptions
----@return boolean
+---@return boolean wanted whether the build should be split
 ---@return table<string, integer>? sizes the bytes each file is, given along with a yes
 ---@param self lye.lsp.Index
 function Index:parallelWanted(paths, opts)
@@ -583,7 +579,6 @@ end
 --- How many processes a build of this many files may use.
 ---@param paths string[]
 ---@param opts lye.lsp.IndexOptions
----@return integer
 ---@param self lye.lsp.Index
 function Index:parallelWorkers(paths, opts)
 	local wanted = opts.workers or self.options.workers
@@ -601,7 +596,6 @@ end
 ---@param index integer
 ---@param isChild boolean
 ---@param hook fun(slice: lye.parallel.Slice, index: integer): string?
----@return boolean
 ---@param self lye.lsp.Index
 function Index:workShard(slice, index, isChild, hook)
 	if isChild and hook then
@@ -641,6 +635,9 @@ function Index:buildShards(entry, root, paths, sizes, opts)
 		return string.format("%s/%s-%d.rec", dir, token, index)
 	end)
 	local hook = opts.onShard or self.options.onShard
+	---@param slice lye.parallel.Slice
+	---@param index integer
+	---@param isChild boolean
 	local function work(slice, index, isChild)
 		return self:workShard(slice, index, isChild, hook)
 	end
@@ -711,6 +708,7 @@ function Index:build(root, opts)
 	end
 	if not isShared then
 		for _, path in ipairs(paths) do
+			---@cast path string
 			local record = self:record(path)
 			if record then entry.files[path] = record end
 		end
@@ -756,6 +754,7 @@ function Index:sync(entry, root, kind, opts, forced, removed)
 	end
 	local suspects = {}
 	for _, path in ipairs(paths) do
+		---@cast path string
 		local record = entry.files[path]
 		if not record or (forced and forced[path]) then
 			suspects[#suspects + 1] = path
@@ -771,6 +770,7 @@ function Index:sync(entry, root, kind, opts, forced, removed)
 		if not present[path] then entry.files[path] = nil end
 	end
 	for _, path in ipairs(suspects) do
+		---@cast path string
 		local record = entry.files[path]
 		local fresh = self:record(path)
 		if not fresh then
@@ -802,7 +802,6 @@ end
 --- written back for the next run.
 ---@param root string
 ---@param opts { kind: "workspace"|"package"?, max: integer? }?
----@return lye.lsp.IndexEntry?
 ---@param self lye.lsp.Index
 function Index:load(root, opts)
 	opts = opts or {}
@@ -816,6 +815,7 @@ function Index:load(root, opts)
 		self.stats_.index += timing.now() - started
 		return nil
 	end
+	---@cast entry lye.lsp.IndexEntry
 	self.kind_ = kind
 	local state = self:sync(entry, root, kind, opts)
 	-- What an entry says about itself has to match what it holds, or it is a wrong answer that
@@ -841,7 +841,6 @@ end
 --- missing, corrupt, older or differently-rooted entry is a miss, never an error.
 ---@param root string
 ---@param opts { kind: "workspace"|"package"? }?
----@return lye.lsp.IndexEntry?
 ---@param self lye.lsp.Index
 function Index:open(root, opts)
 	opts = opts or {}
@@ -849,6 +848,7 @@ function Index:open(root, opts)
 	local kind = opts.kind or self.kind_
 	local entry = cache.load(self:key(root, kind))
 	if not isValidEntry(entry, root) then return nil end
+	---@cast entry lye.lsp.IndexEntry
 	if kind == "package" and type(entry.linkDigest) ~= "string" then return nil end
 	return entry
 end
@@ -857,7 +857,6 @@ end
 --- annotations resolve to is not, because building it from them costs less than reading the types
 --- back and the entry is most of the file's size. A cache that cannot be written is not an error.
 ---@param entry lye.lsp.IndexEntry?
----@return boolean
 ---@param self lye.lsp.Index
 function Index:save(entry)
 	entry = entry or self.entry_
@@ -879,7 +878,6 @@ end
 ---@param root string
 ---@param changes (string|{ path: string, removed: boolean? })[]
 ---@param opts { kind: "workspace"|"package"?, max: integer? }?
----@return lye.lsp.IndexEntry
 ---@param self lye.lsp.Index
 function Index:update(root, changes, opts)
 	opts = opts or {}
@@ -893,6 +891,7 @@ function Index:update(root, changes, opts)
 		self.stats_.index += timing.now() - started
 		return built
 	end
+	---@cast entry lye.lsp.IndexEntry
 	self.kind_ = kind
 
 	local forced, removed = {}, 0
@@ -925,21 +924,18 @@ function Index:update(root, changes, opts)
 	return entry
 end
 
----@return lye.lsp.IndexEntry?
 ---@param self lye.lsp.Index
 function Index:entry()
 	return self.entry_
 end
 
 --- The files the current entry holds, each with its hash, metadata, annotations and types.
----@return table<string, lye.lsp.IndexFile>
 ---@param self lye.lsp.Index
 function Index:files()
 	return self.entry_ and self.entry_.files or {}
 end
 
 ---@param path string
----@return lye.lsp.IndexFile?
 ---@param self lye.lsp.Index
 function Index:file(path)
 	local entry = self.entry_
@@ -947,35 +943,30 @@ function Index:file(path)
 end
 
 --- Each name the root declares, resolved to the type it stands for.
----@return table<string, boolean|lye.doc.Type>
 ---@param self lye.lsp.Index
 function Index:known()
 	return self.entry_ and self.entry_.known or {}
 end
 
 --- Where each class or alias of the root is written.
----@return table<string, lye.lsp.IndexType>
 ---@param self lye.lsp.Index
 function Index:typeLocations()
 	return self.typeLocations_ or {}
 end
 
 --- What every file of the root annotates, as the workspace digest a module is keyed on.
----@return string
 ---@param self lye.lsp.Index
 function Index:digest()
 	return self.entry_ and self.entry_.annotationsDigest or ""
 end
 
 --- What a package's links are, as the digest a module of that package is keyed on.
----@return string?
 ---@param self lye.lsp.Index
 function Index:linkDigest()
 	return self.entry_ and self.entry_.linkDigest
 end
 
 ---@param path string
----@return boolean
 ---@param self lye.lsp.Index
 function Index:isDefinition(path)
 	local record = self:file(path)
@@ -986,7 +977,6 @@ end
 --- often an entry was built, how often one was read and trusted, how many files it holds, how many
 --- source files were read, how many processes the builds used, and how many shards a failed child
 --- left to this process.
----@return { index: number, built: integer, loaded: integer, files: integer, reads: integer, workers: integer, fellBack: integer }
 ---@param self lye.lsp.Index
 function Index:stats()
 	local held = self.stats_

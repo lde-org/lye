@@ -50,7 +50,7 @@ local function complete(prefix)
 		prefix = prefix,
 		workspace = ROOT,
 		packageRoot = PKG,
-	})) do
+	}) or {}) do
 		found[entry.name] = entry
 	end
 	return found
@@ -94,7 +94,7 @@ test.it("answers the builtins when there is no workspace to scan", function()
 	local found = {}
 	for _, entry in ipairs(require("lye-plugin-require").complete({
 		uri = "file:///tmp/x.lua", source = "", text = "", offset = 1, prefix = "",
-	})) do found[entry.name] = entry end
+	}) or {}) do found[entry.name] = entry end
 	test.truthy(found["bit"])
 	test.truthy(found["ffi"])
 	test.falsy(found["thing"])

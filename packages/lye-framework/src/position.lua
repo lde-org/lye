@@ -77,6 +77,9 @@ function position.lineStart(index, line)
 	return index.starts[line + 1]
 end
 
+---@param text string
+---@param index lye.framework.LineIndex
+---@param line integer
 function position.lineText(text, index, line)
 	local start = index.starts[line + 1]
 	if not start then return "" end
@@ -90,7 +93,6 @@ end
 
 ---@param line string
 ---@param byteCount integer
----@return integer
 local function utf16Length(line, byteCount)
 	if not line:find("[\128-\255]") then return byteCount end
 
@@ -118,7 +120,6 @@ position.utf16Length = utf16Length
 
 ---@param line string
 ---@param units integer
----@return integer
 local function utf16ToBytes(line, units)
 	if not line:find("[\128-\255]") then return math.min(units, #line) end
 

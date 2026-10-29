@@ -15,6 +15,7 @@ function require(modname: string): unknown end
 ---@field preload   table<string, fun(name: string): any>
 ---The loaders `require` walks, in order: the preload table, the Lua loader, the C loader.
 ---@field loaders   (fun(name: string): any)[]
+---@field config    string the compile-time package configuration
 package = {}
 
 ---A string describing some compile-time configurations for packages.

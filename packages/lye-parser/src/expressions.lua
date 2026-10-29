@@ -2,9 +2,9 @@
 	Expression grammar: precedence climbing, suffix chains and function bodies.
 ]]
 
-local Parser = require("lye-parser")
+local Parser = require("lye-parser") --[[@as lye.parser.Parser]]
 
-local KIND = Parser.KIND
+local KIND = Parser.KIND --[[@as table<string, integer>]]
 
 --- The text of a string literal without its quotes. Escapes stay as written: decoding them
 --- needs an unescaper, and every reader so far compares plain names.
@@ -166,7 +166,14 @@ local function parseTable(self)
 	-- The lists are made when there is something to put in them: `{}` and `{ "x", "y" }` are
 	-- most literals in a project, and a table per kind of member per literal is most of what the
 	-- parser allocates.
-	local fieldKinds, fieldValues, elementIdxs, keyIdxs
+	---@type table<string, string>?
+	local fieldKinds
+	---@type table<string, integer>?
+	local fieldValues
+	---@type integer[]?
+	local elementIdxs
+	---@type integer[]?
+	local keyIdxs
 	self:expect("{")
 	while not self:check("}") and not self:isEof(self:peek()) do
 		self:skipComments()
@@ -210,6 +217,7 @@ local function parseTable(self)
 	-- they stayed unparented and were taken for statements of the chunk, which is what a guard's
 	-- `fallsThrough` reads when it asks whether the clause ends in a `return` — `if not x then
 	-- return { y = "z" } end` looked like it fell through, so nothing after it was narrowed.
+	---@type integer[]?
 	local members
 	for _, valueIdx in pairs(fieldValues or {}) do
 		members = members or {}
@@ -232,7 +240,9 @@ local function parseTable(self)
 		-- The node each value was read from, so a field of a literal is typed by what is written
 		-- there rather than by the kind of thing it looked like: `{ __add = add }` holds a
 		-- function, not a table.
-		self.tableFieldValues[index] = fieldValues
+		local fieldValueTable = self.tableFieldValues
+		---@cast fieldValueTable table<integer, table>
+		fieldValueTable[index] = fieldValues
 		self.lastFields = fieldKinds
 	else
 		self.lastFields = nil
@@ -245,7 +255,6 @@ end
 --- `n: number`. Types hold no statement, so the reader only has to know where one ends.
 ---@param self lye.parser.Parser
 ---@param token lye.lexer.ffi.token
----@return boolean
 local function isTypeToken(self, token)
 	local kind = token.kind
 	if kind == KIND.name or kind == KIND.number or kind == KIND.string then return true end
@@ -266,10 +275,15 @@ end
 ---@return integer? from where the type starts, for a reader that colours it
 ---@return integer? to where it ends
 local function skipInlineType(self)
-	local depth, from, to, arrow = 0, nil, nil, false
+	local depth, arrow = 0, false
+	---@type integer?
+	local from
+	---@type integer?
+	local to
 	while true do
 		local token = self:peek()
 		if self:isEof(token) then break end
+		---@cast token lye.lexer.ffi.token
 		local text = self.texts[token.index]
 		if text == "(" or text == "{" or text == "[" or text == "<" then
 			depth = depth + 1
@@ -298,13 +312,18 @@ end
 --- Read the `<T: number, V>` a definition file writes after a function's name, and give back its
 --- text. The list is balanced, so the reader stops at the `>` that closes it.
 ---@param self lye.parser.Parser
----@return string? text
 local function skipGenerics(self)
 	if not self:check("<") then return nil end
-	local from, depth, to = self:peek().start, 0, nil
+	local first = self:peek()
+	if self:isEof(first) then return nil end
+	---@cast first lye.lexer.ffi.token
+	local from, depth = first.start, 0
+	---@type integer?
+	local to
 	while true do
 		local token = self:peek()
 		if self:isEof(token) then break end
+		---@cast token lye.lexer.ffi.token
 		local text = self.texts[token.index]
 		to = token.stop
 		self:advance()
@@ -351,6 +370,8 @@ local function parseFunctionBody(self, start, isMethod)
 		end
 		local name, token = self:parseName()
 		if name then
+			---@cast name string
+			---@cast token lye.lexer.ffi.token
 			local param = self:declare(name, "param", token)
 			params[#params + 1] = param
 			-- A definition file writes the type where a caller reads it: `function f(n: number)`.
@@ -361,7 +382,15 @@ local function parseFunctionBody(self, start, isMethod)
 				if self:accept("?") then param.inlineOptional = true end
 				self:skipComments()
 				if self:accept(":") then
-					param.inlineType, param.inlineTypeStart, param.inlineTypeStop = skipInlineType(self)
+					---@type string?
+					local text
+					---@type integer?
+					local typeFrom
+					---@type integer?
+					local typeTo
+					text, typeFrom, typeTo = skipInlineType(self)
+					param.inlineType, param.inlineTypeStart, param.inlineTypeStop =
+						text, typeFrom, typeTo
 				end
 			end
 		end
@@ -439,7 +468,11 @@ local function parsePrimary(self, allowTernaryColon)
 				self:skipComments()
 				if self:check("|") or self:isEof(self:peek()) then break end
 				local name, nameToken = self:parseName()
-				if name then params[#params + 1] = self:declare(name, "param", nameToken) end
+				if name then
+					---@cast name string
+					---@cast nameToken lye.lexer.ffi.token
+					params[#params + 1] = self:declare(name, "param", nameToken)
+				end
 				self:skipComments()
 				if not self:accept(",") then break end
 			end
@@ -516,8 +549,11 @@ local function parseUnary(self, allowTernaryColon)
 		if node.kind == "prefix" then written = node.callee
 		elseif node.kind == "name" then written = node.name end
 		if written then
+			---@cast written string
 			self:pushScope(startOffset)
-			params[1] = self:declare(written, "param", { start = node.start, stop = node.stop })
+			local paramToken = { start = node.start, stop = node.stop }
+			---@cast paramToken lye.lexer.ffi.token
+			params[1] = self:declare(written, "param", paramToken)
 		end
 		local bodyIdx = self:parseBinary(1, allowTernaryColon)
 		if written then self:popScope(self.nodes[bodyIdx].stop) end
@@ -561,7 +597,9 @@ local function parseBinary(self, minPrecedence, allowTernaryColon)
 				leftIdx, thenIdx, elseIdx)
 			self.lastKind = "ternary"
 		else
-			local level = Parser.BINARY_LEVEL[text]
+			local levels = Parser.BINARY_LEVEL
+			---@cast levels table<string, integer>
+			local level = levels[text]
 			if not level or level < minPrecedence then break end
 
 			self:advance()

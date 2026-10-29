@@ -50,7 +50,6 @@ local FILES = {
 }
 
 ---@param text string
----@return string
 local function embed(text)
 	return "[==[\n" .. text .. "]==]"
 end

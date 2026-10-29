@@ -6,6 +6,7 @@
 ]]
 
 local types = require("lye-doc.type")
+local nodesOf = require("lye-parser").nodesOf
 local memo = require("lye-analyzer.memo")
 local names = require("lye-analyzer.names")
 local writtenNameOf, readSubject, readTypeSubject, callName =
@@ -38,7 +39,10 @@ local function predicateSubject(parsed, node, signature, predicate)
 		if annotation.name == predicate.param then target = index end
 	end
 	local argIdx = target and node.args and node.args[target]
+	---@cast argIdx integer?
 	local name, field = argIdx and readSubject(parsed, argIdx)
+	---@cast name string?
+	---@cast field string?
 	if not name then return nil end
 	local isNil = predicate.type == "nil"
 	if predicate.negated then return name, field, isNil and "notnil" or "nottype" end
@@ -57,7 +61,6 @@ end
 --- gathered before it, which is how a guard three lines up stopped holding.
 ---@param parsed lye.parser.Result
 ---@param idx integer?
----@return boolean
 local function oneFieldOn(parsed, idx)
 	local node = idx and parsed.nodes[idx]
 	if not node or node.kind ~= "index" or not node.field or node.isDynamic then return false end
@@ -103,6 +106,8 @@ local function readCondition(parsed, idx, invert, signatures, resolve)
 
 	if node.kind == "prefix" or node.kind == "index" then
 		local name, field = readSubject(parsed, idx)
+		---@cast name string?
+		---@cast field string?
 		if not name then return nil end
 		return { name = name, field = field, kind = "truthy", wantTruthy = not invert }
 	end
@@ -118,6 +123,8 @@ local function readCondition(parsed, idx, invert, signatures, resolve)
 		local other = subjectIdx == node.left and right or left
 		if other and other.kind == "literal" and other.text == "nil" then
 			local name, field = readSubject(parsed, subjectIdx)
+			---@cast name string?
+			---@cast field string?
 			if not name then return nil end
 			local excludesNil = isEqual == invert
 			return {
@@ -129,10 +136,15 @@ local function readCondition(parsed, idx, invert, signatures, resolve)
 		-- `type(x) == "T"`: a call to `type` compared against a string literal.
 		for _, pair in ipairs({ { node.left, right }, { node.right, left } }) do
 			local callIdx, literal = pair[1], pair[2]
+			---@cast callIdx integer?
+			---@cast literal lye.parser.Node?
 			local name, field = readTypeSubject(parsed, callIdx)
+			---@cast name string?
+			---@cast field string?
 			if name and literal and literal.kind == "string" and literal.value then
 				-- `"f"` is not something `type` can return, so it proves nothing about the value.
 				local runtime = literal.value
+				---@cast runtime string
 				if not TYPE_NAMES[runtime] then return nil end
 				-- A cdata is not the bare name `cdata`: lye defines it as the `ffi.cdata*` class, which
 				-- is what a value known to be a cdata has to be handed as.
@@ -151,10 +163,14 @@ local function readCondition(parsed, idx, invert, signatures, resolve)
 		-- `any` is left alone, because nothing can prove what it is.
 		for _, pair in ipairs({ { node.left, right }, { node.right, left } }) do
 			local subjectIdx, literal = pair[1], pair[2]
+			---@cast subjectIdx integer?
+			---@cast literal lye.parser.Node?
 			if subjectIdx and literal and not oneFieldOn(parsed, subjectIdx)
 				and (literal.kind == "string" or literal.kind == "number"
 					or (literal.kind == "literal" and (literal.text == "true" or literal.text == "false"))) then
 				local name, field = readSubject(parsed, subjectIdx)
+				---@cast name string?
+				---@cast field string?
 				local source = parsed.source
 				local text = source and literal.start and source:sub(literal.start, literal.stop) or nil
 				local written = text and types.parse(text)
@@ -173,9 +189,13 @@ local function readCondition(parsed, idx, invert, signatures, resolve)
 		-- and what that rules out is every member that cannot hold the value.
 		for _, pair in ipairs({ { node.left, right }, { node.right, left } }) do
 			local subjectIdx, literal = pair[1], pair[2]
+			---@cast subjectIdx integer?
+			---@cast literal lye.parser.Node?
 			if literal and subjectIdx and (literal.kind == "string" or literal.kind == "number")
 				and oneFieldOn(parsed, subjectIdx) then
 				local name, field = readSubject(parsed, subjectIdx)
+				---@cast name string?
+				---@cast field string?
 				local source = parsed.source
 				local text = source and literal.start and source:sub(literal.start, literal.stop) or nil
 				local written = text and types.parse(text)
@@ -196,6 +216,7 @@ end
 ---@param invert boolean the assertions hold where the condition is false
 ---@param signatures table<string, lye.analyzer.Signature>
 ---@param resolve fun(text: string): lye.doc.Type?
+---@return lye.analyzer.Condition[]
 local function readConditions(parsed, conditionIdx, invert, signatures, resolve)
 	local node = conditionIdx and parsed.nodes[conditionIdx]
 	if not node then return {} end
@@ -252,10 +273,12 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 	-- `local t = type(value)` gives `t` the answer a later `t == "number"` tests. The branch is
 	-- about `value`, so a condition on the alias is retargeted to the value it describes; this is
 	-- how `type` narrows through a named local, which is the shape most writers use.
+	---@type table<string, { at: integer, name: string?, field: string? }[]>
 	local typeAliases = {}
 	---@param name string
 	---@param at integer
 	local function forgetAlias(name, at)
+		---@type { at: integer, name: string?, field: string? }[]?
 		local list = typeAliases[name]
 		if list then list[#list + 1] = { at = at } end
 	end
@@ -264,7 +287,10 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 	---@param at integer
 	local function rememberAlias(name, argIdx, at)
 		local subject, field = readSubject(parsed, argIdx)
+		---@cast subject string?
+		---@cast field string?
 		if not subject then return end
+		---@type { at: integer, name: string?, field: string? }[]?
 		local list = typeAliases[name]
 		if not list then
 			list = {}
@@ -272,24 +298,31 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 		end
 		list[#list + 1] = { at = at, name = subject, field = field }
 	end
+	---@param value lye.parser.Node?
 	local function valueIsTypeCall(value)
-		return value and value.kind == "call" and value.callee == "type"
-			and value.args and value.args[1]
+		if value and value.kind == "call" and value.callee == "type" and value.args then
+			return value.args[1]
+		end
+		return nil
 	end
 	for _, declaration in ipairs(parsed.declarations) do
 		local value = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
-		if valueIsTypeCall(value) then
-			rememberAlias(declaration.name, value.args[1], declaration.start)
+		local argIdx = valueIsTypeCall(value)
+		if argIdx then
+			rememberAlias(declaration.name, argIdx, declaration.start)
 		else
 			forgetAlias(declaration.name, declaration.start)
 		end
 	end
-	for _, node in ipairs(parsed.byKind and parsed.byKind.assignment or {}) do
-		local value = node.value and parsed.nodes[node.value]
+	---@type lye.parser.Node[]
+	local assignments = nodesOf(parsed, "assignment")
+	for _, node in ipairs(assignments) do
+		local value = node.valueIdx and parsed.nodes[node.valueIdx]
 		local name = writtenNameOf(parsed, node.target)
 		if name then
-			if valueIsTypeCall(value) then
-				rememberAlias(name, value.args[1], node.start)
+			local argIdx = valueIsTypeCall(value)
+			if argIdx then
+				rememberAlias(name, argIdx, node.start)
 			else
 				forgetAlias(name, node.start)
 			end
@@ -297,7 +330,7 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 	end
 	---@param name string
 	---@param at integer
-	---@return { name: string, field: string? }?
+	---@return { at: integer, name: string?, field: string? }?
 	local function aliasAt(name, at)
 		local list = typeAliases[name]
 		local chosen
@@ -315,6 +348,7 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 	-- a fact said — which is what makes `if type.isFn(t) then t.fields` readable across the call.
 	---@type table<string, boolean>
 	local pure = {}
+	---@param declaration lye.parser.Declaration
 	local function bodyOf(declaration)
 		local node = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
 		if not node then return nil end
@@ -325,10 +359,14 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 		end
 		return node.kind == "function" and node or nil
 	end
+	---@type table<string, lye.parser.Node>
 	local declaredFunctions = {}
 	for _, declaration in ipairs(parsed.declarations) do
 		local body = declaration.isFunction and bodyOf(declaration)
-		if declaration.name and body then declaredFunctions[declaration.name] = body end
+		if declaration.name and body then
+			---@cast body lye.parser.Node
+			declaredFunctions[declaration.name] = body
+		end
 	end
 
 	-- A body holds the bodies declared inside it, so a statement marks every function it is written
@@ -338,6 +376,7 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 	---@type table<lye.parser.Node, lye.analyzer.BodySpan>
 	local bodySpans = {}
 	for name, body in pairs(declaredFunctions) do
+		---@type lye.analyzer.BodySpan?
 		local span = bodySpans[body]
 		if not span then
 			span = { start = body.start, stop = body.stop, names = {}, calls = {}, writes = false, pure = true }
@@ -475,6 +514,9 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 	---@param until_ integer
 	---@param name string
 	---@param field string?
+	---@return integer? start
+	---@return integer? stop
+	---@return string? kind
 	local function firstDisturbance(from, until_, name, field)
 		local low, high, best = 1, #interfering, nil
 		while low <= high do
@@ -494,12 +536,16 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 			-- others. Being handed a *field* only disturbs a fact about that same field.
 			local hit = node.name == name
 				and (node.kind == "write" or not node.field or node.field == field)
-			if hit then return node.start, node.stop end
+			if hit then return node.start, node.stop, node.kind end
 			best = best + 1
 		end
 		return nil
 	end
 
+	---@param condition lye.analyzer.Condition
+	---@param record lye.parser.Scope
+	---@param from integer?
+	---@param until_ integer?
 	local function add(condition, record, from, until_)
 		local start = from or record.start
 		-- A condition on a `t = type(value)` alias is a condition on `value`.
@@ -535,10 +581,16 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 		-- written *inside* that call is evaluated before the call runs, and `ipairs(shape.params)`
 		-- is the very read the fact was gathered for. Cutting the span here and remembering the
 		-- disturbance is the whole of the invalidation.
-		local disturbance, disturbanceStop
+		local disturbance, disturbanceStop, disturbanceKind
 		if condition.field then
-			disturbance, disturbanceStop = firstDisturbance(start, stop, condition.name, condition.field)
-			if disturbance then stop = disturbance - 1 end
+			disturbance, disturbanceStop, disturbanceKind = firstDisturbance(start, stop, condition.name, condition.field)
+			if disturbance then
+				-- An assignment evaluates its value before it writes. A fact on `current.parent`
+				-- still holds while `current = current.parent` reads the right-hand side; cutting
+				-- at the assignment's start made the recursive scope walk lose its narrowed type.
+				-- A call is different: its body may already have changed the object.
+				stop = disturbanceKind == "write" and (disturbanceStop or disturbance) or (disturbance - 1)
+			end
 		end
 		list[#list + 1] = {
 			name = condition.name, field = condition.field, kind = condition.kind,
@@ -629,8 +681,9 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 		local last = statements[high]
 		if not last or last.start < scope.start then return true end
 		if last.kind == "return" or last.kind == "break" then return false end
-		if last.kind == "call" and declaresNever(last.callee and signatures[last.callee]) then
-			return false
+		if last.kind == "call" then
+			local called = callName(parsed, last) or last.callee
+			if called and declaresNever(signatures[called]) then return false end
 		end
 		return true
 	end
@@ -693,6 +746,7 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 		if node.kind == "if" then
 			-- Each branch also knows every earlier condition is false, which is what narrows
 			-- `elseif` and `else` bodies.
+			---@type integer[]
 			local knownIdxs = {}
 			for _, scope in ipairs(clausesOf(node)) do
 				for _, knownIdx in ipairs(knownIdxs) do
@@ -713,7 +767,11 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 						add(condition, enclosing, node.stop)
 					end
 				end
-				if scope.conditionIdx then knownIdxs[#knownIdxs + 1] = scope.conditionIdx end
+				local conditionIdx = scope.conditionIdx
+				if conditionIdx then
+					---@cast conditionIdx integer
+					knownIdxs[#knownIdxs + 1] = conditionIdx
+				end
 			end
 		elseif node.kind == "while" or node.kind == "repeat" then
 			local scope = guardedScope(node)

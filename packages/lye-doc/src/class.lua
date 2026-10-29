@@ -164,8 +164,10 @@ local function readField(annotation, fallback)
 		visibility = inline
 		local rest = typeText
 		local realName, remaining = rest:match("^([%w_%.]+)(.*)$")
-		if not realName then return nil end
+		if type(realName) ~= "string" or type(remaining) ~= "string" then return nil end
 		name, typeText = realName, (remaining:gsub("^%s+", ""))
+		---@cast name string
+		---@cast typeText string
 		-- `---@field private data table<K, V>` carries the rest in the tag's text, which is where
 		-- the doc reader keeps a field's type when it stopped at the first word.
 		if typeText == "" then
@@ -233,7 +235,7 @@ function classes.resolve(namespace, text)
 
 	-- A name written without arguments — `Vec` rather than `Vec<number>` — has none to split:
 	-- `splitGeneric` gives nil, and splitting that raised on every class read without parameters.
-	return found, argsText ? classes.splitList(argsText) : {}
+	return found, argsText and classes.splitList(argsText) or {}
 end
 
 --- The fields a class has, its parents' included. A parameter is substituted with the argument
@@ -266,8 +268,6 @@ function classes.fieldsOf(namespace, text)
 	collect(found, args)
 	return fields
 end
-
-local x, y, z = string.match("foo", "%d+(%d+)")
 
 --- A function that turns written type text into a type, resolving class names and aliases.
 --- Class fields are resolved once, here, so the type system never has to know about annotations.
@@ -307,8 +307,11 @@ function classes.resolver(namespace, elsewhere)
 			-- extending itself through a parent — finds the type being built rather than an
 			-- unresolved name, and the cycle ends because there is nothing left to build.
 			local classType = types.classType(found.name, argTypes)
+			classType.visibility = classType.visibility or {}
 			built[text] = classType
 			for name, field in pairs(classes.fieldsOf(namespace, text)) do
+				---@cast name string
+				---@cast field lye.doc.Field
 				local held = types.parse(field.type, resolve) or types.UNKNOWN_TYPE
 				-- A field a value may leave out is nil as well as what it says, which is what the
 				-- `?` means: reading it gives the type or nil.
@@ -328,6 +331,7 @@ function classes.resolver(namespace, elsewhere)
 			-- `function Box:get() return self.value end` hands back `T`, and which `T` is what the
 			-- arguments of the class say. Each method is one type shared by every instance, so the
 			-- substitution makes a fresh callable rather than rewriting it.
+			---@type table<string, lye.doc.Type>?
 			local methodBindings
 			if #found.params > 0 then
 				methodBindings = {}
@@ -341,20 +345,26 @@ function classes.resolver(namespace, elsewhere)
 				-- `---@generic T` on `Box.new` has a constructor variable of its own, and binding
 				-- it to the class's argument would make every call return the box the class table
 				-- happens to be written under rather than the one the caller is building.
-				if bindings and types.isFn(field) and field.generics then
-					local shadowed
-					for param in pairs(field.generics) do
-						if bindings[param] then
-							shadowed = shadowed or {}
-							shadowed[param] = true
+				if bindings and field.variant == "fn" then
+					---@type table<string, boolean>?
+					local generics = field.generics
+					if generics then
+						---@type table<string, boolean>?
+						local shadowed
+						for param in pairs(generics) do
+							if bindings[param] then
+								shadowed = shadowed or {}
+								shadowed[param] = true
+							end
 						end
-					end
-					if shadowed then
-						local kept = {}
-						for param, held in pairs(bindings) do
-							if not shadowed[param] then kept[param] = held end
+						if shadowed then
+							---@type table<string, lye.doc.Type>
+							local kept = {}
+							for param, held in pairs(bindings) do
+								if not shadowed[param] then kept[param] = held end
+							end
+							bindings = kept
 						end
-						bindings = kept
 					end
 				end
 				classType.fields[name] = bindings

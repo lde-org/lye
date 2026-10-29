@@ -29,13 +29,67 @@
 	syntax error as about `language.lua`.
 ]]
 
-local bit = require("bit")
-local fs = require("fs")
-local json = require("lye-json")
-local lexer = require("lye-lexer")
-local parser = require("lye-parser")
-local analyzer = require("lye-analyzer")
-local serial = require("lye-doc.serial")
+--- One edit the oracle applies, and what the comparison keeps about it.
+---@class lye.IncrementalEdit
+---@field category string
+---@field start integer
+---@field delete integer
+---@field text string
+---@field from integer? the byte a parser would resume at
+---@field source string? the text after the edit
+---@field resume string? what `resumeAt` answered, rendered
+---@field history lye.IncrementalEdit[]?
+
+---@class lye.IncrementalEntry
+---@field name string
+---@field text string
+---@field uri string
+
+---@class lye.IncrementalStep
+---@field text string
+---@field edit lye.IncrementalEdit
+---@field cold table<string, table>?
+---@field ids table[]?
+
+-- The packages through root `lye.json`, which the checker does not follow.
+---@class lye.IncrementalLexer
+---@field KIND table<string, integer>
+---@field tokenize fun(source: string): lye.lexer.Tokens
+
+---@class lye.IncrementalParsed
+---@field parse fun(self: lye.IncrementalParsed): lye.parser.Result
+
+---@class lye.IncrementalParser
+---@field new fun(source: string, resume?: lye.parser.Resume): lye.IncrementalParsed
+---@field resumeAt fun(parsed: lye.parser.Result, from: integer): lye.parser.Resume?
+
+---@class lye.IncrementalAnalyzer
+---@field prelude fun(sources: table<string, string>): lye.analyzer.Prelude
+---@field analyze fun(source: string, prepared?: lye.analyzer.Prelude, elsewhere?: table<string, boolean|lye.doc.Type>?, modules?: table?, resume?: lye.parser.Resume?, cachedAnnotations?: lye.doc.File?, isModuleOnly?: boolean, isDefinition?: boolean, plugins?: lye.plugin.Spec[]?, report?: fun(message: string)?, options?: lye.analyzer.Options?): lye.analyzer.Result
+
+---@class lye.IncrementalSerial
+---@field write fun(value: unknown): string?
+---@field read fun(bytes: string): unknown?
+
+---@class lye.IncrementalFs
+---@field scan fun(dir: string, pattern: string?, options: { absolute: boolean?, ignore: fun(name: string): boolean? }?): fun(): string
+
+---@class lye.IncrementalJson
+---@field encode fun(value: unknown): string
+---@field decode fun(bytes: string): unknown?
+
+---@class lye.IncrementalBit
+---@field bxor fun(a: integer, b: integer): integer
+---@field lshift fun(a: integer, b: integer): integer
+---@field rshift fun(a: integer, b: integer): integer
+
+local bit = require("bit") --[[@as lye.IncrementalBit]]
+local fs = require("fs") --[[@as lye.IncrementalFs]]
+local json = require("lye-json") --[[@as lye.IncrementalJson]]
+local lexer = require("lye-lexer") --[[@as lye.IncrementalLexer]]
+local parser = require("lye-parser") --[[@as lye.IncrementalParser]]
+local analyzer = require("lye-analyzer") --[[@as lye.IncrementalAnalyzer]]
+local serial = require("lye-doc.serial") --[[@as lye.IncrementalSerial]]
 
 local SCRIPT = assert(debug.getinfo(1, "S").source:sub(2))
 local TOOLS = assert(SCRIPT:match("^(.*)/[^/]+$"))
@@ -66,7 +120,6 @@ local INCREMENTAL = os.getenv("LYE_INCREMENTAL") ~= "0"
 --- xorshift32, so a run of this file with the same seed edits the same bytes in the same order.
 local state = SEED % 0xffffffff
 if state == 0 then state = 1 end
----@return integer
 local function next()
 	state = bit.bxor(state, bit.lshift(state, 13))
 	state = bit.bxor(state, bit.rshift(state, 17))
@@ -74,14 +127,13 @@ local function next()
 	return state
 end
 ---@param count integer
----@return integer
 local function pick(count)
 	if count <= 1 then return 1 end
-	return next() % count + 1
+	local drawn = next() --[[@as integer]]
+	return drawn % count + 1
 end
 
 ---@param path string
----@return string?
 local function read(path)
 	local handle = io.open(path, "rb")
 	if not handle then return nil end
@@ -91,7 +143,6 @@ local function read(path)
 end
 
 ---@param path string
----@return boolean
 local function exists(path)
 	local handle = io.open(path, "rb")
 	if handle then handle:close() end
@@ -126,7 +177,6 @@ local MALFORMED = {
 }
 
 --- The corpus, each entry carrying its text so an edit can be replayed without the disk.
----@return table<integer, { name: string, text: string, uri: string }>
 local function corpus()
 	local entries = {}
 	---@param name string
@@ -147,9 +197,9 @@ local function corpus()
 		if text then add(path:sub(#ROOT + 2), text, "file://" .. path) end
 	end
 
-	local fixture = ROOT .. "/editors/vscode/tests/fixtures/benchmark-lde.lua"
+	local fixture = ROOT .. "/editors/vscode/tests/fixtures/benchmark-lde.lua.txt"
 	local fixtureText = read(fixture)
-	if fixtureText then add("editors/vscode/tests/fixtures/benchmark-lde.lua", fixtureText, "file://" .. fixture) end
+	if fixtureText then add("editors/vscode/tests/fixtures/benchmark-lde.lua.txt", fixtureText, "file://" .. fixture) end
 
 	-- The definitions the analyzer is handed: the built file when the package has one, otherwise
 	-- the meta sources the build would have combined (they are already in the packages walk).
@@ -184,7 +234,6 @@ local function dumpParse(parsed)
 	--- A field of a node: a scalar as itself, a list of indices or names as its entries, so a call's
 	--- arguments are compared too.
 	---@param value unknown
-	---@return string
 	local function scalarOf(value)
 		if type(value) ~= "table" then return tostring(value) end
 		local items = {}
@@ -197,6 +246,7 @@ local function dumpParse(parsed)
 	for index, node in ipairs(parsed.nodes) do
 		local scalars = {}
 		for key, value in pairs(node) do
+			---@cast key string
 			if key ~= "parent" and key ~= "children" and key ~= "params" then
 				scalars[#scalars + 1] = key .. "=" .. scalarOf(value)
 			end
@@ -227,7 +277,6 @@ local function dumpParse(parsed)
 			tostring(scope.depth), tostring(scope.branch), tostring(scope.conditionIdx))
 	end
 	---@param map table
-	---@return string
 	local function keyed(map)
 		local keys = {}
 		for key in pairs(map or {}) do keys[#keys + 1] = key end
@@ -237,7 +286,10 @@ local function dumpParse(parsed)
 			local value = map[key]
 			if type(value) == "table" then
 				local inner = {}
-				for name in pairs(value) do inner[#inner + 1] = name end
+				for name in pairs(value) do
+					---@cast name string
+					inner[#inner + 1] = name
+				end
 				table.sort(inner)
 				local fields = {}
 				for _, name in ipairs(inner) do fields[#fields + 1] = name .. "=" .. tostring(value[name]) end
@@ -264,8 +316,7 @@ end
 
 --- Diagnostics are compared without their order: the same finding in the same place is the same
 --- finding whether a resumed pass met it before or after another.
----@param diagnostics table[]
----@return string
+---@param diagnostics lye.analyzer.Diagnostic[]
 local function dumpDiagnostics(diagnostics)
 	local out = {}
 	for _, entry in ipairs(diagnostics or {}) do
@@ -278,10 +329,11 @@ end
 
 --- A type as bytes: what a module cache would persist, so a warm result has to produce the same.
 ---@param value unknown
----@return string
 local function dumpType(value)
 	if value == nil then return "nil" end
 	local ok, bytes = pcall(serial.write, value)
+	---@cast ok boolean
+	---@cast bytes string?
 	if not ok then return "error: " .. tostring(bytes) end
 	return bytes or "nil"
 end
@@ -289,7 +341,6 @@ end
 --- The first lines two dumps differ on, which is what a failure file is for.
 ---@param expected string
 ---@param actual string
----@return string
 local function difference(expected, actual)
 	local left, right = {}, {}
 	for line in (expected .. "\n"):gmatch("([^\n]*)\n") do left[#left + 1] = line end
@@ -309,9 +360,9 @@ local failures = 0
 local failureIndex = 0
 
 ---@param kind string
----@param entry { name: string, text: string, uri: string }
+---@param entry lye.IncrementalEntry
 ---@param step integer
----@param edit { category: string, start: integer, delete: integer, text: string, from: integer }
+---@param edit lye.IncrementalEdit
 ---@param expected string
 ---@param actual string
 local function fail(kind, entry, step, edit, expected, actual)
@@ -320,6 +371,8 @@ local function fail(kind, entry, step, edit, expected, actual)
 	local slug = entry.name:gsub("[^%w]+", "-"):sub(1, 48)
 	local dir = string.format("%s/%03d-%s-%s", FAILURES, failureIndex, kind, slug)
 	os.execute("mkdir -p " .. string.format("%q", dir))
+	---@param name string
+	---@param text string
 	local function write(name, text)
 		local handle = assert(io.open(dir .. "/" .. name, "wb"))
 		handle:write(text)
@@ -371,12 +424,11 @@ end
 ---@param parsed lye.parser.Result
 ---@param text string
 ---@param action integer 1 insert, 2 delete, 3 replace
----@return { category: string, start: integer, delete: integer, text: string }?
 local function choose(category, parsed, text, action)
 	---@param start integer
 	---@param delete integer
 	---@param inserted string
-	---@return { category: string, start: integer, delete: integer, text: string }
+	---@return lye.IncrementalEdit
 	local function edit(start, delete, inserted)
 		return { category = category, start = start, delete = delete, text = inserted }
 	end
@@ -467,8 +519,7 @@ end
 
 --- Apply an edit at a byte span, 1-based and inclusive.
 ---@param text string
----@param edit { start: integer, delete: integer, text: string }
----@return string
+---@param edit lye.IncrementalEdit
 local function apply(text, edit)
 	return text:sub(1, edit.start - 1) .. edit.text .. text:sub(edit.start + edit.delete)
 end
@@ -477,11 +528,10 @@ end
 --- non-ASCII line is a client detail this oracle does not need to reproduce.
 ---@param text string
 ---@param offset integer
----@return { line: integer, character: integer }?
 local function positionOf(text, offset)
 	local before = text:sub(1, offset - 1)
 	local _, newlines = before:gsub("\n", "\n")
-	local lineStart = before:match(".*()\n") or 0
+	local lineStart = before:match(".*()\n") --[[@as integer?]] or 0
 	local lineText = text:sub(lineStart + 1, (text:find("\n", lineStart + 1, true) or #text + 1) - 1)
 	if lineText:find("[\128-\255]") then return nil end
 	return { line = newlines, character = offset - 1 - lineStart }
@@ -490,14 +540,13 @@ end
 --- Sampled identifier positions, spread over the file, for hover and definition.
 ---@param text string
 ---@param limit integer
----@return table<integer, { line: integer, character: integer }>
 local function probePositions(text, limit)
 	local tokens = lexer.tokenize(text)
 	local found = {}
 	for index = 1, tokens.count do
 		local token = tokens.arena[index]
 		if token.kind == lexer.KIND.name and token.stop > token.start then
-			local position = positionOf(text, token.start)
+			local position = positionOf(text, token.start) --[[@as { line: integer, character: integer }?]]
 			if position then found[#found + 1] = position end
 		end
 	end
@@ -510,7 +559,6 @@ local function probePositions(text, limit)
 end
 
 ---@param value table
----@return string
 local function frame(value)
 	local body = json.encode(value)
 	return "Content-Length: " .. #body .. "\r\n\r\n" .. body
@@ -520,7 +568,7 @@ end
 --- back by id. A server that crashes yields whatever it wrote, and the comparison reports it.
 ---@param frames string[]
 ---@param cache string
----@return table<string, any>
+---@return table<string, table>
 ---@return string
 local function session(frames, cache)
 	local handle = assert(io.open(INPUT, "wb"))
@@ -540,6 +588,8 @@ local function session(frames, cache)
 		local length = tonumber(output:sub(at, stop - 4):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
 		if not length then break end
 		local ok, message = pcall(json.decode, output:sub(stop + 1, stop + length))
+		---@cast ok boolean
+		---@cast message table?
 		if ok and type(message) == "table" and message.id ~= nil then
 			byId[tostring(message.id)] = message
 		end
@@ -550,7 +600,6 @@ end
 
 --- A deterministic rendering of a response, so two sessions that said the same thing compare equal.
 ---@param value unknown
----@return string
 local function canonical(value)
 	local kind = type(value)
 	if kind ~= "table" then return kind .. ":" .. tostring(value) end
@@ -600,8 +649,8 @@ local lspChecks, lspMismatches, lspSkipped = 0, 0, nil
 
 --- One cold session per sampled step and one warm session for the sequence; the answers have to
 --- agree. A mismatch is reported through the same failure directory as the other paths.
----@param entry { name: string, text: string, uri: string }
----@param steps { text: string, edit: table }[]
+---@param entry lye.IncrementalEntry
+---@param steps lye.IncrementalStep[]
 ---@param sampled integer[]
 ---@param cache string
 local function lspCase(entry, steps, sampled, cache)
@@ -645,7 +694,9 @@ local function lspCase(entry, steps, sampled, cache)
 
 	for _, step in ipairs(sampled) do
 		local cold = steps[step].cold
-		for _, request in ipairs(steps[step].ids) do
+		---@type table[]
+		local ids = steps[step].ids or {}
+		for _, request in ipairs(ids) do
 			local key = tostring(request.id)
 			local expected = canonical(cold[key] and cold[key].result)
 			local actual = canonical(warm[key] and warm[key].result)
@@ -655,7 +706,7 @@ local function lspCase(entry, steps, sampled, cache)
 				local history = {}
 				for index = 1, step do history[#history + 1] = steps[index].edit end
 				fail("lsp", entry, step, {
-					category = "lsp", from = 0, delete = 0, text = "", resume = nil,
+					category = "lsp", start = 0, from = 0, delete = 0, text = "", resume = nil,
 					source = steps[step].text, history = history,
 				}, expected, actual)
 			end
@@ -664,8 +715,8 @@ local function lspCase(entry, steps, sampled, cache)
 end
 
 --- Run the LSP sample: the benchmark fixture and one tool, touched at a couple of steps.
----@param entries table[]
----@param sequences table<string, { text: string, edit: table }[]>
+---@param entries lye.IncrementalEntry[]
+---@param sequences table<string, lye.IncrementalStep[]>
 local function lsp(entries, sequences)
 	if not LSP then
 		lspSkipped = "LSP=0"
@@ -704,8 +755,9 @@ local function lsp(entries, sequences)
 	end
 end
 
-local PRELUDE = analyzer.prelude(require("lye-defs"))
+local PRELUDE = analyzer.prelude(require("lye-defs") --[[@as table<string, string>]])
 local entries = corpus()
+---@type table<string, lye.IncrementalStep[]>
 local sequences = {}
 local checks, resumedParser, resumedAnalyzer = 0, 0, 0
 local analyzerSkipped = nil
@@ -717,8 +769,12 @@ os.execute("mkdir -p " .. string.format("%q", FAILURES))
 local startedAt = os.clock()
 for fileIndex, entry in ipairs(entries) do
 	local text = entry.text
-	local steps, history = {}, {}
+	---@type lye.IncrementalStep[]
+	local steps = {}
+	---@type lye.IncrementalEdit[]
+	local history = {}
 	-- The result the text held before the next edit, which is what A3.3 reads as `previous`.
+	---@type lye.analyzer.Result?
 	local previousAnalysis
 
 	for step = 1, STEPS do
@@ -726,6 +782,7 @@ for fileIndex, entry in ipairs(entries) do
 		-- The tree of the text as it stands, which is where an edit inside a string, a function or
 		-- a statement is found.
 		local before = parser.new(text):parse()
+		---@type lye.IncrementalEdit?
 		local edit
 		for offset = 0, #categories - 1 do
 			local category = categories[(fileIndex + step + offset - 1) % #categories + 1]
@@ -737,6 +794,7 @@ for fileIndex, entry in ipairs(entries) do
 			edit = nil
 		end
 		if not edit then break end
+		---@cast edit lye.IncrementalEdit
 
 		local edited = apply(text, edit)
 		edit.from = edit.start

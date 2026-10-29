@@ -18,6 +18,7 @@ usage: lye [options] [files...]
   --stdio          the same, and what editors pass
   init [dir]       write a lye.json there, or in the working directory, if there is not one already
   check [paths...] check every Lua file under the paths, or the working directory
+  extensions [dir] print the file extensions the workspace's plugins claim
   --check <file>   the same for the files named, kept for scripts that pass it
   --cache <dir>    keep what a run worked out there, instead of ./.lye
   --cold           check everything again, keeping nothing (as LYE_CACHE=off does)
@@ -55,6 +56,13 @@ local index = 1
 if args[1] == "check" then
 	isCheck = true
 	index = 2
+elseif args[1] == "extensions" then
+	-- A language client needs the extensions before it can attach to a `.moon` or `.toy` buffer;
+	-- print them one per line so a shell, an editor script or a health check can read them.
+	local dir = args[2] or "."
+	local extensions = check.extensions(dir)
+	for _, extension in ipairs(extensions) do print(extension) end
+	return
 elseif args[1] == "init" then
 	-- A workspace says what it wants in a file beside it, and the file has a shape worth getting
 	-- right: this writes it, and never over one that is already there — a configuration is
@@ -77,8 +85,22 @@ elseif args[1] == "init" then
 	end
 	write:write(STARTER)
 	write:close()
+	-- A check writes `.lye/` beside the project; a generated cache directory should not appear
+	-- as untracked work after the first run.
+	local ignorePath = dir .. "/.gitignore"
+	local ignore = io.open(ignorePath, "rb")
+	local ignored = ignore and ignore:read("*a") or ""
+	if ignore then ignore:close() end
+	if not ignored:match("(^|\n)%.lye/?%s*(\n|$)") then
+		local append = io.open(ignorePath, "ab")
+		if append then
+			if ignored ~= "" and ignored:sub(-1) ~= "\n" then append:write("\n") end
+			append:write(".lye/\n")
+			append:close()
+		end
+	end
 	print(string.format("wrote %s: `plugins` is a list of the plugins this workspace reads with, "
-		.. "and `requirePaths` where its modules are", path))
+		.. "`requirePaths` where its modules are, and `.lye/` to .gitignore", path))
 	return
 end
 while args[index] do

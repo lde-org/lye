@@ -23,7 +23,6 @@ local INITIALIZE = {
 }
 
 ---@param value any
----@return string
 local function frame(value)
 	local body = json.encode(value)
 	return "Content-Length: " .. #body .. "\r\n\r\n" .. body

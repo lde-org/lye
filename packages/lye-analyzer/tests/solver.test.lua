@@ -28,7 +28,6 @@ local PRELUDE = lye.prelude({
 })
 
 ---@param source string
----@return lye.analyzer.Result
 local function analyze(source)
 	local result = lye.analyze(source, PRELUDE, nil, nil, nil, nil, nil, nil, nil, nil, { uri = URI })
 	local kept = {}
@@ -47,6 +46,7 @@ end
 ---@param name string
 ---@return string? type
 local function typeOf(result, name)
+	---@type lye.analyzer.Variable?
 	local found
 	for _, variable in ipairs(result.variables) do
 		if variable.name == name then found = variable end
@@ -55,7 +55,6 @@ local function typeOf(result, name)
 end
 
 ---@param result lye.analyzer.Result
----@return string
 local function messages(result)
 	local list = {}
 	for _, entry in ipairs(result.diagnostics) do list[#list + 1] = entry.message end
@@ -498,4 +497,117 @@ local function f(value, takeString)
 end
 ]])
 	test.truthy(messages(result):match("takeString expects string, got any"), messages(result))
+end)
+
+test.it("keeps a recursive parent walk narrowed and narrows class discriminated unions", function()
+	local result = analyze([[
+---@class Parent
+---@field parent Parent|nil
+
+---@param scope Parent
+---@return Parent
+local function root(scope)
+	local current = scope
+	while current.parent ~= nil do
+		current = current.parent
+	end
+	return current
+end
+
+---@class CA
+---@field kind "ca"
+---@class CB
+---@field kind "cb"
+---@alias CU CA|CB
+
+---@param c CA
+local function takesA(c) end
+
+---@param u CU
+local function use(u)
+	if u.kind == "ca" then
+		takesA(u)
+	elseif u.kind == "cb" then
+		---@cast u CB
+		local c = u
+	end
+end
+return root, use
+]])
+	test.equal(#result.diagnostics, 0, messages(result))
+end)
+
+test.it("treats a module function returning never as terminating flow", function()
+	local result = analyze([[
+local M = {}
+---@param message string
+---@return never
+function M.raise(message) error(message, 0) end
+
+---@param s string|nil
+---@return string
+local function takesString(s)
+	if s == nil then M.raise("missing") end
+	return s:upper()
+end
+return takesString
+]])
+	test.equal(#result.diagnostics, 0, messages(result))
+end)
+
+test.it("reports missing class fields and honours casts on pcall errors", function()
+	local result = analyze([[
+---@class Out
+---@field lines string[]
+
+---@param o Out
+local function read(o) return o.missing end
+---@param o Out
+local function call(o) return o.missing() end
+
+---@class MyErr
+---@field message string
+---@return string
+local function unpackError()
+	local ok, err = pcall(function() error("boom") end)
+	if not ok then
+		---@cast err MyErr
+		return err.message
+	end
+	return "ok"
+end
+return read, call, unpackError
+]])
+	local message = messages(result)
+	test.truthy(message:find("`missing` is not a field of Out", 1, true), message)
+	local count = 0
+	for _ in message:gmatch("`missing` is not a field of Out") do count += 1 end
+	test.equal(count, 2, message)
+	test.falsy(message:find("cannot index a value of unknown type", 1, true), message)
+end)
+
+test.it("contextually types function fields in an annotated table", function()
+	local result = analyze([[
+---@class Def
+---@field impl fun(x: string): string
+
+---@param s string
+---@return string
+local function wants(s) return s end
+
+---@type Def
+local def = { impl = function(x) return wants(x) end }
+return def
+]])
+	test.equal(#result.diagnostics, 0, messages(result))
+end)
+
+test.it("does not emit redundant return hints by default", function()
+	local result = analyze([[
+---@param n number
+---@return number
+local function addOne(n) return n + 1 end
+return addOne
+]])
+	test.equal(#result.diagnostics, 0, messages(result))
 end)

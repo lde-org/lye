@@ -32,7 +32,7 @@ do
 		pcall(ffi.cdef, "int getpid(void);")
 		return tonumber(ffi.C.getpid())
 	end)
-	RUN_TAG = (ok and value and tostring(value) or tostring({}):match("0x(%x+)") or "0")
+	RUN_TAG = tostring(ok and value and tostring(value) or tostring({}):match("0x(%x+)") or "0")
 		.. "-" .. tostring(os.time()) .. "-" .. tostring(math.random(1, 1e9))
 end
 
@@ -45,7 +45,6 @@ if os.execute("command -v flock >/dev/null 2>&1") == 0 then
 end
 
 ---@param value any
----@return string
 local function frame(value)
 	local body = json.encode(value)
 	return "Content-Length: " .. #body .. "\r\n\r\n" .. body
@@ -68,7 +67,6 @@ local function response(frames, id)
 	end
 end
 
----@param frames table[]
 ---@return table[]
 local function parseFrames(output)
 	local frames, at = {}, 1
@@ -139,7 +137,6 @@ end
 --- A stable rendering of a decoded answer, so two sessions are compared by what they said rather
 --- than by the order Lua happened to iterate a table in.
 ---@param value any
----@return string
 local function canonical(value)
 	local kind = type(value)
 	if kind == "table" then
@@ -230,7 +227,6 @@ local function tokens()
 end
 
 ---@param messages table[]
----@return table[]
 local function endingWithShutdown(messages)
 	messages[#messages + 1] = { jsonrpc = "2.0", id = 2, method = "shutdown" }
 	messages[#messages + 1] = { jsonrpc = "2.0", method = "exit" }

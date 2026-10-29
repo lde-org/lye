@@ -11,7 +11,6 @@ local URI = "file:///tmp/reuse.lua"
 
 ---@param source string
 ---@param options table?
----@return lye.analyzer.Result
 local function analyze(source, options)
 	local opts = options or {}
 	opts.incremental = opts.incremental
@@ -21,10 +20,11 @@ local function analyze(source, options)
 end
 
 ---@param result lye.analyzer.Result
----@return string
 local function signatures(result)
 	local list = {}
 	for name, signature in pairs(result.signatures) do
+		---@cast name string
+		---@cast signature lye.analyzer.Signature
 		local inferred = signature.inferred and tostring(signature.inferred.variant) or "-"
 		list[#list + 1] = name .. ":" .. inferred
 	end
@@ -33,7 +33,6 @@ local function signatures(result)
 end
 
 ---@param result lye.analyzer.Result
----@return string
 local function diagnostics(result)
 	local list = {}
 	for _, entry in ipairs(result.diagnostics) do
@@ -44,7 +43,7 @@ local function diagnostics(result)
 	return table.concat(list, "\n")
 end
 
----@param map table<string, boolean>
+---@param map table<string, unknown>
 ---@return integer
 local function count(map)
 	local n = 0
@@ -336,7 +335,7 @@ test.it("gives the cold answer when a deletion makes the file malformed", functi
 		.. "t.add, t.call = add, call\n"
 		.. "return t\n"
 	local base = analyze(source)
-	local at = source:find("add(x, 1)", 1, true)
+	local at = assert(source:find("add(x, 1)", 1, true))
 	local edited = source:sub(1, at - 2) .. source:sub(at) -- break the identifier
 	local cold = analyze(edited, { incremental = false })
 	local default = analyze(edited, { previous = base, from = at })

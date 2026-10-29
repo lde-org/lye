@@ -26,7 +26,6 @@ end
 --- A command with a cache of the test's own: a test that must start cold says where it starts.
 ---@param cacheDir string?
 ---@param command string
----@return string output
 local function runWith(cacheDir, command)
 	local env = cacheDir and ("LYE_CACHE_DIR=" .. string.format("%q", cacheDir) .. " ") or ""
 	local pipe = assert(io.popen(env .. command))
@@ -38,7 +37,6 @@ end
 --- Every command runs with the cache of this suite, so a test never reads or writes the one a
 --- developer's own runs leave beside their project.
 ---@param command string
----@return string output
 local function run(command)
 	return runWith(CACHE, command)
 end
@@ -75,8 +73,12 @@ local function probe(paths, cacheDir)
 	for _, path in ipairs(paths) do named[#named + 1] = string.format("%q", path) end
 	local command = string.format("LYE_WORKERS=1 lde run %q -- %s 2>&1",
 		PROBE, table.concat(named, " "))
-	local output = cacheDir == false and runWith(nil, "LYE_CACHE=off " .. command)
-		or runWith(cacheDir, command)
+	local output
+	if cacheDir == false then
+		output = runWith(nil, "LYE_CACHE=off " .. command)
+	else
+		output = runWith(cacheDir, command)
+	end
 	local line = output:match("CHECK ([^\n]+)")
 	test.truthy(line, "the probe should report what it did: " .. output)
 	local counters = {}
@@ -91,6 +93,7 @@ local function writeTree(root, files)
 	local fs = require("fs")
 	os.execute("rm -rf " .. string.format("%q", root) .. " && mkdir -p " .. string.format("%q", root))
 	for path, source in pairs(files) do
+		---@cast path string
 		local dir = path:match("^(.*)/[^/]+$")
 		if dir then fs.mkdirAll(root .. "/" .. dir) end
 		fs.write(root .. "/" .. path, source)
@@ -100,7 +103,6 @@ end
 --- A path the index and the check both name the same way. A persisted entry is keyed by its root,
 --- so a test that builds one has to spell the root as the run under test will.
 ---@param path string
----@return string
 local function absolutePath(path)
 	if path:sub(1, 1) == "/" then return path end
 	return env.cwd() .. "/" .. (path:gsub("^%./", ""))
@@ -120,14 +122,13 @@ local function buildIndex(root, cacheDir)
 	local index = Index.new()
 	local saved = index:save(index:build(root, { kind = "workspace" }))
 	cache.setEnabled(wasEnabled)
-	cache.setRoot(wasNamed and wasRoot or nil)
+	cache.setRoot(wasNamed and wasRoot or nil --[[@as string]])
 	return saved
 end
 
 --- The findings of a probe run, without its counters: two runs that found the same thing say the
 --- same thing.
 ---@param output string
----@return string
 local function findingsOf(output)
 	return (output:match("^(.-)CHECK ") or output)
 end
@@ -172,7 +173,6 @@ end)
 -- entry point rather than the module.
 ---@param source string
 ---@param flag string
----@return integer
 local function exitCode(source, flag)
 	writeInput(source)
 	local out = run(string.format(
@@ -180,6 +180,14 @@ local function exitCode(source, flag)
 	))
 	return tonumber(out) or -1
 end
+
+test.it("prints the extensions the workspace's plugins claim", function()
+	-- This is what an editor wrapper asks before it can map a `.toy` buffer to a filetype: the
+	-- same loader a check uses, without checking a file.
+	local workspace = TESTS_DIR .. "/fixtures/syntax"
+	local output = run(string.format("lye extensions %q 2>&1", workspace))
+	test.equal((output:gsub("%s+$", "")), "toy")
+end)
 
 test.it("checks a file of a language a plugin reads, and reports it where it is written", function()
 	-- The fixture plugin compiles `let name: type = value` to a `---@type` annotation over a
@@ -194,21 +202,32 @@ test.it("checks a file of a language a plugin reads, and reports it where it is 
 	test.truthy(discovered[toy], "the walk finds the file its plugin claims: "
 		.. table.concat(check.discover(workspace), " "))
 
-	local output = run("lde run " .. string.format("%q", MAIN) .. " --check " .. string.format("%q", toy)
+	-- A walk of the workspace checks what is committed, so the fixture it keeps reads cleanly.
+	-- The fault is written under `target/`, which no walk of the workspace visits, and the
+	-- plugin beside the fixture still lowers it: a check named the file reads it as the language
+	-- its package says it is written in.
+	local target = workspace .. "/target"
+	os.execute("mkdir -p " .. string.format("%q", target))
+	local faulty = target .. "/faulty.toy"
+	local handle = assert(io.open(faulty, "wb"))
+	handle:write("let holding: number = \"not a number\"\nlet plain: number = 1\n")
+	handle:close()
+
+	local output = run("lde run " .. string.format("%q", MAIN) .. " --check " .. string.format("%q", faulty)
 		.. " 2>&1")
 	test.includes(output, "holding is declared as number but is assigned string",
 		"the fault the plugin's own line has: " .. output)
-	test.includes(output, "main.toy:1:", "reported on the first line of the file, where it was written")
+	test.includes(output, "faulty.toy:1:", "reported on the first line of the file, where it was written")
 
 	-- The same file a second time, and the same file named the way a run in a directory names it:
 	-- what is held between the two is the analysis of the lowered text, and a finding of it has to
 	-- travel back once per report rather than once per analysis.
-	local again = run("lde run " .. string.format("%q", MAIN) .. " --check " .. string.format("%q", toy)
-		.. " " .. string.format("%q", toy) .. " 2>&1")
+	local again = run("lde run " .. string.format("%q", MAIN) .. " --check " .. string.format("%q", faulty)
+		.. " " .. string.format("%q", faulty) .. " 2>&1")
 	test.equal(again, output, "a file named twice is checked once, and reported the same way")
 
 	local relative = run("lde run " .. string.format("%q", MAIN)
-		.. " --check tests/fixtures/syntax/main.toy 2>&1")
+		.. " --check tests/fixtures/syntax/target/faulty.toy 2>&1")
 	test.includes(relative, "holding is declared as number but is assigned string",
 		"and a path relative to the run finds the plugin beside it: " .. relative)
 end)
@@ -246,12 +265,13 @@ test.it("writes a configuration where there is none, and never over one", functi
 	do
 		local handle = io.open(dir .. "/lye.json", "rb")
 		if handle then
-			written = handle:read("*a")
+			written = handle:read("*a") --[[@as string? ]]
 			handle:close()
 		end
 	end
 	test.truthy(written, "lye.json is there")
 	local ok, config = pcall(require("lye-json").decode, written or "")
+	---@cast config { plugins: table[], requirePaths: table[] }
 	test.equal(ok, true, "and it parses")
 	test.equal(#config.plugins, 0, "with the keys lye reads, and nothing said yet")
 	test.equal(#config.requirePaths, 0)
@@ -355,6 +375,7 @@ test.it("checks a batch across processes the way one process does", function()
 	})
 	local ringSource = table.concat({
 		'local main = require("main")\n',
+		'local marker = 1\n',
 		'\n',
 		'---@return integer\n',
 		'local function go(round)\n',
@@ -395,10 +416,12 @@ test.it("checks a batch across processes the way one process does", function()
 	}
 	fs.mkdirAll(root)
 	for path in pairs(sources) do
+		---@cast path string
 		local dir = path:match("^(.*)/[^/]+$")
 		if dir then fs.mkdirAll(root .. "/" .. dir) end
 	end
 	for path, source in pairs(sources) do
+		---@cast path string
 		fs.write(root .. "/" .. path, source)
 	end
 
@@ -407,7 +430,7 @@ test.it("checks a batch across processes the way one process does", function()
 			workers, MAIN, root))
 	end
 	local one = checkIn(1)
-	test.truthy(one:match(": hint: "), "the fixture has something to compare, got: " .. one)
+	test.truthy(one:match(": warning: "), "the fixture has something to compare, got: " .. one)
 	test.equal(checkIn(2), one, "two processes must say what one said")
 	test.equal(checkIn(4), one, "and so must four")
 end)
@@ -436,6 +459,7 @@ test.it("reads an unchanged tree back without analysing it", function()
 	writeTree(root, files)
 	local named = {}
 	for relative in pairs(files) do
+		---@cast relative string
 		if relative:sub(-4) == ".lua" then named[#named + 1] = root .. "/" .. relative end
 	end
 	table.sort(named)
@@ -465,6 +489,7 @@ test.it("re-checks only the files whose text changed", function()
 	writeTree(root, files)
 	local named = {}
 	for relative in pairs(files) do
+		---@cast relative string
 		if relative:sub(-4) == ".lua" then named[#named + 1] = root .. "/" .. relative end
 	end
 	table.sort(named)
@@ -514,6 +539,7 @@ end
 local function luaPaths(root, files)
 	local named = {}
 	for relative in pairs(files) do
+		---@cast relative string
 		if relative:sub(-4) == ".lua" then named[#named + 1] = root .. "/" .. relative end
 	end
 	table.sort(named)

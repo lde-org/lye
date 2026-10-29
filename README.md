@@ -129,8 +129,10 @@ A plugin answers one or more hooks:
 | `complete` | module names inside `require("...")` |
 
 The built-in `lye-plugin-require` supplies the `require` completion hook. A plugin's
-`extensions = { "moon" }` makes `lye check .` walk a dialect's files; one plugin can carry syntax,
-colour, types and autocomplete. `packages/lye-plugin` documents the interface.
+`extensions = { "moon" }` makes `lye check .` walk a dialect's files, and an editor that supports
+LSP dynamic registration receives those extensions as document selectors, so a `.moon` document gets
+the same diagnostics, hover and completion as a `.lua` one; one plugin can carry syntax, colour,
+types and autocomplete. `packages/lye-plugin` documents the interface.
 
 ## lde
 
@@ -151,7 +153,14 @@ For a project not laid out that way, `lye.json` can name search paths the way `p
 
 `lye check [paths...]` checks a tree in CI, handing each package to a worker (`LYE_WORKERS=1` for
 one). Results are cached under `./.lye`; `--cache <dir>` or `LYE_CACHE_DIR` moves it, `--cold` and
-`LYE_CACHE=off` disable reuse. `lye init` writes `lye.json`.
+`LYE_CACHE=off` disable reuse. `lye init` writes `lye.json`; `lye extensions [dir]` prints the
+file extensions the workspace's plugins claim, which is what an editor wrapper needs to attach a
+dialect's buffers.
+
+An editor that supports LSP pull diagnostics gets `textDocument/diagnostic` for the open document
+and `workspace/diagnostic` for every Lua file in the workspace; either is a full check of the files
+it names. Clients without workspace pull still publish the open document's diagnostics, and
+`lye check` is the whole-tree pass for CI.
 
 ## Editors
 

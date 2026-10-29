@@ -24,6 +24,14 @@ lde compile -C packages/lye-lsp   # writes the binary into the package's target 
 
 Changing `lye.serverPath` restarts the server.
 
+## Plugin languages
+
+A workspace can name a plugin that adds a language with its own file extension. When the workspace
+contains a `lye.json`, the extension starts even if no Lua file is open; the server reads the
+plugins, and registers their extensions with VS Code through LSP dynamic document registration.
+Opening a `.toy` file (or any extension a plugin claims) then gets the same diagnostics, hover,
+completion and semantic tokens as a `.lua` file.
+
 ## Development
 
 ```sh

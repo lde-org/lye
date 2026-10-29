@@ -92,7 +92,7 @@ end
 --- The name of a table this writes by name, or nil for one it writes out.
 ---@param value table
 ---@param named table<unknown, string>?
----@return integer?
+---@return integer
 ---@return string?
 local function kindOf(value, named)
 	local singleton = SINGLETON_BY_TABLE[value]

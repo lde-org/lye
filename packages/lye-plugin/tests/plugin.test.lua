@@ -133,7 +133,10 @@ test.it("sorts the edits a plugin wrote in any order, and refuses ones that cann
 		{ from = 3, to = 5, text = "y" },
 	})
 	refused("an edit past the text", { { from = 2, to = 99, text = "x" } })
-	refused("an edit that names no text", { { from = 3 } })
+	-- Deliberately malformed: an edit with no `text` is what the check has to refuse.
+	local nameless = { { from = 3 } }
+	---@cast nameless lye.plugin.Edit[]
+	refused("an edit that names no text", nameless)
 	refused("`same` over text of another length", { { from = 1, to = 3, text = "abcd", same = true } })
 end)
 
@@ -171,6 +174,7 @@ test.it("loads a plugin of the workspace's own, and turns a shipped one off by n
 	test.equal(#said, 0, "and nothing was reported")
 
 	local context = { uri = "file:///f.lua", source = "let x be 1", root = WORK }
+	---@cast context lye.plugin.Context
 	local map = plugin.lower(specs, context, report)
 	test.equal(map.text, "local lowered = 1", "the document is lowered through the plugin")
 	test.equal(context.text, "local lowered = 1", "and what the hooks were handed says so")
@@ -211,6 +215,7 @@ test.it("reports a broken hook once, and asks it nothing after that", function()
 	asked = 0
 	local specs = plugin.load({ "./broken.lua", "!patterns", "!formats", "!ffi" }, WORK, resolve, report)
 	local context = { uri = "file:///f.lua", source = "x" }
+	---@cast context lye.plugin.Context
 	plugin.lower(specs, context, report)
 	plugin.lower(specs, context, report)
 	test.equal(asked, 1, "the hook was asked once")
@@ -231,6 +236,7 @@ test.it("reports a lowering that cannot be applied, and keeps the document", fun
 	}, ""))
 	local specs = plugin.load({ "./greedy.lua", "!patterns", "!formats", "!ffi" }, WORK, resolve, report)
 	local context = { uri = "file:///f.lua", source = "short" }
+	---@cast context lye.plugin.Context
 	local map = plugin.lower(specs, context, report)
 	test.equal(context.text, "short", "the document is left as it was")
 	test.equal(map:isEmpty(), true, "and the map moves nothing")
@@ -242,14 +248,17 @@ test.it("hands every plugin the text lye reads, and collects what they colour", 
 	local specs = plugin.load({ "./mine.lua", "!patterns", "!formats", "!ffi" }, WORK, resolve,
 		function() end)
 	local texts = {}
+	---@cast specs lye.plugin.Spec[]
 	specs[1].tokens = function(context)
+		---@cast context lye.plugin.TokenContext
 		texts[#texts + 1] = context.text
 		return { { from = 1, to = 3, type = "property" } }
 	end
 	local context = { uri = "file:///f.lua", source = "abc", text = "abc" }
+	---@cast context lye.plugin.TokenContext
 	local spans = plugin.tokens(specs, context)
 	test.equal(#spans, 1)
-	test.equal(spans[1].type, "property")
+	test.equal(assert(spans[1]).type, "property")
 	test.equal(texts[1], "abc", "the hook is handed the text lye reads")
 end)
 
@@ -262,7 +271,7 @@ test.it("finds a plugin the package installed, and keeps what the workspace list
 	local specs = plugin.load({ "moonscript", "./mine.lua" }, WORK, resolve, report)
 	test.equal(namesOf(specs), "moonscript mine patterns formats ffi",
 		"the two the workspace named, then lye's own")
-	test.equal(specs[1].extensions[1], "moon", "and the extension it claims comes with it")
+	test.equal(assert(specs[1].extensions)[1], "moon", "and the extension it claims comes with it")
 	test.equal(#said, 0, "nothing to report")
 end)
 
@@ -271,7 +280,9 @@ test.it("asks a plugin for the modules it offers inside a require", function()
 		{ name = "one", complete = function() return { { name = "a.b", detail = "LuaJIT" }, { name = "c" } } end },
 		{ name = "two", complete = function() return { { name = "d", path = "/tmp/d.lua" } } end },
 	}
-	local got = plugin.complete(specs, {})
+	local context = {}
+	---@cast context lye.plugin.CompletionContext
+	local got = plugin.complete(specs, context)
 	test.equal(#got, 3)
 	test.equal(got[1].name, "a.b")
 	test.equal(got[3].path, "/tmp/d.lua")
@@ -296,11 +307,15 @@ test.it("asks a plugin for the types it contributes, and calls its providers", f
 		source = "", text = "", parsed = { byKind = {} }, annotations = { annotations = {} },
 		callName = function() return nil end,
 	}
+	---@cast contexts lye.plugin.TypeContext
 	local got = plugin.types(specs, contexts, function() end)
 	test.equal(#got, 1, "one contribution")
 	test.equal(got[1].name, "typed", "named for the plugin that answered")
-	local providers = got[1].types.attach(function(name) return name end)
-	test.equal(providers.call({}), "T", "the provider is built with the document's resolver")
+	---@cast got { name: string, types: lye.plugin.Types }[]
+	local providers = assert(got[1].types.attach(function(name) return name end))
+	local node = {}
+	---@cast node lye.parser.Node
+	test.equal(providers.call(node), "T", "the provider is built with the document's resolver")
 end)
 
 test.it("colours a pattern's escapes and a format's conversion through the shipped plugins", function()
@@ -324,6 +339,7 @@ test.it("colours a pattern's escapes and a format's conversion through the shipp
 		typeOf = function() return types.STRING end,
 		ownerOf = types.ownerOf,
 	}
+	---@cast context lye.plugin.TokenContext
 	local spans = patterns.tokens(context)
 	for _, span in ipairs(require("lye-plugin.plugins.formats").tokens(context)) do
 		spans[#spans + 1] = span
@@ -338,11 +354,13 @@ test.it("colours a pattern's escapes and a format's conversion through the shipp
 
 	-- A replacement's escapes are read too.
 	local escaped = "local s = \"a\"\nlocal r = s:gsub(\"%a\", \"%%\")\n"
-	local other = patterns.tokens({
+	local escapedContext = {
 		uri = "file:///f.lua", source = escaped, text = escaped, parsed = Parser.new(escaped):parse(),
 		map = source.lower(escaped, {}),
 		typeOf = function() return types.STRING end, ownerOf = types.ownerOf,
-	})
+	}
+	---@cast escapedContext lye.plugin.TokenContext
+	local other = patterns.tokens(escapedContext)
 	test.equal(#other, 2, "the pattern and the replacement")
 	test.equal(escaped:sub(other[2].from, other[2].to), "%%", "the escape in the replacement")
 end)
@@ -365,6 +383,7 @@ test.it("colours an ffi.cdef block from our own parse of it, through the shipped
 		uri = "file:///f.lua", source = written, text = written, parsed = parsed,
 		map = source.lower(written, {}),
 	}
+	---@cast context lye.plugin.TokenContext
 	local marks = {}
 	for _, span in ipairs(cdefPlugin.tokens(context)) do
 		marks[#marks + 1] = written:sub(span.from, span.to) .. ":" .. span.type
@@ -391,6 +410,7 @@ test.it("leaves a cdef block a lowering plugin wrote out of it", function()
 		uri = "file:///f.lua", source = written, text = map.text,
 		parsed = Parser.new(map.text):parse(), map = map,
 	}
+	---@cast context lye.plugin.TokenContext
 	test.equal(#cdefPlugin.tokens(context), 0, "nothing is coloured")
 end)
 

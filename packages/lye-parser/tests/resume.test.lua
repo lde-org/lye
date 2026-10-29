@@ -11,13 +11,23 @@
 ]]
 
 local test = require("lde-test")
-local Parser = require("lye-parser")
+
+--- The module's interface, which its own tests do not get through a dependency link: `new` builds
+--- a parser, `parse` returns its result, and `resumeAt` finds the cut a resumed parse starts at.
+---@class lye.parser.ResumeInstance : lye.parser.Parser
+---@field parse fun(self: lye.parser.ResumeInstance): lye.parser.Result
+
+---@class lye.parser.ResumeModule
+---@field new fun(source: string, resume: lye.parser.Resume?, definition: boolean?): lye.parser.ResumeInstance
+---@field resumeAt fun(parsed: lye.parser.Result, offset: integer): lye.parser.Resume?
+---@field KIND table<string, integer>
+
+local Parser = require("lye-parser") --[[@as lye.parser.ResumeModule]]
 
 --- A total, deterministic encoding of a value, used to compare two parses exactly. Numeric keys
 --- sort numerically so an index list keeps its order.
 ---@param value unknown
 ---@param parts string[]?
----@return string
 local function encode(value, parts)
 	parts = parts or {}
 	local valueType = type(value)
@@ -50,7 +60,6 @@ end
 --- The encoding of a whole value, concatenated once. Concatenating at every recursion level
 --- copies the parts collected so far each time, which is quadratic on a large tree.
 ---@param value unknown
----@return string
 local function flatten(value)
 	return table.concat(encode(value, {}))
 end
@@ -102,7 +111,6 @@ end
 --- A short window around the first difference between two encodings.
 ---@param a string
 ---@param b string
----@return string
 local function difference(a, b)
 	local index = 1
 	local limit = math.min(#a, #b)
@@ -125,7 +133,7 @@ local function checkInvariants(parsed, source, label)
 	for index = 1, tokens.count do
 		local token = tokens.arena[index]
 		test.equal(token.index, index, label .. ": token " .. index .. " keeps its index")
-		if token.kind ~= Parser.KIND.eof then
+		if token.kind ~= assert(Parser.KIND).eof then
 			test.equal(tokens.texts[index], source:sub(token.start, token.stop),
 				label .. ": token " .. index .. " text is its own slice")
 		end
@@ -212,12 +220,15 @@ local function checkEdit(label, oldText, newText, expectResume)
 			end
 		end
 		for key in pairs(resume.tableFields) do
+			---@cast key integer
 			test.truthy(key <= resume.nodeCount, label .. ": a kept table is in the prefix")
 		end
 		for key in pairs(resume.tableFieldValues) do
+			---@cast key integer
 			test.truthy(key <= resume.nodeCount, label .. ": a kept table value map is in the prefix")
 		end
 		for key in pairs(resume.tableIndexes) do
+			---@cast key integer
 			test.truthy(key <= resume.nodeCount, label .. ": a kept element map is in the prefix")
 		end
 	end
@@ -256,7 +267,6 @@ end
 ---@param base string
 ---@param at integer
 ---@param text string
----@return string
 local function insert(base, at, text)
 	return base:sub(1, at - 1) .. text .. base:sub(at)
 end
@@ -266,7 +276,6 @@ end
 ---@param from integer
 ---@param to integer
 ---@param text string
----@return string
 local function splice(base, from, to, text)
 	return base:sub(1, from - 1) .. text .. base:sub(to + 1)
 end
@@ -338,7 +347,6 @@ local CRLF = "local a = 1\r\nlocal b = 2\r\nreturn a + b"
 -- scanner findings alone fill the diagnostic cap: the cold parse's budget for parser problems
 -- falls to zero and it drops the one before the edit, which the resume must drop as well.
 ---@param lines integer
----@return string
 local function cappedBudget(lines)
 	local parts = { "local = 1\n", "local s = \"\\0\"\n" }
 	for index = 1, lines do
@@ -394,7 +402,12 @@ local EDITS = {
 
 test.it("resumes every edit at the same tree a full parse builds", function()
 	for _, case in ipairs(EDITS) do
-		checkEdit(case[1], case[2], case[3], case[4])
+		local label, oldText, newText, expectResume = case[1], case[2], case[3], case[4]
+		---@cast label string
+		---@cast oldText string
+		---@cast newText string
+		---@cast expectResume boolean
+		checkEdit(label, oldText, newText, expectResume)
 	end
 end)
 
@@ -559,22 +572,21 @@ end)
 
 --- The 2331-line fixture, found by walking up from the test file so the path does not depend on
 --- the runner's working directory.
----@return string?
 local function benchmarkFixture()
 	local source = debug.getinfo(1, "S").source
 	local directory = source:match("^@(.*)[/\\][^/\\]*$")
-	local candidates = { "editors/vscode/tests/fixtures/benchmark-lde.lua" }
+	local candidates = { "editors/vscode/tests/fixtures/benchmark-lde.lua.txt" }
 	if directory then
 		local walk = directory
 		for _ = 1, 8 do
-			candidates[#candidates + 1] = walk .. "/editors/vscode/tests/fixtures/benchmark-lde.lua"
+			candidates[#candidates + 1] = walk .. "/editors/vscode/tests/fixtures/benchmark-lde.lua.txt"
 			local parent = walk:match("^(.*)[/\\][^/\\]+$")
 			if not parent or parent == walk then break end
 			walk = parent
 		end
 	end
 	for _, path in ipairs(candidates) do
-		local handle = io.open(path, "r")
+		local handle = io.open(path)
 		if handle then
 			local text = handle:read("*a")
 			handle:close()
@@ -585,8 +597,7 @@ local function benchmarkFixture()
 end
 
 test.it("resumes a large file repeatedly and reports the reuse", function()
-	local source = benchmarkFixture()
-	test.truthy(source, "the benchmark fixture is readable")
+	local source = assert(benchmarkFixture(), "the benchmark fixture is readable")
 	local first = Parser.new(source):parse()
 	test.truthy(#first.nodes > 3000, "the fixture should be the large one")
 

@@ -80,13 +80,17 @@ function patterns.tokens(context)
 			-- the name in the source — and by the receiver's own type for a method call.
 			local owner
 			if node.isMethod then
-				owner = context.ownerOf(context.typeOf(node.target))
+				local subject = node.target
+				if subject then owner = context.ownerOf(context.typeOf(subject)) end
 			else
 				local base = target and target.target and parsed.nodes[target.target]
 				owner = base and base.callee
 			end
 			local kinds = field and owner and INTERPRETED[owner .. "." .. field]
-			for index, kind in pairs(kinds or {}) do
+			---@cast kinds table<integer, string>?
+			for index, kind in ipairs(kinds or {}) do
+				---@cast index integer
+				---@cast kind string
 				-- By the position it is written in: these functions take the subject they work on
 				-- first, so the pattern is the second argument of `string.find(s, p)` and the first
 				-- of `s:find(p)`, which is where `shorthand` comes in.
@@ -94,18 +98,24 @@ function patterns.tokens(context)
 				local argument = parsed.nodes[node.args[shorthand and index or index + 1] or 0]
 				local from = argument and argument.kind == "string"
 					and cdef.textStart(text, argument.start, argument.stop)
+				---@cast from integer?
 				-- Only where the literal reads as it was written: an escape inside it moves every
 				-- offset after it, and marking the wrong bytes is worse than marking none.
-				local plain = from and text:sub(from, argument.stop - 1) == argument.value
-				if plain then
-					for _, mark in ipairs(interpretedSpans(argument.value, kind)) do
-						local first, last = from + mark.start - 1, from + mark.stop - 1
-						-- A token may not cross a line, and neither may this one. What lye read out
-						-- of text a lowering plugin wrote has no place in the document at all.
-						local sameLine = not text:find("\n", first, true) or text:find("\n", first, true) > last
-						if sameLine and not map:rangeIsWritten(first, last) then
-							local at, stop = map:toOriginalRange(first, last)
-							spans[#spans + 1] = { from = at, to = stop, type = "regexp" }
+				if from then
+					local content = argument.value
+					---@cast content string
+					local plain = text:sub(from, argument.stop - 1) == content
+					if plain then
+						for _, mark in ipairs(interpretedSpans(content, kind)) do
+							local first, last = from + mark.start - 1, from + mark.stop - 1
+							-- A token may not cross a line, and neither may this one. What lye read
+							-- out of text a lowering plugin wrote has no place in the document at all.
+							local sameLine = not text:find("\n", first, true)
+								or text:find("\n", first, true) > last
+							if sameLine and not map:rangeIsWritten(first, last) then
+								local at, stop = map:toOriginalRange(first, last)
+								spans[#spans + 1] = { from = at, to = stop, type = "regexp" }
+							end
 						end
 					end
 				end

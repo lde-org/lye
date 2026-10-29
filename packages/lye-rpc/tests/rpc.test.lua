@@ -21,7 +21,6 @@ local CHILD = TESTS_DIR .. "/fixtures/echo.lua"
 local INPUT = PACKAGE_DIR .. "/target/rpc-test-input.bin"
 
 ---@param body string
----@return string
 local function frame(body)
 	return "Content-Length: " .. #body .. "\r\n\r\n" .. body
 end
@@ -34,7 +33,6 @@ local function writeInput(input)
 end
 
 ---@param command string
----@return string
 local function readPipe(command)
 	local pipe = assert(io.popen(command))
 	local output = pipe:read("*a")
@@ -44,7 +42,6 @@ end
 
 --- Write `input` and run the child over it.
 ---@param input string
----@return string output
 local function runChild(input)
 	writeInput(input)
 	return readPipe(string.format("cat %q | lde run %q 2>/dev/null", INPUT, CHILD))

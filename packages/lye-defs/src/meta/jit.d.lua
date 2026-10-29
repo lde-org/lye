@@ -5,6 +5,7 @@
 ---@field version_num number
 ---@field os          'Windows'|'Linux'|'OSX'|'BSD'|'POSIX'|'Other'
 ---@field arch        'x86'|'x64'|'arm'|'arm64'|'arm64be'|'ppc'|'ppc64'|'ppc64le'|'mips'|'mipsel'|'mips64'|'mips64el'|string
+---@field opt table<string, fun(...: any): any> JIT compiler options
 jit = {}
 
 function jit.on(func?: function, recursive?: boolean) end

@@ -22,14 +22,12 @@ local reuse = {}
 reuse.VERSION = "lye-analyzer/reuse:2"
 
 ---@param list string[]
----@return string[]
 local function sorted(list)
 	table.sort(list)
 	return list
 end
 
 ---@param map table<string, any>?
----@return string[]
 local function keys(map)
 	local out = {}
 	for name in pairs(map or {}) do out[#out + 1] = name end
@@ -41,7 +39,6 @@ end
 --- item touching the region is recomputed and everything after it shifts by one delta.
 ---@param old string
 ---@param new string
----@return { oldStart: integer, oldStop: integer, newStart: integer, newStop: integer, delta: integer }
 function reuse.region(old, new)
 	local oldLen, newLen = #old, #new
 	local minLen = oldLen < newLen and oldLen or newLen
@@ -68,7 +65,6 @@ end
 --- The signature an item presents to its callers, as one hash. A change here is a change every
 --- reader of the item can observe.
 ---@param item lye.analyzer.Item
----@return string
 function reuse.signatureDigest(item)
 	local parts = { item.kind, item.name, tostring(item.ordinal), item.signature.name or "" }
 	for _, param in ipairs(item.signature.params or {}) do
@@ -86,7 +82,6 @@ end
 --- to one is a change to what a name in any item's annotation means.
 ---@param source string
 ---@param annotations lye.doc.File?
----@return string
 function reuse.namespaceDigest(source, annotations)
 	local parts = {}
 	for _, annotation in ipairs((annotations and annotations.annotations) or {}) do
@@ -108,7 +103,6 @@ local annotationSources = setmetatable({}, { __mode = "k" })
 --- cache keys on.
 ---@param source string
 ---@param annotations lye.doc.File?
----@return string
 function reuse.annotationsDigest(source, annotations)
 	if not annotations then return "" end
 	local held = annotationDigests[annotations]
@@ -128,7 +122,6 @@ end
 --- The plugins a document is read with, as one hash. A workspace that turns one off reads the
 --- same file differently, so its cached results are not this run's.
 ---@param specs { name: string?, path: string? }[]?
----@return string
 function reuse.pluginsDigest(specs)
 	local parts = {}
 	for _, spec in ipairs(specs or {}) do
@@ -142,7 +135,6 @@ end
 --- what this adds is that `Remote` may mean something different today.
 ---@param ctx table
 ---@param item lye.analyzer.Item
----@return string
 local function resolvedAnnotations(ctx, item)
 	local list = (ctx.annotations and ctx.annotations.annotations) or {}
 	-- The annotations are in start order. Find the first that can reach the item, then walk the
@@ -167,7 +159,12 @@ local function resolvedAnnotations(ctx, item)
 				local held = cache[word]
 				if held == nil then
 					local found = ctx.digestResolve and ctx.digestResolve(word) or nil
-					held = found and types.display(found) or ""
+					if found ~= nil then
+						---@cast found lye.doc.Type
+						held = types.display(found)
+					else
+						held = ""
+					end
 					cache[word] = held
 				end
 				if held ~= "" then parts[#parts + 1] = word .. "=" .. held end
@@ -181,7 +178,6 @@ end
 --- the item's cached result was computed from.
 ---@param ctx table
 ---@param item lye.analyzer.Item
----@return string
 function reuse.depsHash(ctx, item)
 	local parts = {
 		reuse.VERSION, ctx.pluginsDigest or "", ctx.namespaceDigest or "",
@@ -190,7 +186,10 @@ function reuse.depsHash(ctx, item)
 	local deps = item.deps
 	for _, id in ipairs(keys(deps.items)) do
 		local dep = ctx.tree.items[id]
-		parts[#parts + 1] = "i\0" .. id .. "\0" .. (dep and reuse.signatureDigest(dep) or "?")
+		---@cast dep lye.analyzer.Item?
+		local digest = "?"
+		if dep ~= nil then digest = reuse.signatureDigest(dep) end
+		parts[#parts + 1] = "i\0" .. id .. "\0" .. digest
 	end
 	for _, name in ipairs(keys(deps.modules)) do
 		parts[#parts + 1] = "m\0" .. name .. "\0" .. (ctx.moduleDigest and ctx.moduleDigest(name) or "")
@@ -224,7 +223,6 @@ end
 --- whose IDs moved is not safe to carry over from an older tree.
 ---@param parsed lye.parser.Result
 ---@param annotations lye.doc.File?
----@return string
 function reuse.declarationShape(parsed, annotations)
 	local parts = {}
 	for _, declaration in ipairs(parsed.declarations or {}) do
@@ -239,27 +237,52 @@ function reuse.declarationShape(parsed, annotations)
 	return table.concat(sorted(parts), "\1")
 end
 
+---@class lye.reuse.Clean
+---@field old lye.analyzer.Item
+---@field delta integer
+---@field rebased boolean?
+
+---@class lye.reuse.Meta
+---@field signatureDigest string?
+---@field depsHash string?
+
+---@class lye.reuse.Plan
+---@field clean table<string, lye.reuse.Clean>
+---@field dirty table<string, boolean>
+---@field meta table<string, lye.reuse.Meta>
+---@field conservative integer
+---@field region table
+
 --- Which items may be reused, and which have to be looked at again.
 ---@param ctx table
 ---@param previous lye.analyzer.Result?
 ---@param region table
----@return { clean: table<string, table>, dirty: table<string, boolean>, meta: table, conservative: integer, region: table }
+---@return lye.reuse.Plan
 function reuse.plan(ctx, previous, region)
 	local plan = { clean = {}, dirty = {}, meta = {}, conservative = 0, region = region }
+	---@type lye.analyzer.ItemTree?
 	local oldTree = previous and previous.items
 	if not (oldTree and oldTree.items) then
 		for id in pairs(ctx.tree.items) do plan.dirty[id] = true end
 		return plan
 	end
-	for id, item in pairs(ctx.tree.items) do
-		local old = oldTree.items[id]
+	---@cast oldTree lye.analyzer.ItemTree
+	---@type table<string, lye.analyzer.Item>
+	local items = ctx.tree.items
+	---@type table<string, lye.analyzer.Item>
+	local oldItems = oldTree.items
+	for id, item in pairs(items) do
+		local old = oldItems[id]
 		local signature = reuse.signatureDigest(item)
 		local deps = reuse.depsHash(ctx, item)
 		plan.meta[id] = { signatureDigest = signature, depsHash = deps }
 		local cache = old and old.cache
-		local same = cache ~= nil and cache.signatureDigest == signature
+		---@cast cache lye.analyzer.ItemCache?
+		local same = old ~= nil and cache ~= nil and cache.signatureDigest == signature
 			and old.bodyHash == item.bodyHash and cache.depsHash == deps
-		if ctx.forceDirty then
+		if not old then
+			plan.dirty[id] = true
+		elseif ctx.forceDirty then
 			-- The parse or the declaration set moved in a way this reuse model does not follow:
 			-- the item may be byte-identical and still observe something different.
 			plan.dirty[id] = true
@@ -308,16 +331,22 @@ end
 ---@param item lye.analyzer.Item
 ---@param fnType lye.doc.Type?
 ---@param exports table<string, string>?
----@return string
 function reuse.resultHash(item, fnType, exports)
 	local parts = { reuse.signatureDigest(item) }
 	if fnType then
-		parts[#parts + 1] = "r:" .. (fnType.returns and types.display(fnType.returns) or "?")
+		local returns = fnType.returns
+		if returns ~= nil then
+			parts[#parts + 1] = "r:" .. types.display(returns)
+		else
+			parts[#parts + 1] = "r:?"
+		end
 		for _, value in ipairs(fnType.values or {}) do
 			parts[#parts + 1] = "v:" .. types.display(value)
 		end
 	end
-	for _, name in ipairs(keys(exports)) do parts[#parts + 1] = "e:" .. name .. "=" .. exports[name] end
+	---@type table<string, string>
+	local values = exports or {}
+	for _, name in ipairs(keys(values)) do parts[#parts + 1] = "e:" .. name .. "=" .. values[name] end
 	return rapidhash.hex(table.concat(parts, "\0"))
 end
 
@@ -325,13 +354,13 @@ end
 --- new analysis: a check that promotes a constraint in place would then change the previous
 --- result's answer, and the next edit would read something the old text never said.
 ---@param held lye.doc.Type?
----@return lye.doc.Type?
 function reuse.copyType(held)
 	if type(held) ~= "table" then return held end
 	local copy = {}
 	for key, value in pairs(held) do copy[key] = value end
 	local metatable = getmetatable(held)
 	if metatable then setmetatable(copy, metatable) end
+	---@cast copy lye.doc.Type
 	return copy
 end
 

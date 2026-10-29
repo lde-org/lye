@@ -19,21 +19,29 @@ local types = require("lye-doc.type")
 local ffiPlugin = {}
 
 --- What a name of a declaration is, in the vocabulary the server advertises.
+---@type table<string, string>
 local DECLARED = {
 	keyword = "keyword", type = "type", class = "class", member = "property",
 	constant = "property", ["function"] = "function", number = "number", variable = "variable",
 	comment = "comment",
 }
 
+--- A block already parsed: the C namespace, the token spans and the annotations built from them.
+---@class lye.plugin.ffi.Block
+---@field declared lye.cdef.Namespace
+---@field spans { start: integer, stop: integer, kind: string }[]
+---@field annotations lye.doc.File
+
 --- The blocks already parsed, by their own text: a cdef is read on every keystroke, and the
 --- colour pass and the type pass ask for the same block. A handful is all a file has; the entry
 --- holds the C namespace, the token spans and the annotations built from them, so the table is
 --- kept small and dropped whole when it grows rather than grown forever.
----@type table<string, { declared: lye.cdef.Namespace, spans: table[], annotations: lye.doc.File }>
+---@type table<string, lye.plugin.ffi.Block>
 local parsed = {}
 
 ---@param text string the block
 local function blockOf(text)
+	---@type lye.plugin.ffi.Block?
 	local held = parsed[text]
 	if held then return held end
 	if next(parsed) and #parsed > 8 then
@@ -69,7 +77,6 @@ end
 --- parse tree.
 ---@param context lye.plugin.TokenContext
 ---@param node lye.parser.Node
----@return string?
 local function callNameOf(context, node)
 	if context.callName then return context.callName(node) end
 	local parsed_ = context.parsed
@@ -90,11 +97,13 @@ function ffiPlugin.tokens(context)
 	-- the same document on every keystroke, and walking every node to find a call is the walk
 	-- this one is over.
 	for _, node in ipairs(parsed_.byKind.call or {}) do
-		if node.kind == "call" and node.args and node.args[1] then
+		local args = node.args
+		if node.kind == "call" and args and args[1] then
 			if callNameOf(context, node) == "ffi.cdef" then
-				local argument = parsed_.nodes[node.args[1]]
+				local argument = parsed_.nodes[args[1]]
 				if argument and argument.kind == "string" and type(argument.value) == "string" then
 					local from = cdef.textStart(text, argument.start, argument.stop)
+					---@cast from integer
 					for _, span in ipairs(blockOf(argument.value).spans) do
 						local kind = DECLARED[span.kind]
 						local first, last = from + span.start - 1, from + span.stop - 1
@@ -140,7 +149,7 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 	---@return lye.cdef.Namespace?
 	local function cTypeOfCallback(written)
 		local found, declared = cTypeNamed(written)
-		if not found then return nil end
+		if not found or not declared then return nil end
 		if found.kind == "function" then return found, declared end
 		if found.kind == "pointer" and found.target and found.target.kind == "function" then
 			return found.target, declared
@@ -161,29 +170,42 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 	local callbackParams = {}
 	---@type table<integer, lye.doc.Type>
 	local callbackReturns = {}
-	for _, node in ipairs(parsed_.byKind.call or {}) do
-		if node.args and node.args[2] then
+	---@type lye.parser.Node[]
+	local calls = parsed_.byKind.call or {}
+	for _, node in ipairs(calls) do
+		local args = node.args
+		if args and args[1] and args[2] then
 			local called = callName(node)
 			if called == "ffi.cast" or called == "ffi.new" then
-				local written = parsed_.nodes[node.args[1]]
-				local body = parsed_.nodes[node.args[2]]
+				local written = parsed_.nodes[args[1]]
+				local body = parsed_.nodes[args[2]]
 				if written and written.kind == "string" and type(written.value) == "string"
 					and body and body.kind == "function" then
 					local signature, declared = cTypeOfCallback(written.value)
-					if signature then
-						for index, param in ipairs(body.params or {}) do
+					if signature and declared then
+						---@type lye.parser.Declaration[]
+						local params = body.params or {}
+						for index, param in ipairs(params) do
 							local wanted = signature.params and signature.params[index]
 							if wanted then
-								callbackParams[param] = types.parse(
+								local held = types.parse(
 									cdef.notation(declared, wanted, "parameter"), resolve)
+								if held ~= nil then
+									---@cast held lye.doc.Type
+									callbackParams[param] = held
+								end
 							end
 						end
 						-- The engine converts what the callback returns into the C result type, so
 						-- the C says what the body has to give — a promise like a `@return`.
 						local returned = signature.returns
 						if returned then
-							callbackReturns[node.args[2]] = types.parse(
+							local held = types.parse(
 								cdef.notation(declared, returned), resolve)
+							if held ~= nil then
+								---@cast held lye.doc.Type
+								callbackReturns[args[2]] = held
+							end
 						end
 					end
 				end
@@ -194,10 +216,11 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 	--- The signatures the file's `ffi.cdef`s declared, as the fields a `ffi.load` gives back. A
 	--- cdef declares the functions of one library, and the file that wrote it is the one that
 	--- knows them: taking every symbol the process has ever seen would be a list nobody can read.
+	---@type lye.doc.Type|false|nil
 	local loaded
-	---@return lye.doc.Type?
 	local function loadedSymbols()
 		if loaded ~= nil then return loaded or nil end
+		---@type table<string, lye.doc.Type>
 		local fields = {}
 		for _, declared in ipairs(cdefs) do
 			for _, name in ipairs(declared.order) do
@@ -221,7 +244,6 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 	end
 
 	---@param node lye.parser.Node
-	---@return lye.doc.Type?
 	local function cTypeOf(node)
 		local called = callName(node)
 		if called == "ffi.load" then return loadedSymbols() end
@@ -229,11 +251,13 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 		local argument = node.args and node.args[1] and parsed_.nodes[node.args[1]]
 		if not argument or argument.kind ~= "string" or type(argument.value) ~= "string" then return nil end
 		local found, declared = cTypeNamed(argument.value)
-		if not found then return nil end
+		if not found or not declared then return nil end
 		-- A struct, a union, an enum or a typedef of one is a class this file declares, and looking the
 		-- name up lets the document's own class win over the generated one. Everything else is mapped.
 		local className = cdef.className(found)
-		local named = className and resolve(className)
+		---@cast className string?
+		local named
+		if className then named = resolve(className) end
 		if named and (found.kind == "struct" or found.kind == "union" or found.kind == "enum"
 			or (found.kind == "typedef" and cdef.resolve(declared, found.name or "") ~= nil)) then
 			return named
@@ -249,7 +273,6 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 	---@param _ any
 	---@param baseName string?
 	---@param field string
-	---@return lye.doc.Type?
 	function answer.field(_, baseName, field)
 		if field == "C" and baseName == "ffi" then return loadedSymbols() end
 	end

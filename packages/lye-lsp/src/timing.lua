@@ -16,6 +16,10 @@ local ffi = require("ffi")
 
 local timing = {}
 
+---@class lye.timespec
+---@field tv_sec number
+---@field tv_nsec number
+
 --- A clock that does not move backwards and counts wall time, which is what a user waits. `os.clock`
 --- counts processor time and would call a scan that waited on `find` free. `clock_gettime` is not on
 --- every system this ships to, and where it is missing the fallback is still monotonic enough for a
@@ -30,13 +34,13 @@ do
 	if clock then
 		local CLOCK_MONOTONIC = 1
 		local held = ffi.new("lye_timespec")
+		---@cast held lye.timespec
 		---@return number
 		function now()
 			if ffi.C.clock_gettime(CLOCK_MONOTONIC, held) ~= 0 then return os.clock() * 1000 end
 			return tonumber(held.tv_sec) * 1000 + tonumber(held.tv_nsec) / 1e6
 		end
 	else
-		---@return number
 		function now() return os.clock() * 1000 end
 	end
 end
@@ -60,13 +64,12 @@ end
 --- holds, but a collected page and a resident one are different answers, and a server's prompt is
 --- about the second. `/proc/self/status` is a one-line read on Linux; `ps` is the fallback for a
 --- system without procfs.
----@return integer? KiB
 function timing.rss()
 	local handle = io.open("/proc/self/status", "rb")
 	if handle then
-		local value
+		local value = nil ---@type number?
 		for line in handle:lines() do
-			local at = line:match("^VmRSS:%s*(%d+)%s*kB")
+			local at = tostring(line):match("^VmRSS:%s*(%d+)%s*kB")
 			if at then
 				value = tonumber(at)
 				break
@@ -78,7 +81,7 @@ function timing.rss()
 	if not pid then return nil end
 	local opened, pipe = pcall(io.popen, "ps -o rss= -p " .. pid .. " 2>/dev/null")
 	if not opened or not pipe then return nil end
-	local written = pipe:read("*a") or ""
+	local written = tostring(pipe:read("*a") or "")
 	pipe:close()
 	return tonumber(written:match("^%s*(%d+)"))
 end
@@ -90,12 +93,10 @@ function timing.heap()
 	return collectgarbage("count")
 end
 
----@return number milliseconds since this module was loaded
 function timing.elapsed()
 	return now() - origin
 end
 
----@return number milliseconds
 function timing.now()
 	return now()
 end
