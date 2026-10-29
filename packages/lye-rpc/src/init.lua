@@ -53,6 +53,7 @@ function Connection:setHandler(handler)
 end
 
 ---@param self lye.rpc.Connection
+---@param handler fun(err: string)
 function Connection:setParseErrorHandler(handler)
 	self.onParseError = handler
 end
@@ -150,6 +151,7 @@ function Connection:request(method, params)
 end
 
 ---@param self lye.rpc.Connection
+---@param message table
 function Connection:dispatch(message)
 	local handler = self.handler
 	assert(handler, "lye-rpc: no message handler installed")

@@ -186,7 +186,7 @@ local function protect(hooks, name, path, report)
 		local asked = hooks[hook]
 		if type(asked) == "function" then
 			local broken = false
-			spec[hook] = function(...)
+			local function protected(...)
 				if broken then return nil end
 				local ok, answer = pcall(asked, ...)
 				if ok then return answer end
@@ -194,6 +194,7 @@ local function protect(hooks, name, path, report)
 				report(string.format("plugin `%s`: %s is broken: %s", name, hook, answer))
 				return nil
 			end
+			spec[hook] = protected
 		end
 	end
 	return spec
@@ -384,7 +385,8 @@ function plugin.types(specs, context, report)
 				local attach = asked.attach
 				if type(attach) == "function" then
 					local broken = false
-					asked.attach = function(resolve)
+					---@param resolve fun(text: string): lye.doc.Type?
+					function asked.attach(resolve)
 						if broken then return nil end
 						local ok, providers = pcall(attach, resolve)
 						if ok then return providers end

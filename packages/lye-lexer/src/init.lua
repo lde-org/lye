@@ -155,6 +155,7 @@ local function emit(self, kind, start, stop, extra, text)
 end
 
 ---@param self lye.lexer.Lexer
+---@param quote integer
 local function scanString(self, quote)
 	local source, len = self.source, #self.source
 	local start = self.pos
@@ -191,6 +192,7 @@ local function scanString(self, quote)
 end
 
 ---@param self lye.lexer.Lexer
+---@param start integer
 ---@return string? level
 ---@return integer? stop
 local function scanLongBracket(self, start)
@@ -333,6 +335,7 @@ local function scanNumber(self)
 end
 
 ---@param self lye.lexer.Lexer
+---@param start integer
 ---@return boolean
 local function scanLabel(self, start)
 	local name = self.source:match("^::%s*([_%a][_%w]*)", start)
@@ -467,6 +470,7 @@ function lexer.resume(source, from, prefix)
 	return self:tokenize()
 end
 
+---@param source string
 ---@return lye.lexer.Tokens
 function lexer.tokenize(source)
 	assert(type(source) == "string", "lexer.tokenize expects a string")

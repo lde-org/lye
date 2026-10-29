@@ -176,18 +176,21 @@ local Parser = {}
 Parser.__index = Parser
 
 ---@return table
+---@param self lye.cdef.Parser
 function Parser:peek()
 	return self.tokens[self.at]
 end
 
 ---@param offset integer?
 ---@return string
+---@param self lye.cdef.Parser
 function Parser:word(offset)
 	return (self.tokens[self.at + (offset or 0)] or {}).text or ""
 end
 
 ---@param text string
 ---@return boolean
+---@param self lye.cdef.Parser
 function Parser:accept(text)
 	if self:word() == text then
 		self.at += 1
@@ -200,6 +203,7 @@ end
 --- right, and the caller skips to the next `;` or `}` and carries on.
 ---@param message string
 ---@param token table?
+---@param self lye.cdef.Parser
 function Parser:problem(message, token)
 	local at = token or self:peek()
 	self.problems[#self.problems + 1] = {
@@ -210,6 +214,7 @@ end
 
 ---@param text string
 ---@return boolean
+---@param self lye.cdef.Parser
 function Parser:expect(text)
 	if self:accept(text) then return true end
 	self:problem(string.format("expected `%s`, found `%s`", text, self:word()))
@@ -217,6 +222,7 @@ function Parser:expect(text)
 end
 
 ---@return string?
+---@param self lye.cdef.Parser
 function Parser:name()
 	local token = self:peek()
 	if token.kind ~= "name" then
@@ -230,6 +236,7 @@ end
 --- Record a name the declaration introduced, so a later declaration can refer to it.
 ---@param name string
 ---@param type lye.cdef.Type
+---@param self lye.cdef.Parser
 function Parser:define(name, type)
 	if not self.namespace.types[name] then self.namespace.order[#self.namespace.order + 1] = name end
 	type.name = type.name or name
@@ -246,6 +253,7 @@ local LEVELS = {
 --- reader wants, and `1 << 4` is as good as `16`.
 ---@param level integer?
 ---@return integer?
+---@param self lye.cdef.Parser
 function Parser:expression(level)
 	level = level or 1
 	local function tighter(self_)
@@ -280,6 +288,7 @@ end
 
 --- The smallest operands: a number, a constant an `enum` named earlier, or a parenthesised
 --- expression. A name that is not a constant is not something this parser can evaluate.
+---@param self lye.cdef.Parser
 function Parser:unary()
 	local word = self:word()
 	if word == "(" then
@@ -310,6 +319,7 @@ end
 
 --- The type words a declaration starts with: `unsigned long int`, `const char`, `struct Foo`.
 ---@return lye.cdef.Type
+---@param self lye.cdef.Parser
 function Parser:specifiers()
 	local isConst, type
 	while true do
@@ -372,6 +382,7 @@ end
 
 ---@param tag string `struct` or `union`
 ---@return lye.cdef.Type
+---@param self lye.cdef.Parser
 function Parser:tagged(tag)
 	self.at += 1
 	local name = self:peek().kind == "name" and self:name() or nil
@@ -419,6 +430,7 @@ function Parser:tagged(tag)
 end
 
 ---@return lye.cdef.Type
+---@param self lye.cdef.Parser
 function Parser:enumerated()
 	self.at += 1
 	local name = self:peek().kind == "name" and self:name() or nil
@@ -453,6 +465,7 @@ end
 --- `int (*f)(void)` is a pointer to one — so the chain is folded outermost last.
 ---@return string? name
 ---@return table[] chain
+---@param self lye.cdef.Parser
 function Parser:declaratorChain()
 	local pointers = 0
 	while true do
@@ -548,6 +561,7 @@ end
 ---@param base lye.cdef.Type
 ---@return string? name
 ---@return lye.cdef.Type
+---@param self lye.cdef.Parser
 function Parser:declarator(base)
 	local name, chain = self:declaratorChain()
 	return name, fold(base, chain)
@@ -555,6 +569,7 @@ end
 
 --- Skip to where the next declaration can start, so one unreadable line does not cost the rest of
 --- the header. A brace is counted so a body that went wrong is left whole.
+---@param self lye.cdef.Parser
 function Parser:recover()
 	local depth = 0
 	while self:peek().kind ~= "eof" do
@@ -575,6 +590,7 @@ function Parser:recover()
 end
 
 --- One declaration: a typedef, a struct, a union, an enum, a function or a variable.
+---@param self lye.cdef.Parser
 function Parser:declaration()
 	if self:accept(";") then return end
 	self.isTypedef = false

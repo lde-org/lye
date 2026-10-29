@@ -216,36 +216,41 @@ end
 
 --- A cursor over the bytes, which fails rather than reads past the end: an entry is a file
 --- somebody else may have written, and a wrong one is an answer to ignore.
----@param text string
+---@param bytes string
 ---@return table
 local function cursor(bytes)
 	local state = { bytes = bytes, at = 1, count = #bytes }
-	return setmetatable(state, { __index = {
-		byte = function(self)
-			if self.at > self.count then error("serial: ended early", 0) end
-			local byte = string.byte(self.bytes, self.at)
-			self.at = self.at + 1
-			return byte
-		end,
-		varint = function(self)
-			local value, shift = 0, 1
-			while true do
-				local byte = self:byte()
-				value = value + (byte % 128) * shift
-				if byte < 128 then return value end
-				shift = shift * 128
-			end
-		end,
-		take = function(self, length)
-			if self.at + length - 1 > self.count then error("serial: ended early", 0) end
-			local part = string.sub(self.bytes, self.at, self.at + length - 1)
-			self.at = self.at + length
-			return part
-		end,
-		text = function(self)
-			return self:take(self:varint())
-		end,
-	} })
+	local methods = {}
+	---@param self table
+	function methods.byte(self)
+		if self.at > self.count then error("serial: ended early", 0) end
+		local byte = string.byte(self.bytes, self.at)
+		self.at = self.at + 1
+		return byte
+	end
+	---@param self table
+	function methods.varint(self)
+		local value, shift = 0, 1
+		while true do
+			local byte = self:byte()
+			value = value + (byte % 128) * shift
+			if byte < 128 then return value end
+			shift = shift * 128
+		end
+	end
+	---@param self table
+	---@param length integer
+	function methods.take(self, length)
+		if self.at + length - 1 > self.count then error("serial: ended early", 0) end
+		local part = string.sub(self.bytes, self.at, self.at + length - 1)
+		self.at = self.at + length
+		return part
+	end
+	---@param self table
+	function methods.text(self)
+		return self:take(self:varint())
+	end
+	return setmetatable(state, { __index = methods })
 end
 
 --- Read a graph written by `serial.write`, with the caller's own tables for the names it was given.

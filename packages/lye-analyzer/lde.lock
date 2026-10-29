@@ -1,5 +1,9 @@
 {
 	"dependencies": {
+		"lde-test": {
+			"commit": "a479bc62a66c567d90087225aa5035ca2b29ceb8",
+			"git": "https://github.com/lde-org/lde"
+		},
 		"lye-cdef": {
 			"path": "../lye-cdef"
 		},
@@ -20,6 +24,6 @@
 			"git": "https://github.com/lde-org/rapidhash.git"
 		}
 	},
-	"manifestHash": "716a59c9bd0641ea",
+	"manifestHash": "8cd77fed8fc17ad1",
 	"version": "1"
 }

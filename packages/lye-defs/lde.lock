@@ -1,5 +1,34 @@
 {
-	"dependencies": [],
-	"manifestHash": "9cdb287cf7448642",
+	"dependencies": {
+		"archive": {
+			"commit": "fffd1657ec146b136f4416a297faa6af59ebeeaa",
+			"git": "https://github.com/lde-org/archive.git"
+		},
+		"curl-sys": {
+			"commit": "5308c3d3f8e5689f19526f84ea671baae9cf0f41",
+			"git": "https://github.com/lde-org/curl-sys.git"
+		},
+		"deflate-sys": {
+			"commit": "100d96ff4e1f78eb604903a239766910a78d9c1f",
+			"git": "https://github.com/lde-org/deflate-sys"
+		},
+		"fs": {
+			"commit": "c52fd12402518db5a1f41f4a189b8376261790d9",
+			"git": "https://github.com/lde-org/fs.git"
+		},
+		"lde-build": {
+			"commit": "a479bc62a66c567d90087225aa5035ca2b29ceb8",
+			"git": "https://github.com/lde-org/lde"
+		},
+		"path": {
+			"commit": "72c972d5818a2b496666e00103f4d1b582c728fa",
+			"git": "https://github.com/lde-org/path.git"
+		},
+		"process": {
+			"commit": "f904b26919ad0d09adacb839a2803848d997ee92",
+			"git": "https://github.com/lde-org/process.git"
+		}
+	},
+	"manifestHash": "f713e7520f4ee4ea",
 	"version": "1"
 }

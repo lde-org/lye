@@ -57,6 +57,7 @@ end
 
 --- Only a read that returns nothing at all is the end of the stream, so a short read is
 --- handled where it happens rather than being mistaken for one.
+---@param chunk table
 ---@return integer
 function stdio.read(chunk)
 	if chunk.n == chunk.capacity then grow(chunk) end
@@ -66,11 +67,16 @@ function stdio.read(chunk)
 	return got
 end
 
+---@param chunk table
+---@param from integer
+---@param to integer
 ---@return string
 function stdio.slice(chunk, from, to)
 	return ffi.string(chunk.buf + (from - 1), to - from + 1)
 end
 
+---@param chunk table
+---@param n integer
 function stdio.consume(chunk, n)
 	if n <= 0 then return end
 	if n >= chunk.n then

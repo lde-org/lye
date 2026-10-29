@@ -4,19 +4,12 @@
 	"version": "0.1.0",
 	"description": "The plugin system: custom syntax, types and tokens for lye",
 	"dependencies": {
-		"lye-cdef": {
-			"path": "../lye-cdef"
-		},
-		"lye-doc": {
-			"path": "../lye-doc"
-		},
-		"rapidhash": {
-			"version": "^0.1.0"
-		}
+		"lye-cdef": {"path": "../lye-cdef"},
+		"lye-doc": {"path": "../lye-doc"},
+		"rapidhash": {"version": "^0.1.0"}
 	},
 	"devDependencies": {
-		"lye-parser": {
-			"path": "../lye-parser"
-		}
+		"lye-parser": {"path": "../lye-parser"},
+		"lde-test": {"git": "https://github.com/lde-org/lde"}
 	}
 }

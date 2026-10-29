@@ -334,12 +334,16 @@ end
 ---@param generics table<string, boolean>?
 ---@param constraints table<string, string>?
 ---@param resolve fun(text: string): lye.doc.Type?
+---@param preserve boolean? keep a generic as the type variable it is rather than as its limit,
+--- for the signature a declaration itself carries: a caller binds its own copy of `T`, while a
+--- call site with nothing to offer still checks against the constraint.
 ---@return fun(text: string): lye.doc.Type?
-local function withGenerics(generics, constraints, resolve)
+local function withGenerics(generics, constraints, resolve, preserve)
 	if not generics or not next(generics) then return resolve end
 	return function(text)
 		-- Membership, not truth: a generic that is not variadic is recorded as `false`.
 		if generics[text] ~= nil then
+			if preserve then return types.extern(text) end
 			local constraint = constraints and constraints[text]
 			local held = constraint and memo.parse(constraint, resolve)
 			if held then return held end
@@ -353,6 +357,7 @@ end
 --- annotation that names nothing cannot be matched to one parameter over another.
 ---@param params lye.doc.Annotation[]?
 ---@param name string
+---@param resolve fun(text: string): lye.doc.Type?
 ---@return lye.doc.Type?
 local function paramTypeOf(params, name, resolve)
 	if not params then return nil end

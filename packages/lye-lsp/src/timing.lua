@@ -30,12 +30,14 @@ do
 	if clock then
 		local CLOCK_MONOTONIC = 1
 		local held = ffi.new("lye_timespec")
-		now = function()
+		---@return number
+		function now()
 			if ffi.C.clock_gettime(CLOCK_MONOTONIC, held) ~= 0 then return os.clock() * 1000 end
 			return tonumber(held.tv_sec) * 1000 + tonumber(held.tv_nsec) / 1e6
 		end
 	else
-		now = function() return os.clock() * 1000 end
+		---@return number
+		function now() return os.clock() * 1000 end
 	end
 end
 

@@ -26,11 +26,35 @@ local newTable = require("table.new")
 ---@field left integer? operand index, for a binary node
 ---@field right integer? operand index, for a binary node
 ---@field target integer? the expression an index or call applies to
+---@field isSafe boolean? the suffix was written `?.`, so a nil target passes through
 ---@field field string? the field an index reads
 ---@field callee string? the name a call invokes
 ---@field args integer[]? the argument node indices of a call
 ---@field params lye.parser.Declaration[]? the parameters a function node declares, `self` first
----@field value string|number|boolean? what a literal node stands for
+---@field value string|number|boolean? what a literal node stands for, or the value index of an assignment
+---@field children integer[]? the nodes inside this one, by arena index
+---@field targets integer[]? every assignment target, for an assignment node
+---@field targetValues integer[]? every assigned value, for an assignment node
+---@field targetPositions integer[]? which value each target takes, for an assignment node
+---@field isMethod boolean? the call or declaration is written with `:`
+---@field isDynamic boolean? an index whose key is an expression rather than a name
+---@field isCall boolean? a call suffix
+---@field isNumeric boolean? a table key is written as a number
+---@field name string? a name node's text
+---@field text string? a literal's source text
+---@field operand integer? operand index, for a unary node
+---@field key integer? key expression index, for a dynamic index
+---@field group integer? parenthesis or call-group expression index
+---@field body integer? body node index, for a function
+---@field alternative integer? the else expression index of a ternary
+---@field anchorIdx integer? token index of the statement opening a declaration
+---@field inlineGenerics table? inline generic names on a function
+---@field inlineVariadic boolean? the function declares an inline variadic parameter
+---@field inlineVariadicStart integer? byte an inline variadic starts at
+---@field inlineVariadicStop integer? byte an inline variadic stops at
+---@field inlineReturns integer? number of inline returns
+---@field inlineReturnsStart integer? byte inline returns start at
+---@field inlineReturnsStop integer? byte inline returns stop at
 
 ---@class lye.parser.Declaration
 ---@field name string
@@ -97,6 +121,7 @@ local newTable = require("table.new")
 ---@field count_ integer how many nodes have been emitted, which the next one's index is
 ---@field tableFieldValues table<integer, table>?
 ---@field lastKind string?
+---@field lastFields table<string, string>? the field kinds of the table just read
 ---@field lastDeclaration integer?
 ---@field statementStart integer? the byte the top-level statement now being parsed began at
 ---@field scopeStarts lye.parser.Frame[]
@@ -422,6 +447,7 @@ function Parser.resumeAt(parsed, offset)
 end
 
 ---@return lye.lexer.ffi.token?
+---@param self lye.parser.Parser
 function Parser:peek()
 	return self.arena[self.index]
 end
@@ -430,26 +456,33 @@ end
 --- a token needs nothing else.
 ---@param token lye.lexer.ffi.token
 ---@return string
+---@param self lye.parser.Parser
 function Parser:text(token)
 	return self.texts[token.index]
 end
 
 ---@param token lye.lexer.ffi.token
 ---@return string
+---@param self lye.parser.Parser
 function Parser:variant(token)
 	return lexer.variantOf(token)
 end
 
+---@param token lye.lexer.ffi.token?
 ---@return boolean
+---@param self lye.parser.Parser
 function Parser:isEof(token)
 	return not token or token.kind == lexer.KIND.eof
 end
 
+---@param ahead integer
 ---@return lye.lexer.ffi.token
+---@param self lye.parser.Parser
 function Parser:peekAt(ahead)
 	return self.arena[self.index + ahead - 1] or self.arena[self.tokenCount]
 end
 
+---@param self lye.parser.Parser
 function Parser:advance()
 	local token = self.arena[self.index]
 	if token.kind ~= lexer.KIND.eof then self.index += 1 end
@@ -466,6 +499,7 @@ end
 --- of what it costs.
 ---@param text string
 ---@return boolean
+---@param self lye.parser.Parser
 function Parser:check(text)
 	local arena, texts = self.arena, self.texts
 	local index = self.index
@@ -479,6 +513,8 @@ function Parser:check(text)
 end
 
 ---@return boolean
+---@param text string
+---@param self lye.parser.Parser
 function Parser:accept(text)
 	local arena, texts = self.arena, self.texts
 	local index = self.index
@@ -496,7 +532,9 @@ function Parser:accept(text)
 	return false
 end
 
+---@param candidates string[]
 ---@return boolean
+---@param self lye.parser.Parser
 function Parser:checkAny(candidates)
 	local arena, texts = self.arena, self.texts
 	local index = self.index
@@ -514,6 +552,7 @@ function Parser:checkAny(candidates)
 	return false
 end
 
+---@param self lye.parser.Parser
 function Parser:report(token, message)
 	if #self.diagnostics >= Parser.MAX_DIAGNOSTICS then return end
 	-- Which statement reported it, so a resume can tell a problem of the kept text from one the
@@ -524,6 +563,8 @@ function Parser:report(token, message)
 end
 
 ---@return boolean
+---@param text string
+---@param self lye.parser.Parser
 function Parser:expect(text)
 	if self:accept(text) then return true end
 	self:report(self:peek(), string.format("expected '%s'", text))
@@ -547,6 +588,7 @@ end
 ---@param child2 integer?
 ---@param child3 integer?
 ---@return integer idx
+---@param self lye.parser.Parser
 function Parser:emit(kind, start, stop, node, child1, child2, child3)
 	self.count_ = self.count_ + 1
 	local index = self.count_
@@ -586,6 +628,7 @@ end
 --- be walked.
 ---@param parentIdx integer
 ---@param childIdxs integer[]
+---@param self lye.parser.Parser
 function Parser:adopt(parentIdx, childIdxs)
 	local children = self.nodes[parentIdx].children
 	for _, childIdx in ipairs(childIdxs) do
@@ -602,6 +645,7 @@ end
 --- A comment can sit anywhere a token can, including inside a table's field list, as LuaLS's
 --- definitions write `---@type Proto[]` between two fields. Expressions and fields step over one;
 --- annotations are read from their own offsets, so nothing depends on the parser stopping at them.
+---@param self lye.parser.Parser
 function Parser:skipComments()
 	local arena = self.arena
 	local index = self.index
@@ -615,11 +659,13 @@ end
 
 --- Open a node that expressions emitted before it closes become children of.
 ---@param index integer
+---@param self lye.parser.Parser
 function Parser:enter(index)
 	self.building[#self.building + 1] = index
 end
 
 ---@return integer? index the node that was being built
+---@param self lye.parser.Parser
 function Parser:leave()
 	local index = self.building[#self.building]
 	self.building[#self.building] = nil
@@ -636,6 +682,7 @@ end
 --- first field as something else left the rest of the table parsed as statements.
 ---@param token lye.lexer.ffi.token
 ---@return boolean
+---@param self lye.parser.Parser
 function Parser:isName(token)
 	if token.kind == lexer.KIND.name then return true end
 	if token.kind ~= lexer.KIND.keyword then return false end
@@ -643,6 +690,7 @@ function Parser:isName(token)
 	return text == "const" or text == "continue" or text == "goto"
 end
 
+---@param self lye.parser.Parser
 function Parser:parseName()
 	local token = self:peek()
 	if self:isName(token) then
@@ -653,6 +701,7 @@ function Parser:parseName()
 	return nil, token
 end
 
+---@param self lye.parser.Parser
 function Parser:setInitializer(index, kind, valueIdx)
 	local declaration = self.declarations[index]
 	if not declaration then return end
@@ -666,6 +715,7 @@ end
 ---@param isFunction boolean?
 ---@param position integer? which name of its statement this is, so a `---@type A, B` above two names is read one type per name
 ---@return lye.parser.Declaration
+---@param self lye.parser.Parser
 function Parser:declare(name, qualifier, token, isFunction, position)
 	local declaration = {
 		name = name,
@@ -687,6 +737,7 @@ function Parser:declare(name, qualifier, token, isFunction, position)
 	return declaration
 end
 
+---@param self lye.parser.Parser
 function Parser:pushScope(start, conditionIdx)
 	assert(start, "pushScope needs the scope's start offset")
 	self.depth += 1
@@ -694,6 +745,7 @@ function Parser:pushScope(start, conditionIdx)
 	self.scopeStarts[#self.scopeStarts + 1] = { start = start, conditionIdx = conditionIdx }
 end
 
+---@param self lye.parser.Parser
 function Parser:popScope(stop, kind)
 	self.scopes[#self.scopes] = nil
 	local frame = self.scopeStarts[#self.scopeStarts]
@@ -708,6 +760,7 @@ function Parser:popScope(stop, kind)
 end
 
 ---@return boolean
+---@param self lye.parser.Parser
 function Parser:isBlockEnd()
 	local token = self:peek()
 	if token.kind == lexer.KIND.eof then return true end
@@ -718,11 +771,13 @@ end
 --- index reads walks those rather than every node in the document.
 ---@param parsed lye.parser.Result
 ---@param kind lye.parser.NodeKind
+---@return lye.parser.Node[]
 function Parser.nodesOf(parsed, kind)
 	return parsed.byKind[kind] or EMPTY_NODES
 end
 
 ---@return lye.parser.Result
+---@param self lye.parser.Parser
 function Parser:parse()
 	self:parseBlock()
 

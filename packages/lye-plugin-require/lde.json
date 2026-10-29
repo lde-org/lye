@@ -4,14 +4,11 @@
 	"version": "0.1.0",
 	"description": "Module names for require() completion",
 	"dependencies": {
-		"lye-plugin": {
-			"path": "../lye-plugin"
-		},
-		"fs": {
-			"version": "^0.3.0"
-		},
-		"lye-json": {
-			"path": "../lye-json"
-		}
+		"lye-plugin": {"path": "../lye-plugin"},
+		"fs": {"version": "^0.3.0"},
+		"lye-json": {"path": "../lye-json"}
+	},
+	"devDependencies": {
+		"lde-test": {"git": "https://github.com/lde-org/lde"}
 	}
 }

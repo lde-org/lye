@@ -23,7 +23,8 @@ local GUARDED = { ["["] = true, [":"] = true, ["("] = true, ["{"] = true }
 
 --- Prefix expressions, with the suffix chain attached: calls, indexing, fields, method
 --- calls and safe navigation all belong to one loop, which is how the engine parses them.
----@param allowTernaryColon boolean
+---@param self lye.parser.Parser
+---@param allowTernaryColon boolean?
 ---@return integer
 local function parsePrefix(self, allowTernaryColon)
 	local token = self:peek()
@@ -109,6 +110,9 @@ local function parsePrefix(self, allowTernaryColon)
 		if not link then break end
 		link.kind = link.isCall and "call" or "index"
 		link.target = expressionIdx
+		-- The guard is what says a nil target is allowed here: `a?.b` and `a?.:m()` are reads a
+		-- missing value passes through, and the type they give is therefore optional as well.
+		link.isSafe = isSafe
 		expressionIdx = self:emit(link.kind, startOffset, self.arena[self.index - 1].stop, link,
 			expressionIdx)
 		-- Arguments are a list of any length, so they are adopted by loop rather than passed.
@@ -122,6 +126,7 @@ end
 
 ---@return integer
 ---@return integer[] arguments arena indices, like every other child in the tree
+---@param self lye.parser.Parser
 local function parseArguments(self)
 	local token = self:peek()
 	if self:text(token) == "(" then
@@ -155,6 +160,7 @@ local function parseArguments(self)
 end
 
 ---@return integer
+---@param self lye.parser.Parser
 local function parseTable(self)
 	local start = self:peek().start
 	-- The lists are made when there is something to put in them: `{}` and `{ "x", "y" }` are
@@ -235,7 +241,6 @@ local function parseTable(self)
 	return index
 end
 
----@return integer
 --- Whether a token can be part of a type written inline, the way a definition file writes
 --- `n: number`. Types hold no statement, so the reader only has to know where one ends.
 ---@param self lye.parser.Parser
@@ -313,6 +318,10 @@ local function skipGenerics(self)
 	return to and self.source:sub(from, to) or nil
 end
 
+---@param self lye.parser.Parser
+---@param self lye.parser.Parser
+---@param start integer
+---@param isMethod boolean
 local function parseFunctionBody(self, start, isMethod)
 	-- The body's scope opens at the parameter list, not at the statement: a `local function f`
 	-- declares its name outside the scope that holds its parameters and body, so the name stays
@@ -387,6 +396,11 @@ local function parseFunctionBody(self, start, isMethod)
 	return index
 end
 
+---@param self lye.parser.Parser
+---@param allowTernaryColon boolean?
+---@param self lye.parser.Parser
+---@param allowTernaryColon boolean?
+---@return integer
 local function parsePrimary(self, allowTernaryColon)
 	local token = self:peek()
 	local kind = token.kind
@@ -466,6 +480,9 @@ local function parsePrimary(self, allowTernaryColon)
 	return parsePrefix(self, allowTernaryColon)
 end
 
+---@param self lye.parser.Parser
+---@param allowTernaryColon boolean?
+---@return integer
 local function parseUnary(self, allowTernaryColon)
 	local token = self:peek()
 	local kind = token.kind
@@ -517,8 +534,10 @@ end
 --- without it `a ? b : c` reads the `:` as a method call.
 --- Operands are node indices. A span comes from the node an index names, never from the
 --- index itself, which is why every name here says which it holds.
+---@param self lye.parser.Parser
 ---@param minPrecedence integer
----@param allowTernaryColon boolean
+---@param allowTernaryColon boolean?
+---@return integer
 local function parseBinary(self, minPrecedence, allowTernaryColon)
 	-- An expression never begins at a comment, which can appear before one.
 	self:skipComments()
@@ -567,6 +586,7 @@ Parser.parsePrimary = parsePrimary
 Parser.parseUnary = parseUnary
 Parser.parseBinary = parseBinary
 
+---@param self lye.parser.Parser
 ---@param allowTernaryColon boolean? absent is the form that allows one
 function Parser:parseExpression(allowTernaryColon)
 	return parseBinary(self, 1, allowTernaryColon ~= false)

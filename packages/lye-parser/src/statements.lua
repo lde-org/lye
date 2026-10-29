@@ -8,6 +8,7 @@ local KIND = Parser.KIND
 
 local statements = {}
 
+---@param self lye.parser.Parser
 function statements.parseIf(self)
 	local start = self:peek().start
 	self:expect("if")
@@ -36,6 +37,7 @@ function statements.parseIf(self)
 	self:emit("if", start, self.arena[self.index - 1].stop)
 end
 
+---@param self lye.parser.Parser
 function statements.parseDoBlock(self, start, conditionIdx)
 	start = start or self:peek().start
 	self:expect("do")
@@ -45,6 +47,7 @@ function statements.parseDoBlock(self, start, conditionIdx)
 	self:expect("end")
 end
 
+---@param self lye.parser.Parser
 function statements.parseWhile(self)
 	local start = self:peek().start
 	self:expect("while")
@@ -53,6 +56,7 @@ function statements.parseWhile(self)
 	self:emit("while", start, self.arena[self.index - 1].stop)
 end
 
+---@param self lye.parser.Parser
 function statements.parseRepeat(self)
 	local start = self:peek().start
 	self:expect("repeat")
@@ -66,6 +70,7 @@ function statements.parseRepeat(self)
 	self:emit("repeat", start, self.arena[self.index - 1].stop)
 end
 
+---@param self lye.parser.Parser
 function statements.parseFor(self)
 	local start = self:peek().start
 	self:expect("for")
@@ -109,6 +114,7 @@ end
 ---@return string? name
 ---@return lye.lexer.ffi.token? token
 ---@return boolean isMethod
+---@param self lye.parser.Parser
 function statements.parseFunctionName(self)
 	local name, token = self:parseName()
 	if not name then return nil, token, false end
@@ -133,6 +139,7 @@ function statements.parseFunctionName(self)
 	return full, token, isMethod
 end
 
+---@param self lye.parser.Parser
 function statements.parseFunctionStatement(self)
 	local start, startIdx = self:peek().start, self.index
 	self:expect("function")
@@ -150,6 +157,7 @@ function statements.parseFunctionStatement(self)
 	if declarationIdx then self:setInitializer(declarationIdx, "function", bodyIdx) end
 end
 
+---@param self lye.parser.Parser
 function statements.parseLocal(self, start)
 	local startIdx = self.index
 	self:expect("local")
@@ -232,6 +240,7 @@ function statements.parseLocal(self, start)
 	self:adopt(localIdx, valueIdxs)
 end
 
+---@param self lye.parser.Parser
 function statements.parseConst(self, start)
 	local startIdx = self.index
 	self:expect("const")
@@ -264,6 +273,7 @@ function statements.parseConst(self, start)
 	self:emit("const", start, self.arena[self.index - 1].stop)
 end
 
+---@param self lye.parser.Parser
 function statements.parseReturn(self)
 	local start = self:peek().start
 	self:expect("return")
@@ -282,7 +292,9 @@ end
 
 --- An assignment or a call statement. The engine parses the prefix once and then decides
 --- from the next token, which is why this reads the same way.
+---@param self lye.parser.Parser
 function statements.parseExpressionStatement(self)
+	local anchorIdx = self.index
 	-- `parsePrefix` reports a node index, so the statement's span comes from that node.
 	local target = self:parsePrefix(true)
 	local start = self.nodes[target].start
@@ -309,7 +321,7 @@ function statements.parseExpressionStatement(self)
 		local lastTarget, lastValue = target, valueIdxs and valueIdxs[#valueIdxs] or firstValue
 		if targets == nil and valueIdxs == nil then
 			self:emit("assignment", start, self.arena[self.index - 1].stop,
-				{ target = lastTarget, value = lastValue }, lastTarget, lastValue)
+				{ target = lastTarget, value = lastValue, anchorIdx = anchorIdx }, lastTarget, lastValue)
 			return
 		end
 		-- A name past the last expression takes its value at that position in it, the way a name
@@ -329,21 +341,22 @@ function statements.parseExpressionStatement(self)
 		self:emit("assignment", start, self.arena[self.index - 1].stop,
 			{
 				target = lastTarget, targets = allTargets, targetValues = values,
-				targetPositions = positions, value = lastValue,
+				targetPositions = positions, value = lastValue, anchorIdx = anchorIdx,
 			},
 			lastTarget, lastValue)
 		return
 	end
 
-	if Parser.COMPOUND[text] then
+	if Parser.COMPOUND and Parser.COMPOUND[text] then
 		self:advance()
 		local valueIdx = self:parseExpression()
 		self:emit("assignment", start, self.arena[self.index - 1].stop,
-			{ target = target, value = valueIdx }, target, valueIdx)
+			{ target = target, value = valueIdx, anchorIdx = anchorIdx }, target, valueIdx)
 	end
 end
 
 ---@return boolean whether the token started a statement
+---@param self lye.parser.Parser
 function statements.parseStatement(self)
 	-- The kind the last expression gave is read while a table is shaped, and a statement does not
 	-- inherit it from the one before: `local t = { x = y }` asks what `y` is, not what the previous
@@ -423,6 +436,7 @@ function statements.parseStatement(self)
 	return false
 end
 
+---@param self lye.parser.Parser
 function statements.parseBlock(self)
 	while true do
 		-- Comments carry no syntax, but they do carry annotations, so they stay in the

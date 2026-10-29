@@ -14,6 +14,7 @@ local Index = require("lye-lsp.index")
 local timing = require("lye-lsp.timing")
 local plugin = require("lye-plugin")
 local json = require("lye-json")
+local Parser = require("lye-parser")
 
 local check = {}
 
@@ -341,6 +342,7 @@ end
 --- answer that depended on it still holds.
 ---@param path string
 ---@return string|false
+---@param self lye.check.Store
 function Store:keyOf(path)
 	local held = self.hashes[path]
 	if held ~= nil then return held end
@@ -354,6 +356,7 @@ end
 --- of them changes what a file of that package is read against.
 ---@param owner string
 ---@return string
+---@param self lye.check.Store
 function Store:farm(owner)
 	local held = self.farms[owner]
 	if held then return held end
@@ -379,6 +382,7 @@ end
 ---@param key string
 ---@param owner string?
 ---@return table?
+---@param self lye.check.Store
 function Store:hit(path, key, owner)
 	local farm = owner and self:farm(owner) or ""
 	local entry = cache.load(cache.key(key, self.annotations, farm, path))
@@ -391,6 +395,7 @@ end
 ---@param key string
 ---@param owner string?
 ---@param entries table[]
+---@param self lye.check.Store
 function Store:keep(path, key, owner, entries)
 	local stored = {}
 	for index, entry in ipairs(entries) do
@@ -411,6 +416,7 @@ end
 ---@param owner string
 ---@param scopes table<string, table<string, boolean|lye.doc.Type>>
 ---@param elsewhere table<string, boolean|lye.doc.Type>?
+---@param store lye.check.Store?
 ---@return table<string, boolean|lye.doc.Type>
 local function scopeFor(owner, scopes, elsewhere, store)
 	local held = scopes[owner]
@@ -430,8 +436,6 @@ end
 --- A plugin named rather than pathed is a module the package installed, which is one lde linked
 --- into its `target/`: the same place a `require` finds. A plugin that cannot be loaded goes to the
 --- run's error stream, because that is a fault of the run rather than of the file being checked.
----@param path string
----@return lye.plugin.Spec[]
 local pluginsByPackage = {}
 
 --- The file a module name resolves to inside a package's `target/`, without reading it: lde
@@ -485,11 +489,13 @@ local function pluginsFor(path)
 	if owner then read(absolute(owner)) end
 	read(absolute(env.cwd()))
 
-	local specs = plugin.load(entries, owner and absolute(owner) or absolute(env.cwd()), function(name)
-		return modulePath(owner or env.cwd(), name)
-	end, function(message)
-		io.stderr:write("check: " .. message .. "\n")
-	end)
+	---@param name string
+	---@return string?
+	local function moduleAt(name) return modulePath(owner or env.cwd(), name) end
+	---@param message string
+	local function reportPlugin(message) io.stderr:write("check: " .. message .. "\n") end
+	local specs = plugin.load(entries, owner and absolute(owner) or absolute(env.cwd()),
+		moduleAt, reportPlugin)
 	pluginsByPackage[key] = specs
 	return specs
 end
@@ -581,6 +587,30 @@ local function saveInterface(key, path, store, owner, written, module)
 	}, namedPreludeTypes())
 end
 
+--- The text of a module the definitions ship, when `name` is one. A definition file that returns
+--- a value is a module `require` may name: `ffi`, `jit`, `string.buffer`, and the test harness.
+---@param name string
+---@return string?
+local builtinModules = {}
+local function builtinModule(name)
+	local held = builtinModules[name]
+	if held ~= nil then return held or nil end
+	local sources = require("lye-defs")
+	local source = sources[name]
+	if type(source) ~= "string" then
+		builtinModules[name] = false
+		return nil
+	end
+	local parsed = Parser.new(source):parse()
+	for _, child in ipairs(parsed.nodes[parsed.root].children or {}) do
+		if parsed.nodes[child].kind == "return" then
+			builtinModules[name] = source
+			return source
+		end
+	end
+	builtinModules[name] = false
+end
+
 --- The type `require("name")` has in `path`: lde links every module a package can reach under its
 --- `target/`, so one rule answers a dependency and a sibling alike. `ffi` and the rest of the
 --- engine's modules are named in the definitions rather than in a file, and come from there.
@@ -597,11 +627,13 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 	local owner = packageOf(path)
 	if not owner then return nil end
 	local found = modulePath(owner, name)
-	if not found then
+	local builtin = not found and builtinModule(name) or nil
+	if not found and not builtin then
 		return nil
 	end
+	if not found then found = "<builtin>/" .. name end
 
-	local source = readSource(found)
+	local source = builtin or readSource(found)
 	if type(source) ~= "string" then
 		return nil
 	end
@@ -651,7 +683,8 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 		stats.analyses += 1
 		names = analyzer.analyze(written, PRELUDE, own, function(inner)
 			return moduleOf(found, inner, modules, analysing, own, scopes, batch, store)
-		end, nil, docsByText[key], batchPath == nil, isDefinitionPath(path), pluginsFor(found),
+		end, nil, docsByText[key], batchPath == nil, builtin ~= nil or isDefinitionPath(path),
+			builtin and {} or pluginsFor(found),
 			function(message) io.stderr:write("check: " .. message .. "\n") end)
 		analysesByText[key] = names
 	end
@@ -733,10 +766,15 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	local names = analysesByText[key]
 	if names == nil then
 		stats.analyses += 1
-		names = analyzer.analyze(written, PRELUDE, elsewhere, function(name)
+		---@param name string
+		---@return lye.doc.Type?
+		local function moduleFor(name)
 			return moduleOf(path, name, modules or {}, analysing, elsewhere, scopes, batch, store)
-		end, nil, docsByText[key], nil, isDefinitionPath(path), pluginsFor(path),
-			function(message) io.stderr:write("check: " .. message .. "\n") end)
+		end
+		---@param message string
+		local function reportPlugin(message) io.stderr:write("check: " .. message .. "\n") end
+		names = analyzer.analyze(written, PRELUDE, elsewhere, moduleFor, nil, docsByText[key],
+			nil, isDefinitionPath(path), pluginsFor(path), reportPlugin)
 		analysesByText[key] = names
 		-- The full analysis says what `require` of this file gives back as well, and it is the
 		-- richer answer: a module another file reaches afterwards takes it rather than being
@@ -746,6 +784,23 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 			stats.interfaces.stored += 1
 		end
 	end
+	-- A `require` naming a module that is neither linked into the package nor one of the
+	-- definitions is not something the analysis can type. Saying so is better than letting every
+	-- use of the value become a silent unknown.
+	for _, node in ipairs(names.parser.nodes) do
+		if node.kind == "call" and node.callee == "require" and node.args and node.args[1] then
+			local argument = names.parser.nodes[node.args[1]]
+			if argument and argument.kind == "string" and type(argument.value) == "string"
+				and not (owner and modulePath(owner, argument.value))
+				and not builtinModule(argument.value) then
+				names.diagnostics[#names.diagnostics + 1] = {
+					message = string.format("module `%s` is not found", argument.value),
+					severity = 1, start = argument.start, stop = argument.stop,
+				}
+			end
+		end
+	end
+
 	-- The analysis parsed the file already: its own parse carries the syntax errors, so a file is
 	-- read by the parser once per check rather than twice.
 	local all = {}
@@ -821,9 +876,10 @@ function check.extensions(root)
 				local dir = file:match("^(.*)/[^/]+$")
 				-- The plugins that file names, loaded the way the package's own check loads them,
 				-- so that the extensions it walks for are the ones its files really have.
-				local specs = plugin.load(config.plugins, dir, function(name)
-					return modulePath(dir, name)
-				end, function() end)
+				---@param name string
+				---@return string?
+				local function moduleAt(name) return modulePath(dir, name) end
+				local specs = plugin.load(config.plugins, dir, moduleAt, function() end)
 				for _, spec in ipairs(specs) do
 					for _, extension in ipairs(spec.extensions or {}) do
 						if not seen[extension] and extension ~= "lua" then

@@ -8,6 +8,10 @@
 			"commit": "54160bc07dd1afedbf449843f1564bfbd6b82960",
 			"git": "https://github.com/lde-org/fs.git"
 		},
+		"lde-test": {
+			"commit": "a479bc62a66c567d90087225aa5035ca2b29ceb8",
+			"git": "https://github.com/lde-org/lde"
+		},
 		"lye-analyzer": {
 			"path": "../lye-analyzer"
 		},
@@ -50,6 +54,6 @@
 			"git": "https://github.com/lde-org/rapidhash.git"
 		}
 	},
-	"manifestHash": "b02de25e0e73eb40",
+	"manifestHash": "66718cb96604347e",
 	"version": "1"
 }

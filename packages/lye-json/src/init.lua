@@ -4,7 +4,9 @@
 ]]
 
 ---@class lye.json.null
-local NULL = setmetatable({}, { __tostring = function() return "json.null" end })
+---@return string
+local function nullToString() return "json.null" end
+local NULL = setmetatable({}, { __tostring = nullToString })
 
 local json = {}
 json.null = NULL
@@ -12,12 +14,12 @@ json.null = NULL
 local ARRAY_MT = { __json = "array" }
 local OBJECT_MT = { __json = "object" }
 
----@return table
+---@param t table?
 function json.array(t)
 	return setmetatable(t or {}, ARRAY_MT)
 end
 
----@return table
+---@param t table?
 function json.object(t)
 	return setmetatable(t or {}, OBJECT_MT)
 end
@@ -37,16 +39,24 @@ local ESCAPE_OUT = { ['"'] = '\\"', ["\\"] = "\\\\", ["\b"] = "\\b", ["\f"] = "\
 local MIN_SAFE_INT, MAX_SAFE_INT = -9007199254740992, 9007199254740992
 
 --- Raises: nothing follows a call to it, which is what `never` says.
+---@param pos integer
+---@param msg string
 ---@return never
 local function fail(pos, msg)
 	assert(false, format("JSON error at byte %d: %s", pos, msg))
 end
 
+---@param pos integer?
+---@param src string
+---@param what string
 ---@return integer
 local function need(pos, src, what)
 	return pos or fail(#src + 1, what)
 end
 
+---@param buf table
+---@param n integer
+---@param cp integer
 ---@return integer
 local function put(buf, n, cp)
 	if cp < 0x80 then
@@ -119,13 +129,15 @@ end
 ---@param i integer
 ---@return string
 ---@return integer
-decodeString = function(src, i)
+function decodeString(src, i)
 	local nxt = find(src, SPEC, i + 1)
 	if not nxt then fail(i, "unterminated string") end
 	if byte(src, nxt) == 34 then return sub(src, i + 1, nxt - 1), nxt + 1 end
 	return decodeEscapes(src, i, i + 1, nxt)
 end
 
+---@param src string
+---@param i integer
 ---@return number?
 ---@return integer
 local function decodeNumber(src, i)
@@ -185,6 +197,9 @@ end
 
 local decodeValue
 
+---@param src string
+---@param i integer
+---@return table
 ---@return integer
 local function decodeArray(src, i)
 	local arr, n = json.array(), 0
@@ -209,6 +224,8 @@ local function decodeArray(src, i)
 	until false
 end
 
+---@param src string
+---@param i integer
 ---@return table
 ---@return integer
 local function decodeObject(src, i)
@@ -241,9 +258,11 @@ local function decodeObject(src, i)
 	until false
 end
 
+---@param src string
+---@param i integer
 ---@return any
 ---@return integer
-decodeValue = function(src, i)
+function decodeValue(src, i)
 	i = find(src, NON_WS, i)
 	if not i then fail(#src + 1, "unexpected end of input") end
 
@@ -258,6 +277,7 @@ decodeValue = function(src, i)
 	fail(i, format("unexpected byte 0x%02x", c))
 end
 
+---@param src string
 ---@return any
 function json.decode(src)
 	assert(type(src) == "string", "json.decode expects a string")
@@ -267,6 +287,7 @@ function json.decode(src)
 	return value
 end
 
+---@param src string
 ---@return any? value
 ---@return string? err
 function json.tryDecode(src)
@@ -293,6 +314,7 @@ end
 
 local encodeValue
 
+---@param t table
 ---@return boolean
 local function isArray(t)
 	local mt = getmetatable(t)
@@ -307,8 +329,9 @@ local function isArray(t)
 	return n > 0 and t[n] ~= nil
 end
 
+---@param value any
 ---@return string
-encodeValue = function(value)
+function encodeValue(value)
 	local t = type(value)
 	if value == nil or value == NULL then return "null" end
 	if t == "boolean" then return value ? "true" : "false" end

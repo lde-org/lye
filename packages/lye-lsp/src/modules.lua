@@ -305,6 +305,7 @@ end
 ---@param from string? the document the require is written in, which is what says which package it
 --- resolves within
 ---@return lye.doc.Type?
+---@param self lye.Modules
 function Modules:type(name, from)
 	local started = timing.detailed() and timing.now() or nil
 	local outermost = next(self.requiring) == nil
@@ -330,6 +331,7 @@ end
 ---@param name string
 ---@param from string?
 ---@return lye.doc.Type?
+---@param self lye.Modules
 function Modules:resolve(name, from)
 	local lye = self.lye
 	local path = lye.declarations:moduleFile(name, from)
@@ -422,11 +424,13 @@ function Modules:resolve(name, from)
 	-- of that package, and what it can reach is what lde linked into that package's `target/`.
 	-- A module reached through `require` is read for its type: its diagnostics belong to its own
 	-- document, which is analysed on its own account when it is open.
-	local names = analyzer.analyze(written, lye.prelude, lye.declarations:view(uri), function(inner)
-		return self:type(inner, uri)
-	end, nil, nil, true, lye:isDefinition(uri), lye:plugins(uri),
-		function(message) lye.server:log(message, framework.LOG.warning) end,
-		{ uri = uri })
+	---@param inner string
+	---@return lye.doc.Type?
+	local function moduleAt(inner) return self:type(inner, uri) end
+	---@param message string
+	local function reportPlugin(message) lye.server:log(message, framework.LOG.warning) end
+	local names = analyzer.analyze(written, lye.prelude, lye.declarations:view(uri), moduleAt,
+		nil, nil, true, lye:isDefinition(uri), lye:plugins(uri), reportPlugin, { uri = uri })
 	self.requiring[path] = nil
 	local kept = names.module
 	local hash = typeHash(kept, known)
@@ -463,6 +467,7 @@ end
 --- under a different digest does not find them anyway.
 ---@param uri string
 ---@param declarations table<string, boolean|lye.doc.Type>? what the document declared before it changed
+---@param self lye.Modules
 function Modules:documentChanged(uri, declarations)
 	self.openDigest = nil
 	local changed = uri and uri:gsub("^file://", "") or nil
@@ -503,6 +508,7 @@ end
 --- session is only the answer for a session with the same ones open. Kept until one of them
 --- changes, which is the only thing that can make it say something else.
 ---@return string
+---@param self lye.Modules
 function Modules:documentsDigest()
 	if self.openDigest then return self.openDigest end
 	local byUri = self.lye.server.documents and self.lye.server.documents.byUri
@@ -517,6 +523,7 @@ function Modules:documentsDigest()
 end
 
 ---@return table
+---@param self lye.Modules
 function Modules:stats()
 	local entries = 0
 	for _ in pairs(self.entries) do entries += 1 end
@@ -531,6 +538,7 @@ function Modules:stats()
 end
 
 --- Drop every held answer. They are persisted, so a miss is one analysis, not correctness.
+---@param self lye.Modules
 function Modules:clear()
 	self.entries = {}
 	self.requiring = {}

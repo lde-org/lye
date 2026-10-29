@@ -3,5 +3,9 @@
 	"name": "lye-lexer",
 	"version": "0.1.0",
 	"description": "Allocation-light LuaJIT-aware Lua tokenizer with byte spans and trivia",
-	"dependencies": {}
+	"dependencies": {
+	},
+	"devDependencies": {
+		"lde-test": {"git": "https://github.com/lde-org/lde"}
+	}
 }

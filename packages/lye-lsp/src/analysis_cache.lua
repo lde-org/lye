@@ -138,6 +138,7 @@ end
 ---@param text string the text the next analysis will read
 ---@param lowered boolean the view is a plugin's lowering of the document
 ---@return { from: integer, prefix: integer, suffix: integer }?
+---@param self lye.AnalysisCache
 function AnalysisCache:span(uri, text, lowered)
 	if lowered then
 		self.parsed[uri] = nil
@@ -156,6 +157,7 @@ end
 ---@param uri string
 ---@param text string
 ---@return lye.doc.File?
+---@param self lye.AnalysisCache
 function AnalysisCache:annotationsFor(uri, text)
 	local held = self.annotations[uri]
 	if held and held.text == text then return held.doc end
@@ -165,6 +167,7 @@ end
 
 --- Drop everything the text meant. The parse stays: the next text is read against it.
 ---@param uri string
+---@param self lye.AnalysisCache
 function AnalysisCache:forget(uri)
 	self.analysis[uri] = nil
 	self.names[uri] = nil
@@ -177,6 +180,7 @@ end
 --- Drop everything held for a document, including what could resume its next text. Closing is the
 --- only time that is right: the document is not coming back to this session.
 ---@param uri string
+---@param self lye.AnalysisCache
 function AnalysisCache:close(uri)
 	self:forget(uri)
 	self:drop(uri)
@@ -186,6 +190,7 @@ end
 
 --- Drop everything held for one document, wherever it is held.
 ---@param uri string
+---@param self lye.AnalysisCache
 function AnalysisCache:drop(uri)
 	self.analysis[uri] = nil
 	self.names[uri] = nil
@@ -199,6 +204,7 @@ end
 --- Record that `uri` is the most recently used entry. The budget is enforced by `evict` once an
 --- idle pass has finished publishing, not here.
 ---@param uri string
+---@param self lye.AnalysisCache
 function AnalysisCache:keep(uri)
 	local order = self.order
 	for index = #order, 1, -1 do
@@ -211,6 +217,7 @@ end
 ---@param names lye.analyzer.Result
 ---@param view lye.View
 ---@param epoch integer
+---@param self lye.AnalysisCache
 function AnalysisCache:store(uri, names, view, epoch)
 	local result = names.parser
 	self.analysis[uri] = result
@@ -231,6 +238,7 @@ function AnalysisCache:store(uri, names, view, epoch)
 end
 
 ---@return lye.AnalysisCacheStats
+---@param self lye.AnalysisCache
 function AnalysisCache:stats()
 	local analyses, analysisBytes = 0, 0
 	local held = {}
@@ -281,6 +289,7 @@ end
 
 --- Drop the least recently used held analysis that is not the current document.
 ---@return boolean didDrop
+---@param self lye.AnalysisCache
 function AnalysisCache:_evictAnalysis()
 	local order = self.order
 	for index = 1, #order do
@@ -307,6 +316,7 @@ end
 --- its analysis loses its parse, predecessor and annotations with that analysis, not before it.
 ---@param field "previous"|"annotations"|"parsed"
 ---@return boolean didDrop
+---@param self lye.AnalysisCache
 function AnalysisCache:_evictUnheld(field)
 	local chosen, chosenAt
 	for uri in pairs(self[field]) do
@@ -324,6 +334,7 @@ end
 --- Enforce the budget. Called after an idle pass has published every answer, so an analysis is
 --- never dropped half way through answering for it, and when a document closes.
 ---@return lye.AnalysisCacheStats the numbers after eviction
+---@param self lye.AnalysisCache
 function AnalysisCache:evict()
 	local measured = self:stats()
 	while measured.analyses > self.maxEntries do

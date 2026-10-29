@@ -66,6 +66,9 @@ function DocumentStore.new()
 end
 
 ---@param self lye.framework.DocumentStore
+---@param uri string
+---@param text string
+---@param version integer
 ---@return lye.framework.Document
 function DocumentStore:open(uri, text, version)
 	local document = Document.new(uri, text, version)
@@ -74,6 +77,7 @@ function DocumentStore:open(uri, text, version)
 end
 
 ---@param self lye.framework.DocumentStore
+---@param uri string
 ---@return lye.framework.Document?
 function DocumentStore:get(uri)
 	return self.byUri[uri]

@@ -22,6 +22,7 @@ local infer = {}
 ---@field building table<integer, boolean> the nodes being typed now, so a self-reach ends
 ---@field modules fun(name: string): lye.doc.Type? what `require("name")` is, when the caller can say
 ---@field ctypes fun(node: lye.parser.Node): lye.doc.Type? what a call naming a C type is worth
+---@field varargAt table<integer, lye.doc.Type>? the `...` type of each literal `...`, by node index
 
 local KNOWN = {
 	number = true, string = true, literal = true, table = true, ["function"] = true,
@@ -56,7 +57,8 @@ end
 local function stringFieldOf(ctx, base, field, start)
 	if not field or not ctx.typeOfName or not types.mayBe(base, "string") then return nil end
 	local library = ctx.typeOfName("string", start)
-	return library and types.fieldOf(library, field) or nil
+	if not library then return nil end
+	return types.fieldOf(library, field)
 end
 
 --- Remember where a placeholder was cached: refinement reads those nodes again, and a walk of
@@ -116,7 +118,10 @@ end
 ---@return lye.doc.Type
 local function argumentValue(ctx, idx, valueOf)
 	local node = ctx.parser.nodes[idx]
-	if node and node.kind == "string" then return types.stringValue(node.value or "") end
+	if node and node.kind == "string" then
+		local value = node.value
+		return types.stringValue(type(value) == "string" and value or "")
+	end
 	return valueOf(ctx, idx)
 end
 
@@ -153,7 +158,7 @@ local function overloadOf(ctx, node, calleeType, valueOf)
 	if receiver then receiver = types.narrowTruthiness(receiver, true) or receiver end
 
 	local best, bestScore
-	for _, shape in ipairs(shapes) do
+	for _, shape in ipairs(shapes or {}) do
 		local fits = true
 		local shift = 0
 		local score = 0
@@ -194,6 +199,9 @@ local function overloadOf(ctx, node, calleeType, valueOf)
 	return best
 end
 
+---@param ctx lye.infer.Context
+---@param idx integer?
+---@return lye.doc.Type
 local function of(ctx, idx)
 	if not idx then return types.mutable() end
 	local cached = ctx.cache[idx]
@@ -234,7 +242,7 @@ local function of(ctx, idx)
 		-- value `false`: `{ ... }` held `false`, the second name of `for _, v in ipairs({ ... })`
 		-- was declared `false`, and every use of it was reported as a value that was not one.
 		if node.text == "..." then
-			result = types.ANY_TYPE
+			result = (ctx.varargAt and ctx.varargAt[idx]) or types.ANY_TYPE
 		else
 			result = node.text == "nil" and types.NIL_TYPE or types.booleanValue(node.text == "true")
 		end
@@ -306,6 +314,9 @@ local function of(ctx, idx)
 		result = node.isDynamic ~= true and stringFieldOf(ctx, base, node.field, node.start)
 			or ctx.typeOfField and ctx.typeOfField(base, baseName, node.field, node.start)
 			or types.indexResult(base, node.field)
+		-- A `?.` read of a value that may be nil is that value's field or nil: it does not fail,
+		-- so the result is optional the way the access is.
+		if node.isSafe then result = types.union({ result, types.NIL_TYPE }) end
 	elseif kind == "call" then
 		-- `require("a.b")` is the module that file returns: asking the caller for it is what turns a
 		-- path into a type, and the caller is whoever can read the file.
@@ -341,6 +352,88 @@ local function of(ctx, idx)
 			local held = of(ctx, node.args[1])
 			result = types.narrowTruthiness(held, true) or held
 			return cache(ctx, idx, result)
+		end
+
+		-- `select("#", ...)` is how many values the rest of the call gave, and `select(n, ...)`
+		-- is the nth of them: the language's own way of working with a tuple, which the type of
+		-- `...` otherwise cannot express.
+		if node.callee == "select" and node.args and node.args[1] then
+			local first = ctx.parser.nodes[node.args[1]]
+			if first and first.kind == "string" and first.value == "#" then
+				result = types.NUMBER
+				return cache(ctx, idx, result)
+			end
+			local index
+			if first and first.kind == "number" and type(first.value) == "number" then
+				index = first.value
+			elseif first and first.kind == "unary" and first.op == "-" then
+				local operand = first.operand and ctx.parser.nodes[first.operand]
+				if operand and operand.kind == "number" and type(operand.value) == "number" then
+					index = -operand.value
+				end
+			end
+			if index then
+				local source
+				if index >= 1 then
+					source = node.args[1 + index]
+				else
+					-- A negative index counts from the end of the values written after it. With
+					-- `...` as the only one, the count is unknown and the varargs' own type is the
+					-- answer; with explicit arguments the position is exact.
+					local count = #node.args - 1
+					local position = count + index + 1
+					if position >= 1 then source = node.args[1 + position] end
+				end
+				if source then
+					local sourceNode = ctx.parser.nodes[source]
+					result = sourceNode and sourceNode.kind == "call"
+						and infer.valuesAt(ctx, source, 1) or of(ctx, source)
+				else
+					result = types.NIL_TYPE
+				end
+				return cache(ctx, idx, result)
+			end
+			-- A computed index selects any of the values, so the second argument's own type is the
+			-- honest answer; `select(i, ...)` in a generic loop reads the varargs' annotation.
+			if node.args[2] then
+				result = of(ctx, node.args[2])
+				return cache(ctx, idx, result)
+			end
+		end
+
+		-- `pcall` and `xpcall` hand back the function's own results when it succeeds, after the
+		-- status. The definitions can only write `any` for the rest, and a caller then cannot use
+		-- what it just called. Reading the callable's results here is what makes the common
+		-- `local ok, value = pcall(decode, text)` usable.
+		if (node.callee == "pcall" or node.callee == "xpcall") and node.args and node.args[1] then
+			local called = of(ctx, node.args[1])
+			if types.isFn(called) then
+				-- The results after the status are read by `valuesAt` when they are wanted: the
+				-- function's body may be typed after this call, and caching the answer here froze
+				-- `local ok, value = pcall(f)` as an unknown value.
+				result = types.BOOLEAN
+				return cache(ctx, idx, result)
+			end
+		end
+
+		-- A pattern call is typed from the pattern written at the call site: `s:match("(%d+)")`
+		-- is a string, not the `any ...` the definitions can only write for a capture. The
+		-- pattern module already knows the values; reading it here keeps a name bound to the
+		-- call from staying `any` through every later use.
+		if node.args then
+			local target = node.target and ctx.parser.nodes[node.target]
+			local field = node.field or (target and target.field)
+			local subject = field and field:match("([%w_]+)$")
+			local at = subject and pattern.CALLS[subject] and node.args[node.isMethod and 1 or 2]
+			local literal = at and ctx.parser.nodes[at]
+			if subject and literal and literal.kind == "string" and type(literal.value) == "string" then
+				local values = pattern.values(subject, literal.value)
+				if values then
+					ctx.callValues[node.index] = values
+					ctx.callTypes[node.index] = values[1]
+					return cache(ctx, idx, values[1])
+				end
+			end
 		end
 
 		-- A call yields what its callee returns, whether that came from an annotation or from the
@@ -381,6 +474,8 @@ local function of(ctx, idx)
 		else
 			result = ctx.returns[node.callee or ""] or types.mutable()
 		end
+		-- A guarded call — `f?.()`, `obj?.:method()` — gives nothing when the value is absent.
+		if node.isSafe then result = types.union({ result, types.NIL_TYPE }) end
 	else
 		result = types.mutable()
 	end
@@ -391,12 +486,16 @@ end
 ---@param parser lye.parser.Result
 ---@param typeOfName fun(name: string, offset: integer): lye.doc.Type
 ---@param returns table<string, lye.doc.Type>?
+---@param typeOfField fun(base: lye.doc.Type, baseName: string?, field: string, offset: integer): lye.doc.Type?
+---@param modules fun(name: string): lye.doc.Type?
+---@param ctypes fun(node: lye.parser.Node): lye.doc.Type?
 ---@return lye.infer.Context
 function infer.context(parser, typeOfName, returns, typeOfField, modules, ctypes)
 	return {
 		parser = parser, typeOfName = typeOfName, returns = returns or {}, typeOfField = typeOfField, cache = {}, mutables = {}, fnTypes = {},
 		callTypes = {},
 		callValues = {},
+		varargAt = {},
 		building = {},
 		modules = modules,
 		ctypes = ctypes,
@@ -428,6 +527,19 @@ function infer.valuesAt(ctx, idx, position)
 	-- cannot know — a pattern written at the call site, most of all.
 	local callValues = ctx.callValues[node.index]
 	if callValues then return callValues[position] or types.NIL_TYPE end
+	-- `pcall` and `xpcall` give the status and then what the function gave. The callable's own
+	-- result is read here rather than only where the call was typed: the literal's body may have
+	-- been typed after that.
+	if (node.callee == "pcall" or node.callee == "xpcall") and position > 1 and node.args
+		and node.args[1] then
+		local called = of(ctx, node.args[1])
+		if types.isFn(called) then
+			local given = called.values or { called.returns }
+			local value = given[position - 1]
+			if not value and called.isSpread then value = called.returns end
+			if value then return value end
+		end
+	end
 	-- A pattern written at the call is read here rather than left to a later pass: a name is typed
 	-- the first time round, and a value that only arrives in the second never reaches it.
 	if node.args then
@@ -438,7 +550,7 @@ function infer.valuesAt(ctx, idx, position)
 		local subject = field and field:match("([%w_]+)$")
 		local at = subject and pattern.CALLS[subject] and node.args[node.isMethod and 1 or 2]
 		local literal = at and ctx.parser.nodes[at]
-		if literal and literal.kind == "string" and type(literal.value) == "string" then
+		if subject and literal and literal.kind == "string" and type(literal.value) == "string" then
 			local values = pattern.values(subject, literal.value)
 			if values and values[position] then return values[position] end
 		end
@@ -527,13 +639,31 @@ function infer.bind(pattern, actual, generics, bindings)
 		if not bindings[pattern.name] then bindings[pattern.name] = actual end
 		return
 	end
-	if pattern.variant == "array" and actual.variant == "array" then
-		return infer.bind(pattern.type, actual.type, generics, bindings)
+	if pattern.variant == "array" then
+		-- A list written `T[]` and one written `{ [integer]: T }` are the same shape, and a
+		-- `table.sort(names, …)` argument is typed the second way by inference.
+		if actual.variant == "array" then
+			return infer.bind(pattern.type, actual.type, generics, bindings)
+		elseif actual.variant == "object" and actual.indexed
+			and (actual.indexed.key == "integer" or actual.indexed.key == "number") then
+			return infer.bind(pattern.type, actual.indexed.type, generics, bindings)
+		end
+		return
+	end
+	if pattern.variant == "fn" and actual.variant == "fn" then
+		for index, param in ipairs(pattern.params or {}) do
+			if actual.params[index] then
+				infer.bind(param, actual.params[index], generics, bindings)
+			end
+		end
+		return infer.bind(pattern.returns, actual.returns, generics, bindings)
 	end
 	if pattern.variant ~= "object" then return end
-	if actual.variant == "object" then
+	if actual.variant == "object" or actual.variant == "class" then
 		for name, field in pairs(pattern.fields) do
-			if actual.fields[name] then infer.bind(field, actual.fields[name], generics, bindings) end
+			if actual.fields and actual.fields[name] then
+				infer.bind(field, actual.fields[name], generics, bindings)
+			end
 		end
 	end
 	if pattern.indexed then

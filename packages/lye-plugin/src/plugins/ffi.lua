@@ -246,10 +246,16 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 	-- `ffi.C` reaches the functions the file's own blocks declared, and the name is what says so:
 	-- the far side is read the way `ffi.cdef`, `ffi.new` and `ffi.load` are, since a file that
 	-- requires `ffi` has that name for it whether or not the definitions reach the table.
-	answer.field = function(_, baseName, field)
+	---@param _ any
+	---@param baseName string?
+	---@param field string
+	---@return lye.doc.Type?
+	function answer.field(_, baseName, field)
 		if field == "C" and baseName == "ffi" then return loadedSymbols() end
 	end
-	answer.parameter = function(declaration) return callbackParams[declaration] end
+	---@param declaration lye.parser.Declaration
+	---@return lye.doc.Type?
+	function answer.parameter(declaration) return callbackParams[declaration] end
 	answer.callbackReturns = callbackReturns
 	return answer
 end
@@ -285,12 +291,15 @@ function ffiPlugin.types(context)
 		end
 	end
 	if #cdefs == 0 then return nil end
+	---@param resolve fun(text: string): lye.doc.Type?
+	---@return lye.plugin.TypeProviders?
+	local function attach(resolve)
+		return providersOf(cdefs, resolve, parsed_, callName)
+	end
 	return {
 		annotations = files,
 		diagnostics = diagnostics,
-		attach = function(resolve)
-			return providersOf(cdefs, resolve, parsed_, callName)
-		end,
+		attach = attach,
 	}
 end
 

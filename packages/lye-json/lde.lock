@@ -1,5 +1,10 @@
 {
-	"dependencies": [],
-	"manifestHash": "b9d9308263dc88c7",
+	"dependencies": {
+		"lde-test": {
+			"commit": "a479bc62a66c567d90087225aa5035ca2b29ceb8",
+			"git": "https://github.com/lde-org/lde"
+		}
+	},
+	"manifestHash": "ac453b9f2226896f",
 	"version": "1"
 }

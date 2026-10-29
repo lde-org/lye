@@ -47,6 +47,9 @@ end
 --- Split `name type # comment`, where the comment is optional and introduced by `#`.
 --- The separator needs whitespace before it because a type can contain `#` in a table
 --- shape, as in `{ # number }`.
+---@param body string
+---@return string
+---@return string?
 local function splitBody(body)
 	local at = body:find("%s#%s")
 	if at then return body:sub(1, at - 1), trim(body:sub(at + 2)) end
@@ -59,7 +62,7 @@ end
 local CONTINUES = {
 	["|"] = true, [","] = true, ["."] = true, ["["] = true, ["]"] = true, ["?"] = true,
 	["*"] = true, ["("] = true, [")"] = true, ["<"] = true, [">"] = true, ["{"] = true,
-	["}"] = true, [":"] = true,
+	["}"] = true, [":"] = true, ["&"] = true, ["+"] = true, ["-"] = true,
 }
 
 --- The same, for the word *before* the space. Only a character that still wants the word after it —
@@ -67,7 +70,7 @@ local CONTINUES = {
 --- space after `)` or `]` begins prose.
 local BINDS = {
 	["|"] = true, [","] = true, ["."] = true, ["?"] = true, ["*"] = true, [":"] = true,
-	["("] = true, ["["] = true, ["{"] = true, ["<"] = true,
+	["("] = true, ["["] = true, ["{"] = true, ["<"] = true, ["&"] = true,
 }
 
 --- The type expression at the front of `text`, with any prose written after it dropped. Brackets
@@ -100,10 +103,18 @@ end
 
 local function cutType(text)
 	text = trim(text)
-	local depth, quote, at, length = 0, nil, 1, #text
+	local conditional = text:find("%f[%w_]extends%f[^%w_]") ~= nil
+	local keyof = text:sub(1, 5) == "keyof"
+	local depth, quote, template, at, length = 0, nil, false, 1, #text
 	while at <= length do
 		local char = text:sub(at, at)
-		if quote then
+		if template then
+			if char == "`" then template = false end
+			at = at + 1
+		elseif char == "`" then
+			template = true
+			at = at + 1
+		elseif quote then
 			if char == "\\" then at = at + 2
 			else
 				if char == quote then quote = nil end
@@ -126,7 +137,9 @@ local function cutType(text)
 			if stop > length then break end
 			local arrowHere = text:sub(at - 2, at - 1) == "->"
 			local arrowNext = text:sub(stop, stop + 1) == "->"
-			if arrowHere or arrowNext or BINDS[text:sub(at - 1, at - 1)] or CONTINUES[text:sub(stop, stop)] then
+			local afterKeyof = keyof and text:sub(1, at - 1):match("^keyof%s*$") ~= nil
+			if conditional or afterKeyof or arrowHere or arrowNext
+				or BINDS[text:sub(at - 1, at - 1)] or CONTINUES[text:sub(stop, stop)] then
 				at = stop
 			else
 				break
@@ -148,12 +161,21 @@ doc.TAG_PATTERN = "%-%-%-[ \t]*@"
 ---@param comment string
 ---@param text string
 ---@param from integer
+---@param comment string
+---@param text string
+---@param from integer
+---@return integer?
+---@return integer?
 local function spanOf(comment, text, from)
 	local at = comment:find(text, from, true)
 	if not at then return nil end
 	return at, at + #text - 1
 end
 
+---@param comment string
+---@param start integer
+---@param stop integer
+---@return lye.doc.Annotation?
 local function parse(comment, start, stop)
 	-- `---@param x T`, and the bracketed `--[[@as T]]` a cast is written with inside an
 	-- expression. Both spellings are read here so the spans a caller computes stay the ones the
@@ -205,6 +227,17 @@ local function parse(comment, start, stop)
 			annotation.type = signature and ("(" .. written .. ")?") or (written .. "?")
 		end
 	elseif tag == "field" then
+		-- `---@field private name type` writes the visibility first, which is the spelling the
+		-- codebase uses. It belongs to the field rather than to its type: reading it as the name
+		-- left the real field named `private` with the type `name`.
+		for _, visibility in ipairs({ "private", "protected", "public" }) do
+			local after = rest:match("^" .. visibility .. "%s+(.*)$")
+			if after then
+				annotation.visibility = visibility
+				rest = after
+				break
+			end
+		end
 		-- `---@field [integer] T` is an index signature rather than a field: what a value indexed
 		-- with that kind of key gives. The bracket is the name slot — a key type, not an
 		-- identifier — and the type after it is the value's.

@@ -64,6 +64,7 @@ server.LOG = {
 	log = 4,
 }
 
+---@param params table
 ---@return string
 local function negotiateEncoding(params)
 	local offered = params.capabilities?.general?.positionEncodings
@@ -100,11 +101,14 @@ function Server.new(connection, options)
 end
 
 ---@param self lye.framework.Server
+---@param method string
+---@param handler fun(self: lye.framework.Server, params: table?, id: any?)
 function Server:on(method, handler)
 	self.handlers[method] = handler
 end
 
 ---@param self lye.framework.Server
+---@param method string
 ---@return fun(self: lye.framework.Server, params: table?, id: any)?
 function Server:handlerFor(method)
 	return self.handlers[method]
@@ -115,6 +119,7 @@ function Server:capability(key, value)
 	self.capabilities[key] = value
 end
 
+---@param message table
 ---@return boolean
 local function isRequest(message)
 	return message.id ~= nil
@@ -215,6 +220,7 @@ function Server:onDidClose(params)
 end
 
 ---@param self lye.framework.Server
+---@param message table
 function Server:handle(message)
 	local method = message.method
 	if not method then

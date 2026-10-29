@@ -41,6 +41,9 @@ Lua runtime, no `lde`, and no packages to install.
 - generic classes and functions with constraints; overloads are checked at the call site and
   narrowed in signature help
 - LuaLS `---@` annotations: classes, aliases, literal/union/`never`/`const` types, casts and `as`
+- type-level forms: intersections (`A & B`), `keyof`, indexed access (`T["k"]`), conditional types
+  (`T extends U ? X : Y`), mapped types (`{ [K in keyof T]: U }`) and template literal types
+- assignment-aware field narrowing, optional-chain (`?.`) typing, and correlated `pcall` values
 - LuaJIT's and Lua 5.1's standard library, from eighteen definition files, drives hover and
   completion
 - FFI types are ordinary types, not `cdata` boxes

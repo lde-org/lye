@@ -4,8 +4,9 @@
 	"version": "0.1.0",
 	"description": "JSON-RPC 2.0 framing and connection handling over a byte stream",
 	"dependencies": {
-		"lye-json": {
-			"path": "../lye-json"
-		}
+		"lye-json": {"path": "../lye-json"}
+	},
+	"devDependencies": {
+		"lde-test": {"git": "https://github.com/lde-org/lde"}
 	}
 }

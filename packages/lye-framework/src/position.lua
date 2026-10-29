@@ -16,6 +16,7 @@ position.UTF16 = "utf-16"
 --- line that is not here has a UTF-16 position equal to its byte offset, which almost every line
 --- of code does; keeping only the exception is what makes the fast path free of a per-line table.
 
+---@param text string
 ---@return lye.framework.LineIndex
 function position.buildLineIndex(text)
 	local starts, wideLines, count = { 1 }, nil, 1
@@ -69,6 +70,8 @@ end
 
 position.lineAt = lineAt
 
+---@param index lye.framework.LineIndex
+---@param line integer
 ---@return integer?
 function position.lineStart(index, line)
 	return index.starts[line + 1]
@@ -85,6 +88,8 @@ function position.lineText(text, index, line)
 	return text:sub(start, stop)
 end
 
+---@param line string
+---@param byteCount integer
 ---@return integer
 local function utf16Length(line, byteCount)
 	if not line:find("[\128-\255]") then return byteCount end
@@ -111,6 +116,8 @@ end
 
 position.utf16Length = utf16Length
 
+---@param line string
+---@param units integer
 ---@return integer
 local function utf16ToBytes(line, units)
 	if not line:find("[\128-\255]") then return math.min(units, #line) end

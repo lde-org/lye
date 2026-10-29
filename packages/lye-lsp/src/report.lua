@@ -51,6 +51,8 @@ local function wantsColor()
 end
 
 ---@param self lye.Report
+---@param name string
+---@param text string
 local function paint(self, name, text)
 	if not self.color then return text end
 	return (PAINT[name] or "") .. text .. PAINT.reset

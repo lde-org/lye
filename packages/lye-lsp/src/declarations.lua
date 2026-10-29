@@ -97,13 +97,15 @@ end
 ---@param below table<string, boolean|lye.doc.Type>
 ---@return table<string, boolean|lye.doc.Type>
 local function layer(held, below)
-	return setmetatable({}, {
-		__index = function(_, name)
-			local value = held[name]
-			if value ~= nil then return value end
-			return below[name]
-		end,
-	})
+	---@param _ table
+	---@param name string
+	---@return boolean|lye.doc.Type?
+	local function layerIndex(_, name)
+		local value = held[name]
+		if value ~= nil then return value end
+		return below[name]
+	end
+	return setmetatable({}, { __index = layerIndex })
 end
 
 --- The workspace/package scans, the declaration view, module names and files, and the locations
@@ -143,6 +145,7 @@ end
 ---@param kind "workspace"|"package"
 ---@param root string
 ---@return lye.lsp.Index
+---@param self lye.Declarations
 function Declarations:newIndex(kind, root)
 	local provider = self.indexes and self.indexes[kind]
 	local injected = provider and provider(root)
@@ -153,6 +156,7 @@ end
 --- Merge where each loaded root writes its types. A name declared twice belongs to the first root
 --- that has it: the workspace, then each package root in path order, so a load and a build of the
 --- same session answer the same.
+---@param self lye.Declarations
 function Declarations:mergeLocations()
 	local merged = {}
 	local function add(index)
@@ -179,6 +183,7 @@ end
 --- reads from it. A load that does not have to read anything is the warm start; `lye.known` is
 --- set to nil by the watcher's full invalidation, and that rebuilds rather than trusts.
 ---@return lye.lsp.Index?
+---@param self lye.Declarations
 function Declarations:ensureWorkspace()
 	local lye = self.lye
 	lye:useWorkspaceCache()
@@ -222,6 +227,7 @@ end
 --- The classes and aliases every file in the workspace declares, each resolved to the type it
 --- stands for. Read once from the index: a warm session touches no source file.
 ---@return table<string, boolean|lye.doc.Type>
+---@param self lye.Declarations
 function Declarations:workspace()
 	self:ensureWorkspace()
 	self.lye.known = self.lye.known or {}
@@ -229,6 +235,7 @@ function Declarations:workspace()
 end
 
 ---@param root string
+---@param self lye.Declarations
 function Declarations:touchPackage(root)
 	local order = self.packageOrder
 	for index = #order, 1, -1 do
@@ -253,6 +260,7 @@ end
 --- contents behind them, so a changed link is a different answer and the workspace is untouched.
 ---@param root string the package root
 ---@return table<string, boolean|lye.doc.Type>
+---@param self lye.Declarations
 function Declarations:package(root)
 	local lye = self.lye
 	if not root then return {} end
@@ -291,6 +299,7 @@ end
 ---@param prefix string what has been typed inside the quotes so far
 ---@param from string? the document the completion is for, which says which layout it uses
 ---@return { name: string, path: string?, detail: string? }[] a workspace file has a path, a module of the engine a detail
+---@param self lye.Declarations
 function Declarations:moduleNames(prefix, from)
 	local root = self.lye.server.rootPath
 	local found, seen = {}, {}
@@ -334,6 +343,7 @@ end
 ---@param name string
 ---@param from string? the document the require is written in
 ---@return string?
+---@param self lye.Declarations
 function Declarations:moduleFile(name, from)
 	local root = self.lye.server.rootPath
 
@@ -395,6 +405,7 @@ end
 --- `require` is answered and forgotten rather than accumulated for the session's lifetime.
 ---@param uri string? the document the names are for
 ---@return table<string, boolean|lye.doc.Type>
+---@param self lye.Declarations
 function Declarations:view(uri)
 	local key = uri or ""
 	local cached = self.views[key]
@@ -414,6 +425,7 @@ end
 --- a view cached against the previous layer is no longer the answer.
 ---@param uri string
 ---@param declarations table<string, boolean|lye.doc.Type>
+---@param self lye.Declarations
 function Declarations:declared(uri, declarations)
 	self.open[uri] = declarations
 	self.generation += 1
@@ -422,6 +434,7 @@ end
 --- A document's text moved on: drop its layer. The analysis that follows calls `declared` with the
 --- declarations of the new text.
 ---@param uri string
+---@param self lye.Declarations
 function Declarations:documentChanged(uri)
 	self.open[uri] = nil
 	self.generation += 1
@@ -430,6 +443,7 @@ end
 --- What every view was built from has changed, and nothing built so far is an answer about the
 --- project on disk. The open documents keep their layers — they are still the text the editor
 --- holds — but every cached view is dropped and the next one is built anew.
+---@param self lye.Declarations
 function Declarations:invalidate()
 	self.generation += 1
 	self.views = {}
@@ -438,6 +452,7 @@ end
 --- The document is closed: its layer went with `documentChanged`, and a view built while it was
 --- open cannot stand in for one built without it.
 ---@param uri string
+---@param self lye.Declarations
 function Declarations:documentClosed(uri)
 	self.open[uri] = nil
 	self:invalidate()
@@ -460,6 +475,7 @@ end
 --- one answer that says the whole workspace has to be read again and the module cache cleared.
 ---@param params table
 ---@return boolean
+---@param self lye.Declarations
 function Declarations:watchedFiles(params)
 	local lye = self.lye
 	local root = lye.server.rootPath
@@ -544,6 +560,7 @@ end
 ---@param name string
 ---@param uri string? the document the question came from, which is read first
 ---@return { location: lye.DefinitionLocation, lines: string }?
+---@param self lye.Declarations
 function Declarations:typeLocation(name, uri)
 	local lye = self.lye
 	-- The document the cursor is in comes first: a class written in a buffer that was never saved
@@ -595,6 +612,7 @@ end
 ---@param name string
 ---@param uri string
 ---@return lye.DefinitionLocation?
+---@param self lye.Declarations
 function Declarations:targetOfType(name, uri)
 	local lye = self.lye
 	local function inDocument(documentUri, names)
@@ -628,6 +646,7 @@ end
 --- validating entries; the rest are counts across the workspace and every loaded package, with
 --- `workers` the processes the builds used and `fellBack` the shards a failed child left behind.
 ---@return table
+---@param self lye.Declarations
 function Declarations:stats()
 	local lye = self.lye
 	local known, packages = 0, 0

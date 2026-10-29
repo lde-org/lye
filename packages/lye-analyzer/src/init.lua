@@ -55,7 +55,7 @@ end
 ---@field declared lye.doc.Type? the type an annotation fixed, if any
 ---@field evolvedType lye.doc.Type? the shape an empty table took from a parameter it was passed to
 ---@field initializer lye.doc.Type
----@field assignments { at: integer, type: lye.doc.Type }[]
+---@field assignments { at: integer, type: lye.doc.Type, valueIdx: integer?, valuePosition: integer? }[]
 ---@field references integer[]
 
 ---@class lye.analyzer.Scope
@@ -167,6 +167,9 @@ end
 ---@field signatures table<string, lye.analyzer.Signature>
 ---@field returns table<string, lye.doc.Type>
 ---@field callTypes table<integer, lye.doc.Type> what each call was bound to, by node index
+---@field fieldWrites table<string, { at: integer, valueIdx: integer, scope: lye.analyzer.Scope }[]> writes to a named field, by `base.field`
+---@field pcallPairs table<lye.analyzer.Variable, lye.analyzer.Variable>? the value a `local ok, value = pcall(...)` declares, by its status name
+---@field inferCtx table? the inference context, for a field read that needs a write's value typed
 ---@field module lye.doc.Type? what `require` of this file means, when it returns a table
 ---@field providers lye.plugin.TypeProviders[]? what the plugins of this document answer
 ---@field items lye.analyzer.ItemTree the item manifest, built for every analysis
@@ -175,14 +178,14 @@ end
 ---@field requiredModules table<string, boolean> names passed to the `modules` callback
 ---@field counters table<string, number>? the phase timings, when the caller asked for them
 
----@param result lye.parser.Result
----@return lye.analyzer.Scope
 local ARITHMETIC = {
 	["+"] = true, ["-"] = true, ["*"] = true, ["/"] = true, ["%"] = true, ["^"] = true,
 	["&"] = true, ["|"] = true, ["~"] = true, ["<<"] = true, [">>"] = true, ["~>>"] = true,
 }
 
 
+---@param result lye.parser.Result
+---@return lye.analyzer.Scope
 local function buildScopes(result)
 	local root = { start = 1, stop = math.huge, depth = 0, variables = {}, children = {}, facts = {} }
 	local byRecord = {}
@@ -231,6 +234,10 @@ local SCOPE_SLOTS = 256
 
 ---@param self lye.analyzer.Result
 ---@param offset integer
+---@return lye.analyzer.Scope
+---@param self lye.analyzer.Result
+---@param offset integer
+---@return lye.analyzer.Scope
 local function scopeAt(self, offset)
 	local slot = (offset % SCOPE_SLOTS) + 1
 	local offsets, scopes_ = self.scopeSlots, self.scopeValues
@@ -442,6 +449,7 @@ end
 --- What a condition says about a type, or nil when it cannot be said of this one.
 ---@param base lye.doc.Type
 ---@param fact lye.analyzer.Narrowing
+---@param onField boolean
 ---@return lye.doc.Type?
 local function applyFact(base, fact, onField)
 	if fact.kind == "type" then
@@ -475,11 +483,26 @@ end
 --- The type of a field read at an offset: what the field holds, narrowed by any condition on it
 --- that still holds where it is read. A condition stops holding where something could have changed
 --- what it was about, which is where its span ends — see where the spans are cut.
+--- Whether `outer` is the scope `inner` is written in, or an outer one: a write there has already
+--- happened however the branches below it ran.
+---@param outer lye.analyzer.Scope
+---@param inner lye.analyzer.Scope
+---@return boolean
+local function scopeCovers(outer, inner)
+	local at = inner
+	while at do
+		if at == outer then return true end
+		at = at.parent
+	end
+	return false
+end
+
 ---@param self lye.analyzer.Result
 ---@param base lye.doc.Type
----@param baseName string? the name the field is read off, when it is a name at all
+---@param baseName string?
 ---@param field string
 ---@param offset integer
+---@return lye.doc.Type?
 function analyzer.fieldTypeAt(self, base, baseName, field, offset)
 	-- A plugin that knows the construct answers first: `ffi.C` is the functions the file's own
 	-- blocks declared, and a workspace without the ffi plugin has no such answer.
@@ -525,6 +548,55 @@ function analyzer.fieldTypeAt(self, base, baseName, field, offset)
 				narrowed = next_
 			end
 		end
+	end
+	-- A write to the field before this read is what the field holds here, when the write dominates
+	-- the read: `a.x = 1; return a.x + 1` is a number even when `x` was declared optional, and a
+	-- write inside a branch that may not have run leaves the declared type alone.
+	if baseName and field and self.fieldWrites then
+		local key = baseName .. "." .. field
+		local writes = self.fieldWrites[key]
+		if writes and not (self.fieldWriteBuilding and self.fieldWriteBuilding[key]) then
+			local combined
+			local readScope = scopeAt(self, offset)
+			for _, entry in ipairs(writes) do
+				if entry.at <= offset and scopeCovers(entry.scope, readScope) then
+					if self.inferCtx then
+						self.fieldWriteBuilding = self.fieldWriteBuilding or {}
+						self.fieldWriteBuilding[key] = true
+						local value = infer.at(self.inferCtx, entry.valueIdx)
+						self.fieldWriteBuilding[key] = nil
+						if value and value.variant ~= "nil" and not types.isMutable(value) then
+							combined = combined and types.combine(combined, value) or value
+						end
+					end
+				end
+			end
+			if combined then return combined end
+		end
+	end
+	-- The value a `pcall` gave is the function's result only where the status was true. In the
+	-- branch that says it failed, the value is the error object: a value nothing is known about,
+	-- so using it is reported rather than typed as the success result.
+	local status = self.pcallPairs and self.pcallPairs[variable]
+	if status then
+		local decision
+		local guard = scopeAt(self, offset)
+		local chain = {}
+		while guard do
+			if guard.facts[status.name] then chain[#chain + 1] = guard end
+			guard = guard.parent
+		end
+		for index = #chain, 1, -1 do
+			for _, fact in ipairs(chain[index].facts[status.name]) do
+				if factHolds(fact, offset) and factReaches(self, fact, status) then
+					if fact.kind == "truthy" then decision = fact.wantTruthy
+					elseif fact.kind == "nil" then decision = false
+					elseif fact.kind == "notnil" then decision = true
+					end
+				end
+			end
+		end
+		if decision == false then return types.UNKNOWN_TYPE end
 	end
 	return narrowed
 end
@@ -590,6 +662,30 @@ function analyzer.typeAt(self, variable, offset)
 			end
 		end
 	end
+	-- The value a `pcall` gave is the function's result only where the status was true. In the
+	-- branch that says it failed, the value is the error object: a value nothing is known about,
+	-- so using it is reported rather than typed as the success result.
+	local status = self.pcallPairs and self.pcallPairs[variable]
+	if status then
+		local decision
+		local guard = scopeAt(self, offset)
+		local chain = {}
+		while guard do
+			if guard.facts[status.name] then chain[#chain + 1] = guard end
+			guard = guard.parent
+		end
+		for index = #chain, 1, -1 do
+			for _, fact in ipairs(chain[index].facts[status.name]) do
+				if factHolds(fact, offset) and factReaches(self, fact, status) then
+					if fact.kind == "truthy" then decision = fact.wantTruthy
+					elseif fact.kind == "nil" then decision = false
+					elseif fact.kind == "notnil" then decision = true
+					end
+				end
+			end
+		end
+		if decision == false then return types.UNKNOWN_TYPE end
+	end
 	return narrowed
 end
 
@@ -607,6 +703,7 @@ end
 ---@param inferCtx lye.infer.Context
 ---@param source string the document, so a string literal can be read where it was written
 ---@param positionalParams fun(signature: lye.analyzer.Signature, resolve: fun(text: string): lye.doc.Type?): (lye.doc.Type?)[]
+---@param reused fun(start: integer, stop: integer): boolean?
 local function checkCalls(self, parsed, signatureOfCall, returns, resolve, inferCtx, source, positionalParams, reused)
 	--- A generic name in a signature is a type variable: the argument cannot be checked against
 	--- the name itself, so it is checked against what the name was limited to, if anything.
@@ -620,7 +717,7 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	-- the same return type as every other call site of the same function, and parsing them again for
 	-- each one was most of the cost of this pass — for the definitions, where a signature is shared
 	-- by every call in every document, it is parsed once per process.
-	---@type table<lye.analyzer.Signature, { params: (lye.doc.Type?)[], returns: lye.doc.Type? }>
+	---@type table<lye.analyzer.Signature, { params: (lye.doc.Type?)[], returns: lye.doc.Type?, variadic: lye.doc.Type? }>
 	local parsedSignatures = {}
 
 	-- The type a written text came to, read through the analysis's memo: a generic signature is read
@@ -695,6 +792,12 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	---@param held lye.doc.Type
 	---@return boolean
 	local function concrete(held)
+		if held.variant == "union" then
+			for _, member in ipairs(held.types) do
+				if not concrete(member) then return false end
+			end
+			return true
+		end
 		local variant = held.variant
 		return variant == "number" or variant == "string" or variant == "boolean" or variant == "table"
 			or variant == "class" or variant == "array" or variant == "object" or variant == "fn"
@@ -706,6 +809,13 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	local function mismatch(wanted, actual, label)
 		if wanted and actual and concrete(wanted) and unknownValue(actual) then
 			return label .. " is unknown"
+		end
+		if wanted and actual and wanted.variant == "class" and actual.variant == "object" then
+			local missing = types.missingRequiredFields(wanted, actual)
+			if #missing > 0 then
+				return string.format("%s is missing %s of %s", label,
+					table.concat(missing, ", "), types.display(wanted))
+			end
 		end
 		return types.mismatch(wanted, actual, label)
 	end
@@ -738,6 +848,7 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	---@return integer? nodeIdx the argument, or the receiver, that cannot be what it is
 	---@return lye.doc.Type? wanted
 	---@return lye.doc.Type? actual
+	---@return string? reason why the value cannot be what the parameter says
 	local function firstMismatch(node, params, receiver, variadic, receiverParam)
 		-- A `:` call passes the receiver as its first argument. A definition may spell that
 		-- parameter (`fun(self: P, x: number)`) or leave it implicit, as `function P:add(x)` does;
@@ -748,9 +859,9 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 				local wanted = params[1]
 				if wanted == nil then
 					shift = 1
-				elseif mismatch(wanted, receiver, "argument 1") then
-					return node.target, wanted, receiver
 				else
+					local reason = mismatch(wanted, receiver, "argument 1")
+					if reason then return node.target, wanted, receiver, reason end
 					shift = 1
 				end
 			else
@@ -766,8 +877,9 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 			if not wanted and variadic and index + shift > #params then wanted = variadic end
 			if wanted and parsed.nodes[argIdx] then
 				local actual = argumentAt(argIdx)
-				if mismatch(wanted, actual, "argument " .. (index + shift)) then
-					return argIdx, wanted, actual
+				local reason = mismatch(wanted, actual, "argument " .. (index + shift))
+				if reason then
+					return argIdx, wanted, actual, reason
 				end
 			end
 		end
@@ -796,8 +908,10 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	---@param params (lye.doc.Type?)[]
 	---@param overloads string[]?
 	---@param receiver lye.doc.Type?
+	---@param variadic lye.doc.Type?
+	---@param receiverParam boolean?
 	local function checkArgs(node, name, params, overloads, receiver, variadic, receiverParam)
-		local blame, wanted, actual = firstMismatch(node, params, receiver, variadic, receiverParam)
+		local blame, wanted, actual, reason = firstMismatch(node, params, receiver, variadic, receiverParam)
 		if not blame then return end
 
 		for _, written in ipairs(overloads or {}) do
@@ -811,7 +925,8 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 		-- parameters never needs one: it is written where the diagnostic it belongs to is.
 		local label = name or callLabel(parsed, node)
 		local argument = parsed.nodes[blame]
-		diagnostic.add(self, string.format("%s expects %s, got %s", label,
+		if reason and not reason:find(" is missing ", 1, true) then reason = nil end
+		diagnostic.add(self, reason or string.format("%s expects %s, got %s", label,
 				types.display(wanted), types.display(actual)), argument.start, argument.stop, 1)
 	end
 
@@ -862,6 +977,11 @@ end
 --- the signature its annotations gave it. A parameter the annotations already typed keeps that
 --- type: the annotation is the older, louder spelling, and two of them disagreeing is not this
 --- reader's to settle.
+---@param params lye.doc.Annotation[]
+---@param returned lye.doc.Annotation?
+---@param generics table<string, boolean>
+---@param constraints table<string, string>
+---@param body lye.parser.Node
 ---@return lye.doc.Annotation[]
 ---@return lye.doc.Annotation?
 local function withInline(params, returned, generics, constraints, body)
@@ -1024,9 +1144,9 @@ function analyzer.prelude(sources)
 	for className, fields in pairs(classFields) do
 		for field, entry in pairs(fields) do
 			if entry.isFunction then
-				-- A generic in a stdlib signature is bound at the call site, so all this knows is
-				-- what the name was limited to.
-				local local_ = withGenerics(entry.generics, entry.constraints, resolveAll)
+				-- A generic in a stdlib signature is a variable the call binds: keeping `T` here
+				-- is what lets `table.sort(list, fn)` hand `fn` the element type of `list`.
+				local local_ = withGenerics(entry.generics, entry.constraints, resolveAll, true)
 				local params, isVariadic, variadic = {}, false, nil
 				for _, annotation in ipairs(entry.params) do
 					if annotation.name == "..." then
@@ -1041,6 +1161,7 @@ function analyzer.prelude(sources)
 				local bare = returned and (returned:gsub("%.%.%.$", "")) or nil
 				local fnType = types.fn(params,
 					(bare and memo.parse(bare, local_)) or types.ANY_TYPE, isVariadic, nil, variadic)
+				fnType.generics, fnType.constraints = entry.generics, entry.constraints
 				-- The overloads a definition writes are call shapes, and their returns are what a
 				-- matching call gets: `file:read("*a")` is a string even though the primary return
 				-- is `any`, because the mode decided it. Kept on the callable so an analysis can
@@ -1197,7 +1318,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		counters.namespaceReused = 0
 		started = os.clock()
 		---@param name string
-		mark = function(name)
+		function mark(name)
 			counters[name] = os.clock() - started
 			started = os.clock()
 		end
@@ -1214,21 +1335,24 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	-- recording has to sit in that lookup rather than in this file's own fallback alone. It is
 	-- index-only: a consumer may ask for a name, never iterate it.
 	local declarationNames = {}
+	---@param _ table
+	---@param name string
+	---@return boolean|lye.doc.Type?
+	local function elsewhereAt(_, name)
+		local held = elsewhere and elsewhere[name]
+		if type(held) == "table" then declarationNames[name] = true end
+		return held
+	end
 	local elsewhereProxy
 	if elsewhere then
-		elsewhereProxy = setmetatable({}, {
-			__index = function(_, name)
-				local held = elsewhere[name]
-				if type(held) == "table" then declarationNames[name] = true end
-				return held
-			end,
-		})
+		elsewhereProxy = setmetatable({}, { __index = elsewhereAt })
 	end
 	-- The names `require` is handed, recorded even when the callback has no answer for them.
 	local requiredModules = {}
 	local moduleLookup
 	if modules then
-		moduleLookup = function(name)
+		---@param name string
+		function moduleLookup(name)
 			requiredModules[name] = true
 			return modules(name)
 		end
@@ -1582,13 +1706,44 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	-- A parameter belongs to the nearest function declared above it, which is what lets its
 	-- `@param` type reach it. Declarations arrive in source order.
 	local paramOwner, signatureOfDecl, annotatedBodies, bodyOwner = {}, {}, {}, {}
-	-- What a field said its function returns, for the bodies written for that field: a body that
-	-- gives something else, or nothing at all, contradicts the type a caller was promised.
-	local fieldReturns = {}
 	-- The parameters a function declares, in order. A signature built from them has the arity the
 	-- function has, so a call with the wrong number of arguments can be seen.
 	local declaredParams = {}
-
+	-- An annotation may introduce a function through an assignment rather than a declaration:
+	-- `decodeString = function(src, i)` with `---@param` above it is how a forward-declared local
+	-- or a module field is written. The statement is not in `parsed.declarations`, so it is read
+	-- as the function body it assigns, and its parameters join the owner map like any other.
+	for _, node in ipairs(nodesOf(parsed, "assignment")) do
+		local value = node.value and parsed.nodes[node.value]
+		if value and value.kind == "function" then
+			local target = node.target and parsed.nodes[node.target]
+			local name = target and writtenNameOf(parsed, node.target) or ""
+			local synthetic = {
+				name = name, start = node.start, stop = node.stop, valueIdx = node.value,
+				isFunction = true, anchorIdx = node.anchorIdx,
+			}
+			local params, returned, generics, constraints, predicates, overloads =
+				signatureOf(parsed, annotations, synthetic)
+			if #params > 0 or returned or next(generics) or #predicates > 0 or #overloads > 0 then
+				bodyOwner[node.value] = synthetic
+				signatureOfDecl[synthetic] = {
+					params = params, returns = returned, generics = generics,
+					constraints = constraints, predicates = predicates, overloads = overloads,
+					values = annotationValues(returned),
+				}
+				local list = {}
+				for _, param in ipairs(value.params or {}) do
+					list[#list + 1] = param
+					paramOwner[param] = synthetic
+				end
+				declaredParams[synthetic] = list
+				annotatedBodies[node.value] = true
+			end
+		end
+	end
+	-- What a field said its function returns, for the bodies written for that field: a body that
+	-- gives something else, or nothing at all, contradicts the type a caller was promised.
+	local fieldReturns = {}
 	for _, declaration in ipairs(parsed.declarations) do
 		local params, returned, generics, constraints, predicates, overloads =
 			signatureOf(parsed, annotations, declaration)
@@ -1609,7 +1764,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 			if #params > 0 or returned or next(generics) or #predicates > 0 then
 				signatureOfDecl[declaration] = {
 					params = params, returns = returned, generics = generics, predicates = predicates,
-					values = annotationValues(returned),
+					overloads = overloads, values = annotationValues(returned),
 				}
 				annotatedBodies[declaration.valueIdx] = true
 			end
@@ -1633,6 +1788,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	--- annotation is `any`: the arity is known even when the type is not.
 	---@param declaration lye.parser.Declaration
 	---@param signature { params: lye.doc.Annotation[] }?
+	---@param resolve fun(text: string): lye.doc.Type?
 	---@return lye.doc.Type[] params
 	---@return boolean isVariadic
 	local function paramsFor(declaration, signature, resolve)
@@ -1676,10 +1832,14 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 
 	--- The type a function's own annotations give it. A declaration with no annotation keeps the
 	--- permissive callable, so only what was written down is enforced.
+	---@param declaration lye.parser.Declaration
 	---@param signature lye.analyzer.Signature
 	---@return lye.doc.Type
 	local function signatureTypeOf(declaration, signature)
-		local local_ = withGenerics(signature.generics, signature.constraints, resolve)
+		-- A signature declares its own variables, so its parameters and its result keep `T` as the
+		-- variable a call binds: `---@generic T ---@return Box<T>` is a constructor that hands
+		-- back a box of whatever it was given, not a box of unknown.
+		local local_ = withGenerics(signature.generics, signature.constraints, resolve, true)
 		local params, isVariadic = paramsFor(declaration, signature, local_)
 		local variadic
 		for _, annotation in ipairs(signature.params) do
@@ -1731,6 +1891,19 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		local fnType = types.fn(params, (returned and memo.parse(returned, local_)) or types.mutable(),
 			isVariadic, isSpread, variadic)
 		if values then fnType.values = values end
+		-- The variables the signature declares travel with it: a call binds them from the
+		-- arguments, and a method of a generic class is not the class's variables.
+		fnType.generics, fnType.constraints = signature.generics, signature.constraints
+		-- The shapes a call may take besides this one travel with the callable: `read("*a")`
+		-- picks the shape that names the mode, and its return is the call's result.
+		if signature.overloads and #signature.overloads > 0 then
+			local shapes = {}
+			for _, written in ipairs(signature.overloads) do
+				local shape = memo.parse(written, local_)
+				if shape and shape.variant == "fn" then shapes[#shapes + 1] = shape end
+			end
+			if #shapes > 0 then fnType.overloads = shapes end
+		end
 		return fnType
 	end
 
@@ -1819,6 +1992,24 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	local root, byRecord, scopes = buildScopes(parsed)
 	self.root = root
 	self.scopes = scopes
+	-- Every write to a named field, so a read after one can see what was put there. The value is
+	-- typed when the read asks, since the write is often below the first pass that types it.
+	self.fieldWrites = {}
+	for _, node in ipairs(nodesOf(parsed, "assignment")) do
+		local target = node.target and parsed.nodes[node.target]
+		if target and target.kind == "index" and target.field and target.target then
+			local base = writtenNameOf(parsed, target.target)
+			if base then
+				local key = base .. "." .. target.field
+				local list = self.fieldWrites[key]
+				if not list then
+					list = {}
+					self.fieldWrites[key] = list
+				end
+				list[#list + 1] = { at = node.start, valueIdx = node.value, scope = scopeAt(self, node.start) }
+			end
+		end
+	end
 	-- The list itself, not the file it was parsed into: a `---@cast` is read from there.
 	narrow.collect(parsed, byRecord, signatures, resolve, annotations.annotations)
 	if counters then mark("scopes") end
@@ -1826,6 +2017,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		return analyzer.fieldTypeAt(self, base, baseName, field, offset)
 	end, moduleLookup, hasCallProvider and providerCall or nil)
 	inferCtx.casts = inlineCasts
+	self.inferCtx = inferCtx
 
 	-- An empty table has no shape of its own, and a function that expects one gives it that shape:
 	--
@@ -2181,6 +2373,9 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 						(parsed.nodes[index].isVariadic == true)
 					)
 				end
+				-- The declaration's parameters are final: a method leaves `self` out, and the
+				-- body walk must not put it back in.
+				inferCtx.fnTypes[index].paramsFilled = true
 			end
 		end
 	end
@@ -2289,13 +2484,29 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	---@param methodName string
 	---@param owner string
 	---@param valueIdx integer
-	local function evolveMethod(owner, methodName, valueIdx)
+	---@param declaration lye.parser.Declaration
+	---@param annotated table? the signature the declaration wrote, when it wrote one
+	local function evolveMethod(owner, methodName, valueIdx, declaration, annotated)
 		-- The definitions are the signatures a document reads, including a document that *is* one
 		-- of them — its text is what a client opens to show the definitions. The prelude's own
 		-- field type is the one its annotations were kept beside, so it stays.
 		local fromPrelude = prepared and prepared.evolved and prepared.evolved[owner]
 		if fromPrelude and fromPrelude[methodName] then return end
-		local methodType = inferCtx.fnTypes[valueIdx] or infer.at(inferCtx, valueIdx)
+		-- The annotations are the whole of a method where it has them: a `---@generic T` and a
+		-- `---@return Box<T>` are what a caller binds against, and a body typed on its own says
+		-- only what this one call returned. The body is the fallback for a method written without
+		-- a signature, which is how most Lua is written.
+		local methodType = annotated and signatureTypeOf(declaration, annotated)
+			or inferCtx.fnTypes[valueIdx] or infer.at(inferCtx, valueIdx)
+		-- A `:` method's value is called without its receiver, which is how `d.bark` reads: the
+		-- implicit `self` is part of the body, not of the callable the field holds.
+		if methodType and types.isFn(methodType) and not annotated
+			and declaration.name:find(":", 1, true) and #methodType.params > 0 then
+			local params = {}
+			for index = 2, #methodType.params do params[#params + 1] = methodType.params[index] end
+			methodType = types.fn(params, methodType.returns, methodType.isVariadic,
+				methodType.isSpread, methodType.variadic)
+		end
 		if methodType and types.isFn(methodType) then
 			doc.classes.evolve(namespace, owner, methodName, methodType)
 		end
@@ -2306,7 +2517,10 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 			local className, methodName = declaration.name:match("^([%w_%.]+)%s*[%.:]([%w_]+)$")
 			-- Only the last segment names the method: `A.B.c` is a method of `A.B`.
 			local owner = className and (namespace.classes[className] and className or classOfTable[className])
-			if owner and methodName then evolveMethod(owner, methodName, declaration.valueIdx) end
+			if owner and methodName then
+				local annotated = signatureOfDecl[declaration]
+				evolveMethod(owner, methodName, declaration.valueIdx, declaration, annotated)
+			end
 		end
 	end
 	for _, node in ipairs(nodesOf(parsed, "assignment")) do
@@ -2317,7 +2531,12 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 			local className, methodName
 			if written then className, methodName = written:match("^([%w_%.]+)%s*[%.:]([%w_]+)$") end
 			local owner = className and (namespace.classes[className] and className or classOfTable[className])
-			if owner and methodName then evolveMethod(owner, methodName, node.value) end
+			if owner and methodName then
+				-- The assignment form has no declaration record, but the method still has a name:
+				-- `Foo.bar = function(self, ...)` keeps its receiver because the written name uses
+				-- `.`, while `Foo:bar = function(...)` does not.
+				evolveMethod(owner, methodName, node.value, { name = written })
+			end
 		end
 	end
 	-- Declaration first, typing second. Every name is in scope before any initializer is
@@ -2325,29 +2544,56 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 	local byDeclaration = {}
 	for _, declaration in ipairs(parsed.declarations) do
 		if declaration.qualifier ~= "label" then
+			local explicit = false
 			local declared = analyzer.declaredTypeFor(parsed, annotations, declaration, resolve)
+			if declared then explicit = true end
 			if not declared then
 				-- Only annotations make a declared signature: an unannotated function is typed
 				-- from its own body, which already carries the parameters and the inferred return.
 				local mine = signatureOfDecl[declaration]
 				if mine then
 					declared = signatureTypeOf(declaration, mine)
+					explicit = true
 				else
 					local ownerDecl = paramOwner[declaration]
 					local owned = ownerDecl and signatureOfDecl[ownerDecl]
+					-- A parameter of a generic function is that function's variable: inside `id`
+					-- the value is `T`, not the unknown an unbound call site has to offer. The
+					-- binding at a call replaces it, and the body is checked against the variable.
 					declared = paramTypeOf(owned and owned.params, declaration.name,
-						withGenerics(owned and owned.generics, owned and owned.constraints, resolve))
+						withGenerics(owned and owned.generics, owned and owned.constraints, resolve, true))
+					if declared then explicit = true end
 					-- `self` is the receiver, and a method is declared `function Foo:bar`, so the
-					-- class is named right there.
+					-- class is named right there. A generic class's receiver is that class with
+					-- its own parameters: inside `Map:get` the value is `Map<K, V>`, so `self.data`
+					-- holds `V` rather than the unknown a bare `Map` stands for.
 					if not declared and declaration.name == "self" and ownerDecl then
 						local className = ownerDecl.name:match("^(.-)%s*:")
-						if className then declared = resolve(className) end
+						if className then
+							local params = namespace.classes[className]
+								or (classOfTable[className] and namespace.classes[classOfTable[className]])
+							-- A method is written on the table that holds its class, so the class
+							-- may have another name: `function Lye:checkpoint` belongs to the
+							-- `---@class lye.Server` declared over `local Lye = {}`.
+							local typeName = params and params.name or className
+							local text = typeName
+							if params and #params.params > 0 then
+								text = typeName .. "<" .. table.concat(params.params, ", ") .. ">"
+							end
+							declared = resolve(text)
+							explicit = declared ~= nil
+						end
 					end
 					-- A function literal handed to `ffi.cast` is called by C, so its parameters are the ones the
 					-- header declares: `ptr` is a pointer rather than a Lua string. The plugin that knows
 					-- the construct answers; a declaration that has its own annotation keeps it.
-					if not declared then declared = providerParameter(declaration) end
+					if not declared then
+						declared = providerParameter(declaration)
+						explicit = declared ~= nil
+					end
 					-- A parameter with no `@param` is `any`: the arity is known, the type is not.
+					-- A callback that is handed to a signature gets its parameters from that
+					-- signature instead, which is what `explicit` leaves room for.
 					if not declared and declaration.qualifier == "param" then
 						declared = types.ANY_TYPE
 					end
@@ -2367,6 +2613,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 				stop = declaration.stop,
 				scope = scopeAt(self, declaration.start),
 				declared = declared,
+				declaredExplicit = explicit,
 				initializer = types.mutable(),
 				assignments = {},
 				references = {},
@@ -2382,6 +2629,27 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 			end
 			declared[#declared + 1] = variable
 		end
+	end
+
+	-- A `pcall` declares two names that are one answer: the status and the value. The value has
+	-- the function's result only on the branch where the status is true; on the failure branch it
+	-- is whatever the error object was, which nothing can use safely.
+	local calls = {}
+	for _, variable in ipairs(self.variables) do
+		local declaration = variable.declaration
+		local idx = declaration.valueIdx
+		local node = idx and parsed.nodes[idx]
+		if node and node.kind == "call" and (node.callee == "pcall" or node.callee == "xpcall") then
+			local position = declaration.valuePosition or 1
+			if position <= 2 then
+				calls[idx] = calls[idx] or {}
+				calls[idx][position] = variable
+			end
+		end
+	end
+	self.pcallPairs = {}
+	for _, pair in pairs(calls) do
+		if pair[1] and pair[2] then self.pcallPairs[pair[2]] = pair[1] end
 	end
 
 	-- Every name is in scope now; an empty table can take the shape the calls written below
@@ -2822,6 +3090,7 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 
 	local typingCtx = {
 		parsed = parsed, self = self, inferCtx = inferCtx, signatures = signatures,
+		lookupIn = lookupIn, scopeAt = scopeAt,
 		returns = returns, resolve = resolve, typeOfText = typeOfText, fieldReturns = fieldReturns,
 		loopOf = loopOf, signatureOfCall = signatureOfCall, returnsOf = returnsOf,
 		bodyOwner = bodyOwner, annotatedBodies = annotatedBodies, checkMetatable = checkMetatable, signatureOfDecl = signatureOfDecl,
@@ -2889,6 +3158,24 @@ function analyzer.analyze(source, prepared, elsewhere, modules, resume, cachedAn
 		end
 	end
 	typeVariables(only)
+	-- What an unannotated parameter holds, from its callers and its body. The first pass has the
+	-- argument types needed to answer it, and the second types the bodies with the answer.
+	local inferredParams = typing.inferParameters(typingCtx, only, cleanSpan)
+	-- A callback written straight into a call is typed by the signature it is handed to. That is
+	-- a second round: the argument that binds a generic comes first, and the body it gives types
+	-- to is typed again so `a < b` sees the element type rather than the `any` it started as.
+	local contextual = typing.contextualize(typingCtx, only, cleanSpan)
+	if inferredParams or contextual then
+		typeVariables(only)
+	end
+	-- Binding a generic method after its callback body settled, or a call typed before its
+	-- callee's body did, can change a callable a later declaration already read. A pass or two
+	-- reads those declarations against the new answers.
+	for _ = 1, 2 do
+		if not typingCtx.callsChanged then break end
+		typingCtx.callsChanged = nil
+		typeVariables(only)
+	end
 
 	-- Early cutoff: a dirty item whose result hash did not move leaves its dependents' cached
 	-- results valid. One that moved invalidates only the items reading it — which then have to be

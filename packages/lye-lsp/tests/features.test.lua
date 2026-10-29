@@ -339,6 +339,31 @@ test.it("answers a hover about the word it is on, not the whole access", functio
 	test.equal(onField.start.character, 9, "and the field's answer at the field")
 end)
 
+test.it("answers a hover on an argument string as the string, not the call", function()
+	-- The call's node covers every argument, so resolving the innermost node at the cursor found
+	-- the callee and showed the function's signature for a string literal.
+	local source = 'local function f(a) return a end\nreturn f("hello")\n'
+	local results = run({ request(2, "textDocument/hover", { line = 1, character = 10 }) }, source)
+	local value = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(value:match("string"), "the hover says the argument is a string: " .. value)
+	test.falsy(value:match("function f"), "and not the function it is passed to: " .. value)
+
+	-- The same shape inside a table constructor: every string is its own node, and the table and
+	-- call around them must not answer in their place.
+	local call = 'local x = table.concat({ "a", "b" }, "")\n'
+	local stringAt = assert(call:find('"a"', 1, true))
+	local calleeAt = assert(call:find("concat", 1, true))
+	local answers = run({
+		request(2, "textDocument/hover", { line = 0, character = stringAt - 1 }),
+		request(3, "textDocument/hover", { line = 0, character = calleeAt - 1 }),
+	}, call)
+	local literal = answers["2"] and answers["2"].contents and answers["2"].contents.value or ""
+	local callee = answers["3"] and answers["3"].contents and answers["3"].contents.value or ""
+	test.truthy(literal:match("string"), "the table's string is a string: " .. literal)
+	test.falsy(literal:match("table.concat"), "not the concat call: " .. literal)
+	test.truthy(callee:match("concat"), "the callee still answers with its signature: " .. callee)
+end)
+
 test.it("says nothing for the punctuation inside a call's arguments", function()
 	-- The expression around a `}` is a call nobody pointed at.
 	local source = 'local function f(a) return a end\nreturn f({ x = 1 })\n'

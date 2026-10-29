@@ -12,7 +12,7 @@
 ---@alias ffi.ct*     ffi.ctype*|ffi.cdecl*|ffi.cdata*
 
 ---@class ffi.cb*: ffi.cdata*
-local cb
+local cb = {}
 ---@class ffi.VLA*:   userdata
 ---@class ffi.VLS*:   userdata
 
@@ -132,8 +132,11 @@ function ffi.abi(param: string): boolean end
 ---@nodiscard
 function ffi.typeinfo(ct: ffi.ct*, ...: any): table end
 
+---@param self ffi.cb*
 function cb:free() end
 
+---@param self ffi.cb*
+---@param func function
 function cb:set(func: function) end
 
 return ffi

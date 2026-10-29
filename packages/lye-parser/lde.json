@@ -4,8 +4,9 @@
 	"version": "0.1.0",
 	"description": "Span-tracking Lua parser producing a lean AST for LuaJIT",
 	"dependencies": {
-		"lye-lexer": {
-			"path": "../lye-lexer"
-		}
+		"lye-lexer": {"path": "../lye-lexer"}
+	},
+	"devDependencies": {
+		"lde-test": {"git": "https://github.com/lde-org/lde"}
 	}
 }

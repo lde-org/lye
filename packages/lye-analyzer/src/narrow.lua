@@ -137,12 +137,34 @@ local function readCondition(parsed, idx, invert, signatures, resolve)
 				-- A cdata is not the bare name `cdata`: lye defines it as the `ffi.cdata*` class, which
 				-- is what a value known to be a cdata has to be handed as.
 				local written = runtime == "cdata" and "ffi.cdata*" or runtime
-				local held = resolve(written) or types.parse(written)
+				local held = types.parse(written, resolve) or types.parse(written)
 				local wantsType = isEqual ~= invert
 				return {
 					name = name, field = field, kind = wantsType and "type" or "nottype",
 					wantTruthy = wantsType, type = held, typeName = runtime,
 				}
+			end
+		end
+
+		-- `x == true` and `x == 1`: a name compared against a literal narrows the name itself.
+		-- An unknown is the union of every type, so this is what turns it into one of them; an
+		-- `any` is left alone, because nothing can prove what it is.
+		for _, pair in ipairs({ { node.left, right }, { node.right, left } }) do
+			local subjectIdx, literal = pair[1], pair[2]
+			if subjectIdx and literal and not oneFieldOn(parsed, subjectIdx)
+				and (literal.kind == "string" or literal.kind == "number"
+					or (literal.kind == "literal" and (literal.text == "true" or literal.text == "false"))) then
+				local name, field = readSubject(parsed, subjectIdx)
+				local source = parsed.source
+				local text = source and literal.start and source:sub(literal.start, literal.stop) or nil
+				local written = text and types.parse(text)
+				if name and written then
+					local wants = isEqual ~= invert
+					return {
+						name = name, field = field, kind = wants and "type" or "nottype",
+						wantTruthy = wants, type = written,
+					}
+				end
 			end
 		end
 
@@ -207,6 +229,7 @@ end
 ---@param byRecord table<lye.parser.Scope, lye.analyzer.Scope>
 ---@param signatures table<string, lye.analyzer.Signature>
 ---@param resolve fun(text: string): lye.doc.Type?
+---@param annotations lye.doc.Annotation[]?
 local function collectNarrowing(parsed, byRecord, signatures, resolve, annotations)
 	local ordered = {}
 	for _, scope in ipairs(parsed.scopes) do ordered[#ordered + 1] = scope end
@@ -226,10 +249,64 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 		end
 	end
 
-	---@param condition lye.analyzer.Condition
-	---@param record lye.parser.Scope
-	---@param from integer? where the fact starts, which is the scope's own start by default
-	---@param until_ integer? where it stops, which is the end of the scope by default
+	-- `local t = type(value)` gives `t` the answer a later `t == "number"` tests. The branch is
+	-- about `value`, so a condition on the alias is retargeted to the value it describes; this is
+	-- how `type` narrows through a named local, which is the shape most writers use.
+	local typeAliases = {}
+	---@param name string
+	---@param at integer
+	local function forgetAlias(name, at)
+		local list = typeAliases[name]
+		if list then list[#list + 1] = { at = at } end
+	end
+	---@param name string
+	---@param argIdx integer?
+	---@param at integer
+	local function rememberAlias(name, argIdx, at)
+		local subject, field = readSubject(parsed, argIdx)
+		if not subject then return end
+		local list = typeAliases[name]
+		if not list then
+			list = {}
+			typeAliases[name] = list
+		end
+		list[#list + 1] = { at = at, name = subject, field = field }
+	end
+	local function valueIsTypeCall(value)
+		return value and value.kind == "call" and value.callee == "type"
+			and value.args and value.args[1]
+	end
+	for _, declaration in ipairs(parsed.declarations) do
+		local value = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
+		if valueIsTypeCall(value) then
+			rememberAlias(declaration.name, value.args[1], declaration.start)
+		else
+			forgetAlias(declaration.name, declaration.start)
+		end
+	end
+	for _, node in ipairs(parsed.byKind and parsed.byKind.assignment or {}) do
+		local value = node.value and parsed.nodes[node.value]
+		local name = writtenNameOf(parsed, node.target)
+		if name then
+			if valueIsTypeCall(value) then
+				rememberAlias(name, value.args[1], node.start)
+			else
+				forgetAlias(name, node.start)
+			end
+		end
+	end
+	---@param name string
+	---@param at integer
+	---@return { name: string, field: string? }?
+	local function aliasAt(name, at)
+		local list = typeAliases[name]
+		local chosen
+		for _, entry in ipairs(list or {}) do
+			if entry.at <= at and (not chosen or entry.at > chosen.at) then chosen = entry end
+		end
+		return chosen
+	end
+
 	-- Everything that could change a field between a condition and a read: a call, because the callee
 	-- may hold the same table and a `__newindex` may run, and a write through the same name. Gathered
 	-- once and sorted, so a fact finds the first one after it by bisection rather than by walking the
@@ -424,13 +501,33 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 	end
 
 	local function add(condition, record, from, until_)
+		local start = from or record.start
+		-- A condition on a `t = type(value)` alias is a condition on `value`.
+		if condition.kind == "type" or condition.kind == "nottype" then
+			local alias = aliasAt(condition.name, start)
+			local written = condition.type and condition.type.variant == "extern"
+				and type(condition.type.name) == "string" and condition.type.name or nil
+			local first, last = written and written:sub(1, 1), written and written:sub(-1)
+			if alias and alias.name and written and (first == '"' or first == "'") and last == first then
+				local runtime = written:sub(2, -2)
+				if TYPE_NAMES[runtime] then
+					local typeName = runtime == "cdata" and "ffi.cdata*" or runtime
+					local held = types.parse(typeName, resolve) or types.parse(typeName)
+					if held then
+						condition = {
+							name = alias.name, field = alias.field, kind = condition.kind,
+							wantTruthy = condition.wantTruthy, typeName = runtime, type = held,
+						}
+					end
+				end
+			end
+		end
 		local guarded = byRecord[record].facts
 		local list = guarded[condition.name]
 		if not list then
 			list = {}
 			guarded[condition.name] = list
 		end
-		local start = from or record.start
 		local stop = until_ or record.stop
 		-- A fact about a field holds only until something could have changed what it was about:
 		-- any call, because the callee may hold the same table, or a write to that field or to
@@ -552,6 +649,20 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 					-- starts. Starting at the left operand's own `stop` covered its name: a prefix
 					-- node's span is a point, so `opts or {}` read the left `opts` as already falsy.
 					add(condition, scope, right.start, node.stop)
+				end
+			end
+		end
+	end
+
+	-- `assert(t == "table")` says the condition is true for the rest of the block: the call does
+	-- not come back otherwise. The assertion is a fact over the enclosing scope, exactly like a
+	-- guard that returns.
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "call" and node.callee == "assert" and node.args and node.args[1] then
+			local scope = scopeAtOffset(node.stop)
+			if scope then
+				for _, condition in ipairs(readConditions(parsed, node.args[1], false, signatures, resolve)) do
+					add(condition, scope, node.stop)
 				end
 			end
 		end

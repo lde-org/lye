@@ -1,5 +1,9 @@
 {
 	"dependencies": {
+		"lde-test": {
+			"commit": "a479bc62a66c567d90087225aa5035ca2b29ceb8",
+			"git": "https://github.com/lde-org/lde"
+		},
 		"lye-json": {
 			"path": "../lye-json"
 		},
@@ -7,6 +11,6 @@
 			"path": "../lye-rpc"
 		}
 	},
-	"manifestHash": "530b61f46bc4bb2f",
+	"manifestHash": "44a39c9d12587449",
 	"version": "1"
 }

@@ -4,11 +4,10 @@
 	"version": "0.1.0",
 	"description": "Language-agnostic LSP server framework: protocol constants, lifecycle, dispatch, document store and position mapping",
 	"dependencies": {
-		"lye-rpc": {
-			"path": "../lye-rpc"
-		},
-		"lye-json": {
-			"path": "../lye-json"
-		}
+		"lye-rpc": {"path": "../lye-rpc"},
+		"lye-json": {"path": "../lye-json"}
+	},
+	"devDependencies": {
+		"lde-test": {"git": "https://github.com/lde-org/lde"}
 	}
 }

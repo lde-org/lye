@@ -184,6 +184,7 @@ end
 ---@param force boolean? collect fully whatever the growth
 ---@return boolean collected
 ---@return boolean full
+---@param self lye.Server
 function Lye:checkpoint(force)
 	local started = timing.now()
 	local grown = (timing.heap() - self.lastHeap) * 1024
@@ -335,16 +336,20 @@ function Lye:plugins(uri)
 			entries[#entries + 1] = entry
 		end
 	end
-	local report = function(message)
+	---@param message string
+	local function report(message)
 		-- A fault in a plugin is the plugin author's to fix, and the user's to see once.
 		self.server:log(message, framework.LOG.warning)
 	end
-	local specs = plugin.load(entries, root, function(name)
+	---@param name string
+	---@return string?
+	local function pluginAt(name)
 		-- A plugin named rather than pathed is a module, and a module of this package is one lde
 		-- linked into its `target/`: the same place `require` finds, so `lde add` is how one is
 		-- installed and `lye.json` is where it is turned on.
 		return self:moduleFile(name, uri)
-	end, report)
+	end
+	local specs = plugin.load(entries, root, pluginAt, report)
 	if wantsRequire or explicit then
 		table.insert(specs, 1, plugin.spec(requireCompletion, "lye-plugin-require", report))
 	end
@@ -484,6 +489,7 @@ end
 ---@param uri string
 ---@param from integer? the byte the change starts at, in the text the held parse was for
 ---@return lye.parser.Result?
+---@param self lye.Server
 function Lye:analyze(uri, from)
 	local document = self.server.documents:get(uri)
 	if not document then return nil end
@@ -516,10 +522,14 @@ function Lye:analyze(uri, from)
 		options = { uri = uri, incremental = false, counters = counters }
 	end
 
-	local names = analyzer.analyze(view.text, PRELUDE, self:declaredTypes(uri), function(name)
-		return self:moduleType(name, uri)
-	end, resume, self.cache:annotationsFor(uri, view.text), nil, self:isDefinition(uri),
-		view.specs, function(message) self.server:log(message, framework.LOG.warning) end, options)
+	---@param name string
+	---@return lye.doc.Type?
+	local function moduleAt(name) return self:moduleType(name, uri) end
+	---@param message string
+	local function reportPlugin(message) self.server:log(message, framework.LOG.warning) end
+	local names = analyzer.analyze(view.text, PRELUDE, self:declaredTypes(uri), moduleAt,
+		resume, self.cache:annotationsFor(uri, view.text), nil, self:isDefinition(uri),
+		view.specs, reportPlugin, options)
 	local parsed = names.parser
 
 	-- Type errors from annotations belong in the same list as syntax errors, but the parse tree is
@@ -531,6 +541,20 @@ function Lye:analyze(uri, from)
 	local diagnostics = {}
 	for index = 1, #parsed.diagnostics do diagnostics[index] = parsed.diagnostics[index] end
 	for _, entry in ipairs(names.diagnostics) do diagnostics[#diagnostics + 1] = entry end
+	-- A `require` naming a module neither the workspace, its packages, nor the definitions
+	-- provide is not typed; the reader is told rather than every use becoming unknown.
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "call" and node.callee == "require" and node.args and node.args[1] then
+			local argument = parsed.nodes[node.args[1]]
+			if argument and argument.kind == "string" and type(argument.value) == "string"
+				and not self:moduleFile(argument.value, uri) then
+				diagnostics[#diagnostics + 1] = {
+					message = string.format("module `%s` is not found", argument.value),
+					severity = 1, start = argument.start, stop = argument.stop,
+				}
+			end
+		end
+	end
 	result.diagnostics = diagnostics
 	if names.doc then
 		self.declaredBy[uri] = declarationsOf(names.doc)
@@ -559,6 +583,7 @@ function Lye:evictCache()
 end
 
 ---@param self lye.Server
+---@param uri string
 ---@return string?
 ---@return lye.framework.LineIndex?
 function Lye:textOf(uri)
@@ -636,6 +661,8 @@ function Lye:publishDiagnostics(uri, result)
 	})
 end
 
+---@param result lye.analyzer.Result
+---@param offset integer
 ---@return lye.lexer.ffi.token?
 local function tokenAt(result, offset)
 	local tokens = result.tokens.arena
@@ -663,6 +690,8 @@ local function isValueToken(token)
 	return kind == KIND.name or kind == KIND.number or kind == KIND.string or kind == KIND.keyword
 end
 
+---@param result lye.analyzer.Result
+---@param offset integer
 ---@return string? name
 local function nameAt(result, offset)
 	local token = tokenAt(result, offset)
@@ -695,6 +724,7 @@ end
 --- through the scope chain, so this asks it instead of repeating the search with looser rules:
 --- two resolvers can disagree about which declaration shadows which.
 ---@param names lye.analyzer.Result
+---@param offset integer
 ---@return lye.parser.Declaration?
 local function declarationFor(names, offset)
 	local name, token = nameAt(names.parser, offset)
@@ -716,6 +746,7 @@ local function declarationFor(names, offset)
 end
 
 ---@param self lye.Server
+---@param params table
 ---@return table?
 function Lye:onDocumentSymbol(params)
 	local uri = params.textDocument?.uri
@@ -834,10 +865,6 @@ local function typeOfExpression(result, idx, offset)
 		-- A generic result belongs to the call rather than to the function, so the analyzer's
 		-- binding is read first and the callee's own return type is the fallback.
 		local bound = result.callTypes and result.callTypes[idx]
-		if node.callee == "require" then
-			io.stderr:write(string.format("DBG require call idx=%s bound=%s offset=%s\\n",
-				tostring(idx), tostring(bound and types.display(bound)), tostring(offset)))
-		end
 		if bound then return bound end
 		local fnType
 		if node.field and node.target then
@@ -1025,14 +1052,23 @@ end
 
 --- The expression node holding an offset, innermost first. Spans are enough: the arena already
 --- says what each node is, so nothing is re-read from the text.
+---
+--- A hover also needs the literal nodes: a string inside `f("x")` is a string, while the call
+--- around it is the function that takes one. Resolution elsewhere — `require` completion, a
+--- definition lookup — asks for the expression node and leaves the literals out.
 ---@param result lye.analyzer.Result
 ---@param offset integer
+---@param withLiterals boolean? include strings, numbers, booleans and table constructors
 ---@return lye.parser.Node?
-local function nodeAt(result, offset)
+local function nodeAt(result, offset, withLiterals)
 	local found
 	for _, node in ipairs(result.parser.nodes) do
 		local isValue = node.kind == "prefix" or node.kind == "index" or node.kind == "call"
 			or node.kind == "name"
+		if withLiterals and (node.kind == "string" or node.kind == "literal"
+			or node.kind == "number" or node.kind == "table") then
+			isValue = true
+		end
 		if isValue and node.start <= offset and offset <= node.stop + 1 then
 			-- The innermost: the latest start, and among those the shortest span.
 			if not found or node.start > found.start
@@ -1116,6 +1152,7 @@ local function wordSpan(source, offset)
 	return from, to
 end
 
+---@param self lye.Server
 function Lye:onHover(params)
 	local uri, text, index, result, offset = self:resolvePosition(params)
 	if not uri then return nil end
@@ -1163,7 +1200,7 @@ function Lye:onHover(params)
 
 	-- Nothing is declared here, so the answer is what the expression holds: `math.floor` is a function of
 	-- the standard library. A function is shown by the signature it was declared with.
-	local node = nodeAt(result, offset)
+	local node = nodeAt(result, offset, true)
 	if not node then return nil end
 	-- The word the cursor is written on decides both answers. A reader moving from `t` to `t.field`
 	-- is asking about two different things, and a range over the whole access tells a client they
@@ -1186,10 +1223,9 @@ function Lye:onHover(params)
 	}
 end
 
----@param self lye.Server
----@return table?
 --- The names the definitions declare, indexed once and written where a client can open them.
 ---@return table
+---@param self lye.Server
 function Lye:definitionIndex()
 	self:useWorkspaceCache()
 	if not self.definitions then
@@ -1320,6 +1356,7 @@ function Lye:targetAt(uri, text, names, offset)
 end
 
 ---@param self lye.Server
+---@param params table
 ---@return table?
 function Lye:onDefinition(params)
 	local uri, text, index, names, offset = self:resolvePosition(params)
@@ -1336,6 +1373,7 @@ function Lye:onDefinition(params)
 end
 
 ---@param self lye.Server
+---@param params table
 ---@return table
 function Lye:onSemanticTokens(params)
 	local started = timing.now()
@@ -1584,15 +1622,21 @@ function Lye:onSemanticTokens(params)
 	-- know it.
 	local askedKind, askedMods = {}, {}
 	local pluginStarted = timing.now()
+	---@param nodeIdx integer?
+	---@return lye.doc.Type?
+	local function typeOfNode(nodeIdx)
+		local node = nodeIdx and result.nodes[nodeIdx]
+		return node and typeOfExpression(self.names[uri], nodeIdx, node.start) or nil
+	end
+	---@param node lye.parser.Node
+	---@return string?
+	local function callNameOf(node) return analyzerNames.callName(result, node) end
 	local asked = plugin.tokens(view.specs, {
 		uri = uri, source = view.source, text = view.text, root = self:packageRoot(uri),
 		map = view.map, parsed = result, analysis = self.names[uri] or {},
-		typeOf = function(nodeIdx)
-			local node = nodeIdx and result.nodes[nodeIdx]
-			return node and typeOfExpression(self.names[uri], nodeIdx, node.start) or nil
-		end,
+		typeOf = typeOfNode,
 		ownerOf = types.ownerOf,
-		callName = function(node) return analyzerNames.callName(result, node) end,
+		callName = callNameOf,
 	})
 	timing.detail("plugin-tokens", pluginStarted, "plugins=%d spans=%d", #view.specs, #asked)
 	for _, span in ipairs(asked) do
@@ -1608,6 +1652,10 @@ function Lye:onSemanticTokens(params)
 	-- Every span in the editor's own offsets, in order, with what a plugin coloured cut out of what
 	-- the walk found: a `%d` inside a string is a conversion, and the string is written around it.
 	local pieces = {}
+	---@param from integer
+	---@param to integer
+	---@param kind string
+	---@param modifiers integer?
 	local function collect(from, to, kind, modifiers)
 		if from > to then return end
 		pieces[#pieces + 1] = { from = from, to = to, kind = kind, modifiers = modifiers }
@@ -1653,6 +1701,10 @@ function Lye:onSemanticTokens(params)
 	---@param from integer
 	---@param to integer
 	---@param kind string
+	---@param modifiers integer?
+	---@param from integer
+	---@param to integer
+	---@param kind integer
 	---@param modifiers integer?
 	local function write(from, to, kind, modifiers)
 		-- Two spans of the lowered text can stand for one span of the editor's — everything a
@@ -1731,6 +1783,8 @@ end
 
 --- Everything a value carries, by name.
 ---@param type lye.doc.Type
+---@param result lye.analyzer.Result
+---@param offset integer
 ---@return table<string, lye.doc.Type>
 local function fieldsOf(type, result, offset)
 	local out = {}
@@ -1742,6 +1796,7 @@ end
 --- already knows: `math.` is an index whose field failed to parse, and `table.inse` one whose
 --- field is half written, so nothing is recovered by looking at the text.
 ---@param result lye.analyzer.Result
+---@param source string
 ---@param offset integer where the cursor is
 ---@return integer? target arena index of the value
 ---@return string prefix what has been typed of the field name
@@ -1848,6 +1903,7 @@ function Lye:completeTypes(uri)
 end
 
 ---@param self lye.Server
+---@param params table
 ---@return table
 function Lye:onCompletion(params)
 	local uri = params.textDocument?.uri
@@ -2067,6 +2123,7 @@ end
 --- one most recently changed goes first — that is the document the writer is looking at — and the
 --- rest follow in the same pass: nothing promises another idle tick if no further message arrives,
 --- and an editor is owed diagnostics for every document it changed.
+---@param self lye.Server
 function Lye:onIdle()
 	local dirty = {}
 	for uri in pairs(self.dirty) do
@@ -2183,6 +2240,7 @@ local function placesOf(self, text, index, variable)
 end
 
 ---@param self lye.Server
+---@param params table
 ---@return table?
 function Lye:onReferences(params)
 	local variable = targetAt(self, params)
@@ -2199,8 +2257,6 @@ function Lye:onReferences(params)
 	return out
 end
 
----@param self lye.Server
----@return table?
 --- Where a name written in an annotation is written again: the annotation that declares it and
 --- every type text that names it. The name is dotted — `jit.funcinfo.c` — so a match counts only
 --- where neither side of it runs on into another name.
@@ -2237,6 +2293,8 @@ function Lye:placesOfType(text, lineIndex, names, written)
 	return out
 end
 
+---@param self lye.Server
+---@param params table
 function Lye:onDocumentHighlight(params)
 	local uri, text, index, names, offset = self:resolvePosition(params)
 	-- A type named in an annotation is not a name the parser sees: the annotation is one comment
@@ -2268,6 +2326,7 @@ function Lye:onDocumentHighlight(params)
 end
 
 ---@param self lye.Server
+---@param params table
 ---@return table?
 function Lye:onPrepareRename(params)
 	local variable = targetAt(self, params)
@@ -2282,6 +2341,7 @@ function Lye:onPrepareRename(params)
 end
 
 ---@param self lye.Server
+---@param params table
 ---@return table?
 function Lye:onRename(params)
 	local variable = targetAt(self, params)
@@ -2300,6 +2360,7 @@ end
 --- The declaration a type came from: `---@class Point` over `local Point = {}` is a declaration
 --- like any other, so go-to-type is a lookup by the class's name.
 ---@param self lye.Server
+---@param params table
 ---@return table?
 function Lye:onTypeDefinition(params)
 	local uri, text, index, names, offset = self:resolvePosition(params)
@@ -2337,6 +2398,7 @@ end
 
 --- Folding: the blocks the parser recorded, and the comment blocks above them.
 ---@param self lye.Server
+---@param params table
 ---@return table
 function Lye:onFoldingRange(params)
 	local uri = params.textDocument?.uri
@@ -2389,6 +2451,7 @@ end
 
 --- Selection ranges: the chain of expressions and blocks containing a position, innermost first.
 ---@param self lye.Server
+---@param params table
 ---@return table
 function Lye:onSelectionRange(params)
 	local uri = params.textDocument?.uri
@@ -2451,6 +2514,7 @@ local function hintText(type)
 	return (word or cut) .. "…"
 end
 
+---@param self lye.Server
 function Lye:onInlayHint(params)
 	local uri = params.textDocument?.uri
 	local document = uri and self.server.documents:get(uri)
@@ -2630,6 +2694,7 @@ local function narrowedSignature(names, node, text, kept)
 end
 
 ---@param self lye.Server
+---@param params table
 ---@return table?
 function Lye:onSignatureHelp(params)
 	local _, text, _, names, offset = self:resolvePosition(params)
@@ -3349,15 +3414,21 @@ function Lye:register()
 	server:capability("completionProvider", { triggerCharacters = { ".", ":", "[", '"', "'" } })
 	server:capability("signatureHelpProvider", { triggerCharacters = { "(", "," } })
 
-	server:on(method.didOpen, function(_, params)
+	---@param _ any
+	---@param params table?
+	local function onDidOpen(_, params)
 		self.server:onDidOpen(params or {})
 		self:onDocumentChanged(params or {}, true)
-	end)
+	end
+	server:on(method.didOpen, onDidOpen)
 
-	server:on(method.didChange, function(_, params)
+	---@param _ any
+	---@param params table?
+	local function onDidChange(_, params)
 		self.server:onDidChange(params or {})
 		self:onDocumentChanged(params or {})
-	end)
+	end
+	server:on(method.didChange, onDidChange)
 
 	server:on(method.didClose, function(_, params)
 		self.server:onDidClose(params or {})

@@ -4,20 +4,13 @@
 	"version": "0.1.0",
 	"description": "Name resolution and type inference for LuaJIT",
 	"dependencies": {
-		"lye-parser": {
-			"path": "../lye-parser"
-		},
-		"lye-lexer": {
-			"path": "../lye-lexer"
-		},
-		"lye-doc": {
-			"path": "../lye-doc"
-		},
-		"lye-plugin": {
-			"path": "../lye-plugin"
-		},
-		"rapidhash": {
-			"git": "https://github.com/lde-org/rapidhash.git"
-		}
+		"lye-parser": {"path": "../lye-parser"},
+		"lye-lexer": {"path": "../lye-lexer"},
+		"lye-doc": {"path": "../lye-doc"},
+		"lye-plugin": {"path": "../lye-plugin"},
+		"rapidhash": {"git": "https://github.com/lde-org/rapidhash.git"}
+	},
+	"devDependencies": {
+		"lde-test": {"git": "https://github.com/lde-org/lde"}
 	}
 }

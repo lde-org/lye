@@ -137,6 +137,18 @@ test.it("accepts a file that parses", function()
 	test.equal(check.file(INPUT), true)
 end)
 
+test.it("resolves a module the definitions ship", function()
+	-- `lde-test` is injected by the runner and has no file in `target/`; the definitions carry
+	-- its type, so a test file is checked like any other module.
+	writeInput('local test = require("lde-test")\ntest.it("works", function() end)\n')
+	test.equal(check.files({ INPUT }), true)
+end)
+
+test.it("reports a require that names no module", function()
+	writeInput('local missing = require("no.such.module")\nmissing.run()\n')
+	test.equal(check.files({ INPUT }), false)
+end)
+
 test.it("rejects a file with a syntax error", function()
 	writeInput("local x = 1\nlocal = 2\n")
 	test.equal(check.file(INPUT), false)

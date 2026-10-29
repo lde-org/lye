@@ -3,5 +3,9 @@
 	"name": "lye-json",
 	"version": "0.1.0",
 	"description": "Minimal JSON encode/decode for LuaJIT, tuned for LSP message payloads",
-	"dependencies": {}
+	"dependencies": {
+	},
+	"devDependencies": {
+		"lde-test": {"git": "https://github.com/lde-org/lde"}
+	}
 }

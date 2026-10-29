@@ -154,10 +154,11 @@ local function readField(annotation, fallback)
 	local name = annotation.name
 	if not name then return nil end
 
-	local visibility = fallback
+	local visibility = annotation.visibility or fallback
 	local typeText = annotation.type or "any"
 	-- The inline form: `---@field private name type`, where the tag's own name slot holds the
-	-- visibility and the field's name moves into the type text.
+	-- visibility and the field's name moves into the type text. The doc reader splits the common
+	-- spelling, and this keeps a hand-built annotation working the same way.
 	local inline = name
 	if inline == "private" or inline == "protected" or inline == "public" then
 		visibility = inline
@@ -165,7 +166,12 @@ local function readField(annotation, fallback)
 		local realName, remaining = rest:match("^([%w_%.]+)(.*)$")
 		if not realName then return nil end
 		name, typeText = realName, (remaining:gsub("^%s+", ""))
-		if typeText == "" then typeText = "any" end
+		-- `---@field private data table<K, V>` carries the rest in the tag's text, which is where
+		-- the doc reader keeps a field's type when it stopped at the first word.
+		if typeText == "" then
+			local after = (annotation.text or ""):match("^private%s+[%w_%.]+%s+(.*)$")
+			typeText = after and (after:gsub("%s+$", "")) or "any"
+		end
 	end
 
 	-- `---@field x? number` marks the field optional, which is what `?` means on the type: it is
@@ -318,7 +324,42 @@ function classes.resolver(namespace, elsewhere)
 			end
 			local methods = found.name
 				and (evolved[found.name] or evolved[bareName(found.name)])
-			for name, field in pairs(methods or {}) do classType.fields[name] = field end
+			-- A method declared on a generic class is written in the class's own parameters:
+			-- `function Box:get() return self.value end` hands back `T`, and which `T` is what the
+			-- arguments of the class say. Each method is one type shared by every instance, so the
+			-- substitution makes a fresh callable rather than rewriting it.
+			local methodBindings
+			if #found.params > 0 then
+				methodBindings = {}
+				for index, param in ipairs(found.params) do
+					methodBindings[param] = argTypes[index] or types.UNKNOWN_TYPE
+				end
+			end
+			for name, field in pairs(methods or {}) do
+				local bindings = methodBindings
+				-- A method that declares its own variables shadows the class's: `Box<T>` with
+				-- `---@generic T` on `Box.new` has a constructor variable of its own, and binding
+				-- it to the class's argument would make every call return the box the class table
+				-- happens to be written under rather than the one the caller is building.
+				if bindings and types.isFn(field) and field.generics then
+					local shadowed
+					for param in pairs(field.generics) do
+						if bindings[param] then
+							shadowed = shadowed or {}
+							shadowed[param] = true
+						end
+					end
+					if shadowed then
+						local kept = {}
+						for param, held in pairs(bindings) do
+							if not shadowed[param] then kept[param] = held end
+						end
+						bindings = kept
+					end
+				end
+				classType.fields[name] = bindings
+					and types.substitute(field, bindings) or field
+			end
 			if found.parent then
 				local parentType = resolve(substitute(found.parent, found.params, args))
 				if parentType then classType.parents[#classType.parents + 1] = parentType end
@@ -334,27 +375,47 @@ function classes.resolver(namespace, elsewhere)
 		local alias = namespace.aliases[bareName(aliasName)]
 		if alias and not active[aliasName] then
 			if built[text] then return built[text] end
-			active[aliasName] = true
+			-- A body may name the alias being read: `---@alias Tree { children: Tree[] }` is how a
+			-- recursive shape is written. A placeholder is what the body sees while it is being
+			-- read; once the body has settled, the placeholder is promoted in place, so every
+			-- reference the body made to the alias is the alias itself rather than `any`.
+			local placeholder = types.mutable()
+			built[text] = placeholder
+			active[aliasName] = placeholder
 			local body = alias.body
 			if #alias.params > 0 then
 				body = substitute(body, alias.params, argsText and classes.splitList(argsText) or {})
 			end
-			-- A body may name the alias being read: `lye.doc.Type` holds a list of `lye.doc.Type`.
-			-- A class may reach itself because it is *named* — reading a field of it stops at the
-			-- name — while an alias has no name to stop at, so a body that mentions itself is read
-			-- as `any` rather than built into a type that contains itself, which nothing can walk.
-			active[aliasName] = "self"
 			local resolved = types.parse(body, resolve)
 			active[aliasName] = nil
 			-- The body is built once per spelling, the way a class is: an alias named by a hundred
 			-- signatures is one type, and reading it again is a tree per read. `Foo<number>` and
 			-- `Foo<string>` are two spellings and two types, which is what the arguments say.
-			built[text] = resolved
-			return resolved
+			if resolved and placeholder.variant == "unknown" and not types.isMutable(resolved) then
+				types.promote(placeholder, resolved)
+			end
+			-- A name is what a reader of a type error should see. The body of `lye.doc.Type`
+			-- is a union of a dozen object shapes; printing that union verbatim turned one
+			-- parameter into a screenful of structure. The alias keeps its name and the display
+			-- uses it, while the type system still works with the body.
+			local named = built[text]
+			-- Only a wide union needs the name in preference to its structure. Small aliases
+			-- stay useful as the shape they write, which is what the doc tests and a reader
+			-- comparing types expect.
+			local wide = type(named) == "table" and named.variant == "union" and #named.types > 4
+			if wide and named.variant ~= "class"
+				and named ~= types.NUMBER and named ~= types.STRING and named ~= types.BOOLEAN
+				and named ~= types.NIL_TYPE and named ~= types.TABLE and named ~= types.VOID
+				and named ~= types.NEVER and named ~= types.UNKNOWN_TYPE and named ~= types.ANY_TYPE
+				and not named.aliasName then
+				named.aliasName = text
+			end
+			return built[text]
 		end
-		-- Reading the body of an alias that names itself: `any` says the same thing a class's own
-		-- name does, that the value fits wherever it is used.
-		if active[aliasName] == "self" then return types.ANY_TYPE end
+		-- Reading the body of an alias that names itself: the placeholder the outer read is
+		-- holding, so the alias can contain itself. A class may do the same because it is *named*
+		-- — reading a field of it stops at the name — and an alias has no name to stop at.
+		if active[aliasName] then return active[aliasName] end
 	end
 	return resolve
 end

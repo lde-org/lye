@@ -2,5 +2,10 @@
 	"$schema": "https://raw.githubusercontent.com/lde-org/lde/master/schemas/lde.schema.json",
 	"name": "lye-defs",
 	"version": "0.1.0",
-	"description": "LuaJIT standard library definitions for lye"
+	"description": "LuaJIT standard library definitions for lye",
+	"devDependencies": {
+		"lde-build": {
+			"git": "https://github.com/lde-org/lde"
+		}
+	}
 }
