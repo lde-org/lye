@@ -602,6 +602,22 @@ return def
 	test.equal(#result.diagnostics, 0, messages(result))
 end)
 
+test.it("hints a local return annotation that repeats the body", function()
+	-- `analyze` keeps errors and warnings only; this is a hint, so ask the analyzer directly.
+	local source = table.concat({
+		"---@param n number\n",
+		"---@return number\n",
+		"local function addOne(n) return n + 1 end\n",
+		"return addOne(1)\n",
+	}, "")
+	local result = lye.analyze(source, PRELUDE, nil, nil, nil, nil, nil, nil, nil, nil, { uri = URI })
+	local hints = 0
+	for _, entry in ipairs(result.diagnostics) do
+		if entry.severity == 3 and entry.message:find("already infers", 1, true) then hints += 1 end
+	end
+	test.equal(hints, 1)
+end)
+
 test.it("does not emit redundant return hints by default", function()
 	local result = analyze([[
 ---@param n number

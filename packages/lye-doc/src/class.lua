@@ -139,12 +139,22 @@ end
 ---@return table<string, string> constraints
 local function readAlias(text)
 	local trimmed = text:gsub("^%s+", "")
-	if trimmed:sub(1, 1) ~= "<" then return {}, trimmed, {}, {} end
-	local closeAt = closeAngle(trimmed, 1)
-	if not closeAt then return {}, trimmed, {}, {} end
-	local params, constraints, consts = classes.readParams(trimmed:sub(2, closeAt - 1))
-	return params, (trimmed:sub(closeAt + 1):gsub("^%s+", "")), consts, constraints
+	local params, constraints, consts, body = {}, {}, {}, trimmed
+	if trimmed:sub(1, 1) == "<" then
+		local closeAt = closeAngle(trimmed, 1)
+		if closeAt then
+			params, constraints, consts = classes.readParams(trimmed:sub(2, closeAt - 1))
+			body = (trimmed:sub(closeAt + 1):gsub("^%s+", ""))
+		end
+	end
+	-- LuaLS's definition templates mark the first alias member with `|>`: the `>` is a default
+	-- marker, not part of the literal. Keeping it made `openmode` start with a member named
+	-- `>"r"`, so `io.open(path, "r")` was rejected while every later mode worked. The comments
+	-- after members are prose, not part of the values.
+	body = body:gsub("%s*#[^|]*", ""):gsub("|>%s*", "|"):gsub("^>%s*", "")
+	return params, body, consts, constraints
 end
+
 
 --- A `---@field` line: `---@field [visibility] name[?] type`.
 ---@param annotation lye.doc.Annotation
@@ -466,6 +476,9 @@ end
 function classes.read(file)
 	local namespace = { classes = {}, aliases = {} }
 	local current, visibility = nil, "public"
+	-- An enum block may have aliases between its declarations, and those end `current`. The class
+	-- that owns the enums is still the last class declared in the file.
+	local enumOwner
 
 	for _, annotation in ipairs(file.annotations) do
 		if annotation.tag == "class" then
@@ -475,6 +488,7 @@ function classes.read(file)
 				constraints = constraints,
 			}
 			namespace.classes[bareName(name)] = current
+			enumOwner = current
 			visibility = "public"
 		elseif annotation.tag == "field" then
 			if current then
@@ -494,6 +508,23 @@ function classes.read(file)
 			end
 		elseif annotation.tag == "private" or annotation.tag == "protected" or annotation.tag == "public" then
 			visibility = annotation.tag
+		elseif annotation.tag == "enum" then
+			-- `---@enum vk.Format` names the table a class holds under its last part: `vk.RawEnums`
+			-- has a `Format` table, and the enum itself is a number for annotations. The concrete
+			-- members are read from the table at runtime, so a string index signature is the honest
+			-- shape for `Format.R8G8...` rather than an invented list of names.
+			local written = annotation.name or (annotation.text or ""):match("^%s*([%w_%.]+)")
+			if written then
+				local name = bareName(written)
+				local field = name:match("([^%.]+)$")
+				local owner = current or enumOwner
+				if owner and field then
+					owner.fields[#owner.fields + 1] = {
+						name = field, type = "table<string, number>", visibility = visibility,
+					}
+				end
+				namespace.aliases[name] = { params = {}, body = "number", consts = {}, constraints = {} }
+			end
 		elseif annotation.tag == "alias" then
 			-- `---@alias ArrayOfNumberLike<T: number> T[]`: the doc reader hands the parameters over
 			-- in the type text, ahead of the body, and both are kept as written. The body is not
@@ -540,9 +571,11 @@ function classes.declare(files)
 	local found = {}
 	for _, file in ipairs(files) do
 		for _, annotation in ipairs(file.annotations) do
-			if (annotation.tag == "class" or annotation.tag == "alias") and annotation.name
-				and found[annotation.name] == nil then
-				found[annotation.name] = resolve(annotation.name) or true
+			local declared = annotation.name
+				or (annotation.tag == "enum" and (annotation.text or ""):match("^%s*([%w_%.]+)"))
+			if (annotation.tag == "class" or annotation.tag == "alias" or annotation.tag == "enum")
+				and declared and found[declared] == nil then
+				found[declared] = resolve(declared) or true
 			end
 		end
 	end

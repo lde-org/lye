@@ -1151,6 +1151,22 @@ local function typeOfExpression(result, idx, offset)
 	end
 end
 
+--- The function a call's field holds, rather than the value the call returns. Hovering the name
+--- of `queue:submit` is asking what `submit` is, and a void method otherwise looked like its `any`
+--- result.
+---@param result lye.analyzer.Result
+---@param node lye.parser.Node
+---@param offset integer
+---@return lye.doc.Type?
+local function fieldTypeOf(result, node, offset)
+	if node.kind ~= "call" or not node.field or not node.target then return nil end
+	local base = typeOfExpression(result, node.target, offset)
+	if not base then return nil end
+	local target = result.parser.nodes[node.target]
+	local baseName = target and target.kind == "prefix" and target.callee or nil
+	return analyzer.fieldTypeAt(result, base, baseName, node.field, offset)
+end
+
 --- A signature as its annotations wrote it: `print(...: any)`, `math.floor(x: number) -> number`.
 --- The name is optional, since a completion item is already labelled with it, and so is the
 --- signature: a caller that has none shows the type instead.
@@ -1485,6 +1501,10 @@ function Lye:onHover(params)
 	---@type lye.analyzer.Signature?
 	local signature = signatureFor(self.names[uri], node, offset)
 	local held = typeOfExpression(result, node.index, offset)
+	if not signature then
+		local method = fieldTypeOf(result, node, offset)
+		if method and types.isFn(method) then held = method end
+	end
 	if not signature and not held then return nil end
 
 	local label

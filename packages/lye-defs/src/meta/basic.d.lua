@@ -168,7 +168,7 @@ function setfenv(f: function|integer, table: table<string, any>): function end
 ---
 ---To change the metatable of other types from Lua code, you must use the debug library (§6.10).
 ---
-function setmetatable<T: table>(table: T, metatable?: lye.Metatable<table>): T end
+function setmetatable<T: table>(table: T, metatable?: any): T end
 
 ---When called with no `base`, `tonumber` tries to convert its argument to a number. If the argument is already a number or a string convertible to a number, then `tonumber` returns this number; otherwise, it returns `fail`.
 ---

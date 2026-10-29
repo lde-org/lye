@@ -2993,10 +2993,27 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 	-- It runs after every name is in scope, because the value a field is written on is looked up by
 	-- name, and before the typing rounds, because the type it is given here is the one those rounds
 	-- read: the literal's own table, not a copy.
+	--- Whether the statement at `offset` has a `---@type` immediately above it. An annotated
+	--- field assignment is a promise about the class table it writes, not just the literal value.
+	---@param offset integer
+	---@return boolean
+	local function hasTypeAnnotation(offset)
+		local written = annotations.annotations or {}
+		for index = #written, 1, -1 do
+			local annotation = written[index]
+			if annotation.stop < offset then
+				if annotation.tag ~= "type" then return false end
+				return source:sub(annotation.stop + 1, offset - 1):match("^%s*$") ~= nil
+			end
+		end
+		return false
+	end
+
 	---@param written string the name as written, `M.field`, `M:field` or `A.B.field`
 	---@param offset integer
 	---@param fieldType lye.doc.Type?
-	local function addTableField(written, offset, fieldType)
+	---@param annotated boolean? whether a `---@type` is written directly above the assignment
+	local function addTableField(written, offset, fieldType, annotated)
 		if not fieldType then return end
 		local base, field = written:match("^(.-)[%.:]([%w_]+)$")
 		---@cast base string?
@@ -3011,7 +3028,20 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		if first then variable = lookupIn(scopeAt(self, offset), first, offset) end
 		-- An annotation governs the value: `---@type App local x = {}` is an App, and a method written on
 		-- `x` belongs to App — which the class pass above has given it — not to the literal behind it.
-		if variable and variable.declared then return end
+		-- A `---@type` over a field assignment is different: it says the class table itself gains that
+		-- field (`gl.clearColor = ...` is how an OpenGL entry point is installed).
+		if variable and variable.declared then
+			if variable.declared.variant == "class" and base == first and rest == "" then
+				local fields = variable.declared.fields
+				-- A function assigned without an annotation is the body of a method; it is
+				-- already added by the method pass, and its untyped parameters here would make
+				-- the field look like an unknown callable. A value or an annotated assignment is
+				-- a real field of the class table.
+				local add = fieldType ~= nil and (annotated or fieldType.variant ~= "fn")
+				if add and fields and fields[field] == nil then fields[field] = fieldType end
+			end
+			return
+		end
 		local declaration = variable and variable.declaration
 		---@type lye.doc.Type?
 		local held
@@ -3127,7 +3157,8 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 			if written and written:find("[%.:]") then
 				local owner = ownerItemAt(node.start, node.stop)
 				if not (owner and plan.clean[owner.id]) or writesModuleTable(written, node.start) then
-					addTableField(written, node.start, infer.at(inferCtx, node.valueIdx))
+					addTableField(written, node.start, infer.at(inferCtx, node.valueIdx),
+						hasTypeAnnotation(node.start))
 				end
 			end
 		end

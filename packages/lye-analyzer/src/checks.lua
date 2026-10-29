@@ -108,11 +108,12 @@ end
 
 ---@param ctx lye.analyzer.CheckContext
 local function returnHints(ctx)
-	-- Explicit return annotations are public API documentation. Flagging every one as redundant
-	-- made a fully documented library impossible to check cleanly; keep the maintainer audit
-	-- available, but do not put it in the default diagnostic stream. The inferred values below
-	-- are still recorded: hover and signature help read them.
-	local wantHints = os.getenv("LYE_REDUNDANT_RETURNS") == "1"
+	-- Explicit return annotations on exported functions are public API documentation. A local helper
+	-- that is not exported is different: its annotation is a line kept in step with the body for
+	-- nothing, and it should be reported by default. The environment variable forces the audit for
+	-- every function, exported or not. The inferred values below are still recorded either way:
+	-- hover and signature help read them.
+	local forceHints = os.getenv("LYE_REDUNDANT_RETURNS") == "1"
 	local parsed, self = ctx.parsed, ctx.self
 	local signatures = ctx.signatures
 	local resolve = ctx.resolve
@@ -140,6 +141,32 @@ local function returnHints(ctx)
 		return count
 	end
 
+	--- Whether a local function is part of the module's surface. A `return helper` or a write to a
+	--- field is how a local helper becomes public; one that is only called inside the file is not.
+	---@param declaration lye.parser.Declaration
+	---@return boolean
+	local function exported(declaration)
+		if declaration.qualifier ~= "local" then return true end
+		local name = declaration.name
+		if not name then return true end
+		for _, node in ipairs(parsed.nodes) do
+			if node.kind == "return" then
+				for _, child in ipairs(node.children or {}) do
+					local value = parsed.nodes[child]
+					if value and value.kind == "prefix" and value.callee == name then return true end
+				end
+			elseif node.kind == "assignment" and node.valueIdx then
+				local value = parsed.nodes[node.valueIdx]
+				local target = node.target and parsed.nodes[node.target]
+				if value and value.kind == "prefix" and value.callee == name
+					and target and (target.kind == "index" or target.kind == "prefix") then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
 	local previous
 	for _, declaration in ipairs(parsed.declarations) do
 		---@type lye.analyzer.Signature?
@@ -159,7 +186,7 @@ local function returnHints(ctx)
 			-- it, not only the value a call in an expression is worth.
 			if not signature.values then signature.inferredValues = values end
 		end
-		if wantHints then
+		if forceHints or (declaration.qualifier == "local" and not exported(declaration)) then
 		-- An annotation that says exactly what the body says is a line kept in step with the code
 		-- for nothing. A hint rather than a warning, since a written signature is often what a
 		-- reader wants. Only a lone one: with a second line below it, the line is a position. The

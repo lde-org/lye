@@ -9,6 +9,7 @@
 
 ---@class ffi.cdecl*: string
 ---@class ffi.cdata*: userdata
+---@field [string] any
 ---@alias ffi.ct*     ffi.ctype*|ffi.cdecl*|ffi.cdata*
 
 ---@class ffi.cb*: ffi.cdata*
@@ -101,7 +102,7 @@ function ffi.metatype(ct: ffi.ctype*|ffi.cdata*, metatable: table): ffi.ctype* e
 function ffi.gc<T: ffi.cdata*>(cdata: T, finalizer?: fun(obj: T)): T end
 
 ---@nodiscard
-function ffi.sizeof(ct: ffi.ct*, nelem?: integer): integer? end
+function ffi.sizeof(value: any): integer? end
 
 ---@nodiscard
 function ffi.alignof(ct: ffi.ct*): integer end

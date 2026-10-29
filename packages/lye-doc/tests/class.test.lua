@@ -160,6 +160,35 @@ test.it("reads an optional field", function()
 	test.equal(found.optional, true, "and a value may leave it out")
 end)
 
+test.it("reads an enum as a number and a table on the class that holds it", function()
+	local namespace = read(table.concat({
+		"---@class Enums\n",
+		"---@enum Enums.Format\n",
+		"Enums.Format = { RGBA = 1, BGRA = 2 }\n",
+		"---@enum Enums.PresentMode\n",
+		"Enums.PresentMode = { FIFO = 1 }\n",
+	}, ""))
+	test.equal(table.concat(fields(namespace, "Enums"), ", "),
+		"Format: table<string, number>, PresentMode: table<string, number>")
+	local resolve = classes.resolver(namespace)
+	---@cast resolve fun(name: string): lye.doc.Type
+	test.equal(doctype.display(resolve("Enums.Format")), "number",
+		"the enum's own type is the value it holds")
+end)
+
+test.it("reads the default marker on the first alias member", function()
+	-- The definitions copied from LuaLS write the first member with `|>`; the `>` marks its
+	-- default, and it is not part of the text to compare against.
+	local namespace = read(table.concat({
+		"---@alias openmode\n",
+		'---|>"r" # Read mode.\n',
+		'---| "w" # Write mode.\n',
+	}, ""))
+	local resolve = classes.resolver(namespace)
+	---@cast resolve fun(name: string): lye.doc.Type
+	test.equal(doctype.display(resolve("openmode")), '"r"|"w"')
+end)
+
 test.it("reads an alias", function()
 	local namespace = read("---@alias Id number|string\n")
 	test.equal(namespace.aliases.Id.body, "number|string")
