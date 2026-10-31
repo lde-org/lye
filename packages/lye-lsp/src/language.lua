@@ -5,6 +5,7 @@
 -- First, so the mark it writes for `initialize` covers everything this server loaded.
 local timing = require("lye-lsp.timing")
 local rpc = require("lye-rpc")
+local stdio = require("lye-rpc.stdio")
 local doc = require("lye-doc")
 local classes = require("lye-doc.class")
 local framework = require("lye-framework")
@@ -15,8 +16,10 @@ local Parser = require("lye-parser")
 local analyzer = require("lye-analyzer")
 local analyzerNames = require("lye-analyzer.names")
 local editorconfig = require("lye-lsp.editorconfig")
-local KIND = require("lye-lexer").KIND
+local lexer = require("lye-lexer")
+local KIND = lexer.KIND
 local types = require("lye-doc.type")
+local rapidhash = require("rapidhash")
 local cache = require("lye-lsp.cache")
 local plugin = require("lye-plugin")
 -- A package of its own, but linked into this server: the static `require` is what a bundler can
@@ -27,6 +30,18 @@ local Modules = require("lye-lsp.modules")
 local AnalysisCache = require("lye-lsp.analysis_cache")
 
 local SYMBOL_KIND = { ["function"] = 12, variable = 13 }
+
+-- The pause that ends a burst of keystrokes. Diagnostics are due then, not on every key: an
+-- analysis nobody reads delays the key after it, and the text it described is already gone.
+-- How long a burst has to pause before its analysis is due. A document under 128 KiB is answered
+-- as soon as the input pauses: the pass is short enough that waiting only delays the answer. A
+-- larger one is coalesced, because typing does not stop for a pass that costs a tenth of a second.
+local IDLE_DELAY_SMALL = 0
+local IDLE_DELAY_MEDIUM = 0
+local IDLE_DELAY_LARGE = 250
+-- A full collection walks the heap for tens of milliseconds. It is worth that pause once the
+-- editor is quiet, never between two keystrokes, so it waits this long after the last message.
+local CHECKPOINT_QUIET = 400
 
 --- The LuaJIT definitions, prepared once: they are the same for every document, and parsing
 --- them per keystroke would be absurd.
@@ -55,6 +70,89 @@ local function originalAt(map, offset)
 	return (map:toOriginal(offset))
 end
 
+--- Whether one edit could have changed which classes and aliases a text declares. The ranges are
+--- written in the text before the change, so they are read against the line index of that text;
+--- an inserted `---` is found in the text the editor sent. An edit that touches neither an
+--- annotation line nor its own inserted text leaves the annotation blocks alone.
+---@param changes lye.framework.Change[]? the edits this message carried
+---@param text string? the text before them
+---@param index lye.framework.LineIndex? the line index of that text
+local function changeTouchesAnnotation(changes, text, index)
+	if not changes or not text or not index then return true end
+	if #changes == 0 then return true end
+	---@param line integer
+	local function lineIsAnnotation(line)
+		local start = index.starts[line + 1]
+		if not start then return false end
+		local stop = (index.starts[line + 2] or (index.length + 1)) - 1
+		local written = text:sub(start, stop)
+		if written:match("^%s*%-%-%-") then return true end
+		if written:match("^%s*%-%-%[=*%[") then
+			local close = text:find("]]", start, true)
+			local window = text:sub(start, close and (close + 1) or math.min(#text, start + 4096))
+			return window:find("@class", 1, true) ~= nil or window:find("@alias", 1, true) ~= nil
+		end
+		return false
+	end
+	for _, change in ipairs(changes) do
+		local written = change.text or ""
+		if written:find("%-%-%-", 1) or written:find("%-%-%[=*%[", 1) then return true end
+		local range = change.range
+		if not range then return true end
+		local first, last = range.start.line, range["end"].line
+		for line = first, last do
+			if lineIsAnnotation(line) then return true end
+		end
+		-- A newline that joins an annotation line to the line before it is written at the end of
+		-- the range, so the line after the range is the one to ask about.
+		if lineIsAnnotation(last + 1) then return true end
+	end
+	return false
+end
+
+--- The annotation blocks of a text, as one hash. Classes and aliases are what another document's
+--- `require` reads this one for, and they are written as annotation comments; an edit that leaves
+--- those blocks alone cannot change what this file declares. A block is a run of `---` lines:
+--- an ordinary comment between two of them splits the run, so an edit that changes which
+--- declaration a `---@field` lands on is seen as a change.
+---@param text string
+local function annotationFingerprint(text)
+	-- Only lines that could be annotations are visited. Splitting every line of a large file was
+	-- the cost of deciding whether an edit left the annotations alone, which is a question asked
+	-- on every keystroke. A line's offset is part of the hash, so moving an annotation relative to
+	-- the code around it is a change like any other.
+	local parts = {}
+	local at = 1
+	while true do
+		local found = text:find("---", at, true)
+		if not found then break end
+		local lineStart = found
+		while lineStart > 1 and text:byte(lineStart - 1) ~= 10 do lineStart -= 1 end
+		if text:sub(lineStart, found - 1):match("^[ \t]*$") then
+			local lineStop = text:find("\n", found, true) or (#text + 1)
+			local written = text:sub(found, lineStop - 1):gsub("%s+$", "")
+			parts[#parts + 1] = tostring(lineStart) .. ":" .. written
+		end
+		at = found + 3
+	end
+	-- A class may also be written in a long comment, whose lines do not start with `---`. Only
+	-- one that carries an annotation is kept: an ordinary long comment declares nothing.
+	local at = 1
+	while true do
+		local start, stop, equals = text:find("%-%-%[(=*)%[", at)
+		if not start then break end
+		local terminator = "]" .. equals .. "]"
+		local finish = text:find(terminator, stop + 1, true)
+		if not finish then break end
+		at = finish + #terminator
+		local held = text:sub(start, at - 1)
+		if held:find("@class", 1, true) or held:find("@alias", 1, true) then
+			parts[#parts + 1] = held
+		end
+	end
+	return rapidhash.hex(table.concat(parts, "\0"))
+end
+
 local TOKEN_LEGEND = {
 	tokenTypes = {
 		"keyword", "string", "number", "comment", "operator", "variable", "function", "parameter",
@@ -78,6 +176,121 @@ for index, name in ipairs(TOKEN_LEGEND.tokenModifiers) do
 	TOKEN_MODIFIER[name] = 2 ^ (index - 1)
 end
 
+--- An encoder for semantic tokens: spans in source order, as the relative integers the protocol
+--- asks for. A token never spans a line, so a span that does is written as one per line. Spans that
+--- begin where the one before already reached are trimmed, which is how a plugin's colour and the
+--- walk's overlap without both being sent.
+---@param source string the text the offsets are in
+---@param index lye.framework.LineIndex its line index
+---@param encoding string the client's position encoding
+---@return fun(from: integer, to: integer, kind: string, modifiers: integer?)
+---@return fun(): table, integer
+local function tokenEncoder(source, index, encoding)
+	local data, count = json.array(), 0
+	local lastLine, lastStart, lastStop, isFirst = 0, 0, 0, true
+	-- Spans arrive in source order, so the line cursor advances through the line index once rather
+	-- than searching the text for a newline at every token.
+	local starts = index.starts
+	local line = 0
+
+	--- Move the line cursor to the line holding `offset`.
+	---@param offset integer
+	local function advanceTo(offset)
+		while starts[line + 2] and starts[line + 2] <= offset do line += 1 end
+	end
+
+	--- The code-unit distance from the start of the current line to `offset`.
+	---@param offset integer
+	local function characterAt(offset)
+		local lineStart = starts[line + 1]
+		local byteCount = offset - lineStart
+		if encoding == position.UTF8 or byteCount <= 0 then return byteCount end
+		if not (index.wide and index.wide[line + 1]) then return byteCount end
+		return position.utf16Length(source:sub(lineStart, offset - 1), byteCount)
+	end
+
+	---@param from integer
+	---@param to integer
+	---@param kind string
+	---@param modifiers integer?
+	local function write(from, to, kind, modifiers)
+		local kindNumber = TOKEN_TYPE[kind]
+		if not kindNumber then return end
+		if from <= lastStop then from = lastStop + 1 end
+		if from > to then return end
+		local at = from
+		while at <= to do
+			advanceTo(at)
+			local nextStart = starts[line + 2]
+			-- A token may not cross a line break: the newline itself is not part of the line the
+			-- editor colours. `nextStart - 2` is the byte before the `\n` that opens the next line.
+			local lineLimit = nextStart and (nextStart - 2) or to
+			local lineStop = math.min(to, lineLimit)
+			if lineStop >= at then
+				local start = characterAt(at)
+				local stopCharacter = characterAt(lineStop)
+				local deltaLine = isFirst and line or (line - lastLine)
+				local deltaStart = isFirst and start or (deltaLine == 0 and (start - lastStart) or start)
+				count += 1
+				data[count] = deltaLine
+				count += 1
+				data[count] = deltaStart
+				count += 1
+				data[count] = math.max(stopCharacter - start + 1, 1)
+				count += 1
+				data[count] = kindNumber
+				count += 1
+				data[count] = modifiers or 0
+				lastLine, lastStart, isFirst, lastStop = line, start, false, lineStop
+			end
+			if not nextStart or to <= lineLimit then break end
+			line += 1
+			at = nextStart
+		end
+	end
+
+	---@return table
+	---@return integer
+	local function finish() return data, count end
+	return write, finish
+end
+
+--- The spans of an answer for a text, with one edit applied. Spans wholly before it stand, spans
+--- wholly after it move by the edit's delta, and spans it overlaps are dropped: the inserted text
+--- is coloured by what it says of itself, and the next type pass colours the rest.
+---@param spans { from: integer, to: integer, kind: string, modifiers: integer? }[]
+---@param from integer the first byte the edit replaces
+---@param to integer the last byte it replaces
+---@param delta integer inserted bytes minus replaced bytes
+---@param inserted string
+local function shiftTokenSpans(spans, from, to, delta, inserted)
+	-- The list is the caller's to consume: the answer it described is being replaced by this one.
+	-- Compacting in place keeps a keystroke from allocating a table per token.
+	local kept, insertAt = 0, nil
+	for index = 1, #spans do
+		local span = spans[index]
+		if span.to < from then
+			kept += 1
+			spans[kept] = span
+		elseif span.from > to then
+			span.from += delta
+			span.to += delta
+			kept += 1
+			spans[kept] = span
+		end
+		if not insertAt and span.from >= from then insertAt = kept + 1 end
+	end
+	for index = kept + 1, #spans do spans[index] = nil end
+	local at = insertAt or (kept + 1)
+	if inserted:match("^%s*%-%-") then
+		table.insert(spans, at, {
+			from = from, to = from + #inserted - 1,
+			kind = "comment", modifiers = TOKEN_MODIFIER.documentation,
+		})
+	end
+	return spans
+end
+
 --- The words that are grammar inside a type rather than the name of one.
 local TYPE_KEYWORD = {
 	const = true, fun = true, fn = true, async = true,
@@ -90,6 +303,15 @@ local TYPE_KEYWORD = {
 -- really grown, or when a document that made it grow has closed.
 local GC_STEP_BYTES = 2 * 1024 * 1024
 local GC_FULL_BYTES = 8 * 1024 * 1024
+-- A full collection walks the whole live set, which for a document this server holds is tens of
+-- milliseconds. A typing burst grows the heap past the full threshold on every keystroke, and
+-- paying that pause between each of them is what the user feels; the first one is enough until the
+-- burst has had time to settle. The collector's own pause runs in between, and a close collects
+-- whatever the clock says. `timing.now()` counts milliseconds.
+local GC_FULL_MILLISECONDS = 1000
+-- One step is a bounded slice of the collector's work, not a full walk: enough to keep a typing
+-- session from piling garbage up, small enough not to be the pause the user feels.
+local GC_STEP_UNITS = 100
 
 -- The features a plugin extension has to join when its language is not Lua. The selector is
 -- registered for each file extension a plugin claims, so an editor that supports dynamic document
@@ -245,6 +467,7 @@ local DOC_TAG_NAME = "[%a_][%w_]*"
 --- present here: a table whose every field is optional makes a later argument mis-bind.
 ---@class lye.lsp.ChangeParams
 ---@field textDocument lye.lsp.TextDocument
+---@field contentChanges lye.framework.Change[]? the edits this notification carried
 
 ---@class lye.Server
 ---@field server lye.framework.Server
@@ -270,8 +493,16 @@ local DOC_TAG_NAME = "[%a_][%w_]*"
 ---@field lastHeap number? the heap size at the last collection checkpoint
 ---@field dirtyAt table<string, number>? when each dirty document last changed, so the newest is analysed first
 ---@field dirtyEpoch table<string, integer>? which change count last marked each dirty document, breaking a tie on the clock
----@field tokens_ table<string, { text: string, answer: table }>? the token answer for a document
---- that has not changed since it was worked out
+---@field tokens_ table<string, { text: string, answer: table, spans: table[]? }>? the token answer
+--- for a document that has not changed since it was worked out
+---@field fastTokens_ table<string, { text: string, answer: table, spans: table[]? }>? a lexical answer
+--- for a text whose type pass is still pending
+---@field lastTexts table<string, string> the text each document held at the last change
+---@field lastIndexes table<string, lye.framework.LineIndex> the line index of that text
+---@field annotationFingerprints table<string, string>? what each document's annotations hash to
+---@field pendingChanges table<string, lye.framework.Change[]>? the edits since the last answer
+---@field pendingChangeTexts table<string, string>? the text those edits were written in
+---@field lastMessageAt number? when the last message arrived, for the pause that ends a burst
 ---@field viewByIndex table<lye.framework.LineIndex, lye.View>? the same, found by a line index a
 --- range was written with
 ---@field workspace table[]? the symbols of the workspace, listed once
@@ -283,6 +514,7 @@ Lye.__index = Lye
 function Lye.new(server)
 	local lye = setmetatable({
 		server = server, declaredBy = {}, dirty = {}, epoch = 0, prelude = PRELUDE,
+		lastTexts = {}, lastIndexes = {}, tokens_ = {}, fastTokens_ = {},
 		lastHeap = timing.heap(),
 	}, Lye)
 	-- The cache owns `analysis`, `names` and `order`; it publishes the same tables on `lye`,
@@ -290,6 +522,13 @@ function Lye.new(server)
 	lye.cache = AnalysisCache.new(lye)
 	lye.declarations = Declarations.new(lye)
 	lye.modules = Modules.new(lye)
+	-- The first patch a keystroke asks for should not also compile the loop that does it. The
+	-- synthetic list is long enough for the trace to be worth compiling.
+	local warm = {}
+	for index = 1, 96 do
+		warm[index] = { from = index * 8, to = index * 8 + 3, kind = "variable" }
+	end
+	shiftTokenSpans(warm, 100, 120, 7, "-- warm\n")
 	return lye
 end
 
@@ -314,11 +553,22 @@ end
 ---@return boolean full
 ---@param self lye.Server
 function Lye:checkpoint(force)
+	-- The editor may already be sending the next key. A collection started now is a pause the
+	-- handler for that key waits through, and the work can be done at the next quiet moment.
+	if not force and stdio.readable() then return false end
 	local started = timing.now()
 	local grown = (timing.heap() - self.lastHeap) * 1024
 	local collect, full = Lye.gcDecision(grown, force)
+	if full and not force then
+		local now = timing.now()
+		if self.lastFull ~= nil and now - self.lastFull < GC_FULL_MILLISECONDS then
+			-- Downgrade to a bounded step: the pause a full walk costs belongs between bursts.
+			full = false
+		end
+		if full then self.lastFull = now end
+	end
 	if collect then
-		if full then collectgarbage("collect") else collectgarbage("step") end
+		if full then collectgarbage("collect") else collectgarbage("step", GC_STEP_UNITS) end
 		self.lastHeap = timing.heap()
 	end
 	timing.memory(started, collect)
@@ -581,13 +831,6 @@ function Lye:moduleType(name, from)
 	return self.modules:type(name, from)
 end
 
---- A digest of the documents an editor has open, which a kept module answer is read against.
----@param self lye.Server
----@return string
-function Lye:documentsDigest()
-	return self.modules:documentsDigest()
-end
-
 --- Where this session keeps what it works out: the workspace the editor opened, so a second
 --- editor on the same project reads what the first one worked out. A run that named a directory —
 --- `LYE_CACHE_DIR`, or the command line — has said where it wants everything, and this leaves it
@@ -639,6 +882,7 @@ end
 ---@param uri string
 ---@param from integer? the byte the change starts at, in the text the held parse was for
 ---@param self lye.Server
+---@return lye.parser.Result?
 function Lye:analyze(uri, from)
 	---@type lye.framework.Document?
 	local document = self.server.documents:get(uri)
@@ -666,28 +910,49 @@ function Lye:analyze(uri, from)
 	if incremental then
 		options = {
 			uri = uri, previous = self.cache.previous[uri], from = fromOffset,
-			incremental = true, counters = counters,
+			incremental = true, reuse = true, rebase = true, counters = counters,
+			declarationsVersion = self.declarations.generation,
+			modulesVersion = self.modules.version,
 		}
 	else
 		-- The cold path: the previous result and the offset are not offered at all.
-		options = { uri = uri, incremental = false, counters = counters }
+		options = {
+			uri = uri, incremental = false, counters = counters,
+			declarationsVersion = self.declarations.generation,
+			modulesVersion = self.modules.version,
+		}
 	end
 
+	local declaredStarted = timing.now()
+	local declared = self:declaredTypes(uri)
+	timing.detail("declared-types", declaredStarted)
 	---@param name string
 	local function moduleAt(name) return self:moduleType(name, uri) end
 	---@param message string
 	local function reportPlugin(message) self.server:log(message, framework.LOG.warning) end
-	local names = analyzer.analyze(view.text, PRELUDE, self:declaredTypes(uri), moduleAt,
+	local analysisStarted = timing.now()
+	local names = analyzer.analyze(view.text, PRELUDE, declared, moduleAt,
 		resume, self.cache:annotationsFor(uri, view.text), nil, self:isDefinition(uri),
 		view.specs, reportPlugin, options)
+	timing.detail("analyzer-call", analysisStarted, "bytes=%d", #view.text)
+	if counters then
+		timing.detail("analyzer-phases", analysisStarted,
+			"parse=%.1f checks=%.1f checkCalls=%.1f typing=%.1f typing2=%.1f inferParams=%.1f contextual=%.1f scopes=%.1f setup=%.1f reuse=%.1f finalize=%.1f",
+			(counters.parse or 0) * 1000, (counters.checkReport or 0) * 1000,
+			(counters.checkCalls or 0) * 1000, (counters.typing or 0) * 1000,
+			(counters.typing2 or 0) * 1000, (counters.inferParams or 0) * 1000,
+			(counters.contextual or 0) * 1000, (counters.scopes or 0) * 1000,
+			(counters.itemsBuild or 0) * 1000 + (counters.itemIndexes or 0) * 1000
+				+ (counters.declare or 0) * 1000 + (counters.methods or 0) * 1000,
+			(counters.reuseTime or 0) * 1000, (counters.finalize or 0) * 1000)
+	end
 	local parsed = names.parser
 
 	-- Type errors from annotations belong in the same list as syntax errors, but the parse tree is
 	-- the parser's own: it is what the next text resumes from, and a diagnostic the analyzer
 	-- appended here would be carried into that parse and appended again. So the combined list is
 	-- a result-table copy, and the tree the cache keeps stays parser-only.
-	---@type lye.parser.Result
-	local result = {}
+	local result = {} --[[@as lye.parser.Result]]
 	for key, value in pairs(parsed) do result[key] = value end
 	---@type lye.parser.Problem[]
 	local diagnostics = {}
@@ -717,6 +982,16 @@ function Lye:analyze(uri, from)
 		self.declarations:declared(uri, self.declaredBy[uri])
 	end
 	self.cache:store(uri, names, view, self.epoch)
+	-- What this text declares, kept for the next edit: an edit that does not touch an annotation
+	-- leaves it standing, and recomputing it over the whole document is a cost a keystroke should
+	-- not carry. The first analysis of a document pays it once.
+	if view.map:isEmpty() then
+		self.annotationFingerprints = self.annotationFingerprints or {}
+		if self.annotationFingerprints[uri] == nil then
+			self.annotationFingerprints[uri] = annotationFingerprint(view.text)
+		end
+	end
+	if self.fastTokens_ then self.fastTokens_[uri] = nil end
 	self.dirty[uri] = nil
 
 	local items, reused = 0, 0
@@ -1327,6 +1602,27 @@ end
 ---@return integer
 local function fieldStartAt(text, targetStop)
 	local at = targetStop + 1
+	-- Lua allows a suffix to start on the next line: `obj:method()` followed by a new line and
+	-- spaces before `:other()`. Measuring from the receiver's last byte without skipping that
+	-- whitespace pointed at the newline rather than the method name, leaving the name uncoloured.
+	while at <= #text do
+		local byte = text:byte(at)
+		if byte == 32 or byte == 9 or byte == 10 or byte == 13 then
+			at += 1
+		elseif text:sub(at, at + 1) == "--" then
+			-- A comment may sit between the receiver and the chained `:`, as it does after a
+			-- chained call in the triangle example. Skip the comment as whitespace.
+			local long = text:match("^%-%-%[(=*)%[", at)
+			if long then
+				local close = text:find("]" .. long .. "]", at + 4 + #long, true)
+				at = close and close + #long + 2 or #text + 1
+			else
+				at = text:find("\n", at + 2, true) or #text + 1
+			end
+		else
+			break
+		end
+	end
 	if text:sub(at, at + 1) == "?." then at = at + 2 end
 	local delimiter = text:sub(at, at)
 	return (delimiter == "." or delimiter == ":" or delimiter == "[") and at + 1 or at
@@ -1442,6 +1738,62 @@ local function wordSpan(source, offset)
 	return from, to
 end
 
+--- A declaration shown as a type rather than as the annotations that wrote it: classes as a
+--- class shape with their fields, aliases as an alias and unions as a union. The text is fenced
+--- as Lua so clients that highlight hover code still colour comments, strings and numbers.
+---@param lines string the class/alias declaration read from the index
+---@return string? declaration
+---@return string? documentation
+local function shownType(lines)
+	local documentation = {}
+	---@cast documentation string[]
+	for line in lines:gmatch("[^\n]+") do
+		if line:match("^%s*%-%-%-@") then break end
+		local prose = line:match("^%s*%-%-%-?%s?(.*)$")
+		if prose and prose ~= "" then documentation[#documentation + 1] = prose end
+	end
+	local file = doc.parse(lines)
+	---@cast file lye.doc.File
+	local namespace = classes.read(file)
+	for _, annotation in ipairs(file.annotations or {}) do
+		if annotation.tag == "class" then
+			---@type lye.doc.Class?
+			local class
+			for _, candidate in pairs(namespace.classes) do class = candidate; break end
+			if class then
+				local params = #class.params > 0 and ("<" .. table.concat(class.params, ", ") .. ">") or ""
+				local parent = class.parent and (": " .. class.parent) or ""
+				local out = { "class " .. class.name .. params .. parent .. " {" }
+				for _, field in ipairs(class.fields) do
+					---@cast field lye.doc.Field
+					local name = field.name
+					if field.optional then name = name .. "?" end
+					local prefix = field.visibility and field.visibility ~= "public"
+						and (field.visibility .. " ") or ""
+					local comment = field.comment and (" -- " .. field.comment) or ""
+					out[#out + 1] = string.format("    %s%s: %s,%s", prefix, name, field.type, comment)
+				end
+				out[#out + 1] = "}"
+				return table.concat(out, "\n"), #documentation > 0 and table.concat(documentation, "\n") or nil
+			end
+		elseif annotation.tag == "alias" then
+			---@type lye.doc.Alias?
+			local alias
+			for _, candidate in pairs(namespace.aliases) do alias = candidate; break end
+			if alias then
+				local name = annotation.name or "Alias"
+				if #alias.params > 0 then
+					name = name .. "<" .. table.concat(alias.params, ", ") .. ">"
+				end
+				local body = alias.body:gsub("%s*|%s*", " | ")
+				local kind = body:find("|", 1, true) and "union" or "alias"
+				return kind .. " " .. name .. " = " .. body,
+					#documentation > 0 and table.concat(documentation, "\n") or nil
+			end
+		end
+	end
+end
+
 ---@param self lye.Server
 ---@param params lye.lsp.Params
 function Lye:onHover(params)
@@ -1483,8 +1835,13 @@ function Lye:onHover(params)
 	local declared = written and self:typeDeclaration(written, uri)
 	if declared then
 		local from, to = wordSpan(text, offset)
+		local shape, documentation = shownType(declared.lines)
+		local code = "```lua\n" .. (shape or declared.lines) .. "\n```"
 		return {
-			contents = { kind = "markdown", value = "```lua\n" .. declared.lines .. "\n```" },
+			contents = {
+				kind = "markdown",
+				value = documentation and (documentation .. "\n\n" .. code) or code,
+			},
 			range = self:toRange(text, index, from or offset, to or offset),
 		}
 	end
@@ -1695,6 +2052,102 @@ function Lye:onDefinition(params)
 	return { uri = target.uri, range = self:rangeIn(target) }
 end
 
+--- The colour of the text as the scanner sees it, without the type pass. A name is a variable, a
+--- keyword is a keyword: what this cannot say — a function, a field, a method — is exactly what the
+--- analysis is still working out. A document a plugin lowered is left to that analysis, because
+--- every span has to travel back through the map before an editor can see it.
+---@param self lye.Server
+---@param uri string
+---@param patchedOnly boolean? answer only when the text before the edit's answer can be shifted
+---@return table?
+function Lye:fastSemanticTokens(uri, patchedOnly)
+	---@type lye.framework.Document?
+	local document = self.server.documents:get(uri)
+	local view = uri and self:view(uri)
+	if not document or not view or not view.map:isEmpty() then return nil end
+	self.fastTokens_ = self.fastTokens_ or {}
+	self.tokens_ = self.tokens_ or {}
+	local held = self.fastTokens_[uri]
+	if held and held.text == document.text then return held.answer end
+
+	local started = timing.now()
+
+	-- A changed document usually asks for colour before the type pass has run. The spans of the
+	-- answer for the text before the edit still describe every byte the edit did not touch, so the
+	-- edit is applied to them and only the changed region loses its colour until the next answer.
+	-- This is the difference between re-scanning a document per keystroke and shifting the
+	-- list a keystroke moved.
+	local cached = self.fastTokens_[uri]
+	if not (cached and cached.spans) then
+		local accurate = self.tokens_[uri]
+		if accurate and accurate.spans then
+			cached = accurate
+			-- The shift below compacts the list in place; the answer it described is the one this
+			-- request replaces.
+			self.tokens_[uri] = nil
+		end
+	end
+	local changes = self.pendingChanges and self.pendingChanges[uri]
+	local before = self.pendingChangeTexts and self.pendingChangeTexts[uri]
+	local beforeIndex = self.lastIndexes[uri]
+	if cached and cached.spans and before and beforeIndex and cached.text == before
+		and changes and #changes == 1 and changes[1].range then
+		local change = changes[1]
+		local beforeText, beforeLine = assert(before), assert(beforeIndex)
+		local range = assert(change.range)
+		local start, stop = assert(range.start), assert(range["end"])
+		local from = position.toOffset(beforeText, beforeLine,
+			start.line, start.character, self.server.encoding)
+		local to = position.toOffset(beforeText, beforeLine,
+			stop.line, stop.character, self.server.encoding)
+		if to < from then from, to = to, from end
+		local inserted = change.text or ""
+		local delta = #inserted - (to - from)
+		local spans = shiftTokenSpans(cached.spans, from, to, delta, inserted)
+		timing.detail("tokens-fast-shift", started, "spans=%d", #spans)
+		local write, finish = tokenEncoder(view.source, view.sourceIndex, self.server.encoding)
+		for _, span in ipairs(spans) do write(span.from, span.to, span.kind, span.modifiers) end
+		local data, count = finish()
+		local answer = { data = data }
+		self.fastTokens_[uri] = { text = document.text, answer = answer, spans = spans }
+		timing.detail("tokens-fast-patch", started, "tokens=%d spans=%d", count / 5, #spans)
+		return answer
+	end
+
+	if patchedOnly then return nil end
+	local tokens = lexer.tokenize(view.text)
+	timing.detail("tokens-fast-lex", started, "tokens=%d", tokens.count)
+	local write, finish = tokenEncoder(view.source, view.sourceIndex, self.server.encoding)
+	for at = 1, tokens.count do
+		local token = tokens.arena[at]
+		local written = tokens.texts[at] or ""
+		---@type string?
+		local kind
+		if token.kind == KIND.comment then
+			kind = "comment"
+		elseif token.kind == KIND.keyword then
+			kind = "keyword"
+		elseif token.kind == KIND.string then
+			kind = "string"
+		elseif token.kind == KIND.number then
+			kind = "number"
+		elseif token.kind == KIND.symbol and written ~= "::" and written ~= "label" then
+			kind = "operator"
+		elseif token.kind == KIND.name then
+			kind = "variable"
+		end
+		if kind then
+			write(token.start, token.stop, kind,
+				kind == "comment" and TOKEN_MODIFIER.documentation or nil)
+		end
+	end
+	local data, count = finish()
+	local answer = { data = data }
+	self.fastTokens_[uri] = { text = document.text, answer = answer }
+	timing.detail("tokens-fast", started, "tokens=%d", count / 5)
+	return answer
+end
+
 ---@param self lye.Server
 ---@param params lye.lsp.Params
 ---@return table
@@ -1704,7 +2157,27 @@ function Lye:onSemanticTokens(params)
 	---@type lye.framework.Document?
 	local document = uri and self.server.documents:get(uri)
 	---@type lye.parser.Result?
-	local result = uri and (self.analysis[uri] or self:analyze(uri))
+	local result = uri and self.analysis[uri]
+	if uri and not result and self.dirty[uri] then
+		-- The text changed and the type pass that describes it is waiting for the burst to end.
+		-- Colour is not a question about types: the scanner answers every token the editor holds
+		-- now, which is what makes a keystroke cost a lex rather than an analysis. The next ask,
+		-- after the pass, answers with what the types say.
+		local fast = self:fastSemanticTokens(uri, true)
+		if fast then
+			timing.detail("tokens-request", started, "fast=1")
+			return fast
+		end
+	end
+	if uri and not result then
+		result = self:analyze(uri)
+		-- The request is the first look since the change: the diagnostics the edit produced are
+		-- due now, not only after the next quiet moment.
+		if result then
+			---@cast result lye.parser.Result
+			self:publishDiagnostics(uri, result)
+		end
+	end
 	---@type lye.View?
 	local view = uri and self:view(uri)
 	if not uri or not document or not result or not view then return { data = json.array() } end
@@ -1722,6 +2195,7 @@ function Lye:onSemanticTokens(params)
 	-- carried back through the map before a token is written down.
 	local text = view.text
 	local encoding = self.server.encoding
+	local stageStarted = timing.now()
 
 	---@type table<integer, string>
 	local kinds = {}
@@ -1802,6 +2276,8 @@ function Lye:onSemanticTokens(params)
 	-- Every span the walk below decides is collected rather than written out: a plugin answers with
 	-- spans of its own over the same text, and the two sets have to become one before any of it is
 	-- carried back through the map and written down.
+	timing.detail("token-kinds", stageStarted)
+	stageStarted = timing.now()
 	---@type { from: integer, to: integer, kind: string, modifiers: integer? }[]
 	local spans = {}
 	local spanCount = 0
@@ -1868,6 +2344,16 @@ function Lye:onSemanticTokens(params)
 		-- grammar and stays part of the comment.
 		for _, annotation in ipairs(annotations) do
 			if annotation.start >= token.start and annotation.stop <= token.stop then
+				-- A bracketed annotation — `--[[@as T]]` — is one comment token whose tag is not
+				-- at the start of a `---` line, so the keyword carve above never saw it. Find
+				-- the `@` inside the annotation's own span.
+				if not isAnnotation then
+					local tagAt = text:find("@", annotation.start, true)
+					local tagStop = tagAt and text:find("[^%w_]", tagAt + 1) or nil
+					if tagAt and tagAt < (annotation.typeStart or annotation.stop) then
+						carve(tagAt, (tagStop or annotation.stop) - 1, "keyword")
+					end
+				end
 				---@type integer?
 				local nameStart = annotation.nameStart
 				---@type integer?
@@ -1962,6 +2448,9 @@ function Lye:onSemanticTokens(params)
 		end
 	end
 
+	timing.detail("token-walk", stageStarted)
+	stageStarted = timing.now()
+
 	-- What the plugins asked to colour, by the byte of *the reader's* text: a plugin colours the
 	-- language it reads, so its spans are already in the offsets the editor holds and need no map.
 	-- A kind the legend does not have is left out rather than advertised to an editor that cannot
@@ -1990,6 +2479,8 @@ function Lye:onSemanticTokens(params)
 		callName = callNameOf,
 	})
 	timing.detail("plugin-tokens", pluginStarted, "plugins=%d spans=%d", #view.specs, #asked)
+	timing.detail("token-plugin", stageStarted)
+	stageStarted = timing.now()
 	for _, span in ipairs(asked) do
 		local from, to, kind = span.from, span.to, span.type
 		if type(from) == "number" and type(to) == "number" and TOKEN_TYPE[kind] and to >= from then
@@ -2045,56 +2536,18 @@ function Lye:onSemanticTokens(params)
 		if left.from ~= right.from then return left.from < right.from end
 		return left.to > right.to
 	end)
+	timing.detail("token-merge", stageStarted)
+	stageStarted = timing.now()
 
-	local data, count = json.array(), 0
-	local lastLine, lastStart, lastStop = 0, 0, 0
-	local isFirst = true
-
-	--- Tokens are relative to the one before, and a token never spans a line, so a span that does
-	--- is written as one token per line it covers.
-	---@param from integer
-	---@param to integer
-	---@param kind string
-	---@param modifiers integer?
-	local function write(from, to, kind, modifiers)
-		-- Two spans of the lowered text can stand for one span of the editor's — everything a
-		-- plugin wrote inside a statement answers with that statement — so a span that begins where
-		-- the one before it already reached is not one to send.
-		if from <= lastStop then from = lastStop + 1 end
-		if from > to then return end
-		local at = from
-		while at <= to do
-			local newline = view.source:find("\n", at, true)
-			---@type integer
-			local lineStop = to
-			if newline then lineStop = math.min(newline - 1, to) end
-			if lineStop >= at then
-				local line, start = position.toPosition(view.source, view.sourceIndex, at, encoding)
-				local _, stopCharacter = position.toPosition(view.source, view.sourceIndex, lineStop, encoding)
-				local deltaLine = isFirst and line or (line - lastLine)
-				local deltaStart = isFirst and start or (deltaLine == 0 and (start - lastStart) or start)
-				count += 1
-				data[count] = deltaLine
-				count += 1
-				data[count] = deltaStart
-				count += 1
-				data[count] = math.max(stopCharacter - start + 1, 1)
-				count += 1
-				data[count] = TOKEN_TYPE[kind]
-				count += 1
-				data[count] = modifiers or 0
-				lastLine, lastStart, isFirst, lastStop = line, start, false, lineStop
-			end
-			if not newline or newline > to then break end
-			at = newline + 1
-		end
-	end
-
+	local write, finish = tokenEncoder(view.source, view.sourceIndex, encoding)
 	for _, piece in ipairs(pieces) do write(piece.from, piece.to, piece.kind, piece.modifiers) end
+	local data, count = finish()
+	timing.detail("token-encode", stageStarted, "tokens=%d spans=%d", count / 5, #pieces)
 
 	local answer = { data = data }
-	self.tokens_[uri] = { text = document.text, answer = answer }
+	self.tokens_[uri] = { text = document.text, answer = answer, spans = pieces }
 	timing.detail("tokens", started, "cached=0 tokens=%d spans=%d", count / 5, #pieces)
+	timing.detail("tokens-request", started, "fast=0")
 	return answer
 end
 
@@ -2464,6 +2917,7 @@ function Lye:onDocumentChanged(params, atOnce)
 	local uri = params.textDocument?.uri
 	if not uri then return end
 	local started = timing.now()
+	local previousText = self.lastTexts[uri]
 	self.epoch = self.epoch + 1
 
 	-- Where this text first differs from the text the held parse read. The change ranges the
@@ -2475,20 +2929,48 @@ function Lye:onDocumentChanged(params, atOnce)
 	if view then
 		self.cache.spans[uri] = self.cache:span(uri, view.text, not view.map:isEmpty())
 	end
+	timing.detail("change-span", started)
 
 	-- The text has moved on, so what was worked out for the old text is not an answer about this
 	-- one. It is dropped rather than analysed over: a burst of keystrokes arrives faster than a
 	-- file can be analysed, and the ones in between are answers nobody reads. The parse stays.
-	self:forget(uri)
+	-- What the file declares to other documents is its annotation blocks, and a keystroke in code
+	-- leaves those alone: the modules read from it, and the view every other document resolves
+	-- names through, stay the answers they were.
+	local fingerprint
+	local keepDeclarations = false
+	if view then
+		local previous = self.annotationFingerprints and self.annotationFingerprints[uri]
+		if previous and view.map:isEmpty()
+			and not changeTouchesAnnotation(params.contentChanges, self.lastTexts[uri], self.lastIndexes[uri]) then
+			fingerprint = previous
+		else
+			fingerprint = annotationFingerprint(view.text)
+		end
+		keepDeclarations = self.annotationFingerprints ~= nil
+			and self.annotationFingerprints[uri] == fingerprint
+	end
+	self:forget(uri, keepDeclarations)
+	timing.detail("change-forget", started)
+	if fingerprint then
+		self.annotationFingerprints = self.annotationFingerprints or {}
+		self.annotationFingerprints[uri] = fingerprint
+	end
 
 	if atOnce then
 		local span = self.cache.spans[uri]
 		---@type lye.parser.Result?
-		local result = self:analyze(uri, span and span.from)
+		local result = self:analyze(uri, span and span.prefix > 0 and span.from or nil)
 		if result then
 			---@cast result lye.parser.Result
 			self:publishDiagnostics(uri, result)
+			-- The first keystroke should not also be the first run of the scanner that colours
+			-- it. The answer is kept, so this is the same work the first ask would have done,
+			-- done while the editor is still showing the file.
+			pcall(self.fastSemanticTokens, self, uri)
 		end
+		local document = self.server.documents:get(uri)
+		self.lastTexts[uri], self.lastIndexes[uri] = view and view.text or nil, document and document.lineIndex or nil
 		timing.detail("open", started, "bytes=%d", #self.server.documents:get(uri).text)
 		if self.cache.analysis[uri] then self.cache.current = uri end
 		self:evictCache()
@@ -2501,6 +2983,13 @@ function Lye:onDocumentChanged(params, atOnce)
 	self.dirtyAt[uri] = started
 	self.dirtyEpoch = self.dirtyEpoch or {}
 	self.dirtyEpoch[uri] = self.epoch
+	self.pendingChanges = self.pendingChanges or {}
+	self.pendingChangeTexts = self.pendingChangeTexts or {}
+	self.pendingChanges[uri] = params.contentChanges
+	self.pendingChangeTexts[uri] = previousText
+	local document = self.server.documents:get(uri)
+	self.lastTexts[uri], self.lastIndexes[uri] = view and view.text or nil, document and document.lineIndex or nil
+	timing.detail("change", started, "bytes=%d", #view.text)
 end
 
 --- Every document whose text has changed since it was last analysed, read once the editor has
@@ -2508,8 +2997,15 @@ end
 --- one most recently changed goes first — that is the document the writer is looking at — and the
 --- rest follow in the same pass: nothing promises another idle tick if no further message arrives,
 --- and an editor is owed diagnostics for every document it changed.
+---
+--- Without `force`, a change younger than the debounce deadline only reports how long is left; the
+--- listener waits for that or for the next message, so a burst is coalesced instead of blocking
+--- the editor behind an analysis nobody will read. A request that needs the answer passes `true`.
 ---@param self lye.Server
-function Lye:onIdle()
+---@param force boolean? analyse now, whatever the clock says
+---@param collect boolean? a checkpoint is wanted with the answer, for a session that is ending
+---@return number? the milliseconds until this work is due, when it was not done now
+function Lye:onIdle(force, collect)
 	local dirty = {}
 	for uri in pairs(self.dirty) do
 		dirty[#dirty + 1] = {
@@ -2523,14 +3019,32 @@ function Lye:onIdle()
 		-- stored without a pass of its own. Trim here so a read-only session between changes is
 		-- held to the same budget as a typing one.
 		self:evictCache()
+		-- A request is waiting for this pass's answer: the collection can happen after it, in a
+		-- pass nothing is waiting on.
+		if force and not collect then return nil end
+		local remaining = CHECKPOINT_QUIET - (timing.now() - (self.lastMessageAt or 0))
+		if remaining > 0 then return remaining end
 		self:checkpoint()
-		return
+		return nil
 	end
 	table.sort(dirty, function(a, b)
 		if a.at ~= b.at then return a.at > b.at end
 		if a.seq ~= b.seq then return a.seq > b.seq end
 		return a.uri < b.uri
 	end)
+	if not force then
+		-- The largest dirty document decides: one that costs a type pass is worth waiting for,
+		-- even when the document the writer is looking at is small.
+		local bytes = 0
+		for _, entry in ipairs(dirty) do
+			local document = self.server.documents:get(entry.uri)
+			if document and #document.text > bytes then bytes = #document.text end
+		end
+		local delay = bytes <= 8192 and IDLE_DELAY_SMALL
+			or (bytes <= 131072 and IDLE_DELAY_MEDIUM or IDLE_DELAY_LARGE)
+		local remaining = delay - (timing.now() - dirty[1].at)
+		if remaining > 0 then return remaining end
+	end
 
 	for _, entry in ipairs(dirty) do
 		local uri = entry.uri
@@ -2541,7 +3055,7 @@ function Lye:onIdle()
 		local analyzeStarted = timing.now()
 		local span = self.cache.spans[uri]
 		---@type lye.parser.Result?
-		local result = self:analyze(uri, span and span.from)
+		local result = self:analyze(uri, span and span.prefix > 0 and span.from or nil)
 		if result then
 			---@cast result lye.parser.Result
 			self:publishDiagnostics(uri, result)
@@ -2552,19 +3066,36 @@ function Lye:onIdle()
 	-- keeps whatever the older ones needed.
 	if self.cache.analysis[dirty[1].uri] then self.cache.current = dirty[1].uri end
 	self:evictCache()
-	self:checkpoint()
+	-- A forced pass is one a request is waiting on; the collection belongs after its answer,
+	-- unless the caller asked for it now because the session is ending.
+	if collect or not force then self:checkpoint() end
+	return nil
 end
 
 --- Everything the old text meant, dropped: the analysis, the names it declared, what it
 --- contributed to the declaration and module layers, and its parsed annotations. The parse tree
---- stays, because the next text is read against it.
+--- stays, because the next text is read against it. `keepDeclarations` is for a text whose
+--- annotations did not move: what it declares is still what the last analysis said it declares,
+--- and every module read against those names keeps its answer.
 ---@param self lye.Server
 ---@param uri string
-function Lye:forget(uri)
+---@param keepDeclarations boolean?
+function Lye:forget(uri, keepDeclarations)
+	local started = timing.now()
 	self.cache:forget(uri)
+	-- The document's own layer leaves the view either way: the text the next analysis reads says
+	-- what it declares, and a layer of the old text would answer with the analysis being replaced.
 	self.declarations:documentChanged(uri)
+	timing.detail("forget-cache", started)
+	if keepDeclarations then
+		-- The file's code still moved: a module that requires it was read through the old exports.
+		self.modules:fileChanged(uri)
+		timing.detail("forget-modules", started)
+		return
+	end
 	self.modules:documentChanged(uri, self.declaredBy[uri])
 	self.declaredBy[uri] = nil
+	timing.detail("forget-modules", started)
 end
 
 ---@param self lye.Server
@@ -2578,6 +3109,7 @@ function Lye:onDocumentClosed(params)
 	-- predecessor that only an open document is worth holding.
 	self:forget(uri)
 	self.cache:close(uri)
+	self.modules:documentClosed(uri)
 	self.declarations:documentClosed(uri)
 	self.dirty[uri] = nil
 	if self.dirtyAt then self.dirtyAt[uri] = nil end
@@ -2593,6 +3125,11 @@ function Lye:onDocumentClosed(params)
 		end
 	end
 	if self.tokens_ then self.tokens_[uri] = nil end
+	if self.fastTokens_ then self.fastTokens_[uri] = nil end
+	if self.annotationFingerprints then self.annotationFingerprints[uri] = nil end
+	self.lastTexts[uri], self.lastIndexes[uri] = nil, nil
+	if self.pendingChanges then self.pendingChanges[uri] = nil end
+	if self.pendingChangeTexts then self.pendingChangeTexts[uri] = nil end
 	self.server:notify(framework.METHOD.publishDiagnostics, { uri = uri, diagnostics = json.array() })
 	-- The document's trees and facts are unreachable now, and the editor is not waiting for the
 	-- close notification's answer. This is the one place a full collection is worth its pause.
@@ -2920,6 +3457,45 @@ local function hintText(type)
 	return (word or cut) .. "…"
 end
 
+--- Whether a declaration's value is written out as a literal a reader can see. A number, a
+--- string, a boolean or nil says its own type; a table shape, a call or an expression does not.
+---@param node lye.parser.Node?
+---@param initializer lye.doc.Type?
+local function literalInitializer(node, initializer)
+	if node then
+		if node.kind == "number" or node.kind == "string" or node.kind == "literal" then return true end
+	end
+	if initializer then
+		if initializer.variant == "number" and initializer.value ~= nil then return true end
+		if initializer.variant == "boolean" and initializer.value ~= nil then return true end
+		if initializer.variant == "nil" then return true end
+		if initializer.variant == "extern" and type(initializer.name) == "string" then
+			local first, last = initializer.name:sub(1, 1), initializer.name:sub(-1)
+			return (first == '"' or first == "'") and last == first
+		end
+	end
+	return false
+end
+
+--- The type a hint shows for a declaration that evolves. The name is written again below, so what
+--- it holds then is the type a reader wants; a literal that was one value widens to its base, and
+--- `0 | 1` becomes `number` rather than two literals nobody wants to read.
+---@param variable lye.analyzer.Variable
+---@param names lye.analyzer.Result
+---@return lye.doc.Type?
+local function evolvedHintType(variable, names)
+	if #variable.assignments == 0 then
+		return analyzer.typeAt(names, variable, variable.declaration.stop)
+	end
+	local held = variable.declared or variable.evolvedType or variable.initializer or types.mutable()
+	for _, assignment in ipairs(variable.assignments) do
+		if assignment.type then
+			held = types.combine(types.widenLiteral(held), types.widenLiteral(assignment.type))
+		end
+	end
+	return types.widenLiteral(held)
+end
+
 ---@param self lye.Server
 ---@param params lye.lsp.Params
 function Lye:onInlayHint(params)
@@ -2951,8 +3527,13 @@ function Lye:onInlayHint(params)
 		-- hint would land on the `(` of its parameter list.
 		local isFunction = value ~= nil and value.kind == "function"
 		if not variable.declared and not isFunction and declaration.start >= from and declaration.stop <= to then
-			local held = analyzer.typeAt(names, variable, declaration.stop)
-			local shown = hintText(held)
+			-- `local x = 0` says its type already; a hint repeating the literal is noise. A name
+			-- written again below is not a constant, and its settled type is the useful one.
+			local literal = literalInitializer(value, variable.initializer)
+			local evolves = #variable.assignments > 0
+			local held
+			if not (literal and not evolves) then held = evolvedHintType(variable, names) end
+			local shown = held and hintText(held) or nil
 			-- `local ffi = require("ffi")` with a type that reads `ffi` says nothing: the hint
 			-- would be the name written twice.
 			if shown == variable.name then shown = nil end
@@ -3932,17 +4513,24 @@ function Lye:register()
 			},
 		})
 	end)
-	server.connection:setIdleHandler(function() self:onIdle() end)
+	server.connection:setIdleHandler(function() return self:onIdle() end)
 	-- A change may be followed by more of the same burst, which is worth waiting for; anything else
-	-- is reading what the burst described and has to find it done.
+	-- is reading what the burst described and has to find it done. Semantic tokens are the exception:
+	-- they are colour, an editor asks for them again, and the lexical walk answers the text it now
+	-- holds without waiting for a type pass. Every other feature is a question about types and waits.
 	server.connection:setBeforeHandler(function(message)
 		---@cast message { method: string }
+		self.lastMessageAt = timing.now()
 		local method = message.method
 		-- The first request an editor sends, after the runtime and the definitions are already
 		-- loaded: from here on the session is answering rather than starting.
 		if method == framework.METHOD.initialize then timing.fromStart("initialize") end
-		if method ~= framework.METHOD.didChange and method ~= framework.METHOD.didOpen then
-			self:onIdle()
+		if method ~= framework.METHOD.didChange and method ~= framework.METHOD.didOpen
+			and method ~= framework.METHOD.semanticTokens
+			and method ~= framework.METHOD.semanticTokensRange then
+			local ending = method == framework.METHOD.shutdown or method == framework.METHOD.exit
+				or method == framework.METHOD.didClose
+			self:onIdle(true, ending)
 		end
 	end)
 	server:capability("completionProvider", { triggerCharacters = { ".", ":", "[", '"', "'" } })

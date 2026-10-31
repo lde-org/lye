@@ -10,7 +10,6 @@ local cache = require("lye-lsp.cache")
 local plugin = require("lye-plugin")
 local rapidhash = require("rapidhash")
 local serial = require("lye-doc.serial")
-local docType = require("lye-doc.type")
 local timing = require("lye-lsp.timing")
 
 --- The definitions' own types, by a name a session can say them with. A module's answer holds
@@ -34,12 +33,19 @@ local function namedPreludeTypes(prelude)
 	local names = {} ---@type table<unknown, string>
 	local tables = {} ---@type table<string, unknown>
 	if not prelude then return { names = names, tables = tables } end
+	-- One name per table, chosen the same way in every process. `pairs` has no order, and the
+	-- first spelling a table happened to be reached under decided which name an entry was written
+	-- with; a later run that reached it under another spelled the same type differently, and the
+	-- entry was rejected as damaged. A prelude table may be reached by several names, so the
+	-- smallest of them is the one taken.
+	---@type table<unknown, string>
+	local chosen = {}
 	---@param held unknown
 	---@param name string
 	local function add(held, name)
-		if type(held) ~= "table" or names[held] then return end
-		names[held] = name
-		tables[name] = held
+		if type(held) ~= "table" then return end
+		local previous = chosen[held]
+		if previous == nil or name < previous then chosen[held] = name end
 	end
 	-- A field's type is what the completion looks a signature up by, so it needs its name most:
 	-- `evolved` is where the definitions' methods were put as they were declared.
@@ -62,6 +68,12 @@ local function namedPreludeTypes(prelude)
 	for text, held in pairs(prelude.built or {}) do
 		---@cast text string
 		add(held, "built:" .. text)
+	end
+	for held, name in pairs(chosen) do
+		---@cast held table
+		---@cast name string
+		names[held] = name
+		tables[name] = held
 	end
 	preludeTypes = { names = names, tables = tables }
 	return preludeTypes
@@ -91,60 +103,113 @@ local function estimateBytes(value)
 	return walk(value)
 end
 
---- The tables `serial` writes by name, which a canonical copy must keep as themselves: a type
---- compared by identity has to come back as the very table it was, and a copied singleton would
---- serialize as a plain table and hash differently on load.
-local SINGLETONS = {}
-for _, name in ipairs({
-	"NUMBER", "STRING", "BOOLEAN", "NIL_TYPE", "TABLE", "VOID", "NEVER", "UNKNOWN_TYPE",
-	"ANY_TYPE", "FUNCTION",
-}) do
-	local held = docType[name]
-	if held then SINGLETONS[held] = true end
-end
-
---- A copy of a type graph whose fields are inserted in a fixed order, so `serial.write` writes the
---- same bytes for the same structure however the table's hash slots happen to be laid out. Shared
---- tables and cycles stay shared; named tables are kept, because the writer refers to them.
----@param value any
+--- The graph `serial.write` keeps, hashed. The writer sorts every table's fields and its string
+--- table, so the same graph writes the same bytes however `pairs` ordered it; no copy is needed
+--- to make it canonical.
+---@param held lye.doc.Type?
 ---@param known { names: table<unknown, string>, tables: table<string, unknown> }
----@param seen table<table, table>?
-local function canonical(value, known, seen)
-	if type(value) ~= "table" then return value end
-	if known.names[value] or SINGLETONS[value] then return value end
-	seen = seen or {}
-	local made = seen[value]
-	if made then return made end
-	made = {}
-	seen[value] = made
-	local keys = {}
-	for key in pairs(value) do keys[#keys + 1] = key end
-	table.sort(keys, function(left, right)
-		if type(left) == type(right) then
-			if type(left) == "number" then return left < right end
-			return tostring(left) < tostring(right)
-		end
-		return type(left) == "number"
-	end)
-	for _, key in ipairs(keys) do made[key] = canonical(value[key], known, seen) end
-	return made
+local function typeText(held, known)
+	if held == false or held == nil then return "false" end
+	return serial.write(held, known)
 end
 
---- The identity of a module's exported type: the bytes `serial.write` keeps it as, hashed. A
---- module that returns nothing says `false` — a real answer, not a missing one — so it is hashed
---- as that word rather than as an empty graph.
----
---- The graph is put in a canonical order first. `serial.write` follows `pairs`, whose order a
---- hash table does not promise and a round trip changes, so hashing the raw bytes would call every
---- loaded entry a mismatch. Sorting the fields before writing them makes the same structure hash
---- the same on both sides while keeping shared tables and cyclic classes as the tables they are.
 ---@param held lye.doc.Type?
 ---@param known { names: table<unknown, string>, tables: table<string, unknown> }
 local function typeHash(held, known)
-	if held == false or held == nil then return rapidhash.hex("false") end
-	local text = serial.write(canonical(held, known), known)
+	local text = typeText(held, known)
 	if not text then return nil end
 	return rapidhash.hex(text)
+end
+
+--- One hash over every name a module asked another document for, and the answer it got. Two
+--- sessions with the same answers can reuse the module's entry even when a different file is open;
+--- an open buffer that declares a name the module looked up changes the digest and is a miss.
+---@param view table<string, boolean|lye.doc.Type> the declarations the analysis read
+---@param base table<string, boolean|lye.doc.Type> the same without open documents
+---@param names table<string, boolean>?
+---@param known { names: table<unknown, string>, tables: table<string, unknown> }
+local function foreignDigest(view, base, names, known)
+	local parts = {}
+	for name, found in pairs(names or {}) do
+		local held = found and view[name] or nil
+		local stable = base[name]
+		-- A name that resolves to the very table the disk layer holds is not something an open
+		-- buffer changed. Only a shadowing buffer can make this answer depend on what is open.
+		if held ~= stable then
+			local part
+			if type(held) == "table" then
+				part = typeHash(held, known) or "?"
+			elseif held == nil then
+				part = "missing"
+			else
+				part = "present"
+			end
+			parts[#parts + 1] = name .. "=" .. part
+		end
+	end
+	table.sort(parts)
+	return rapidhash.hex(table.concat(parts, "\0"))
+end
+
+--- A definition file describes a library the prelude already built. Its own analysis builds the
+--- same classes again, and a field it gives is a new callable; the prelude's field carries the
+--- signature and documentation a reader is shown. Wire the two together by class and field name,
+--- so a module read from disk and one analysed here answer with the same tables.
+---@param held lye.doc.Type?
+---@param prelude lye.analyzer.Prelude?
+local function bindPrelude(held, prelude)
+	local evolved = prelude and prelude.evolved
+	if type(held) ~= "table" or not evolved then return held end
+	local seen = {}
+	---@param value unknown
+	local function walk(value)
+		if type(value) ~= "table" or seen[value] then return end
+		seen[value] = true
+		local className = value.name
+		local fields = value.fields
+		local known = type(className) == "string" and evolved[className] or nil
+		if known and type(fields) == "table" then
+			for field, signature in pairs(known) do
+				if fields[field] ~= nil then fields[field] = signature end
+			end
+		end
+		for key, inner in pairs(value) do
+			if type(key) == "table" then walk(key) end
+			if type(inner) == "table" then walk(inner) end
+		end
+	end
+	walk(held)
+	return held
+end
+
+--- Whether the files a stored entry required still hold the text it read. A required module whose
+--- text did not move is the answer it was; one whose text moved is re-analysed rather than trusted.
+---@param self lye.Modules
+---@param entry lye.ModuleRecord
+---@return boolean
+local function requiresStored(self, entry)
+	for _, required in pairs(entry.requires or {}) do
+		if required.path and required.textHash then
+			local held = self.entries[required.path]
+			local textHash = held and held.textHash
+			if not textHash then
+				-- An editor buffer is the text the module was read against; an unsaved edit is a
+				-- different answer even though the file on disk has not moved.
+				local document = self.lye.server.documents
+					and self.lye.server.documents:get("file://" .. required.path)
+				if document then
+					textHash = rapidhash.hex(document.text)
+				else
+					local handle = io.open(required.path, "rb")
+					if not handle then return false end
+					textHash = rapidhash.hex(handle:read("*a"))
+					handle:close()
+				end
+			end
+			if textHash ~= required.textHash then return false end
+		end
+	end
+	return true
 end
 
 --- What one resolved module is kept as: its own text and exported type, what they hash to, and the
@@ -155,6 +220,8 @@ end
 ---@field typeHash string?
 ---@field requires table<string, { path: string?, textHash: string?, typeHash: string? }>?
 ---@field declarationNames table<string, boolean>?
+---@field foreignNames table<string, boolean>?
+---@field foreign string?
 ---@field key string?
 
 ---@class lye.ModuleRecord
@@ -164,6 +231,8 @@ end
 ---@field typeHash string? identity of the exported type, or of the `false` answer
 ---@field requires table<string, { path: string?, textHash: string?, typeHash: string? }>? the names it required and what they were
 ---@field declarationNames table<string, boolean>? names it resolved from another document's declarations
+---@field foreignNames table<string, boolean>? every name it asked of another document, true when found
+---@field foreign string? the digest of those names' answers
 ---@field key string? the persisted key, when one was written for it
 ---@field bytes integer
 ---@field used integer how recently the entry was read or written; higher is more recent
@@ -184,8 +253,8 @@ local MAX_MODULE_BYTES = 16 * 1024 * 1024
 ---@field maxBytes integer the budget `bytes` is kept under
 ---@field evictions integer
 ---@field clock integer the last use stamp; a higher one is more recently used
+---@field version integer bumped whenever a held answer changes, for a caller's reuse fast path
 ---@field lastPath string? the module the outermost lookup answered, which is never evicted
----@field openDigest string? the digest of the open documents, until one changes
 ---@field blocked table<string, boolean> modules whose kept answer was invalidated here, so the
 --- persisted entry they still have is not read back until they are analysed again
 local Modules = {}
@@ -198,7 +267,7 @@ function Modules.new(lye, options)
 	return setmetatable({
 		lye = lye, entries = {}, requiring = {}, blocked = {}, hits = 0, misses = 0, bytes = 0,
 		maxBytes = (options and options.maxBytes) or MAX_MODULE_BYTES,
-		evictions = 0, clock = 0,
+		evictions = 0, clock = 0, version = 0,
 	}, Modules)
 end
 
@@ -246,6 +315,7 @@ end
 ---@param known { names: table<unknown, string>, tables: table<string, unknown> }
 ---@param record lye.ModuleRecordSeed?
 function Modules:keep(path, text, held, known, record)
+	self.version += 1
 	local previous = self.entries[path]
 	if previous then self.bytes -= previous.bytes end
 	local bytes = #text + estimateBytes(held)
@@ -256,6 +326,8 @@ function Modules:keep(path, text, held, known, record)
 		typeHash = record and record.typeHash or typeHash(held, known),
 		requires = record and record.requires,
 		declarationNames = record and record.declarationNames,
+		foreignNames = record and record.foreignNames,
+		foreign = record and record.foreign,
 		key = record and record.key,
 		bytes = bytes,
 		used = 0,
@@ -308,12 +380,18 @@ function Modules:requiresOf(from, names)
 		local held = path and self.entries[path]
 		local textHash = held and held.textHash
 		if path and not textHash then
-			-- A cycle or a failed resolution kept no entry; the text hash is still cheap to read and
-			-- is what says whether the next session read the same file.
-			local handle = io.open(path, "rb")
-			if handle then
-				textHash = rapidhash.hex(handle:read("*a"))
-				handle:close()
+			-- A cycle or a failed resolution kept no entry. An editor buffer is the text that was
+			-- actually read; the file on disk is the fallback.
+			local document = self.lye.server.documents
+				and self.lye.server.documents:get("file://" .. path)
+			if document then
+				textHash = rapidhash.hex(document.text)
+			else
+				local handle = io.open(path, "rb")
+				if handle then
+					textHash = rapidhash.hex(handle:read("*a"))
+					handle:close()
+				end
 			end
 		end
 		requires[name] = {
@@ -400,6 +478,7 @@ function Modules:resolve(name, from)
 	-- answer, and a monorepo with several files of one package open pays it once per file.
 	local open = lye.names[uri]
 	if document and open and open.module ~= nil then
+		if open.isDefinition then open.module = bindPrelude(open.module, lye.prelude) end
 		self:keep(path, written, open.module, known, {
 			textHash = textKey,
 			requires = self:requiresOf(uri, open.requiredModules),
@@ -418,8 +497,10 @@ function Modules:resolve(name, from)
 	local owner = lye:packageRoot(uri)
 	if owner then lye.declarations:package(owner) end
 	local key = cache.key("module", textKey, lye.annotationsDigest or "",
-		(lye.packageDigests or {})[owner] or "", self:documentsDigest(),
-		plugin.digest(lye:plugins(uri)))
+		(lye.packageDigests or {})[owner] or "", plugin.digest(lye:plugins(uri)))
+	-- An entry this session invalidated is still worth reading: its own record says whether the
+	-- names and requires it was built from are the current ones. The block only stops a *stale*
+	-- answer, and the digest below is what decides that now.
 	local entry
 	if not self.blocked[path] then entry = cache.load(key, known) end
 	-- An entry is the answer for this text only if it was written by this code version and its
@@ -430,7 +511,15 @@ function Modules:resolve(name, from)
 		and type(entry.typeHash) == "string" and (entry.module == false or type(entry.module) == "table") then
 		local negative = entry.module == false
 		local stored = entry.module --[[@as lye.doc.Type? ]]
-		if typeHash(negative and false or stored, known) == entry.typeHash then
+		local loadedText = typeText(negative and false or stored, known)
+		local view = lye.declarations:view(uri)
+		local base = lye.declarations.base and lye.declarations:base(uri) or view
+		local current = type(entry.foreignNames) == "table"
+			and foreignDigest(view, base, entry.foreignNames, known) or nil
+		local typeOk = loadedText ~= nil and rapidhash.hex(loadedText) == entry.typeHash
+		local foreignOk = entry.foreign == current
+		local requiresOk = requiresStored(self, entry)
+		if typeOk and foreignOk and requiresOk then
 			-- `false` is the answer a module that returns nothing came to: it is kept too, so a
 			-- run after this one is not made to read the file again to learn nothing.
 			local kept = stored
@@ -439,6 +528,9 @@ function Modules:resolve(name, from)
 				textHash = textKey,
 				typeHash = entry.typeHash,
 				key = key,
+				requires = entry.requires,
+				declarationNames = entry.declarationNames,
+				foreignNames = entry.foreignNames,
 			})
 			self.hits += 1
 			self.lastPath = path
@@ -447,6 +539,7 @@ function Modules:resolve(name, from)
 	end
 
 	self.requiring[path] = true
+	timing.detail("module-miss", timing.now(), "path=%s", path)
 	-- The module's own `require`s resolve within *its* package: a dependency's file is a document
 	-- of that package, and what it can reach is what lde linked into that package's `target/`.
 	-- A module reached through `require` is read for its type: its diagnostics belong to its own
@@ -459,13 +552,20 @@ function Modules:resolve(name, from)
 		nil, nil, true, lye:isDefinition(uri), lye:plugins(uri), reportPlugin, { uri = uri })
 	self.requiring[path] = nil
 	local kept = names.module
-	local hash = typeHash(kept, known)
+	if names.isDefinition then kept = bindPrelude(kept, lye.prelude) end
+	local keptText = typeText(kept, known)
+	local hash = keptText and rapidhash.hex(keptText) or nil
 	local requires = self:requiresOf(uri, names.requiredModules)
+	local view = lye.declarations:view(uri)
+	local base = lye.declarations.base and lye.declarations:base(uri) or view
+	local foreign = foreignDigest(view, base, names.foreignNames, known)
 	self:keep(path, written, kept, known, {
 		textHash = textKey,
 		typeHash = hash,
 		requires = requires,
 		declarationNames = names.declarationNames,
+		foreignNames = names.foreignNames,
+		foreign = foreign,
 		key = key,
 	})
 	self.misses += 1
@@ -480,9 +580,49 @@ function Modules:resolve(name, from)
 			key = cache.codeVersion(),
 			module = kept or false,
 			typeHash = hash,
+			requires = requires,
+			declarationNames = names.declarationNames,
+			foreignNames = names.foreignNames,
+			foreign = foreign,
 		}, known)
 	end
 	return kept
+end
+
+--- A document's code changed but its annotations did not: what it declares to another document
+--- still stands, but a module that requires its file was read through the old text's exports and
+--- is no longer valid. Only that dependency drops; a module that merely resolved one of its
+--- declaration names keeps its answer.
+---@param uri string
+---@param self lye.Modules
+function Modules:fileChanged(uri)
+	local changed = uri:gsub("^file://", "")
+	for path, entry in pairs(self.entries) do
+		for _, required in pairs(entry.requires or {}) do
+			if required.path == changed then
+				self.bytes -= entry.bytes
+				self.entries[path] = nil
+				self.blocked[path] = true
+				break
+			end
+		end
+	end
+end
+
+--- A document closed. Whatever this session invalidated because of its buffer is no longer blocked
+--- from the entry on disk: the persisted record is now the answer to compare against, and its
+--- foreign-name and requires digests say whether it is still the right one.
+---@param self lye.Modules
+function Modules:documentClosed()
+	self.version += 1
+	-- The declarations every held answer was read against just changed. The persisted record is the
+	-- one to ask now: its foreign-name and requires digests say whether its answer still holds, and
+	-- a module that really depended on the closed buffer is re-analysed. Keeping the in-memory
+	-- records would block that question with the answer it is replacing.
+	self.entries = {}
+	self.blocked = {}
+	self.bytes = 0
+	self.lastPath = nil
 end
 
 --- A document's text moved on. A module read against its declarations, or requiring its file, no
@@ -495,7 +635,6 @@ end
 ---@param declarations table<string, boolean|lye.doc.Type>? what the document declared before it changed
 ---@param self lye.Modules
 function Modules:documentChanged(uri, declarations)
-	self.openDigest = nil
 	local changed = uri and uri:gsub("^file://", "") or nil
 	for path, entry in pairs(self.entries) do
 		local drop
@@ -529,27 +668,6 @@ function Modules:documentChanged(uri, declarations)
 	end
 end
 
---- A digest of the documents an editor has open. A module is analysed against what they declare —
---- a class written in an unsaved buffer is as real to it as one on disk — so an answer kept for a
---- session is only the answer for a session with the same ones open. Kept until one of them
---- changes, which is the only thing that can make it say something else.
----@param self lye.Modules
-function Modules:documentsDigest()
-	if self.openDigest then return self.openDigest end
-	local documents = self.lye.server.documents
-	local byUri = documents and documents.byUri
-	if not byUri then return "" end
-	local parts = {} ---@type string[]
-	for uri, document in pairs(byUri) do
-		---@cast uri string
-		---@cast document lye.framework.Document
-		parts[#parts + 1] = uri .. "\0" .. rapidhash.hex(document.text or "")
-	end
-	table.sort(parts)
-	self.openDigest = rapidhash.hex(table.concat(parts, "\1"))
-	return self.openDigest
-end
-
 ---@return table
 ---@param self lye.Modules
 function Modules:stats()
@@ -568,10 +686,10 @@ end
 --- Drop every held answer. They are persisted, so a miss is one analysis, not correctness.
 ---@param self lye.Modules
 function Modules:clear()
+	self.version += 1
 	self.entries = {}
 	self.requiring = {}
 	self.blocked = {}
-	self.openDigest = nil
 	self.bytes = 0
 	self.evictions = 0
 	self.clock = 0

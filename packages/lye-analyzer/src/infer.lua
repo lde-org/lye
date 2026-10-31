@@ -61,6 +61,21 @@ local function stringFieldOf(ctx, base, field, start)
 	return types.fieldOf(library, field)
 end
 
+--- Whether a cached type is the narrowed shape of an unknown — the truthy or non-nil set — which
+--- is not a placeholder itself, so promoting a placeholder never reaches it, even though it was
+--- worked out from one.
+---@param held lye.doc.Type
+---@return boolean
+local function narrowedUnknown(held)
+	if held == types.truthyUnknown() or held == types.nonNilUnknown() then return true end
+	if held.variant == "union" then
+		for _, member in ipairs(held.types) do
+			if member == types.truthyUnknown() or member == types.nonNilUnknown() then return true end
+		end
+	end
+	return false
+end
+
 --- Remember where a placeholder was cached: refinement reads those nodes again, and a walk of
 --- every node to find them costs more than the list does.
 ---@param ctx lye.infer.Context
@@ -69,8 +84,27 @@ end
 local function cache(ctx, idx, value)
 	ctx.cache[idx] = value
 	if value.isMutable then
-		local list = ctx.mutables
-		list[#list + 1] = idx
+		-- One entry per node: a placeholder is read again and again while it is unknown, and a
+		-- list carrying every read made refinement walk the arena once per read.
+		local seen = ctx.mutableSet
+		if seen == nil then
+			seen = {}
+			ctx.mutableSet = seen
+		end
+		if not seen[idx] then
+			seen[idx] = true
+			local list = ctx.mutables
+			list[#list + 1] = idx
+		end
+	elseif narrowedUnknown(value) then
+		-- A narrowing of an unknown is not a placeholder, so promotion never revisits it: the
+		-- list says which reads refinement has to make again once the name they narrow settled.
+		local list = ctx.narrowed
+		if list == nil then
+			list = {}
+			ctx.narrowed = list
+		end
+		list[idx] = true
 	end
 	return value
 end
@@ -517,7 +551,8 @@ end
 ---@return lye.infer.Context
 function infer.context(parser, typeOfName, returns, typeOfField, modules, ctypes)
 	return {
-		parser = parser, typeOfName = typeOfName, returns = returns or {}, typeOfField = typeOfField, cache = {}, mutables = {}, fnTypes = {},
+		parser = parser, typeOfName = typeOfName, returns = returns or {}, typeOfField = typeOfField,
+		cache = {}, mutables = {}, narrowed = {}, fnTypes = {},
 		callTypes = {},
 		callValues = {},
 		varargAt = {},
@@ -712,21 +747,6 @@ function infer.isResolved(ctx, idx)
 	return cached ~= nil and cached.variant ~= "unknown"
 end
 
---- Whether a cached type is the narrowed shape of an unknown — the truthy or non-nil set — which
---- is not a placeholder itself, so promoting a placeholder never reaches it, even though it was
---- worked out from one.
----@param held lye.doc.Type
----@return boolean
-local function narrowedUnknown(held)
-	if held == types.truthyUnknown() or held == types.nonNilUnknown() then return true end
-	if held.variant == "union" then
-		for _, member in ipairs(held.types) do
-			if member == types.truthyUnknown() or member == types.nonNilUnknown() then return true end
-		end
-	end
-	return false
-end
-
 --- Promote anything still unknown that a known type now contradicts. A mutable unknown is a
 --- promise that a later pass may learn more, so this is where that promise is kept.
 ---@param ctx lye.infer.Context
@@ -775,62 +795,96 @@ function infer.refine(ctx, returns)
 	-- `held and held.field` caches the truthy narrowing of the unknown while `held` was still a
 	-- placeholder, and that narrowing is not itself a placeholder: the promotion never reaches it,
 	-- and `self.doc and self.doc.annotations` kept an unknown element type long after `self.doc`
-	-- settled. Read again in arena order, so what a node was built from is fresh first.
-	for _, node in ipairs(parser.nodes) do
-		local cached = ctx.cache[node.index]
-		if cached and not types.isMutable(cached) and narrowedUnknown(cached) then
-			ctx.cache[node.index] = nil
-			ctx.cache[node.index] = of(ctx, node.index)
+	-- settled. Only the reads recorded when they were cached are read again, in arena order so
+	-- what a node was built from is fresh first.
+	local narrowed = ctx.narrowed
+	if narrowed ~= nil and next(narrowed) ~= nil then
+		local order = {}
+		for index in pairs(narrowed) do order[#order + 1] = index end
+		table.sort(order)
+		-- A read that is narrowed again from the settled names belongs to the next pass, not this
+		-- one, so the list it lands in is a fresh one.
+		ctx.narrowed = {}
+		for _, index in ipairs(order) do
+			local cached = ctx.cache[index]
+			if cached and not types.isMutable(cached) and narrowedUnknown(cached) then
+				ctx.cache[index] = nil
+				of(ctx, index)
+			end
 		end
 	end
 
 	-- A field read while the value it read was unsettled was cached without the narrowing the
 	-- conditions around it ask for: `{ archive = dir }` under `if dir then` kept a `string?` even
-	-- after `dir` settled. Each field is read again, into the same table so everything else
-	-- written to it stays.
+	-- after `dir` settled. Only a table holding one of those reads is worked out again; the rest
+	-- of the table literals hold answers that cannot have changed.
 	local tableFieldValues = parser.tableFieldValues
-	---@type lye.parser.Node[]
-	local tableNodes = nodesOf(parser, "table")
-	-- The parent links, indexed once for the whole refinement. Building this inside the table
-	-- loop made the replacement for the ancestor walk more expensive than the walk.
-	local children = {}
-	---@cast children table<integer, integer[]>
-	for _, child in ipairs(parser.nodes) do
-		local parent = child.parent
-		if parent then
-			local list = children[parent]
-			if not list then list = {}; children[parent] = list end
-			list[#list + 1] = child.index
-		end
-	end
-	for _, node in ipairs(tableNodes) do
-		local cached = ctx.cache[node.index]
-		if cached and not types.isMutable(cached) and cached.variant == "object" then
-			local values = tableFieldValues and tableFieldValues[node.index]
-			---@cast values table<string, integer>?
-			if values then
-				-- Clearing the value node alone is not enough: the answer was built from nodes
-				-- below it, and a read cached while the name it reads was still a placeholder is
-				-- not itself a placeholder — `{ a = xs and xs[1] }` kept the truthy narrowing of
-				-- the placeholder for `xs` after `xs` was typed as a list. Every node inside the
-				-- value is read again, so the field is worked out from what its parts are now.
-				local refresh = {}
-				for _, valueIdx in pairs(values) do refresh[valueIdx] = true end
-				-- Clear only the descendants of the values that changed. Scanning every arena
-				-- node and walking each one's ancestor chain made this O(nodes x fields x depth)
-				-- for every table literal.
-				local stack = {}
-				for valueIdx in pairs(refresh) do stack[#stack + 1] = valueIdx end
-				while #stack > 0 do
-					local index = stack[#stack]
-					stack[#stack] = nil
-					ctx.cache[index] = nil
-					for _, child in ipairs(children[index] or {}) do stack[#stack + 1] = child end
+	if tableFieldValues ~= nil and next(tableFieldValues) ~= nil then
+		-- Which table declares each node as one of its fields, indexed once per analysis.
+		local owner = ctx.tableFieldOwner
+		if owner == nil then
+			owner = {}
+			for tableIndex, values in pairs(tableFieldValues) do
+				for _, valueIdx in pairs(values) do
+					---@cast valueIdx integer
+					owner[valueIdx] = tableIndex
 				end
-				for name, valueIdx in pairs(values) do
-					ctx.cache[valueIdx] = nil
-					local fresh = of(ctx, valueIdx)
-					if fresh and fresh.variant ~= "unknown" then cached.fields[name] = fresh end
+			end
+			ctx.tableFieldOwner = owner
+		end
+		-- The tables whose values were built from a placeholder or a narrowing of one: walking
+		-- each such node's parents marks the literals it is written into, however deeply.
+		local stale = {}
+		for index in pairs(ctx.narrowed or {}) do stale[index] = true end
+		for position = 1, #mutables do stale[mutables[position]] = true end
+		local tables = {}
+		for index in pairs(stale) do
+			local node = parser.nodes[index]
+			while node ~= nil do
+				local tableIndex = owner[node.index]
+				if tableIndex ~= nil then tables[tableIndex] = true end
+				node = node.parent and parser.nodes[node.parent]
+			end
+		end
+		-- The children each dirty value is worked out from, indexed once: clearing the value node
+		-- alone is not enough, `{ a = xs and xs[1] }` cached the narrowing of the placeholder for
+		-- `xs` below it.
+		local children = ctx.children
+		if children == nil then
+			children = {}
+			for _, child in ipairs(parser.nodes) do
+				local parent = child.parent
+				if parent then
+					local list = children[parent]
+					if not list then
+						list = {}
+						children[parent] = list
+					end
+					list[#list + 1] = child.index
+				end
+			end
+			ctx.children = children
+		end
+		for tableIndex in pairs(tables) do
+			local node = parser.nodes[tableIndex]
+			local cached = ctx.cache[tableIndex]
+			if node ~= nil and cached and not types.isMutable(cached) and cached.variant == "object" then
+				local values = tableFieldValues[tableIndex]
+				if values then
+					-- Clear only the descendants of the values that changed.
+					local stack = {}
+					for _, valueIdx in pairs(values) do stack[#stack + 1] = valueIdx end
+					while #stack > 0 do
+						local index = stack[#stack]
+						stack[#stack] = nil
+						ctx.cache[index] = nil
+						for _, child in ipairs(children[index] or {}) do stack[#stack + 1] = child end
+					end
+					for name, valueIdx in pairs(values) do
+						ctx.cache[valueIdx] = nil
+						local fresh = of(ctx, valueIdx)
+						if fresh and fresh.variant ~= "unknown" then cached.fields[name] = fresh end
+					end
 				end
 			end
 		end

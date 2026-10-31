@@ -130,10 +130,10 @@ local function commonSuffix(a, b, limit)
 	return at
 end
 
---- The change from the text the held parse was for to `text`, or nil when there is nothing to
---- resume from. A plugin-lowered document is a different text at different offsets, so its parse
---- is dropped rather than resumed: a kept tree of the text the editor holds would be resumed at
---- offsets of the text the plugin wrote.
+--- The change from the text the held parse was for to `text`. Nil when there is no held parse, and
+--- for a plugin-lowered document: its parse is a different text at different offsets, so it is
+--- dropped rather than resumed. A region with no common prefix is still returned — the caller
+--- needs to know what changed even when a parse cannot carry anything over.
 ---@param uri string
 ---@param text string the text the next analysis will read
 ---@param lowered boolean the view is a plugin's lowering of the document
@@ -147,8 +147,10 @@ function AnalysisCache:span(uri, text, lowered)
 	local held = self.parsed[uri]
 	if not held then return nil end
 	local prefix = commonPrefix(held.source, text)
-	if prefix == 0 then return nil end
 	local suffix = commonSuffix(held.source, text, math.min(#held.source, #text) - prefix)
+	-- The whole region is returned even when nothing is shared: a resume starts at 1 and re-reads
+	-- everything, but the caller still needs to know what changed (an annotation check, a token
+	-- patch) without comparing the texts a second time.
 	return { from = prefix + 1, prefix = prefix, suffix = suffix }
 end
 

@@ -218,10 +218,11 @@ local function hover(line, character, at, id)
 	}
 end
 
+---@param id integer?
 ---@return table
-local function tokens()
+local function tokens(id)
 	return {
-		jsonrpc = "2.0", id = 11, method = "textDocument/semanticTokens/full",
+		jsonrpc = "2.0", id = id or 11, method = "textDocument/semanticTokens/full",
 		params = { textDocument = { uri = URI } },
 	}
 end
@@ -312,6 +313,50 @@ local function analyzeMarks(stderr)
 	end
 	return resumed, full
 end
+
+test.it("colours a changed text before the type pass, and the settled answer after it", function()
+	-- An editor asks for colour as it types. Waiting for a type pass to answer is what made a
+	-- keystroke cost the whole analysis; the scanner can answer the text it now holds, and the
+	-- next ask after the pass has the types. Both answers must be a valid token stream.
+	local changed = table.concat({
+		"local first = 1\n",
+		"local second = 20\n",
+		"local third = 3\n",
+		"return first + second + third\n",
+	}, "")
+	local warm = run(endingWithShutdown({
+		didOpen(INITIAL),
+		didChangeMany(2, {
+			{ range = { start = { line = 1, character = 15 }, ["end"] = { line = 1, character = 15 } },
+				text = "0" },
+		}),
+		tokens(11),
+		hover(3, 16),
+		tokens(12),
+	}))
+	local quick = assert(response(warm, 11), "the fast token answer")
+	---@cast quick { data: integer[] }
+	test.equal(#quick.data % 5, 0, "a token stream is five integers per token")
+	test.truthy(#quick.data > 0, "and it colours the text the editor holds")
+
+	-- A patched answer is still a protocol answer: every token names a line and a span inside it.
+	local lines = {}
+	for line in (changed .. "\n"):gmatch("([^\n]*)\n") do lines[#lines + 1] = line end
+	local line, character = 0, 0
+	for index = 1, #quick.data, 5 do
+		line += quick.data[index]
+		character = quick.data[index] == 0 and (character + quick.data[index + 1])
+			or quick.data[index + 1]
+		local length = quick.data[index + 2]
+		test.truthy(lines[line + 1] ~= nil, "a token names a line of the new text")
+		test.truthy(character + length <= #lines[line + 1],
+			"and stays inside it")
+	end
+
+	local cold = run(endingWithShutdown({ didOpen(changed), hover(3, 16), tokens(12) }))
+	test.equal(canonical(assert(response(warm, 12))), canonical(assert(response(cold, 12))),
+		"the answer after the pass is the one a cold session gives")
+end)
 
 test.it("resumes an edit after the first statement, and does not when asked not to", function()
 	local _, _, stderr = run(endingWithShutdown({

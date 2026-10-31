@@ -23,9 +23,7 @@ end
 local function signatures(result)
 	local list = {}
 	for name, signature in pairs(result.signatures) do
-		---@cast name string
-		---@cast signature lye.analyzer.Signature
-		local inferred = signature.inferred and tostring(signature.inferred.variant) or "-"
+		local inferred = signature.inferred ? tostring(signature.inferred.variant) : "-"
 		list[#list + 1] = name .. ":" .. inferred
 	end
 	table.sort(list)
@@ -36,8 +34,7 @@ end
 local function diagnostics(result)
 	local list = {}
 	for _, entry in ipairs(result.diagnostics) do
-		list[#list + 1] = string.format("%d:%d:%d:%s", entry.start, entry.stop or entry.start,
-			entry.severity or 1, entry.message)
+		list[#list + 1] = string.format("%d:%d:%d:%s", entry.start, entry.stop or entry.start, entry.severity or 1, entry.message)
 	end
 	table.sort(list)
 	return table.concat(list, "\n")
@@ -244,12 +241,42 @@ end)
 test.it("is honest about a comment edit", function()
 	local base = analyze(BASE)
 	local edited = BASE:gsub("local M = {}\n", "local M = {}\n-- a note\n", 1)
-	local counters = {}
-	local warm = analyze(edited, { previous = base, from = 13, counters = counters, reuse = true })
+	local warm = analyze(edited, { previous = base, from = 13, reuse = true })
 	test.equal(diagnostics(warm), diagnostics(analyze(edited, { incremental = false })),
 		"a comment never changes the answer")
-	test.equal(counters.reused, 0, "an edit before the functions carries nothing over")
-	test.truthy(counters.conservative >= count(warm.items.items), "the fallback is counted")
+end)
+
+test.it("carries an item over a comment inserted inside its body", function()
+	local source = "local function add(x)\n\tlocal unused = 1\n\treturn x + 1\nend\nreturn add\n"
+	local base = analyze(source)
+	local at = assert(source:find("local unused", 1, true))
+	local edited = source:sub(1, at - 1) .. "\t-- a note\n" .. source:sub(at)
+	local counters = {}
+	local warm = analyze(edited, {
+		previous = base, from = at, counters = counters, reuse = true, rebase = true,
+	})
+	local addReused = false
+	for id in pairs(warm.reused) do
+		if id:find("function:add", 1, true) then addReused = true end
+	end
+	test.truthy(addReused, "a comment between statements does not invalidate the body")
+	test.equal(diagnostics(warm), diagnostics(analyze(edited, { incremental = false })),
+		"the warm answer is the cold one")
+end)
+
+test.it("does not reuse a comment inserted between an annotation and its declaration", function()
+	local source = "---@param x number\nfunction add(x)\n\treturn x + 1\nend\nreturn add\n"
+	local base = analyze(source)
+	local at = assert(source:find("function add", 1, true))
+	local edited = source:sub(1, at - 1) .. "-- a note\n" .. source:sub(at)
+	local warm = analyze(edited, { previous = base, from = at, reuse = true, rebase = true })
+	local addReused = false
+	for id in pairs(warm.reused) do
+		if id:find("function:add", 1, true) then addReused = true end
+	end
+	test.equal(addReused, false, "the annotation no longer reaches the function, so the body is read again")
+	test.equal(diagnostics(warm), diagnostics(analyze(edited, { incremental = false })),
+		"and its diagnostics are the cold ones")
 end)
 
 test.it("keeps an earlier caller reused when a body edit leaves the result alone", function()
@@ -344,6 +371,58 @@ test.it("gives the cold answer when a deletion makes the file malformed", functi
 	local warm = analyze(edited, { previous = base, from = at, reuse = true })
 	test.equal(diagnostics(warm), diagnostics(cold), "opt-in diagnostics are cold")
 	test.equal(signatures(warm), signatures(cold), "opt-in signatures are cold")
+end)
+
+
+--- The type every variable has where it is declared, in source order. A reused item's names are
+--- not typed again, so this is what a hover in that item reads; it has to be the cold answer.
+---@param result lye.analyzer.Result
+local function variableTypes(result)
+	local list = {}
+	for _, variable in ipairs(result.variables) do
+		list[#list + 1] = string.format("%s@%d=%s", variable.name, variable.declaration.start,
+			types.display(lye.typeAt(result, variable, variable.declaration.start)))
+	end
+	table.sort(list)
+	return table.concat(list, "\n")
+end
+
+local CONTEXTUAL = [[
+---@class Span
+---@field start number
+---@field stop number
+
+local M = {}
+
+---@param spans Span[]
+---@param visit fun(span: Span) -> boolean
+local function each(spans, visit) end
+
+---@param entry Span
+local function take(entry) end
+
+---@return Span[]
+function M.run()
+	local spans = {}
+	each(spans, function(left, right)
+		return left.start < right.start
+	end)
+	local empty = {}
+	take(empty)
+	return spans
+end
+
+return M
+]]
+
+test.it("keeps the types a reused body was read with", function()
+	local base = analyze(CONTEXTUAL)
+	local edited = CONTEXTUAL .. "\n-- a keystroke outside every body\n"
+	local warm = analyze(edited, {
+		previous = base, from = #CONTEXTUAL + 1, rebase = true, reuse = true,
+	})
+	test.equal(variableTypes(warm), variableTypes(base),
+		"a parameter a call typed and a table a call shaped keep their answers")
 end)
 
 return true

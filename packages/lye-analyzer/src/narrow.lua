@@ -707,6 +707,31 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 		end
 	end
 
+	-- `cond ? a : b` runs each branch under the opposite truth of the condition, the way `and`
+	-- and `or` do. The condition opens no scope of its own, so the fact is attached to the scope
+	-- holding the branch and covers the branch's own span.
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "ternary" and node.left and node.right and node.alternative then
+			local thenBranch, elseBranch = parsed.nodes[node.right], parsed.nodes[node.alternative]
+			if thenBranch then
+				local scope = scopeAtOffset(thenBranch.start)
+				if scope then
+					for _, condition in ipairs(readConditions(parsed, node.left, false, signatures, resolve)) do
+						add(condition, scope, thenBranch.start, thenBranch.stop)
+					end
+				end
+			end
+			if elseBranch then
+				local scope = scopeAtOffset(elseBranch.start)
+				if scope then
+					for _, condition in ipairs(readConditions(parsed, node.left, true, signatures, resolve)) do
+						add(condition, scope, elseBranch.start, elseBranch.stop)
+					end
+				end
+			end
+		end
+	end
+
 	-- `assert(t == "table")` says the condition is true for the rest of the block: the call does
 	-- not come back otherwise. The assertion is a fact over the enclosing scope, exactly like a
 	-- guard that returns.

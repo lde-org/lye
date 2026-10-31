@@ -66,7 +66,7 @@ function statements.parseRepeat(self)
 	self:parseBlock()
 	self:popScope(self:peek().start - 1)
 	-- The condition is parsed after the body, so the scope it guards takes it afterwards.
-	local scope = self.scopes_[#self.scopes_]
+	local scope = self.lastScope
 	self:expect("until")
 	scope.conditionIdx = self:parseExpression()
 	self:emit("repeat", start, self.arena[self.index - 1].stop)

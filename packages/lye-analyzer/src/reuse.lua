@@ -14,12 +14,13 @@
 
 local rapidhash = require("rapidhash")
 local types = require("lye-doc.type")
+local lexer = require("lye-lexer")
 
 local reuse = {}
 
 -- The version of the reuse model itself. A cached result from another one is a miss even when
 -- every source hash happens to agree.
-reuse.VERSION = "lye-analyzer/reuse:2"
+reuse.VERSION = "lye-analyzer/reuse:3"
 
 ---@param list string[]
 local function sorted(list)
@@ -60,6 +61,49 @@ function reuse.region(old, new)
 		newStart = prefix + 1, newStop = newLen - suffix,
 		delta = newLen - oldLen,
 	}
+end
+
+---@param text string
+local function annotationText(text)
+	return text:match("^%-%-%-?%s*@") ~= nil or text:match("^%-%-%[=*%[%s*@") ~= nil
+end
+
+--- The code a parse holds, as one hash: every token outside an ordinary comment, with the
+--- annotation comments and how far each sits from the code it annotates. Whitespace and ordinary
+--- comments can move every offset in a file without changing one token the inference reads, so
+--- two parses with the same digest are the same code. A digest is used rather than comparing the
+--- two trees because a resumed parse overwrites the token and node arrays it carries: the previous
+--- tree is no longer the previous text by the time the new one exists. An annotation is attached
+--- to the declaration only while whitespace is the whole gap after it, so an ordinary comment
+--- between the two is part of the digest; one inside a body is not.
+---@param parsed lye.parser.Result?
+---@return string
+function reuse.codeDigest(parsed)
+	local tokens = parsed and parsed.tokens
+	if not tokens then return "" end
+	local texts = tokens.texts
+	local parts, pending, ordinary = {}, {}, 0
+	for index = 1, tokens.count do
+		local token = tokens.arena[index]
+		local text = texts[token.index] or ""
+		if token.kind == lexer.KIND.comment then
+			if annotationText(text) then
+				pending[#pending + 1] = { text = text, at = ordinary }
+			else
+				ordinary += 1
+			end
+		else
+			for _, held in ipairs(pending) do
+				parts[#parts + 1] = "\2a" .. held.text .. "\0" .. (ordinary - held.at)
+			end
+			pending, ordinary = {}, 0
+			parts[#parts + 1] = "\2t" .. token.kind .. "\0" .. text
+		end
+	end
+	for _, held in ipairs(pending) do
+		parts[#parts + 1] = "\2a" .. held.text .. "\0" .. (ordinary - held.at)
+	end
+	return rapidhash.hex(table.concat(parts, "\1"))
 end
 
 --- The signature an item presents to its callers, as one hash. A change here is a change every
@@ -161,7 +205,7 @@ local function resolvedAnnotations(ctx, item)
 					local found = ctx.digestResolve and ctx.digestResolve(word) or nil
 					if found ~= nil then
 						---@cast found lye.doc.Type
-						held = types.display(found)
+						held = types.display(found) or ""
 					else
 						held = ""
 					end
@@ -178,10 +222,10 @@ end
 --- the item's cached result was computed from.
 ---@param ctx table
 ---@param item lye.analyzer.Item
-function reuse.depsHash(ctx, item)
+function reuse.depsHash(ctx, item, signature)
 	local parts = {
 		reuse.VERSION, ctx.pluginsDigest or "", ctx.namespaceDigest or "",
-		reuse.signatureDigest(item),
+		signature or reuse.signatureDigest(item),
 	}
 	local deps = item.deps
 	for _, id in ipairs(keys(deps.items)) do
@@ -218,29 +262,13 @@ function reuse.depsHash(ctx, item)
 	return rapidhash.hex(table.concat(parts, "\1"))
 end
 
---- The declarations and annotations a document has, as one string. A name that appeared,
---- disappeared or changed kind changes structural IDs and annotation ownership, and an item
---- whose IDs moved is not safe to carry over from an older tree.
----@param parsed lye.parser.Result
----@param annotations lye.doc.File?
-function reuse.declarationShape(parsed, annotations)
-	local parts = {}
-	for _, declaration in ipairs(parsed.declarations or {}) do
-		parts[#parts + 1] = table.concat({ tostring(declaration.depth), declaration.name,
-			tostring(declaration.isFunction), tostring(declaration.valueIdx ~= nil) }, "\0")
-	end
-	for _, annotation in ipairs((annotations and annotations.annotations) or {}) do
-		if annotation.tag == "class" or annotation.tag == "alias" then
-			parts[#parts + 1] = "a\0" .. annotation.tag .. "\0" .. tostring(annotation.name or "")
-		end
-	end
-	return table.concat(sorted(parts), "\1")
-end
 
 ---@class lye.reuse.Clean
 ---@field old lye.analyzer.Item
 ---@field delta integer
 ---@field rebased boolean?
+---@field splitRel integer? relative offsets at or after this one move by `shift`
+---@field shift integer?
 
 ---@class lye.reuse.Meta
 ---@field signatureDigest string?
@@ -271,22 +299,62 @@ function reuse.plan(ctx, previous, region)
 	local items = ctx.tree.items
 	---@type table<string, lye.analyzer.Item>
 	local oldItems = oldTree.items
+	local sameCode = ctx.sameCode == true
 	for id, item in pairs(items) do
 		local old = oldItems[id]
 		local signature = reuse.signatureDigest(item)
-		local deps = reuse.depsHash(ctx, item)
-		plan.meta[id] = { signatureDigest = signature, depsHash = deps }
 		local cache = old and old.cache
 		---@cast cache lye.analyzer.ItemCache?
+		-- A signature and a body are cheap to compare; the dependency digest is not. An item
+		-- whose own body moved is dirty whatever its dependencies did, so the digest is read only
+		-- where it can still make a reusable item.
 		local same = old ~= nil and cache ~= nil and cache.signatureDigest == signature
-			and old.bodyHash == item.bodyHash and cache.depsHash == deps
+			and (sameCode or old.bodyHash == item.bodyHash)
+		local deps
+		if same and ctx.worldStable and cache.depsHash ~= nil then
+			-- The fixed world is unchanged, so only the items this one reads can have moved.
+			local intact = true
+			for id in pairs(item.deps.items or {}) do
+				local dep = ctx.tree.items[id]
+				local previousDep = ctx.previous and ctx.previous.items.items[id]
+				if not dep or not previousDep or not previousDep.cache
+					or previousDep.cache.signatureDigest ~= reuse.signatureDigest(dep) then
+					intact = false
+					break
+				end
+			end
+			if intact and ctx.changedWrites then
+				for name in pairs(item.deps.upvalues or {}) do
+					if ctx.changedWrites[name] then intact = false; break end
+				end
+				if intact then
+					for name in pairs(item.deps.globals or {}) do
+						if ctx.changedWrites[name] then intact = false; break end
+					end
+				end
+				if intact then
+					for name in pairs(item.deps.tables or {}) do
+						if ctx.changedWrites[name] then intact = false; break end
+					end
+				end
+			end
+			if intact then
+				deps = cache.depsHash
+			else
+				deps = reuse.depsHash(ctx, item, signature)
+				same = cache.depsHash == deps
+			end
+		elseif same then
+			deps = reuse.depsHash(ctx, item, signature)
+			same = cache.depsHash == deps
+		end
+		if same then plan.meta[id] = { signatureDigest = signature, depsHash = deps } end
 		if not old then
 			plan.dirty[id] = true
 		elseif ctx.forceDirty then
 			-- The parse or the declaration set moved in a way this reuse model does not follow:
 			-- the item may be byte-identical and still observe something different.
 			plan.dirty[id] = true
-			if same then plan.conservative += 1 end
 		elseif not same then
 			plan.dirty[id] = true
 		else
@@ -309,14 +377,22 @@ function reuse.plan(ctx, previous, region)
 					plan.dirty[id] = true
 					plan.conservative += 1
 				else
-				local delta = item.start - old.start
-				if delta == region.delta and item.stop - old.stop == delta then
-					plan.clean[id] = { old = old, delta = delta, rebased = true }
-				else
-					plan.dirty[id] = true
-					plan.conservative += 1
+					local delta = item.start - old.start
+					if delta == region.delta and item.stop - old.stop == delta then
+						plan.clean[id] = { old = old, delta = delta, rebased = true }
+					else
+						plan.dirty[id] = true
+						plan.conservative += 1
+					end
 				end
-				end
+			elseif sameCode and item.start <= region.oldStart and item.stop >= region.oldStop then
+				-- The edit only added whitespace or an ordinary comment inside the item. Every
+				-- token the item reads is the same, so its cached answer still holds; records
+				-- after the edit move by the region's delta, records before it do not.
+				plan.clean[id] = {
+					old = old, delta = 0, rebased = true,
+					splitRel = region.newStart - item.start, shift = region.delta,
+				}
 			else
 				plan.dirty[id] = true
 				plan.conservative += 1

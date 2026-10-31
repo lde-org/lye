@@ -20,6 +20,7 @@ local classes = {}
 ---@field type string the declared type, as written, with the class's parameters substituted
 ---@field optional boolean? the field is one a value may leave out, written `name?`
 ---@field visibility lye.doc.Visibility
+---@field comment string? the prose written after the type, as `# comment`
 
 ---@class lye.doc.Class
 ---@field consts table<string, boolean>? the parameters that take a value rather than a type
@@ -199,7 +200,8 @@ local function readField(annotation, fallback)
 		optional = true
 	end
 
-	return { name = name, type = typeText, optional = optional, visibility = visibility }
+	return { name = name, type = typeText, optional = optional, visibility = visibility,
+		comment = annotation.comment }
 end
 
 --- Replace each parameter name in a type's text with the argument written for it, so a field read

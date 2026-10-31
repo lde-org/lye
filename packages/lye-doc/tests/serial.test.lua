@@ -23,6 +23,22 @@ test.it("gives back a type as the type it was", function()
 	test.equal(written.variant, "class")
 end)
 
+test.it("writes the same graph as the same bytes however it was built", function()
+	-- A map built by two analyses has its fields in whatever order `pairs` happens to give them.
+	-- The bytes are a cache key, so the order they were inserted in must not be part of it.
+	local first = { beta = "two", alpha = "one", nested = { z = 3, y = 2, x = 1 } }
+	local second = { nested = { x = 1, z = 3, y = 2 }, alpha = "one", beta = "two" }
+	test.equal(assert(sequel.write(first)), assert(sequel.write(second)),
+		"two insertion orders are one entry")
+end)
+
+test.it("writes a graph it read back as the bytes it read", function()
+	local value = { list = { "a", "b" }, alpha = "one", nested = { z = 3, y = 2 } }
+	local text = assert(sequel.write(value))
+	test.equal(assert(sequel.write(assert(sequel.read(text)))), text,
+		"a round trip is the same bytes, not only the same fields")
+end)
+
 test.it("keeps a type that holds itself in one piece", function()
 	-- A class with a field of its own type is a cycle, and the chunk has to make every table
 	-- before it points one at another.

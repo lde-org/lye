@@ -254,8 +254,8 @@ test.it("evolves a name that is assigned after its declaration", function()
 	local result = analyzer.analyze(source)
 	local byName = {}
 	for _, variable in ipairs(result.variables) do byName[variable.name] = variable end
-	test.equal(types.display(analyzer.typeAt(result, byName.x, #source)), "5|string")
-	test.equal(types.display(analyzer.typeAt(result, byName.y, #source)), "5|string",
+	test.equal(types.display(analyzer.typeAt(result, byName.x, #source)), "number|string")
+	test.equal(types.display(analyzer.typeAt(result, byName.y, #source)), "number|string",
 		"an initializer sees what the name became, not what it started as")
 end)
 
@@ -313,7 +313,7 @@ test.it("keeps a parameter clear of a local of the same name", function()
 	test.equal(types.display(analyzer.typeAt(result, param, at)), "number")
 	local localX = result.variables[1]
 	test.equal(localX.qualifier, "local")
-	test.equal(types.display(analyzer.typeAt(result, localX, #source)), "5|string")
+	test.equal(types.display(analyzer.typeAt(result, localX, #source)), "number|string")
 end)
 
 ---@param source string
@@ -718,7 +718,7 @@ end
 
 test.it("evolves a type as later assignments widen it", function()
 	local source = "local x = 5\nx = \"foo\"\n"
-	test.equal(typeAtOffset(source, "x", #source), "5|string")
+	test.equal(typeAtOffset(source, "x", #source), "number|string")
 	-- Before the second assignment it is still just a number.
 	test.equal(typeAtOffset(source, "x", 12), "5")
 end)
@@ -879,14 +879,14 @@ test.it("reports a table literal whose field does not fit", function()
 	test.equal(#result.diagnostics, 1)
 end)
 
-test.it("widens to a union from two different values", function()
+test.it("widens each literal that is written again to its base type", function()
 	local source = "local x = 1\nx = \"s\"\nx = true\n"
 	local result = analyzer.analyze(source)
 	---@type lye.analyzer.Variable
 	local variable = result.variables[1]
 	local held = analyzer.typeAt(result, variable, #source)
 	---@cast held lye.doc.Type
-	test.equal(types.display(held), "1|string|true")
+	test.equal(types.display(held), "boolean|number|string")
 end)
 
 ---@param source string
@@ -1609,6 +1609,37 @@ test.it("gives an empty table the shape a parameter expects", function()
 	local said = {}
 	for _, entry in ipairs(conflict.diagnostics) do said[#said + 1] = entry.message end
 	test.truthy(table.concat(said, " / "):match("second expects"), table.concat(said, " / "))
+end)
+
+test.it("gives pairs the key and value of the table it walks", function()
+	local source = table.concat({
+		"---@class Entry\n",
+		"---@field name string\n",
+		"\n",
+		"---@param map table<string, Entry>\n",
+		"---@param list Entry[]\n",
+		"local function visit(map, list)\n",
+		"  for key, entry in pairs(map) do\n",
+		"    local named = entry.name\n",
+		"  end\n",
+		"  for index, item in pairs(list) do\n",
+		"    local first = item.name\n",
+		"  end\n",
+		"end\n",
+		"return visit\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	local held = {}
+	for _, variable in ipairs(result.variables) do held[variable.name] = variable end
+	test.equal(types.display(analyzer.typeAt(result, held.key, #source)), "string",
+		"pairs yields the key type of the map it walks")
+	test.equal(types.display(analyzer.typeAt(result, held.entry, #source)), "Entry",
+		"and the value type")
+	test.equal(types.display(analyzer.typeAt(result, held.named, #source)), "string",
+		"so a field of the value is read")
+	test.equal(types.display(analyzer.typeAt(result, held.index, #source)), "number",
+		"an array's keys are numbers")
+	test.equal(types.display(analyzer.typeAt(result, held.item, #source)), "Entry")
 end)
 
 test.it("checks an argument against its parameter type", function()
@@ -2643,6 +2674,25 @@ test.it("types a field of a literal from the name as it is narrowed there", func
 		.. "\t\t---@type { archive: string }\n\t\tlocal entry = { archive = dir }\n"
 		.. "\t\treturn entry\n\tend\nend\n"
 	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
+test.it("narrows a ternary's branch from its condition", function()
+	-- `cond ? a : b` runs each branch under the opposite truth of the condition, the way `and`
+	-- does. Reading `inferred.variant` where the condition proved `inferred` is there must not
+	-- report the optional field as absent.
+	local source = "---@class Shape\n---@field variant string\n"
+		.. "---@class Box\n---@field inferred Shape?\n"
+		.. "---@param box Box\nlocal function f(box)\n"
+		.. "\treturn box.inferred ? box.inferred.variant : \"-\"\nend\n"
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+
+	-- The other branch is where the condition is false, and a local's optional is nil there.
+	local bad = "---@class Shape\n---@field variant string\n"
+		.. "---@param x Shape?\nlocal function f(x)\n"
+		.. "\treturn x ? \"-\" : x.variant\nend\n"
+	local diagnostics = analyzer.analyze(bad).diagnostics
+	test.equal(#diagnostics, 1)
+	test.truthy(diagnostics[1].message:match("nil"), diagnostics[1].message)
 end)
 
 test.it("reads a string key in brackets as a field", function()

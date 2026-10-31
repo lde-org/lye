@@ -37,7 +37,10 @@ local isNeverNumeric, callLabel = annotations.isNeverNumeric, annotations.callLa
 ---@field declaredField fun(held: lye.doc.Type, field: string): lye.doc.Type?
 ---@field assignments { name: string, at: integer, valueIdx: integer, valuePosition: integer? }[]
 ---@field reusedSpan fun(from: integer, to: integer): boolean?
+---@field nodes lye.parser.Node[]? the nodes outside reused items, when most of the document is reused
+---@field nodesOf fun(kind: string): lye.parser.Node[] the nodes of one kind, restricted to the same
 ---@field arithmetic table<string, boolean>
+---@field counters table<string, number>? the phase timings, when the caller asked for them
 
 local checks = {}
 
@@ -141,30 +144,27 @@ local function returnHints(ctx)
 		return count
 	end
 
-	--- Whether a local function is part of the module's surface. A `return helper` or a write to a
-	--- field is how a local helper becomes public; one that is only called inside the file is not.
-	---@param declaration lye.parser.Declaration
-	---@return boolean
-	local function exported(declaration)
-		if declaration.qualifier ~= "local" then return true end
-		local name = declaration.name
-		if not name then return true end
-		for _, node in ipairs(parsed.nodes) do
-			if node.kind == "return" then
-				for _, child in ipairs(node.children or {}) do
-					local value = parsed.nodes[child]
-					if value and value.kind == "prefix" and value.callee == name then return true end
-				end
-			elseif node.kind == "assignment" and node.valueIdx then
-				local value = parsed.nodes[node.valueIdx]
-				local target = node.target and parsed.nodes[node.target]
-				if value and value.kind == "prefix" and value.callee == name
-					and target and (target.kind == "index" or target.kind == "prefix") then
-					return true
+	--- The local functions that become part of the module's surface. A `return helper` or a
+	--- write to a field is public; one that is only called inside the file is not. Collected in
+	--- one walk: asking this per local declaration was the declarations times the nodes.
+	---@type table<string, boolean>
+	local exportedNames = {}
+	for _, node in ipairs(parsed.nodes) do
+		if node.kind == "return" then
+			for _, child in ipairs(node.children or {}) do
+				local value = parsed.nodes[child]
+				if value and value.kind == "prefix" and value.callee then
+					exportedNames[value.callee] = true
 				end
 			end
+		elseif node.kind == "assignment" and node.valueIdx then
+			local value = parsed.nodes[node.valueIdx]
+			local target = node.target and parsed.nodes[node.target]
+			if value and value.kind == "prefix" and value.callee
+				and target and (target.kind == "index" or target.kind == "prefix") then
+				exportedNames[value.callee] = true
+			end
 		end
-		return false
 	end
 
 	local previous
@@ -186,7 +186,7 @@ local function returnHints(ctx)
 			-- it, not only the value a call in an expression is worth.
 			if not signature.values then signature.inferredValues = values end
 		end
-		if forceHints or (declaration.qualifier == "local" and not exported(declaration)) then
+		if forceHints or (declaration.qualifier == "local" and not exportedNames[declaration.name or ""]) then
 		-- An annotation that says exactly what the body says is a line kept in step with the code
 		-- for nothing. A hint rather than a warning, since a written signature is often what a
 		-- reader wants. Only a lone one: with a second line below it, the line is a position. The
@@ -305,7 +305,7 @@ local function fieldWrites(ctx)
 
 	-- A value with a type does not grow fields nobody declared, and a function written for a field has
 	-- to be the function that field says it is: what was written does not fit what the type said.
-	for _, node in ipairs(parsed.nodes) do
+	for _, node in ipairs(ctx.nodesOf("assignment")) do
 		if not reused(ctx, node.start, node.stop) then
 		---@type lye.parser.Node?
 		local target
@@ -396,7 +396,7 @@ local function metatableChecks(ctx)
 	local parsed, self = ctx.parsed, ctx.self
 	local resolve, inferCtx = ctx.resolve, ctx.inferCtx
 	local functionNodes, bodyOwner = ctx.functionNodes, ctx.bodyOwner
-	for _, node in ipairs(parsed.nodes) do
+	for _, node in ipairs(ctx.nodes or parsed.nodes) do
 		if not reused(ctx, node.start, node.stop) then
 		if node.kind == "index" and node.field and not node.isMethod then
 			local targetType = infer.at(inferCtx, node.target)
@@ -442,6 +442,9 @@ local function deadCode(ctx)
 	-- over every node in the document, and the scope is asked once per statement.
 	for _, index in ipairs(parsed.topLevel) do
 		local node = parsed.nodes[index]
+		-- A reused item's dead-code findings travelled with its cached result; only the statement
+		-- this edit touched can add or remove one.
+		if not reused(ctx, node.start, node.stop) then
 		local scope = scopeAt(self, node.start)
 		---@type lye.parser.Node[]?
 		local list = dead[scope]
@@ -450,6 +453,7 @@ local function deadCode(ctx)
 			dead[scope] = list
 		end
 		list[#list + 1] = node
+		end
 	end
 	--- The call a statement ends on, when that call never comes back: `error("x")`, and also
 	--- `local value = error("x")`, whose declaration never finishes either.
@@ -506,9 +510,9 @@ local function arithmeticChecks(ctx)
 	local parsed, self = ctx.parsed, ctx.self
 	local inferCtx = ctx.inferCtx
 	local ARITHMETIC = ctx.arithmetic
-	for _, node in ipairs(parsed.nodes) do
+	for _, node in ipairs(ctx.nodesOf("binary")) do
 		if not reused(ctx, node.start, node.stop) then
-		if node.kind == "binary" and ARITHMETIC[node.op] then
+		if ARITHMETIC[node.op] then
 			local op = node.op
 			---@cast op string
 			local left = infer.at(inferCtx, node.left)
@@ -549,9 +553,9 @@ end
 local function indexedReads(ctx)
 	local parsed, self = ctx.parsed, ctx.self
 	local inferCtx = ctx.inferCtx
-	for _, node in ipairs(parsed.nodes) do
+	for _, node in ipairs(ctx.nodesOf("index")) do
 		if not reused(ctx, node.start, node.stop) then
-		if node.kind == "index" and node.isDynamic == true and node.target and node.key then
+		if node.isDynamic == true and node.target and node.key then
 			local base = infer.at(inferCtx, node.target)
 			local key = infer.at(inferCtx, node.key)
 			-- A value whose metatable answers `__index`/`__newindex` can be indexed whatever its
@@ -836,9 +840,9 @@ end
 ---@param ctx lye.analyzer.CheckContext
 local function comparisonChecks(ctx)
 	local parsed, self, inferCtx = ctx.parsed, ctx.self, ctx.inferCtx
-	for _, node in ipairs(parsed.nodes) do
-		if not reused(ctx, node.start, node.stop)
-			and node.kind == "binary" and (node.op == "==" or node.op == "~=" or node.op == "!=") then
+	for _, node in ipairs(ctx.nodesOf("binary")) do
+		if not reused(ctx, node.start, node.stop) then
+		if node.op == "==" or node.op == "~=" or node.op == "!=" then
 			local left = parsed.nodes[node.left]
 			local right = parsed.nodes[node.right]
 			local literal, other, otherIdx
@@ -864,6 +868,7 @@ local function comparisonChecks(ctx)
 					end
 				end
 			end
+		end
 		end
 	end
 end
@@ -956,7 +961,7 @@ local function nilReads(ctx)
 		return false
 	end
 
-	for _, node in ipairs(parsed.nodes) do
+	for _, node in ipairs(ctx.nodes or parsed.nodes) do
 		if not node.isSafe and (node.kind == "index" or node.kind == "call") and node.target then
 			local targetNode = parsed.nodes[node.target]
 			-- A local whose type holds nil because of one initializer is not an optional name:
@@ -1032,9 +1037,9 @@ end
 ---@param ctx lye.analyzer.CheckContext
 local function missingFieldReads(ctx)
 	local parsed, self, inferCtx = ctx.parsed, ctx.self, ctx.inferCtx
-	for _, node in ipairs(parsed.nodes) do
-		if node.kind == "index" and node.field and node.target and not node.isSafe
-			and not reused(ctx, node.start, node.stop) then
+	for _, node in ipairs(ctx.nodesOf("index")) do
+		if not reused(ctx, node.start, node.stop) then
+		if node.field and node.target and not node.isSafe then
 			local parent = node.parent and parsed.nodes[node.parent]
 			local isWrite = parent and parent.kind == "assignment" and parent.target == node.index
 			if not isWrite then
@@ -1085,6 +1090,7 @@ local function missingFieldReads(ctx)
 				end
 			end
 		end
+		end
 	end
 end
 
@@ -1118,7 +1124,7 @@ local function unknownUses(ctx)
 		return index and infer.at(inferCtx, index) or nil
 	end
 
-	for _, node in ipairs(parsed.nodes) do
+	for _, node in ipairs(ctx.nodes or parsed.nodes) do
 		if node.kind == "index" and node.target then
 			if settledUnknown(typeOfNode(node.target)) then
 				reportUnknown(node, "cannot index a value of unknown type")
@@ -1165,25 +1171,30 @@ local function unknownUses(ctx)
 end
 
 ---@param ctx lye.analyzer.CheckContext
+local CHECK_LIST = {
+	{ "returnHints", returnHints }, { "anyFunctionHints", anyFunctionHints },
+	{ "constWrites", constWrites }, { "declaredMismatches", declaredMismatches },
+	{ "fieldWrites", fieldWrites }, { "metatableChecks", metatableChecks },
+	{ "deadCode", deadCode }, { "arithmeticChecks", arithmeticChecks },
+	{ "comparisonChecks", comparisonChecks }, { "indexedReads", indexedReads },
+	{ "globalNames", globalNames }, { "paramNames", paramNames },
+	{ "unusedLocals", unusedLocals }, { "callbackReturns", callbackReturns },
+	{ "nilReads", nilReads }, { "missingFieldReads", missingFieldReads },
+	{ "unknownUses", unknownUses }, { "moduleExport", moduleExport },
+}
+
+---@param ctx lye.analyzer.CheckContext
 function checks.report(ctx)
-	returnHints(ctx)
-	anyFunctionHints(ctx)
-	constWrites(ctx)
-	declaredMismatches(ctx)
-	fieldWrites(ctx)
-	metatableChecks(ctx)
-	deadCode(ctx)
-	arithmeticChecks(ctx)
-	comparisonChecks(ctx)
-	indexedReads(ctx)
-	globalNames(ctx)
-	paramNames(ctx)
-	unusedLocals(ctx)
-	callbackReturns(ctx)
-	nilReads(ctx)
-	missingFieldReads(ctx)
-	unknownUses(ctx)
-	moduleExport(ctx)
+	local counters = ctx.counters
+	for _, entry in ipairs(CHECK_LIST) do
+		if counters then
+			local started = os.clock()
+			entry[2](ctx)
+			counters["check_" .. entry[1]] = os.clock() - started
+		else
+			entry[2](ctx)
+		end
+	end
 end
 
 return checks

@@ -447,8 +447,8 @@ test.it("answers for a type named in an annotation, and jumps to it", function()
 	}, source)
 	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
 	test.truthy(shown:match("A dependency of the check"), "the documentation is shown: " .. shown)
-	test.truthy(shown:match("%-%-%-@class Dep"), "and the declaration: " .. shown)
-	test.truthy(shown:match("amount number"), "with the fields written under it: " .. shown)
+	test.truthy(shown:match("class Dep {"), "and the declaration: " .. shown)
+	test.truthy(shown:match("amount: number"), "with the fields written under it: " .. shown)
 	local target = results["3"]
 	test.truthy(target and target.uri and target.uri:match("f%.lua"), "the jump is in this document")
 	test.equal(target.range.start.line, 1, "and lands on the class declaration")
@@ -469,13 +469,42 @@ test.it("says nothing where a table shape cannot fit in a hint", function()
 	test.equal(#(results["2"] or {}), 0, "a table shape that does not fit is not hinted")
 end)
 
+test.it("says nothing for a literal a reader can see", function()
+	-- `local x = 0` already says what the value is. A hint repeating the literal is noise.
+	local source = table.concat({
+		"local number = 0\n",
+		'local text = "hi"\n',
+		"local flag = true\n",
+		"local nothing = nil\n",
+		"return number, text, flag, nothing\n",
+	}, "")
+	local results = run({ request(2, "textDocument/inlayHint", { line = 0, character = 0 }) }, source)
+	test.equal(#(results["2"] or {}), 0, "a literal needs no hint")
+end)
+
+test.it("shows the widened type of a name that is written again", function()
+	-- `x = x + 1` makes the name a number; the hint at the declaration says what it becomes, not
+	-- the one literal it started as.
+	local source = table.concat({
+		"local x = 0\n",
+		"x = x + 1\n",
+		"return x\n",
+	}, "")
+	local results = run({ request(2, "textDocument/inlayHint", { line = 0, character = 0 }) }, source)
+	local hints = results["2"]
+	---@cast hints lye.test.Inlay[]
+	test.equal(#hints, 1, "the name that changes is hinted")
+	test.equal(hints[1].label, ": number", "with the type it settles on")
+	test.equal(hints[1].position.line, 0, "at the declaration")
+end)
+
 test.it("keeps an inlay hint short", function()
 	-- A table of six fields and a sentence-length string are both correct answers to "what is this",
 	-- and neither is readable beside a name. The hover still has the whole type.
 	local source = table.concat({
-		"local small = 1\n",
+		"local small = math.max(1, 2)\n",
 		"local big = { alpha = 1, beta = 2, gamma = 3, delta = 4, epsilon = 5, zeta = 6 }\n",
-		'local long = "a string long enough to be worth cutting down to size"\n',
+		'local long = tostring("a string long enough to be worth cutting down to size")\n',
 	}, "")
 	local results = run({ request(2, "textDocument/inlayHint", { line = 0, character = 0 }) }, source)
 	local hints = results["2"]
@@ -483,7 +512,7 @@ test.it("keeps an inlay hint short", function()
 	local labels = {}
 	for _, hint in ipairs(hints) do labels[#labels + 1] = hint.label end
 	-- The table's own shape is dropped rather than cut: see the test above. The other two are
-	-- shown, short.
+	-- calls, not literals a reader can see through, so both are shown short.
 	test.truthy(#hints >= 2, "a hint for what can be shown: " .. table.concat(labels, " | "))
 	for _, hint in ipairs(hints) do
 		test.truthy(#hint.label <= 40, "a hint is short: " .. hint.label)
@@ -1005,7 +1034,7 @@ test.it("hints an inferred name and leaves the function it is written in alone",
 		"\tprint(self)\n",
 		"end\n",
 		"\n",
-		"local count = 1\n",
+		"local count = math.max(1, 2)\n",
 	}, "")
 	local whole = { start = { line = 0, character = 0 }, ["end"] = { line = 8, character = 0 } }
 	local request2 = {
@@ -1017,7 +1046,7 @@ test.it("hints an inferred name and leaves the function it is written in alone",
 	local where = {}
 	for _, hint in ipairs(hints) do where[#where + 1] = hint.label .. " on line " .. hint.position.line end
 	test.equal(#hints, 1, table.concat(where, ", "))
-	test.equal(hints[1].label, ": 1", "the local is the name nobody wrote down")
+	test.equal(hints[1].label, ": number", "the local is the name nobody wrote down")
 	test.equal(hints[1].position.line, 7)
 end)
 
@@ -1043,6 +1072,33 @@ test.it("takes a method's parameters from the field it implements", function()
 	local hover = run({ hoverRequest }, source)["2"]
 	test.truthy(hover, "the parameter should answer a hover")
 	test.truthy(hover.contents.value:match("y: string"), hover.contents.value)
+end)
+
+test.it("shows a type declaration as a class, alias or union", function()
+	local source = table.concat({
+		"---@class Base\n",
+		"---@field id number\n",
+		"local Base = {}\n",
+		"---@class App: Base\n",
+		"---@field pos Vec3 # position\n",
+		"---@field f number\n",
+		"local App = {}\n",
+		"---@alias Id number|string\n",
+		"---@type App\n",
+		"local app = {}\n",
+		"---@type Id\n",
+		"local id = \"x\"\n",
+	}, "")
+	local results = run({
+		request(2, "textDocument/hover", { line = 8, character = 11 }),
+		request(3, "textDocument/hover", { line = 10, character = 9 }),
+	}, source)
+	local app = assert(results["2"] and results["2"].contents.value)
+	test.truthy(app:match("class App: Base {"), app)
+	test.truthy(app:match("pos: Vec3, %-%- position"), app)
+	test.truthy(app:match("f: number,"), app)
+	local id = assert(results["3"] and results["3"].contents.value)
+	test.truthy(id:match("union Id = number | string"), id)
 end)
 
 test.it("jumps to a class from an annotation and to a builtin from code", function()
@@ -1147,6 +1203,43 @@ test.it("reads an access a guard is written before", function()
 	end
 	test.equal(seen["2:10"], "method", "the name after `?.:` is the method it is")
 	test.equal(seen["3:9"], "property", "and a guarded field is the property it is")
+end)
+
+test.it("colours the tag and type of a bracketed @as annotation", function()
+	local source = "local x = y --[[@as lye.analyzer.Scope]]\n"
+	local results = run({ request(2, "textDocument/semanticTokens/full", {}) }, source)
+	local data = results["2"] and results["2"].data or {}
+	local line, start, seen = 0, 0, {}
+	for at = 1, #data, 5 do
+		local deltaLine, deltaStart = data[at], data[at + 1]
+		line += deltaLine
+		start = deltaLine == 0 and (start + deltaStart) or deltaStart
+		seen[string.format("%d:%d", line, start)] = TYPES[data[at + 3] + 1]
+	end
+	test.equal(seen["0:16"], "keyword", "the @as tag is a keyword")
+	test.equal(seen["0:20"], "type", "and the type it names is a type")
+end)
+
+test.it("colours a method chained after whitespace on the next line", function()
+	-- Lua does not require the `:` to sit immediately after the receiver. A method call on a new
+	-- line is still a method call; measuring the name from the receiver's last byte without
+	-- skipping the whitespace pointed at the newline and left the name as an unknown variable.
+	local source = table.concat({
+		'local s = "Hello"\n',
+		"local t = s:upper() -- after the receiver\n",
+		"    :lower()\n",
+		"print(t)\n",
+	}, "")
+	local results = run({ request(2, "textDocument/semanticTokens/full", {}) }, source)
+	local data = results["2"] and results["2"].data or {}
+	local line, start, seen = 0, 0, {}
+	for at = 1, #data, 5 do
+		local deltaLine, deltaStart = data[at], data[at + 1]
+		line += deltaLine
+		start = deltaLine == 0 and (start + deltaStart) or deltaStart
+		seen[string.format("%d:%d", line, start)] = TYPES[data[at + 3] + 1]
+	end
+	test.equal(seen["2:5"], "method", "the name after the indented `:` is a method")
 end)
 
 test.it("reads a field on a value that may be absent", function()

@@ -118,6 +118,7 @@ end
 ---@field packageOrder string[] loaded package roots, least recently used first
 ---@field views table<string, { generation: integer, view: table<string, boolean|lye.doc.Type> }> the view per open document
 ---@field indexes { workspace: fun(root: string): lye.lsp.Index?, package: fun(root: string): lye.lsp.Index? }? injected for tests
+---@field base fun(self: lye.Declarations, uri: string?): table<string, boolean|lye.doc.Type> the layers without open buffers
 local Declarations = {}
 Declarations.__index = Declarations
 
@@ -416,6 +417,20 @@ function Declarations:view(uri)
 	if uri and self.lye.server.documents and self.lye.server.documents:get(uri) then
 		self.views[key] = { generation = self.generation, view = top }
 	end
+	return top
+end
+
+--- The declarations that do not come from an open buffer: the workspace, the document's package
+--- and the definitions. A module's answer depends on the open buffers only for the names they
+--- actually shadow, and this is the layer to compare against to find those.
+---@param uri string?
+---@return table<string, boolean|lye.doc.Type>
+---@param self lye.Declarations
+function Declarations:base(uri)
+	self:ensureWorkspace()
+	local top = self.lye.known or {}
+	local root = uri and self.lye:packageRoot(uri) --[[@as string? ]]
+	if root then top = layer(self:package(root), top) end
 	return top
 end
 

@@ -94,15 +94,13 @@ end
 
 --- The key the cache writes a module under, mirrored from `Modules:resolve`.
 ---@param lye table
----@param modules lye.Modules
 ---@param path string
 ---@param text string
-local function keyOf(lye, modules, path, text)
+local function keyOf(lye, path, text)
 	local uri = "file://" .. path
 	local owner = lye:packageRoot(uri)
 	return cache.key("module", rapidhash.hex(text), lye.annotationsDigest or "",
-		(lye.packageDigests or {})[owner] or "", modules:documentsDigest(),
-		plugin.digest(lye:plugins(uri)))
+		(lye.packageDigests or {})[owner] or "", plugin.digest(lye:plugins(uri)))
 end
 
 local PONY = table.concat({
@@ -145,7 +143,7 @@ test.it("a module is analysed once, and a second lookup is a hit", function()
 	test.equal(record.textHash, rapidhash.hex(PONY))
 	test.equal(record.type, first)
 	test.truthy(record.typeHash, "the exported type has an identity")
-	test.equal(record.key, keyOf(lye, modules, lye.paths.pony, PONY))
+	test.equal(record.key, keyOf(lye, lye.paths.pony, PONY))
 	test.truthy(record.declarationNames, "the dependency set is recorded")
 	test.truthy(record.requires, "the requires are recorded")
 end)
@@ -208,7 +206,7 @@ end)
 test.it("a version mismatch or a damaged entry is a miss", function()
 	local lye = prepare({ pony = PONY })
 	local modules = Modules.new(lye)
-	local key = keyOf(lye, modules, lye.paths.pony, PONY)
+	local key = keyOf(lye, lye.paths.pony, PONY)
 	local textKey = rapidhash.hex(PONY)
 	local known = { names = {}, tables = {} }
 
@@ -275,7 +273,7 @@ test.it("a module that returns nothing stays false, and is a hit", function()
 	test.equal(warm:stats().hits, 1)
 	test.equal(warm:stats().misses, 0)
 
-	local entry = cache.load(keyOf(lye, warm, lye.paths.nothing, "return\n"),
+	local entry = cache.load(keyOf(lye, lye.paths.nothing, "return\n"),
 		{ names = {}, tables = {} })
 	test.truthy(entry, "the entry is written")
 	test.equal(entry.module, false, "and keeps the negative answer as false")

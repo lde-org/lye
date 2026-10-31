@@ -251,6 +251,21 @@ local function baseOfLiteral(held)
 	end
 end
 
+--- The base type a literal belongs to, or the type itself when it is not a literal. A union is
+--- widened member by member, so `0 | 1` is `number` and `"a" | nil` is `string | nil`.
+---@param held lye.doc.Type
+---@return lye.doc.Type
+function types.widenLiteral(held)
+	local base = baseOfLiteral(held)
+	if base then return base end
+	if held.variant == "union" and not held.aliasName then
+		local members = {}
+		for index, member in ipairs(held.types) do members[index] = types.widenLiteral(member) end
+		return types.union(members)
+	end
+	return held
+end
+
 --- Whether `held` is the base type a literal belongs to. Compared by shape rather than identity:
 --- `number` parsed from text and the `types.NUMBER` singleton answer the same question.
 ---@param held lye.doc.Type
@@ -397,8 +412,17 @@ function types.keyof(type)
 			---@cast name string
 			keys[#keys + 1] = types.stringValue(name)
 		end
-		if type.indexed and type.indexed.key == "string" then
-			keys[#keys + 1] = types.STRING
+		local indexed = type.indexed
+		if indexed then
+			local key = indexed.key
+			if key == "string" then
+				keys[#keys + 1] = types.STRING
+			elseif key == "integer" or key == "number" then
+				keys[#keys + 1] = types.NUMBER
+			elseif key == "any" then
+				keys[#keys + 1] = types.STRING
+				keys[#keys + 1] = types.NUMBER
+			end
 		end
 		return types.union(keys)
 	end

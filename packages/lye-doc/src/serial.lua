@@ -42,6 +42,27 @@ for name, held in pairs(SINGLETONS) do
 	if held ~= nil then SINGLETON_BY_TABLE[held] = name end
 end
 
+--- A total order over the keys a graph holds. `pairs` has no order, and an entry written one
+--- way and read another is a different hash for the same type; sorting every walk makes the bytes
+--- a function of the graph alone.
+---@param left string|number
+---@param right string|number
+local function keyBefore(left, right)
+	local leftKind, rightKind = type(left), type(right)
+	if leftKind ~= rightKind then return leftKind == "number" end
+	return left < right
+end
+
+--- The fields of a table in that order.
+---@param value table
+---@return table
+local function orderedFields(value)
+	local keys = {}
+	for key in pairs(value) do keys[#keys + 1] = key end
+	table.sort(keys, keyBefore)
+	return keys
+end
+
 --- The index of each table in the graph, in the order they were met, and the list itself.
 ---@param root unknown
 ---@return table<unknown, integer>
@@ -53,9 +74,9 @@ local function index(root)
 		if type(value) ~= "table" or at[value] then return end
 		at[value] = #order + 1
 		order[#order + 1] = value
-		for key, held in pairs(value) do
+		for _, key in ipairs(orderedFields(value)) do
 			if type(key) == "table" then visit(key) end
-			visit(held)
+			visit(value[key])
 		end
 	end
 	visit(root)
@@ -120,8 +141,9 @@ local function stringsOf(order, named)
 		if name then
 			add(name)
 		else
-			for key, held in pairs(value) do
+			for _, key in ipairs(orderedFields(value)) do
 				if type(key) == "string" then add(key) end
+				local held = value[key]
 				if type(held) == "string" then add(held) end
 			end
 		end
@@ -160,10 +182,8 @@ function serial.write(root, known)
 			-- A field of another table is counted apart from the scalars, so every table is made
 			-- before any of them points at another: a class with a field of its own type needs it.
 			local scalars, references = {}, {}
-			for key, held in pairs(value) do
-				if type(key) ~= "string" and type(key) ~= "number" then
-					return nil, "a table is used as a key"
-				end
+			for _, key in ipairs(orderedFields(value)) do
+				local held = value[key]
 				if type(held) == "table" then
 					references[#references + 1] = { key, at[held] }
 				elseif held ~= nil then

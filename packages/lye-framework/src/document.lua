@@ -50,9 +50,9 @@ function Document:applyChange(change, encoding)
 		return
 	end
 
-	-- Recomputed per change: a stale index resolves the range against wrong bytes.
-	self.lineIndex = position.buildLineIndex(self.text)
-
+	-- The index is the one this text was built with: a range is written in the text as it stands,
+	-- and `setText` rebuilds the index for the text that replaces it. Rebuilding here as well made
+	-- a keystroke scan the document twice more than it had to.
 	local from = position.toOffset(
 		self.text, self.lineIndex, range.start.line, range.start.character, encoding
 	)
@@ -109,7 +109,6 @@ function DocumentStore:change(uri, version, changes, encoding)
 	for _, change in ipairs(changes) do
 		document:applyChange(change, encoding)
 	end
-	document.lineIndex = position.buildLineIndex(document.text)
 	return document
 end
 

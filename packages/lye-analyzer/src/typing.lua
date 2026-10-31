@@ -212,7 +212,7 @@ end
 		for _, node in ipairs(nodesOf(parsed, "call")) do
 			if not (reused and reused(node.start, node.stop)) and node.callee then
 				local variable = lookupIn(scopeAt(self, node.start), node.callee, node.start)
-				local bodyIdx = variable and variable.declaration.valueIdx
+				local bodyIdx = variable and variable.declaration and variable.declaration.valueIdx
 				local body = bodyIdx and parsed.nodes[bodyIdx]
 				if body and body.kind == "function" and body ~= node then
 					local params = body.params or {}
@@ -306,7 +306,11 @@ end
 			local declaration = ctx.bodyOwner and ctx.bodyOwner[node.index]
 			local method = declaration and declaration.name:find(":", 1, true)
 			local fnType = inferCtx.fnTypes[node.index]
-			if fnType and fnType.params and not method then
+			-- A reused body already carries the parameters it was inferred with, and no dirty
+			-- parameter can reach it: the caller walk above only updates names in `only`. Walking
+			-- every node to invalidate reads of its name was the whole arena times every function.
+			if fnType and fnType.params and not method
+				and not (reused and reused(node.start, node.stop)) then
 				local params = {}
 				for index, param in ipairs(node.params or {}) do
 					local variable = self.byStart[param.start]
@@ -329,15 +333,16 @@ end
 	end
 
 
-	--- What a generic `for` gives its *second* name: `for key, value in pairs(map)`, `for index,
-	--- item in ipairs(list)`. The iterator's own type carries the first name and nothing about the
-	--- second — `ipairs` is written as returning a function of `V[]` — so the table it walks is
-	--- asked instead, which is what makes `for _, name in ipairs(names)` a string.
+	--- The table a generic `for` walks, read again because the first pass may have cached the
+	--- iterator's placeholder. Only a call of `pairs`, `ipairs` or `next` has one; `for k in next,
+	--- t` hands the function itself and is read from its own signature.
 	---@param ctx lye.analyzer.TypingContext
 	---@param node lye.parser.Node
-	function typing.iteratedValueOf(ctx, node)
-	local parsed = ctx.parsed
-	local inferCtx = ctx.inferCtx
+	---@return lye.doc.Type? walked
+	---@return string? callee
+	local function walkedIterator(ctx, node)
+		local parsed = ctx.parsed
+		local inferCtx = ctx.inferCtx
 		local iterator = node.children and node.children[1]
 		local call = iterator and parsed.nodes[iterator]
 		if not call or call.kind ~= "call" or not call.callee then return nil end
@@ -361,6 +366,38 @@ end
 		-- started as, and answering from it made the loop's second name a string. The claim is
 		-- made again after refinement, when the local has settled.
 		if narrowedUnknown(walked) then return nil end
+		return walked, call.callee
+	end
+
+	--- What a generic `for` gives its *first* name, when the iterator's own signature cannot say:
+	--- `pairs` is declared as returning `fun(table: table<K, V>): K, V`, and `K` is a generic that
+	--- nothing in `pairs(t)` binds — the argument is `T`, not `table<K, V>` — so the key reads as
+	--- unknown. The table it walks says what its keys are, and that is what a `for name in pairs(t)`
+	--- is asking for.
+	---@param ctx lye.analyzer.TypingContext
+	---@param node lye.parser.Node
+	---@return lye.doc.Type? key
+	function typing.iteratedKeyOf(ctx, node)
+		local walked, callee = walkedIterator(ctx, node)
+		if not walked or callee == "ipairs" then return nil end
+		if walked.variant ~= "object" and walked.variant ~= "class" and walked.variant ~= "array"
+			and walked.variant ~= "union" then
+			return nil
+		end
+		local keys = types.keyof(walked)
+		if keys.variant == "keyof" or keys.variant == "never" then return nil end
+		return keys
+	end
+
+	--- What a generic `for` gives its *second* name: `for key, value in pairs(map)`, `for index,
+	--- item in ipairs(list)`. The iterator's own type carries the first name and nothing about the
+	--- second — `ipairs` is written as returning a function of `V[]` — so the table it walks is
+	--- asked instead, which is what makes `for _, name in ipairs(names)` a string.
+	---@param ctx lye.analyzer.TypingContext
+	---@param node lye.parser.Node
+	function typing.iteratedValueOf(ctx, node)
+		local walked = walkedIterator(ctx, node)
+		if not walked then return nil end
 		-- A list or an index signature says what it holds; a table of named fields is what `pairs`
 		-- walks, and its values are what the second name gets.
 		local held = types.indexResult(walked, nil)
@@ -564,7 +601,11 @@ end
 						if isNumeric then
 							wanted = types.NUMBER
 						elseif position == 1 then
-							if children ~= nil then
+							-- `pairs(t)` names its key as a generic the call cannot bind; the table
+							-- it walks knows. Everything else takes the iterator's own first result,
+							-- which is what `ipairs` states the index is.
+							wanted = typing.iteratedKeyOf(ctx, owner)
+							if wanted == nil and children ~= nil then
 								local yielded = infer.at(inferCtx, children[1])
 								if types.isFn(yielded) then wanted = yielded.returns end
 							end

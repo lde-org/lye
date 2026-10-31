@@ -12,9 +12,19 @@ ffi.cdef [[
 	long write(int fd, const void *buf, size_t count);
 	int _setmode(int fd, int mode);
 	void exit(int status);
+	struct pollfd { int fd; short events; short revents; };
+	int poll(struct pollfd *fds, unsigned long nfds, int timeout);
+	int usleep(unsigned int microseconds);
+	void Sleep(unsigned int milliseconds);
 ]]
 
 local C = ffi.C
+
+-- Waiting for input with a bound is what lets the server coalesce a burst of keystrokes. A blocking
+-- read cannot: the listener would sit in `read` while the debounce ran. Both `poll` and the sleep
+-- used where it is absent are declared above so the checker can see what the branches call; a
+-- symbol a platform does not have resolves only when the call is made, and that call is guarded.
+local HAS_POLL = ffi.os ~= "Windows"
 
 if ffi.os == "Windows" then
 	local O_BINARY = 0x8000
@@ -99,6 +109,41 @@ end
 ---@param code integer
 function stdio.exit(code)
 	C.exit(code)
+end
+
+--- Wait until input is readable or `milliseconds` pass. True means a read will make progress (or
+--- report end of stream); false means the deadline passed with nothing waiting. A system without
+--- `poll` sleeps the interval and reports the deadline, so the caller retries its work rather than
+--- blocking input forever.
+---@param milliseconds integer
+---@return boolean readable
+function stdio.wait(milliseconds)
+	if milliseconds < 0 then return false end
+	if HAS_POLL then
+		local fds = ffi.new("struct pollfd[1]")
+		fds[0].fd, fds[0].events = 0, 1 -- POLLIN
+		local ready = tonumber(C.poll(fds, 1, milliseconds)) or 0
+		return ready > 0
+	end
+	if ffi.os == "Windows" then
+		C.Sleep(milliseconds)
+	else
+		C.usleep(milliseconds * 1000)
+	end
+	return false
+end
+
+--- Whether a read would make progress now. A zero timeout is the check, not a wait; the caller
+--- uses it to leave a pause for later when the editor is already sending the next key.
+---@return boolean readable
+function stdio.readable()
+	if not HAS_POLL then return false end
+	local fds = ffi.new("struct pollfd[1]")
+	fds[0].fd, fds[0].events = 0, 1 -- POLLIN
+	local ready = tonumber(C.poll(fds, 1, 0)) or 0
+	-- A hung-up stream is not an editor about to send a key: it is the end of the session, and
+	-- the work can run.
+	return ready > 0 and (fds[0].revents % 2) == 1
 end
 
 return stdio

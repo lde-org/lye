@@ -192,10 +192,16 @@ function Connection:listen()
 		end
 
 		-- Bytes still in hand mean more is already on its way, so this is not the pause between
-		-- bursts and the work can wait for the one that is.
+		-- bursts and the work can wait for the one that is. A handler may ask for a delay: the
+		-- server then waits for the first of that deadline or more input, so a keystroke inside a
+		-- burst cancels the work rather than being stuck behind it.
 		if self.onIdle and self.chunk.n == 0 then
-			local isHandled, err = pcall(self.onIdle)
-			assert(isHandled, err)
+			while true do
+				local isHandled, delay = pcall(self.onIdle)
+				assert(isHandled, delay)
+				if type(delay) ~= "number" or delay <= 0 then break end
+				if stdio.wait(math.ceil(delay)) then break end
+			end
 		end
 	end
 end

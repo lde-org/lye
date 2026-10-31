@@ -141,7 +141,8 @@ local newTable = require("table.new")
 ---@field definition boolean? the file describes a library rather than an implementation
 ---@field statementStart integer? the byte the top-level statement now being parsed began at
 ---@field scopeStarts lye.parser.Frame[]
----@field scopes_ lye.parser.Scope[]
+---@field scopes_ lye.parser.Scope[] every scope in the order it opened, which is source order
+---@field lastScope lye.parser.Scope? the scope closed last, for the statement that reads it back
 ---@field tableFields table<integer, table<string, string>> field kinds per table literal
 ---@field tableIndexes table<integer, integer[]> positional element indices per table literal
 ---@field byKind table<string, lye.parser.Node[]> every node, listed under its kind, in emission order
@@ -290,6 +291,7 @@ function Parser.new(source, resume, definition)
 		scopes = { {} },
 		scopeStarts = {},
 		scopes_ = {},
+		lastScope = nil,
 		tableFields = {},
 		tableFieldValues = {},
 		tableIndexes = {},
@@ -785,7 +787,16 @@ function Parser:pushScope(start, conditionIdx)
 	assert(start, "pushScope needs the scope's start offset")
 	self.depth += 1
 	self.scopes[#self.scopes + 1] = {}
-	self.scopeStarts[#self.scopeStarts + 1] = { start = start, conditionIdx = conditionIdx }
+	-- The record is made where the scope opens and filled where it closes, so the list a reader
+	-- gets is in source order: a flat list of post-order records was not, and every reader of it
+	-- sorted two thousand scopes to put them back.
+	local record = {
+		kind = "scope", start = start, depth = self.depth, conditionIdx = conditionIdx,
+	}
+	self.scopes_[#self.scopes_ + 1] = record
+	self.scopeStarts[#self.scopeStarts + 1] = {
+		start = start, conditionIdx = conditionIdx, record = record,
+	}
 end
 
 ---@param self lye.parser.Parser
@@ -796,10 +807,10 @@ function Parser:popScope(stop, kind)
 	local frame = self.scopeStarts[#self.scopeStarts]
 	self.scopeStarts[#self.scopeStarts] = nil
 	if frame then
-		self.scopes_[#self.scopes_ + 1] = {
-			kind = "scope", branch = kind, start = frame.start, stop = stop, depth = self.depth,
-			conditionIdx = frame.conditionIdx,
-		}
+		local record = frame.record
+		record.stop = stop
+		record.branch = kind
+		self.lastScope = record
 	end
 	self.depth -= 1
 end

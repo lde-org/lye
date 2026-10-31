@@ -9,7 +9,6 @@
 
 ---@class ffi.cdecl*: string
 ---@class ffi.cdata*: userdata
----@field [string] any
 ---@alias ffi.ct*     ffi.ctype*|ffi.cdecl*|ffi.cdata*
 
 ---@class ffi.cb*: ffi.cdata*
