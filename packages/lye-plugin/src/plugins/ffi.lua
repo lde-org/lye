@@ -72,6 +72,44 @@ local function cdefTextStart(written, argument, offset)
 	return argument.start + opened + offset - 1
 end
 
+--- The string a call hands to `ffi.cdef`. Directly, that is the first argument. The common
+--- `pcall(ffi.cdef, [[...]])` spelling passes the function as a value instead, so the call the
+--- walk sees is `pcall`; its second argument (third for `xpcall`, after the message handler) is
+--- still the cdef text the rest of the file is read against.
+---@param parsed_ lye.parser.Result
+---@param node lye.parser.Node
+---@param callName fun(node: lye.parser.Node): string?
+---@return lye.parser.Node? argument
+local function cdefArgument(parsed_, node, callName)
+	local called = callName and callName(node)
+	if not called then
+		-- A plain call has no field, and the analyzer's `callName` is about dotted names: `pcall`
+		-- is the prefix it targets, not a field of one.
+		local target = node.target and parsed_.nodes[node.target]
+		if target and target.kind == "prefix" then called = target.callee end
+	end
+	local position
+	if called == "ffi.cdef" then
+		position = 1
+	elseif called == "pcall" then
+		position = 2
+	elseif called == "xpcall" then
+		position = 3
+	else
+		return nil
+	end
+	if position > 1 then
+		local first = node.args and node.args[1] and parsed_.nodes[node.args[1]]
+		if not first or first.kind ~= "index" or first.field ~= "cdef" then return nil end
+		local target = first.target and parsed_.nodes[first.target]
+		if not target or target.kind ~= "prefix" or target.callee ~= "ffi" then return nil end
+	end
+	local argument = node.args and node.args[position] and parsed_.nodes[node.args[position]]
+	if argument and argument.kind == "string" and type(argument.value) == "string" then
+		return argument
+	end
+end
+
 --- The dotted name a call is written with, as the analyzer names it. `context.callName` is the
 --- analyzer's own reader; the fallback keeps the colour hook usable when a caller hands it only a
 --- parse tree.
@@ -96,24 +134,22 @@ function ffiPlugin.tokens(context)
 	-- The calls of the document, from the index the parser keeps: a plugin is asked about
 	-- the same document on every keystroke, and walking every node to find a call is the walk
 	-- this one is over.
+	---@param node lye.parser.Node
+	local function nameOf(node) return callNameOf(context, node) end
 	for _, node in ipairs(parsed_.byKind.call or {}) do
-		local args = node.args
-		if node.kind == "call" and args and args[1] then
-			if callNameOf(context, node) == "ffi.cdef" then
-				local argument = parsed_.nodes[args[1]]
-				if argument and argument.kind == "string" and type(argument.value) == "string" then
-					local from = cdef.textStart(text, argument.start, argument.stop)
-					---@cast from integer
-					for _, span in ipairs(blockOf(argument.value).spans) do
-						local kind = DECLARED[span.kind]
-						local first, last = from + span.start - 1, from + span.stop - 1
-						-- What lye read out of text a lowering plugin wrote has no place in the
-						-- document, and a block the plugin wrote is one lye should not colour.
-						if kind and not map:rangeIsWritten(first, last) then
-							local at, stop = map:toOriginalRange(first, last)
-							spans[#spans + 1] = { from = at, to = stop, type = kind }
-						end
-					end
+		local argument = cdefArgument(parsed_, node, nameOf)
+		if argument then
+			local written = argument.value --[[@as string]]
+			local from = cdef.textStart(text, argument.start, argument.stop)
+			---@cast from integer
+			for _, span in ipairs(blockOf(written).spans) do
+				local kind = DECLARED[span.kind]
+				local first, last = from + span.start - 1, from + span.stop - 1
+				-- What lye read out of text a lowering plugin wrote has no place in the
+				-- document, and a block the plugin wrote is one lye should not colour.
+				if kind and not map:rangeIsWritten(first, last) then
+					local at, stop = map:toOriginalRange(first, last)
+					spans[#spans + 1] = { from = at, to = stop, type = kind }
 				end
 			end
 		end
@@ -292,28 +328,41 @@ function ffiPlugin.types(context)
 	if not source:find("cdef", 1, true) then return nil end
 	local cdefs, files, diagnostics = {}, {}, {}
 	for _, node in ipairs(parsed_.byKind.call or {}) do
-		if callName(node) == "ffi.cdef" then
-			local argument = node.args and node.args[1] and parsed_.nodes[node.args[1]]
-			if argument and argument.kind == "string" and type(argument.value) == "string" then
-				local held = blockOf(argument.value)
-				cdefs[#cdefs + 1] = held.declared
-				files[#files + 1] = held.annotations
-				-- A declaration that could not be read is reported inside the string, so the
-				-- offsets the parser gives have to be mapped before they mean anything. What *was*
-				-- readable is still used.
-				for _, problem in ipairs(held.declared.problems) do
-					local at = cdefTextStart(source, argument, problem.start)
-					diagnostics[#diagnostics + 1] = {
-						message = "cdef: " .. problem.message,
-						severity = 1,
-						start = at,
-						stop = at + math.max(problem.stop - problem.start, 0),
-					}
-				end
+		local argument = cdefArgument(parsed_, node, callName)
+		if argument then
+			local written = argument.value --[[@as string]]
+			local held = blockOf(written)
+			cdefs[#cdefs + 1] = held.declared
+			files[#files + 1] = held.annotations
+			-- A declaration that could not be read is reported inside the string, so the offsets
+			-- the parser gives have to be mapped before they mean anything. What *was* readable
+			-- is still used.
+			for _, problem in ipairs(held.declared.problems) do
+				local at = cdefTextStart(source, argument, problem.start)
+				diagnostics[#diagnostics + 1] = {
+					message = "cdef: " .. problem.message,
+					severity = 1,
+					start = at,
+					stop = at + math.max(problem.stop - problem.start, 0),
+				}
 			end
 		end
 	end
 	if #cdefs == 0 then return nil end
+	-- A cdef call adds to the engine's one type namespace: a later block may name a type an
+	-- earlier one declared. Each block is parsed on its own for its colours and annotations, so
+	-- that reference reads as unknown inside the block; it is not a problem if some block here
+	-- declares the name.
+	local declaredNames = {}
+	for _, declared in ipairs(cdefs) do
+		for name in pairs(declared.types) do declaredNames[name] = true end
+	end
+	local kept = {}
+	for _, entry in ipairs(diagnostics) do
+		local missing = entry.message:match("^cdef: unknown type `([^`]+)`$")
+		if not (missing and declaredNames[missing]) then kept[#kept + 1] = entry end
+	end
+	diagnostics = kept
 	---@param resolve fun(text: string): lye.doc.Type?
 	---@return lye.plugin.TypeProviders?
 	local function attach(resolve)

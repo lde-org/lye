@@ -397,6 +397,52 @@ test.it("colours an ffi.cdef block from our own parse of it, through the shipped
 	end
 end)
 
+test.it("reads a cdef passed to pcall as a value", function()
+	-- `pcall(ffi.cdef, [[...]])` passes the cdef function rather than calling it directly. The
+	-- call the tree records is the outer `pcall`, so the block is its second argument.
+	local Parser = require("lye-parser")
+	local cdefPlugin = require("lye-plugin.plugins.ffi")
+
+	local written = table.concat({
+		"local ffi = require(\"ffi\")\n",
+		"pcall(ffi.cdef, [[\n",
+		"typedef struct { int x; } Wrapped;\n",
+		"]])\n",
+	}, "")
+	local parsed = Parser.new(written):parse()
+	local context = {
+		uri = "file:///f.lua", source = written, text = written, parsed = parsed,
+		map = source.lower(written, {}),
+	}
+	---@cast context lye.plugin.TokenContext
+	local marks = {}
+	for _, span in ipairs(cdefPlugin.tokens(context)) do
+		marks[#marks + 1] = written:sub(span.from, span.to) .. ":" .. span.type
+	end
+	test.includes(table.concat(marks, " "), "typedef:keyword", "the keyword")
+	test.includes(table.concat(marks, " "), "Wrapped:class", "and the name it declared")
+end)
+
+test.it("keeps a type an earlier pcall cdef declared", function()
+	-- LuaJIT keeps one cdef namespace, so a later block may name a type an earlier call added.
+	-- Parsed block by block the reference reads as unknown; that is not a problem for the file.
+	local Parser = require("lye-parser")
+	local cdefPlugin = require("lye-plugin.plugins.ffi")
+
+	local written = table.concat({
+		"local ffi = require(\"ffi\")\n",
+		"pcall(ffi.cdef, \"typedef struct { long tv_sec; long tv_nsec; } timespec;\")\n",
+		"pcall(ffi.cdef, \"int clock_gettime(int clk_id, timespec *tp);\")\n",
+	}, "")
+	local parsed = Parser.new(written):parse()
+	local context = {
+		uri = "file:///f.lua", source = written, parsed = parsed,
+	}
+	---@cast context lye.plugin.TypeContext
+	local result = assert(cdefPlugin.types(context))
+	test.equal(#(result.diagnostics or {}), 0, "the second block's type is known from the first")
+end)
+
 test.it("leaves a cdef block a lowering plugin wrote out of it", function()
 	-- The block is in text lye was handed by another plugin, so there is no place in the document
 	-- for its colours: a plugin colours the language it reads, and this is not the reader's.

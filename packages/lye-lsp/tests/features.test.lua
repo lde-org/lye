@@ -569,6 +569,23 @@ test.it("refuses to index a type that holds nothing at a key", function()
 	test.truthy(shown:match("ffi%.int"), "an array is indexed: " .. shown)
 end)
 
+test.it("reads a cdef passed to pcall before the type it declares is used", function()
+	-- The common Windows probe is `pcall(ffi.cdef, [[...]])`: the cdef is an argument to pcall
+	-- rather than the callee of its own call. Its declarations still belong to the file, and
+	-- `ffi.new` has to find the type the block introduced.
+	local source = table.concat({
+		'local ffi = require("ffi")\n',
+		"pcall(ffi.cdef, [[\n",
+		"\ttypedef struct { int x; } Wrapped;\n",
+		"]])\n",
+		'local f = ffi.new("Wrapped")\n',
+		"return f.x\n",
+	}, "")
+	local results = run({ request(2, "textDocument/hover", { line = 4, character = 6 }) }, source)
+	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(shown:match("f: Wrapped"), shown)
+end)
+
 test.it("gives ffi.load the symbols the file's cdef declared", function()
 	-- A cdef declares the functions of one library, and the file that wrote it is what knows them:
 	-- every symbol the process has seen would be a list nobody can read.
