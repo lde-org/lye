@@ -461,6 +461,43 @@ test.it("narrows every member of a union to the value the branch holds", functio
 	test.equal(doctype.display(doctype.narrowTruthiness(doctype.BOOLEAN, false)), "false")
 end)
 
+test.it("binds the variable a conditional's extends names", function()
+	-- `T extends Option<infer V> ? V : never` is how a descriptor's value type is read. The
+	-- variable is bound by the match, and an optional marker in the branch belongs to `V`, not to
+	-- a nested conditional's question mark.
+	local resolver = function(text)
+		if text == "T" then return doctype.extern("T") end
+		if text == "Option<infer V>" then
+			return doctype.classType("Option", { doctype.infer("V") })
+		end
+	end
+	local condition = parse("T extends Option<infer V> ? V? : never", resolver)
+	local option = doctype.classType("Option", { doctype.NUMBER })
+	local resolved = doctype.substitute(condition, { T = option })
+	test.equal(doctype.display(resolved), "number?")
+	test.equal(doctype.display(doctype.substitute(condition, { T = doctype.STRING })), "never")
+end)
+
+test.it("reads a mapped value indexed through two keys", function()
+	-- `T[K]["value"]` is two accesses: the first is still unresolved when the mapped type is
+	-- written, so it has to survive until the key substitution gives it a class to read.
+	local function point(arg)
+		return doctype.classType("Point", { arg }, { value = arg })
+	end
+	local shape = doctype.object({ name = point(doctype.STRING) })
+	local mapped = doctype.mapped("K", doctype.keyof(shape),
+		doctype.indexedAccess(doctype.indexedAccess(shape, doctype.extern("K")),
+			doctype.stringValue("value")))
+	test.equal(doctype.display(doctype.fieldOf(mapped, "name")), "string")
+end)
+
+test.it("checks a mapped shape where a parameter is declared", function()
+	local shape = doctype.object({ a = doctype.NUMBER, b = doctype.STRING })
+	local mapped = doctype.mapped("K", doctype.keyof(shape), doctype.NUMBER)
+	test.equal(doctype.satisfies(doctype.object({ a = doctype.NUMBER, b = doctype.NUMBER }), mapped), true)
+	test.equal(doctype.satisfies(doctype.object({ a = doctype.NUMBER, b = doctype.STRING }), mapped), false)
+end)
+
 test.it("brackets a union an array display holds", function()
 	local element = doctype.union({ parse("{ a: number }"), parse("{ b: string }") })
 	test.equal(doctype.display(doctype.array(element)), "({ a: number }|{ b: string })[]")

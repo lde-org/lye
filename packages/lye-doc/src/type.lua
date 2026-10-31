@@ -28,6 +28,7 @@ local types = {}
 ---| { variant: "indexed", object: lye.doc.Type, key: lye.doc.Type }
 ---| { variant: "conditional", check: lye.doc.Type, extends: lye.doc.Type, thenType: lye.doc.Type, elseType: lye.doc.Type }
 ---| { variant: "mapped", key: string, source: lye.doc.Type, value: lye.doc.Type }
+---| { variant: "infer", name: string }
 ---| { variant: "template", parts: (string|lye.doc.Type)[] }
 ---| { variant: "class", name: string, args: lye.doc.Type[], fields: table<string, lye.doc.Type>, parents: lye.doc.Type[], indexed: { key: string, type: lye.doc.Type }?, metatable: lye.doc.Type?, visibility: table<string, string>?, fromDocument: boolean?, hasWorkspaceMethods: boolean?, operators: table<string, lye.doc.Type>?, deprecatedFields: table<string, boolean>? }
 ---| { variant: "never" }
@@ -229,6 +230,10 @@ types.FUNCTION = types.fn({}, types.ANY_TYPE, true)
 
 ---@param name string
 function types.extern(name) return make("extern", { name = name }) end
+
+--- A variable bound by the `extends` side of a conditional: `T extends Option<infer V> ? V : nil`.
+---@param name string
+function types.infer(name) return make("infer", { name = name }) end
 
 ---@param inner lye.doc.Type
 function types.array(inner) return make("array", { type = inner }) end
@@ -450,7 +455,15 @@ function types.indexedAccess(object, key)
 		local first, last = key.name:sub(1, 1), key.name:sub(-1)
 		if (first == '"' or first == "'") and last == first then name = key.name:sub(2, -2) end
 	end
-	if name then return types.indexResult(object, name) end
+	if name then
+		-- A field of a value that is not known yet is another indexed access, not an unknown:
+		-- `T[K]["value"]` must survive until the substitution gives `T[K]` a shape.
+		if object.variant == "indexed" or object.variant == "extern" or object.variant == "keyof"
+			or object.variant == "mapped" or object.variant == "conditional" then
+			return make("indexed", { object = object, key = key })
+		end
+		return types.indexResult(object, name)
+	end
 	if key.variant == "keyof" then
 		local values = {}
 		for _, member in ipairs((object.variant == "union" and object.types) or { object }) do
@@ -528,14 +541,105 @@ function types.template(parts)
 	return make("template", { parts = parts })
 end
 
---- A conditional type, evaluated as soon as both sides are known.
+--- Whether a pattern names an `infer` variable anywhere.
+---@param type lye.doc.Type?
+---@return boolean
+local function hasInfer(type)
+	if not type then return false end
+	if type.variant == "infer" then return true end
+	if type.variant == "class" then
+		for _, arg in ipairs(type.args or {}) do if hasInfer(arg) then return true end end
+		return false
+	end
+	if type.variant == "union" or type.variant == "intersection" then
+		for _, member in ipairs(type.types) do if hasInfer(member) then return true end end
+		return false
+	end
+	if type.variant == "array" then return hasInfer(type.type) end
+	if type.variant == "fn" then
+		for _, param in ipairs(type.params) do if hasInfer(param) then return true end end
+		return hasInfer(type.returns) or hasInfer(type.variadic)
+	end
+	if type.variant == "object" then
+		for _, field in pairs(type.fields or {}) do if hasInfer(field) then return true end end
+		return false
+	end
+	return false
+end
+
+--- Match a condition's `extends` pattern against a value, binding its `infer` names.
+--- A class only matches a class of the same name; its arguments are matched in order.
+---@param pattern lye.doc.Type
+---@param actual lye.doc.Type
+---@param bindings table<string, lye.doc.Type>
+---@return boolean
+local function matchPattern(pattern, actual, bindings)
+	if pattern.variant == "infer" then
+		local name = pattern.name
+		local held = bindings[name]
+		if held then
+			return types.display(held) == types.display(actual) or types.satisfies(actual, held)
+		end
+		bindings[name] = actual
+		return true
+	end
+	if pattern.variant == "union" then
+		for _, member in ipairs(pattern.types) do
+			local trial = {}
+			for name, held in pairs(bindings) do trial[name] = held end
+			if matchPattern(member, actual, trial) then
+				for name, held in pairs(trial) do bindings[name] = held end
+				return true
+			end
+		end
+		return false
+	end
+	if pattern.variant == "class" then
+		if actual.variant ~= "class" or actual.name ~= pattern.name then return false end
+		if #(pattern.args or {}) ~= #(actual.args or {}) then return false end
+		for index, arg in ipairs(pattern.args or {}) do
+			if not matchPattern(arg, actual.args[index], bindings) then return false end
+		end
+		return true
+	end
+	if pattern.variant == "array" then
+		return actual.variant == "array" and matchPattern(pattern.type, actual.type, bindings)
+	end
+	if pattern.variant == "fn" then
+		if actual.variant ~= "fn" or #pattern.params ~= #actual.params then return false end
+		for index, param in ipairs(pattern.params) do
+			if not matchPattern(param, actual.params[index], bindings) then return false end
+		end
+		return matchPattern(pattern.returns, actual.returns, bindings)
+	end
+	return types.satisfies(actual, pattern)
+end
+
+--- A conditional type, evaluated as soon as both sides are known. A conditional whose check is a
+--- union distributes over its members when its pattern binds an `infer`: the result is the union
+--- of each member's branch.
 ---@param check lye.doc.Type
 ---@param extends lye.doc.Type
 ---@param thenType lye.doc.Type
 ---@param elseType lye.doc.Type
 function types.conditional(check, extends, thenType, elseType)
-	if not types.isSymbolic(check) and not types.isSymbolic(extends) then
+	local inferred = hasInfer(extends)
+	if not inferred and not types.isSymbolic(check) and not types.isSymbolic(extends) then
 		return types.satisfies(check, extends) and thenType or elseType
+	end
+	if inferred and not types.isSymbolic(check) then
+		if check.variant == "union" then
+			local members = {}
+			for index, member in ipairs(check.types) do
+				members[index] = types.conditional(member, extends, thenType, elseType)
+			end
+			return types.union(members)
+		end
+		local bindings = {}
+		if matchPattern(extends, check, bindings) then
+			return types.substitute(thenType, bindings)
+		end
+		return elseType
 	end
 	return make("conditional", {
 		check = check, extends = extends, thenType = thenType, elseType = elseType,
@@ -776,6 +880,18 @@ function fits(type, constraint, depth, seen)
 			return fits(answer, constraint, depth + 1, seen)
 		end
 		return true
+	end
+	-- A mapped type is a shape once its source names keys it can enumerate. It is expanded here
+	-- rather than compared as an operation: `{[K in keyof T]: number}` is a parameter's shape, and
+	-- an object with a string field has to be refused by it.
+	if constraint.variant == "mapped" or type.variant == "mapped" then
+		local decided = constraint.variant == "mapped" and constraint or type
+		---@cast decided { key: string, source: lye.doc.Type, value: lye.doc.Type }
+		if types.isSymbolic(decided.source) then return true end
+		local expanded = types.mapped(decided.key, decided.source, decided.value)
+		if expanded.variant == "mapped" then return true end
+		if constraint.variant == "mapped" then return fits(type, expanded, depth + 1, seen) end
+		return fits(expanded, constraint, depth + 1, seen)
 	end
 	if constraint.variant == "template" or type.variant == "template" then
 		return type.variant == "string" or type.variant == "template"
@@ -2059,6 +2175,7 @@ end
 ---@return lye.doc.Type
 local function substituted(type, bindings, seen)
 	if type.variant == "extern" then return bindings[type.name] or type end
+	if type.variant == "infer" then return type end
 	if type.variant == "fn" then
 		local seenHere = seen[type]
 		if seenHere then return seenHere end
@@ -2256,7 +2373,14 @@ local function conditionalParts(text)
 		local char = text:sub(at, at)
 		if char == "<" or char == "{" or char == "(" or char == "[" then depth += 1
 		elseif char == ">" or char == "}" or char == ")" or char == "]" then depth -= 1
-		elseif depth == 0 and char == "?" then condDepth += 1
+		elseif depth == 0 and char == "?" then
+			-- A `?` that follows a type with no space is its optional marker (`V? : never`), not
+			-- the question of a nested conditional. Counting it made the innermost branch fail to
+			-- read at all, and the whole conditional fell through to an unresolved name.
+			local after = text:sub(at + 1):match("^%s*(.)")
+			local before = text:sub(at - 1, at - 1)
+			local optional = after == ":" or (before ~= " " and after ~= nil and after:match("[|%]%),}]"))
+			if not optional then condDepth += 1 end
 		elseif depth == 0 and char == ":" then
 			if condDepth == 0 then colon = at break end
 			condDepth -= 1
@@ -2269,12 +2393,60 @@ local function conditionalParts(text)
 		(text:sub(colon + 1):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+--- Split the outermost indexed access: `T[K]["value"]` is `T[K]` indexed by `"value"`.
+--- A pattern anchored on the last `]` cannot do it, because the key of the outer access is the
+--- text between the last top-level `[` and that `]`; a quoted key may itself contain brackets.
+---@param text string
+---@return string? base
+---@return string? key
+local function indexedParts(text)
+	local depth, start, at = 0, nil, 1
+	while at <= #text do
+		local char = text:sub(at, at)
+		if char == '"' or char == "'" then
+			local quote, from = char, at
+			at += 1
+			while at <= #text do
+				local held = text:sub(at, at)
+				if held == "\\" then at += 2
+				elseif held == quote then at += 1 break
+				else at += 1 end
+			end
+			-- Nothing after a string literal can be the base of an access this walk is inside.
+			if from == 1 and at - 1 == #text then return nil, nil end
+		elseif char == "[" then
+			if depth == 0 then start = at end
+			depth += 1
+			at += 1
+		elseif char == "]" then
+			if depth > 0 then
+				depth -= 1
+				if depth == 0 then
+					if start and at == #text then
+						return text:sub(1, start - 1), text:sub(start + 1, at - 1)
+					end
+					start = nil
+				end
+			end
+			at += 1
+		else
+			at += 1
+		end
+	end
+	return nil, nil
+end
+
 ---@param text string?
 ---@param resolve (fun(text: string): lye.doc.Type?)?
 ---@return lye.doc.Type?
 function types.parse(text, resolve)
 	local trimmed = (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	if trimmed == "" then return nil end
+
+	-- `infer X` is a variable the `extends` side of a conditional binds. It is read before
+	-- `typeEnd`, which would otherwise cut the name at the space.
+	local inferred = trimmed:match("^infer%s+([%w_%.]+)$")
+	if inferred then return types.infer(inferred) end
 
 	-- A signature is read before the bar and the marker that may follow its return, because both
 	-- follow the *return type* and belong to it: `fun(): T?` returns a `T?` rather than being a
@@ -2408,8 +2580,8 @@ function types.parse(text, resolve)
 
 	-- `T["field"]`, `T[K]` and `keyof T`: an indexed access is the value at that key. A key that
 	-- is still a name keeps the access until the substitution answers both sides.
-	local baseText, keyText = trimmed:match("^(.-)%[(.-)%]$")
-	if baseText and keyText ~= "" then
+	local baseText, keyText = indexedParts(trimmed)
+	if baseText and keyText and keyText ~= "" then
 		local object = types.parse(baseText, resolve)
 		local key = types.parse(keyText, resolve)
 		if object and key then return types.indexedAccess(object, key) end
@@ -2553,6 +2725,7 @@ function types.displayOf(type)
 		end
 		return table.concat(parts, " & ")
 	end
+	if type.variant == "infer" then return "infer " .. type.name end
 	if type.variant == "keyof" then return "keyof " .. types.display(type.type) end
 	if type.variant == "indexed" then
 		return types.display(type.object) .. "[" .. types.display(type.key) .. "]"

@@ -2704,6 +2704,18 @@ test.it("reads a string key in brackets as a field", function()
 	test.equal(#analyzer.analyze(source).diagnostics, 0)
 end)
 
+test.it("checks a mapped parameter's shape at the call site", function()
+	-- A mapped parameter is a shape, not an operation left for the reader: every key of the
+	-- source has to hold the mapped value, and a string in a number field is a mistake.
+	local source = "---@param spec { [K in keyof { a: number, b: string }]: number }\n"
+		.. "local function takesMapped(spec) end\n"
+		.. "takesMapped({ a = 1, b = 2 })\n"
+		.. "takesMapped({ a = 1, b = \"x\" })\n"
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 1)
+	test.includes(result.diagnostics[1].message, "b")
+end)
+
 test.it("does not cast an expression of another branch from a trailing `@cast`", function()
 	-- `else ---@cast flag string` has no expression before it: the node ending just above the
 	-- annotation belongs to the branch that came before, and casting it turned that branch's

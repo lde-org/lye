@@ -206,6 +206,18 @@ test.it("substitutes the arguments of a generic alias", function()
 		"an alias with no argument holds unknown, as a class does")
 end)
 
+test.it("substitutes a class's parameters into a method added after it was built", function()
+	-- `function Box:get()` is written after the class, and a Box<number> built before it has
+	-- already had its fields read. The method has to arrive as `number`, not as the raw `T`.
+	local namespace = read("---@class Box<T>\nlocal Box = {}\n")
+	local resolve = classes.resolver(namespace)
+	local built = resolve("Box<number>")
+	---@cast built lye.doc.Type
+	classes.evolve(namespace, "Box", "get", doctype.fn({}, doctype.extern("T")))
+	local get = built.fields.get
+	test.equal(doctype.display(get.returns), "number")
+end)
+
 test.it("reads an alias that names a class declared below it", function()
 	local namespace = read(table.concat({
 		"---@alias Ids Point[]\n",

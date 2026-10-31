@@ -491,9 +491,76 @@ function classes.evolve(namespace, className, field, method)
 	end
 	if className ~= bare then namespace.evolved[className] = fields end
 	fields[field] = method
+	-- A method written on a generic class is written in that class's parameters. A class type
+	-- built before the method was declared already had its fields built, so the method added now
+	-- has to be substituted with that instance's arguments rather than stored as the raw `T`.
+	local types = require("lye-doc.type")
+	local declared = namespace.classes[bare] or namespace.classes[className]
+	local params = declared and declared.params or {}
+
+	-- Substitution builds fresh class types, and a method's result must be the class type the
+	-- document already has: the fresh copy does not receive the methods declared after it, which
+	-- left `option():short():number()` with an option whose `number` was declared later. A class
+	-- type is keyed by its name and arguments, and the first built one is the canonical table.
+	---@param classType lye.doc.Type
+	---@return string?
+	local function classKey(classType)
+		if classType.variant ~= "class" or not classType.name then return nil end
+		local args = {}
+		for index, arg in ipairs(classType.args or {}) do args[index] = types.display(arg) end
+		return classType.name .. "<" .. table.concat(args, ",") .. ">"
+	end
+	local canonical = {}
+	for _, classType in pairs(namespace.built or {}) do
+		if classType.variant == "class" and classType.name then
+			local key = classKey(classType)
+			if key and not canonical[key] then canonical[key] = classType end
+		end
+	end
+	---@param held lye.doc.Type?
+	---@param seen table<lye.doc.Type, boolean>
+	---@return lye.doc.Type?
+	local function canonicalize(held, seen)
+		if not held then return held end
+		if held.variant == "class" then
+			local key = classKey(held)
+			return key and canonical[key] or held
+		end
+		if seen[held] then return held end
+		seen[held] = true
+		if held.variant == "fn" then
+			for index, param in ipairs(held.params or {}) do held.params[index] = canonicalize(param, seen) end
+			held.returns = canonicalize(held.returns, seen)
+			held.variadic = canonicalize(held.variadic, seen)
+			local values = held.values
+			if values then
+				for index, value in ipairs(values) do values[index] = canonicalize(value, seen) end
+			end
+		elseif held.variant == "union" or held.variant == "intersection" then
+			for index, member in ipairs(held.types) do held.types[index] = canonicalize(member, seen) end
+		elseif held.variant == "array" then
+			held.type = canonicalize(held.type, seen)
+		end
+		return held
+	end
+
 	for _, classType in pairs(namespace.built or {}) do
 		if classType.variant == "class" and classType.name and bareName(classType.name) == bare then
-			classType.fields[field] = method
+			---@type table<string, lye.doc.Type>?
+			local bindings
+			if #params > 0 then
+				bindings = {}
+				for index, param in ipairs(params) do
+					bindings[param] = (classType.args and classType.args[index]) or types.UNKNOWN_TYPE
+				end
+				-- A method may declare a variable with the class's name; that one is the method's,
+				-- not the instance's.
+				if method.variant == "fn" and method.generics then
+					for param in pairs(method.generics) do bindings[param] = nil end
+				end
+			end
+			classType.fields[field] = bindings
+				and canonicalize(types.substitute(method, bindings), {}) or method
 		end
 	end
 end
