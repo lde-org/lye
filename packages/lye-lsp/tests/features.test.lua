@@ -80,6 +80,7 @@ end
 ---@field uri string
 ---@field range lye.test.Range
 ---@field changes table<string, lye.test.Edit[]>?
+---@field resultId string?
 
 ---@class lye.test.WireMessage
 ---@field id integer|string?
@@ -1654,6 +1655,27 @@ test.it("lists symbols from every workspace folder", function()
 	for _, symbol in ipairs(symbols) do names[symbol.name] = true end
 	test.truthy(names.alpha, "the first root's function")
 	test.truthy(names.beta, "and the second root's")
+end)
+
+test.it("answers a semantic-token delta against the answer it held", function()
+	local source = "local x = 1\nreturn x\n"
+	local first = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/semanticTokens/full",
+		params = { textDocument = { uri = "file:///f.lua" } },
+	} }, source)
+	local id = first["2"] and first["2"].resultId
+	test.truthy(id, "the full answer has an identity")
+	local second = run({
+		{ jsonrpc = "2.0", id = 2, method = "textDocument/semanticTokens/full",
+			params = { textDocument = { uri = "file:///f.lua" } } },
+		{ jsonrpc = "2.0", id = 3, method = "textDocument/semanticTokens/full/delta",
+			params = { textDocument = { uri = "file:///f.lua" }, previousResultId = id } },
+	}, source)
+	local delta = second["3"] or {}
+	---@cast delta { resultId: string?, edits: table[]?, data: integer[]? }
+	test.truthy(delta.resultId, "the delta has an identity")
+	test.truthy(delta.edits and #delta.edits == 1, "it replaces the answer with one edit")
+	test.truthy(delta.edits[1].data and #delta.edits[1].data > 0, "carrying the new tokens")
 end)
 
 test.it("spaces a formatted line without touching a string", function()
