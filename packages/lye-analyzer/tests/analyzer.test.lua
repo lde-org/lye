@@ -2704,6 +2704,21 @@ test.it("reads a string key in brackets as a field", function()
 	test.equal(#analyzer.analyze(source).diagnostics, 0)
 end)
 
+test.it("binds const generic arguments into an operation result", function()
+	-- The body is generic, so it is checked against its constraint rather than against one
+	-- instantiation; the call binds the literals and the result is the concatenated string.
+	local source = "---@type fn<const A: string, const B: string>(a: A, b: B) -> A .. B\n"
+		.. "local function concat(a, b)\n\treturn a .. b\nend\n"
+		.. "local text = concat(\"bar\", \"baz\")\n"
+		.. "---@type number\n"
+		.. "local bad = text\n"
+		.. "return text, bad\n"
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 1)
+	test.includes(result.diagnostics[1].message, 'declared as number')
+	test.includes(result.diagnostics[1].message, '"barbaz"')
+end)
+
 test.it("checks a mapped parameter's shape at the call site", function()
 	-- A mapped parameter is a shape, not an operation left for the reader: every key of the
 	-- source has to hold the mapped value, and a string in a number field is a mistake.

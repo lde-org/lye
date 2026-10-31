@@ -821,7 +821,8 @@ end
 						local wanted = callee.params[index + shift]
 						local actual = infer.at(inferCtx, argIdx)
 						if wanted and actual then
-							infer.bind(wanted, actual, callee.generics, bindings)
+							infer.bindArgument(inferCtx, wanted, actual, argIdx, callee.generics,
+								callee.consts, bindings)
 						end
 					end
 					if next(bindings) then
@@ -1093,7 +1094,8 @@ end
 							local wanted = params[index + shift] or calleeType.variadic
 							local actual = infer.at(inferCtx, argIdx)
 							if wanted and actual then
-								infer.bind(wanted, actual, generics, bindings)
+								infer.bindArgument(inferCtx, wanted, actual, argIdx, generics,
+									calleeType.consts, bindings)
 							end
 						end
 					end

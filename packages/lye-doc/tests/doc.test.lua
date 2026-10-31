@@ -461,6 +461,48 @@ test.it("narrows every member of a union to the value the branch holds", functio
 	test.equal(doctype.display(doctype.narrowTruthiness(doctype.BOOLEAN, false)), "false")
 end)
 
+test.it("reads const generic names and folds their result", function()
+	-- `fn<const A: string, const B: string>(a: A, b: B) -> A .. B` binds the literal arguments,
+	-- and the result is the string the expression spells rather than the expression or `string`.
+	---@param text string
+	local resolver = function(text)
+		if text == "A" or text == "B" then return doctype.extern(text) end
+	end
+	local signature = parse("fn<const A: string, const B: string>(a: A, b: B) -> A .. B", resolver)
+	local generics = signature.generics or {}
+	local constraints = signature.constraints or {}
+	test.equal(generics.A, true)
+	test.equal(generics.B, true)
+	test.equal(constraints.A, "string")
+	test.equal(constraints.B, "string")
+	test.equal(doctype.display(signature.returns), "A .. B")
+	local folded = doctype.substitute(signature.returns, {
+		A = doctype.stringValue("bar"),
+		B = doctype.stringValue("baz"),
+	})
+	test.equal(doctype.display(folded), '"barbaz"')
+end)
+
+test.it("folds arithmetic between const generic arguments", function()
+	---@param text string
+	local resolver = function(text)
+		if text == "A" or text == "B" then return doctype.extern(text) end
+	end
+	local cases = {
+		{ "A + B", "5" }, { "A - B", "1" }, { "A * B", "6" }, { "A / B", "1.5" }, { "A ^ B", "9" },
+	}
+	for _, case in ipairs(cases) do
+		local written, expected = case[1], case[2]
+		---@cast written string
+		---@cast expected string
+		local signature = parse("fn<const A: number, const B: number>(a: A, b: B) -> " .. written, resolver)
+		local folded = doctype.substitute(signature.returns, {
+			A = doctype.numberValue(3), B = doctype.numberValue(2),
+		})
+		test.equal(doctype.display(folded), expected, written)
+	end
+end)
+
 test.it("binds the variable a conditional's extends names", function()
 	-- `T extends Option<infer V> ? V : never` is how a descriptor's value type is read. The
 	-- variable is bound by the match, and an optional marker in the branch belongs to `V`, not to

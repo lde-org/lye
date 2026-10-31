@@ -16,7 +16,7 @@ local types = {}
 ---| { variant: "nil" }
 ---| { variant: "void" }
 ---| { variant: "table" }
----| { variant: "fn", params: lye.doc.Type[], returns: lye.doc.Type, isVariadic: boolean?, variadic: lye.doc.Type?, values: lye.doc.Type[]?, overloads: lye.doc.Type[]?, generics: table<string, boolean>?, constraints: table<string, string>?, isMethod: boolean?, isSpread: boolean?, deprecated: boolean?, nodiscard: boolean?, async: boolean? }
+---| { variant: "fn", params: lye.doc.Type[], returns: lye.doc.Type, isVariadic: boolean?, variadic: lye.doc.Type?, values: lye.doc.Type[]?, overloads: lye.doc.Type[]?, generics: table<string, boolean>?, constraints: table<string, string>?, consts: table<string, boolean>?, isMethod: boolean?, isSpread: boolean?, deprecated: boolean?, nodiscard: boolean?, async: boolean? }
 ---| { variant: "any" }
 ---| { variant: "unknown", isMutable: boolean? }
 ---| { variant: "extern", name: string }
@@ -29,6 +29,7 @@ local types = {}
 ---| { variant: "conditional", check: lye.doc.Type, extends: lye.doc.Type, thenType: lye.doc.Type, elseType: lye.doc.Type }
 ---| { variant: "mapped", key: string, source: lye.doc.Type, value: lye.doc.Type }
 ---| { variant: "infer", name: string }
+---| { variant: "operation", op: string, left: lye.doc.Type, right: lye.doc.Type }
 ---| { variant: "template", parts: (string|lye.doc.Type)[] }
 ---| { variant: "class", name: string, args: lye.doc.Type[], fields: table<string, lye.doc.Type>, parents: lye.doc.Type[], indexed: { key: string, type: lye.doc.Type }?, metatable: lye.doc.Type?, visibility: table<string, string>?, fromDocument: boolean?, hasWorkspaceMethods: boolean?, operators: table<string, lye.doc.Type>?, deprecatedFields: table<string, boolean>? }
 ---| { variant: "never" }
@@ -393,6 +394,9 @@ function types.isSymbolic(type)
 	if type.variant == "array" then return types.isSymbolic(type.type) end
 	if type.variant == "keyof" then return types.isSymbolic(type.type) end
 	if type.variant == "indexed" then return types.isSymbolic(type.object) or types.isSymbolic(type.key) end
+	if type.variant == "operation" then
+		return types.isSymbolic(type.left) or types.isSymbolic(type.right)
+	end
 	if type.variant == "conditional" then
 		return types.isSymbolic(type.check) or types.isSymbolic(type.extends)
 	end
@@ -878,6 +882,18 @@ function fits(type, constraint, depth, seen)
 				and decided.thenType or decided.elseType
 			if constraint.variant == "conditional" then return fits(type, answer, depth + 1, seen) end
 			return fits(answer, constraint, depth + 1, seen)
+		end
+		return true
+	end
+	-- A type-level operation is evaluated where both operands are known. While one is still a
+	-- variable it is a promise rather than a shape, so a value of any type may be what it gives.
+	if constraint.variant == "operation" or type.variant == "operation" then
+		local decided = constraint.variant == "operation" and constraint or type
+		if types.isSymbolic(decided) then return true end
+		local value = types.operation(decided.op, decided.left, decided.right)
+		if value ~= decided then
+			if constraint.variant == "operation" then return fits(type, value, depth + 1, seen) end
+			return fits(value, constraint, depth + 1, seen)
 		end
 		return true
 	end
@@ -1393,6 +1409,49 @@ local ARITHMETIC_RESULT = {
 	["+"] = add, ["-"] = subtract, ["*"] = multiply, ["/"] = divide, ["%"] = modulo, ["^"] = power,
 }
 
+--- The text a string literal type spells, or nil when it is not one.
+---@param type lye.doc.Type
+---@return string?
+local function literalString(type)
+	if type.variant ~= "extern" then return nil end
+	local first, last = type.name:sub(1, 1), type.name:sub(-1)
+	if (first == '"' or first == "'") and last == first then return type.name:sub(2, -2) end
+end
+
+--- An operator written in a type, such as the `A .. B` a const parameter's result is. It is
+--- worked out when both operands are literals; a broad operand gives the broad result; a variable
+--- that is not bound yet keeps the operation for the substitution that will bind it.
+---@param op string
+---@param left lye.doc.Type
+---@param right lye.doc.Type
+---@return lye.doc.Type
+function types.operation(op, left, right)
+	if types.isSymbolic(left) or types.isSymbolic(right) then
+		return make("operation", { op = op, left = left, right = right })
+	end
+	local leftNumber, rightNumber = types.numericValue(left), types.numericValue(right)
+	if op == ".." then
+		local leftText, rightText = literalString(left), literalString(right)
+		if leftNumber ~= nil then leftText = tostring(leftNumber) end
+		if rightNumber ~= nil then rightText = tostring(rightNumber) end
+		if leftText ~= nil and rightText ~= nil then return types.stringValue(leftText .. rightText) end
+		if left.variant == "string" or right.variant == "string"
+			or (left.variant == "number" and right.variant == "number") then
+			return types.STRING
+		end
+		return types.mutable()
+	end
+	if leftNumber ~= nil and rightNumber ~= nil and ARITHMETIC_RESULT[op] then
+		local ok, folded = pcall(ARITHMETIC_RESULT[op], leftNumber, rightNumber)
+		if ok and type(folded) == "number" then return types.numberValue(folded) end
+	end
+	if (left.variant == "number" or left.variant == "integer")
+		and (right.variant == "number" or right.variant == "integer") then
+		return types.NUMBER
+	end
+	return types.mutable()
+end
+
 ---@param op string
 ---@param left lye.doc.Type
 ---@param right lye.doc.Type
@@ -1859,10 +1918,19 @@ local function typeEndScan(text)
 			depth -= 1
 		elseif char == " " and depth == 0 then
 			-- A marker on either side of the space keeps the type going: `fun(a): string` has one
-			-- after the colon, `nil | string` one before the bar.
+			-- after the colon, `nil | string` one before the bar. An operator on either side does
+			-- the same for a const expression: `A .. B` and `A + B` are one type.
 			local after = text:sub(at + 1):match("^(%S)")
 			local before = text:sub(at - 1, at - 1)
-			if not (conditional or CONTINUES[before] or (after and CONTINUES[after])) then return at - 1 end
+			local rest = text:sub(at + 1)
+			local left = text:sub(1, at - 1)
+			-- Only a spaced operator continues the type. `ffi.cdata*` and `...` end in characters
+			-- that are operators too, and prose after them is not an operand.
+			local expression = rest:match("^%.%.%s") ~= nil or rest:match("^[%+%-%*/%%%^]%s") ~= nil
+				or left:match("%s%.%.$") ~= nil or left:match("%s[%+%-%*/%%%^]$") ~= nil
+			if not (conditional or CONTINUES[before] or (after and CONTINUES[after]) or expression) then
+				return at - 1
+			end
 		end
 	end
 end
@@ -1901,8 +1969,9 @@ end
 ---@param text string the text between the angle brackets
 ---@return table<string, boolean> names
 ---@return table<string, string> constraints
+---@return table<string, boolean> consts
 local function readGenericNames(text)
-	local names, constraints = {}, {}
+	local names, constraints, consts = {}, {}, {}
 	local depth, from = 0, 1
 	for index = 1, #text + 1 do
 		local char = text:sub(index, index)
@@ -1913,15 +1982,21 @@ local function readGenericNames(text)
 		elseif (char == "," or char == "") and depth == 0 then
 			local part = (text:sub(from, index - 1):gsub("^%s+", ""):gsub("%s+$", ""))
 			local colon = part:find(":", 1, true)
+			local marked = part:match("^const%s+") ~= nil
 			if colon then
-				constraints[(part:sub(1, colon - 1):gsub("%s+$", ""))] = (part:sub(colon + 1):gsub("^%s+", ""))
-				part = (part:sub(1, colon - 1):gsub("%s+$", ""))
+				local name = (part:sub(1, colon - 1):gsub("%s+$", ""))
+				constraints[(name:gsub("^const%s+", ""))] = (part:sub(colon + 1):gsub("^%s+", ""))
+				part = name
 			end
-			if part ~= "" then names[part] = true end
+			part = part:gsub("^const%s+", "")
+			if part ~= "" then
+				names[part] = true
+				if marked then consts[part] = true end
+			end
 			from = index + 1
 		end
 	end
-	return names, constraints
+	return names, constraints, consts
 end
 
 --- Where a signature's parameter list is. `fn(` or the `fun(` spelling; `f?un` would read as "un"
@@ -2068,7 +2143,7 @@ local function parseFn(text, resolve)
 	if values then signature.values = values end
 	if method then signature.isMethod = true end
 	if declared then
-		signature.generics, signature.constraints = readGenericNames(declared)
+		signature.generics, signature.constraints, signature.consts = readGenericNames(declared)
 	end
 	return signature
 end
@@ -2186,7 +2261,7 @@ local function substituted(type, bindings, seen)
 		end
 		out.returns = substituted(type.returns, bindings, seen)
 		out.variadic = type.variadic and substituted(type.variadic, bindings, seen)
-		out.generics, out.constraints = type.generics, type.constraints
+		out.generics, out.constraints, out.consts = type.generics, type.constraints, type.consts
 		out.isMethod = type.isMethod
 		-- A generic call substitutes into every value it gives back, not only the first: reading
 		-- `---@return T...` through a binding otherwise lost that it was a spread at all.
@@ -2259,6 +2334,10 @@ local function substituted(type, bindings, seen)
 	if type.variant == "mapped" then
 		return types.mapped(type.key, substituted(type.source, bindings, seen),
 			substituted(type.value, bindings, seen))
+	end
+	if type.variant == "operation" then
+		return types.operation(type.op, substituted(type.left, bindings, seen),
+			substituted(type.right, bindings, seen))
 	end
 	if type.variant == "template" then
 		local parts = {}
@@ -2436,6 +2515,73 @@ local function indexedParts(text)
 	return nil, nil
 end
 
+--- The operators a type expression may write, and how tightly they bind. `..` and `^` bind to
+--- the right, as they do in Lua; the rest to the left.
+local EXPRESSION_PRECEDENCE = {
+	[".."] = 1, ["+"] = 2, ["-"] = 2, ["*"] = 3, ["/"] = 3, ["%"] = 3, ["^"] = 4,
+}
+local RIGHT_ASSOCIATIVE = { [".."] = true, ["^"] = true }
+
+--- The outermost operator of an expression written in a type, if there is one. Bracketed parts
+--- and quoted literals are operands, not places to look for the operator.
+---@param text string
+---@return integer? at
+---@return string? op
+local function expressionParts(text)
+	local depth, bestAt, bestOp, bestPrecedence = 0, nil, nil, nil
+	local at = 1
+	while at <= #text do
+		local char = text:sub(at, at)
+		if char == '"' or char == "'" then
+			local quote = char
+			at += 1
+			while at <= #text do
+				local held = text:sub(at, at)
+				if held == "\\" then at += 2
+				elseif held == quote then at += 1 break
+				else at += 1 end
+			end
+		elseif char == "`" then
+			at += 1
+			while at <= #text and text:sub(at, at) ~= "`" do at += 1 end
+			at += 1
+		elseif char == "<" or char == "{" or char == "(" or char == "[" then
+			depth += 1
+			at += 1
+		elseif char == ">" or char == "}" or char == ")" or char == "]" then
+			depth -= 1
+			at += 1
+		elseif depth == 0 then
+			local op
+			if text:sub(at, at + 1) == ".." and text:sub(at + 2, at + 2) ~= "." then
+				op = ".."
+			elseif char == "+" or char == "-" or char == "*" or char == "/" or char == "%" or char == "^" then
+				op = char
+			end
+			if op then
+				local before = text:sub(1, at - 1)
+				local left = before:gsub("%s+$", "")
+				local right = text:sub(at + #op):gsub("^%s+", "")
+				local unary = op == "-" and (left == "" or left:sub(-1):match("[%(,%+%-%*/%%%^%.,<>=]") ~= nil)
+				if not unary and left ~= "" and right ~= "" and not (op == "-" and text:sub(at + 1, at + 1) == ">") then
+					local precedence = EXPRESSION_PRECEDENCE[op]
+					local take = bestAt == nil or precedence < bestPrecedence
+					if not take and precedence == bestPrecedence then
+						if RIGHT_ASSOCIATIVE[op] then take = at < bestAt else take = at > bestAt end
+					end
+					if take then bestAt, bestOp, bestPrecedence = at, op, precedence end
+				end
+				at += #op
+			else
+				at += 1
+			end
+		else
+			at += 1
+		end
+	end
+	return bestAt, bestOp
+end
+
 ---@param text string?
 ---@param resolve (fun(text: string): lye.doc.Type?)?
 ---@return lye.doc.Type?
@@ -2566,6 +2712,16 @@ function types.parse(text, resolve)
 	-- is prose, and reading it as part of the type would make the annotation mean nothing.
 	local stop = typeEnd(trimmed)
 	if stop then trimmed = (trimmed:sub(1, stop):gsub("%s+$", "")) end
+
+	-- An operation over type variables: `A .. B` is a value the call's bindings decide. It is
+	-- read before the suffixes so `A .. B[]` is the concatenation of A and a list, not a list of
+	-- concatenations.
+	local opAt, op = expressionParts(trimmed)
+	if opAt and op then
+		local left = types.parse(trimmed:sub(1, opAt - 1), resolve)
+		local right = types.parse(trimmed:sub(opAt + #op), resolve)
+		if left and right then return types.operation(op, left, right) end
+	end
 
 	if trimmed:sub(-1) == "?" then
 		-- An annotation says what may arrive, so an optional type is the union of the two: a name
@@ -2726,6 +2882,12 @@ function types.displayOf(type)
 		return table.concat(parts, " & ")
 	end
 	if type.variant == "infer" then return "infer " .. type.name end
+	if type.variant == "operation" then
+		local left, right = types.display(type.left), types.display(type.right)
+		if type.left.variant == "union" then left = "(" .. left .. ")" end
+		if type.right.variant == "union" then right = "(" .. right .. ")" end
+		return left .. " " .. type.op .. " " .. right
+	end
 	if type.variant == "keyof" then return "keyof " .. types.display(type.type) end
 	if type.variant == "indexed" then
 		return types.display(type.object) .. "[" .. types.display(type.key) .. "]"

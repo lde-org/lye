@@ -145,7 +145,13 @@ local function cutType(text)
 			local arrowHere = text:sub(at - 2, at - 1) == "->"
 			local arrowNext = text:sub(stop, stop + 1) == "->"
 			local afterKeyof = keyof and text:sub(1, at - 1):match("^keyof%s*$") ~= nil
-			if conditional or afterKeyof or arrowHere or arrowNext
+			-- An operator on either side of the space belongs to a const expression: `A + B`
+			-- and `A .. B` are one type, not a type followed by prose.
+			local left = text:sub(1, at - 1)
+			local right = text:sub(stop)
+			local expression = left:match("%s%.%.$") ~= nil or left:match("%s[%+%-%*/%%%^]$") ~= nil
+				or right:match("^%.%.%s") ~= nil or right:match("^[%+%-%*/%%%^]%s") ~= nil
+			if conditional or afterKeyof or arrowHere or arrowNext or expression
 				or BINDS[text:sub(at - 1, at - 1)] or CONTINUES[text:sub(stop, stop)] then
 				at = stop
 			else

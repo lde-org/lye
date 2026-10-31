@@ -544,7 +544,8 @@ local function of(ctx, idx)
 					local wanted = calleeType.params[index]
 					local actual = of(ctx, argIdx)
 					if wanted and actual then
-						infer.bind(wanted, actual, calleeType.generics, bindings)
+						infer.bindArgument(ctx, wanted, actual, argIdx, calleeType.generics,
+							calleeType.consts, bindings)
 					end
 				end
 				result = types.substitute(calleeType.returns, bindings)
@@ -663,7 +664,8 @@ function infer.valuesAt(ctx, idx, position)
 					local wanted = calleeType.params[index]
 					local actual = of(ctx, argIdx)
 					if wanted and actual then
-						infer.bind(wanted, actual, calleeType.generics, bindings)
+						infer.bindArgument(ctx, wanted, actual, argIdx, calleeType.generics,
+							calleeType.consts, bindings)
 					end
 				end
 				return types.substitute(value, bindings)
@@ -699,6 +701,46 @@ function infer.calleeTypeOf(ctx, node)
 		if callable then return callable end
 	end
 	return node.callee and ctx.typeOfName(node.callee, node.start) or nil
+end
+
+--- The literal type the argument at `idx` spells, when it is written as one. A string literal is
+--- usually widened to `string` for inference, but a `const` parameter asks for the value itself.
+---@param ctx lye.infer.Context
+---@param idx integer?
+---@return lye.doc.Type?
+local function literalTypeOf(ctx, idx)
+	local node = idx and ctx.parser.nodes[idx]
+	if not node then return nil end
+	if node.kind == "string" then
+		return types.stringValue(type(node.value) == "string" and node.value or "")
+	end
+	if node.kind == "number" and type(node.value) == "number" then
+		return types.numberValue(node.value, node.text)
+	end
+	if node.kind == "literal" then
+		if node.text == "true" then return types.booleanValue(true) end
+		if node.text == "false" then return types.booleanValue(false) end
+	end
+end
+
+--- Bind one argument to a signature's parameters, giving a `const` variable the literal the call
+--- wrote rather than the widened type inference gives a string.
+---@param ctx lye.infer.Context
+---@param pattern lye.doc.Type?
+---@param actual lye.doc.Type?
+---@param idx integer
+---@param generics table<string, boolean>
+---@param consts table<string, boolean>?
+---@param bindings table<string, lye.doc.Type>
+function infer.bindArgument(ctx, pattern, actual, idx, generics, consts, bindings)
+	if pattern and pattern.variant == "extern" and consts and consts[pattern.name] then
+		local literal = literalTypeOf(ctx, idx)
+		if literal then
+			bindings[pattern.name] = literal
+			return
+		end
+	end
+	infer.bind(pattern, actual, generics, bindings)
 end
 
 --- Match a written type against the type of the argument it was given, recording what each

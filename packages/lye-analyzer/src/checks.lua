@@ -233,6 +233,25 @@ local function constWrites(ctx)
 
 end
 
+--- The type a generic declaration promises its body: its variables stand for what the call may
+--- bind them to, so checking the body against one guessed use would either pin it to that use or
+--- report a correct generic implementation. A constrained name is checked as its constraint; an
+--- unconstrained one is unknown, which the body may be anything that fits.
+---@param declared lye.doc.Type
+---@param resolve fun(text: string): lye.doc.Type?
+---@return lye.doc.Type
+local function bodyTypeOf(declared, resolve)
+	if declared.variant ~= "fn" or not declared.generics then return declared end
+	local bindings = {}
+	for name in pairs(declared.generics) do
+		---@cast name string
+		local constraint = declared.constraints and declared.constraints[name]
+		local held = constraint and types.parse(constraint, resolve)
+		bindings[name] = held or types.UNKNOWN_TYPE
+	end
+	return types.substitute(declared, bindings)
+end
+
 ---@param ctx lye.analyzer.CheckContext
 local function declaredMismatches(ctx)
 	local parsed, self = ctx.parsed, ctx.self
@@ -248,6 +267,7 @@ local function declaredMismatches(ctx)
 		if declared ~= nil and variable.qualifier ~= "param" and not variable.name:match("^_")
 			and not reused(ctx, variable.declaration.start, variable.declaration.stop or variable.declaration.start) then
 			---@cast declared lye.doc.Type
+			declared = bodyTypeOf(declared, ctx.resolve)
 			local declaration = variable.declaration
 			-- A `:` method's body carries `self` as its first parameter while the annotation that
 			-- describes it leaves the receiver implicit. Line the two up before comparing them, or
