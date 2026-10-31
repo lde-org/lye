@@ -297,8 +297,9 @@ local function signatureOf(parsed, file, declaration)
 			-- `---@overload fun(opt?: "collect")` is another shape the call may take, written as a
 			-- signature rather than as parameters. Reading the first one only would report every
 			-- call that uses another, which is what `debug.getinfo(1, "S")` and `collectgarbage`
-			-- are: one entry with six overloads.
-			if annotation.type then overloads[#overloads + 1] = annotation.type end
+			-- are: one entry with six overloads. Walking backwards, each earlier line goes in
+			-- front, so the shapes keep the order their reader wrote them in.
+			if annotation.type then table.insert(overloads, 1, annotation.type) end
 		elseif annotation.tag == "type" or annotation.tag == "class" then
 			break
 		end

@@ -249,6 +249,22 @@ test.it("reads a function signature", function()
 		"the spelling LuaLS uses reads the same")
 end)
 
+test.it("reads every value a function type gives back", function()
+	-- An overload is written as a function type, so `pcall`'s success shape can say
+	-- `boolean, T` rather than only the status. The parser has to keep the values after the
+	-- first, and the generic that the return names.
+	local signature = parse("fun<T>(f: fun(...): T): boolean, T")
+	local first = assert(signature.values and signature.values[1]) --[[@as lye.doc.Type]]
+	local second = assert(signature.values and signature.values[2]) --[[@as lye.doc.Type]]
+	test.equal(#signature.values, 2, "both results are kept")
+	test.equal(doctype.display(first), "boolean")
+	test.equal(second.variant, "extern")
+	test.equal(second.name, "T")
+	test.truthy(signature.generics and signature.generics.T, "the overload declares T")
+	test.equal(doctype.display(signature),
+		"fn(fn(...) -> T) -> boolean, T", "and the display names both results")
+end)
+
 test.it("reads the marker and the bar after a signature as the return they follow", function()
 	-- Both follow the return type, so both belong to it: a resolver that returns `Type?` returns
 	-- one, and is not a function that may be absent. What may be absent is written without a

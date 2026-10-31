@@ -8,7 +8,6 @@ local types = require("lye-doc.type")
 local pattern = require("lye-doc.pattern")
 
 local infer = {}
-local nodesOf = require("lye-parser").nodesOf
 
 ---@class lye.infer.Context
 ---@field parser lye.parser.Result
@@ -234,6 +233,25 @@ local function overloadOf(ctx, node, calleeType, valueOf)
 		end
 	end
 	return best
+end
+
+--- What an overload shape's generic variables are bound to at this call. It is the same walk a
+--- generic primary signature uses, but the shape's parameter list is the one to match: `read("*a")`
+--- and `pcall(f)` pick their own signatures' names.
+---@param ctx lye.infer.Context
+---@param node lye.parser.Node
+---@param shape lye.doc.Type
+---@param valueOf fun(ctx: lye.infer.Context, idx: integer): lye.doc.Type
+---@return table<string, lye.doc.Type>
+local function overloadBindings(ctx, node, shape, valueOf)
+	local bindings = {}
+	if not shape.generics or not next(shape.generics) then return bindings end
+	for index, argIdx in ipairs(node.args or {}) do
+		local wanted = shape.params[index]
+		local actual = wanted and valueOf(ctx, argIdx)
+		if wanted and actual then infer.bind(wanted, actual, shape.generics, bindings) end
+	end
+	return bindings
 end
 
 ---@param ctx lye.infer.Context
@@ -508,6 +526,8 @@ local function of(ctx, idx)
 			-- The shape this call fits says what it gives back; the primary signature may only be
 			-- able to say `any` because the arguments decide.
 			result = overload.returns or types.ANY_TYPE
+			local bindings = overloadBindings(ctx, node, overload, of)
+			if next(bindings) then result = types.substitute(result, bindings) end
 			ctx.callTypes[node.index] = result
 		elseif calleeType and types.isAnyFn(calleeType) then
 			-- A callable that says nothing about itself — a bare `function`, or one whose own type
@@ -615,6 +635,18 @@ function infer.valuesAt(ctx, idx, position)
 	end
 	local calleeType = infer.calleeTypeOf(ctx, node)
 	if calleeType and types.isFn(calleeType) then
+		-- The chosen overload's own result list comes first: `pcall(f)`'s success shape is
+		-- `boolean, T`, and T belongs to that shape rather than to the primary signature.
+		local overload = overloadOf(ctx, node, calleeType, of)
+		if overload and overload.values then
+			local value = overload.values[position]
+				or (overload.isSpread and overload.values[#overload.values])
+			if value then
+				local bindings = overloadBindings(ctx, node, overload, of)
+				if next(bindings) then value = types.substitute(value, bindings) end
+				return value
+			end
+		end
 		-- Several values written down: `---@return A, B` gives A first and B second, and a body
 		-- that returns two values is read the same way. A name of the signature's own binds from
 		-- this call, so the second value is as substituted as the first.

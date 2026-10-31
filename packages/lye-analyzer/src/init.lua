@@ -793,7 +793,7 @@ function typeAt(self, variable, offset)
 				end
 			end
 		end
-		if decision == false and not explicitCast then return types.UNKNOWN_TYPE end
+		if decision == false and not explicitCast then return types.ANY_TYPE end
 	end
 	return narrowed
 end

@@ -394,6 +394,28 @@ test.it("answers a hover about the word it is on, not the whole access", functio
 	test.equal(onField.start.character, 9, "and the field's answer at the field")
 end)
 
+test.it("types pcall's success value and its error value apart", function()
+	-- The definition's overload says the success value is the called function's result. The
+	-- failure branch is the error object, and any value can be raised, so its type is `any`.
+	local source = table.concat({
+		"local function f() return \"x\" end\n",
+		"local ok, value = pcall(f)\n",
+		"if not ok then local errorValue = value end\n",
+		"return ok, value\n",
+	}, "")
+	local results = run({
+		request(2, "textDocument/hover", { line = 2, character = 34 }),
+		request(3, "textDocument/hover", { line = 3, character = 11 }),
+		request(4, "textDocument/hover", { line = 1, character = 18 }),
+	}, source)
+	local failure = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	local success = results["3"] and results["3"].contents and results["3"].contents.value or ""
+	local definition = results["4"] and results["4"].contents and results["4"].contents.value or ""
+	test.truthy(failure:match("value: any"), failure)
+	test.truthy(success:match("value: string"), success)
+	test.truthy(definition:find("fun<T>(f: fun(...): T): boolean, T", 1, true), definition)
+end)
+
 test.it("answers a hover on an argument string as the string, not the call", function()
 	-- The call's node covers every argument, so resolving the innermost node at the cursor found
 	-- the callee and showed the function's signature for a string literal.

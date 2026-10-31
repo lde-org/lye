@@ -55,6 +55,19 @@ local function typeOf(result, name)
 end
 
 ---@param result lye.analyzer.Result
+---@param name string
+---@param offset integer
+---@return string? type
+local function typeAt(result, name, offset)
+	---@type lye.analyzer.Variable?
+	local found
+	for _, variable in ipairs(result.variables) do
+		if variable.name == name then found = variable end
+	end
+	return found and types.display(lye.typeAt(result, found, offset))
+end
+
+---@param result lye.analyzer.Result
 local function messages(result)
 	local list = {}
 	for _, entry in ipairs(result.diagnostics) do list[#list + 1] = entry.message end
@@ -299,6 +312,8 @@ test.it("correlates pcall's status with its value", function()
 local ok, value = pcall(function() return 1 end)
 if not ok then return value:upper() end
 ]])
+	test.equal(typeAt(failure, "value", assert(failure.parser.source:find("value:upper", 1, true))),
+		"any", "the failure value is any: an error can be anything the program raises")
 	test.truthy(messages(failure):match("cannot index a value of unknown type"), messages(failure))
 
 	local success = analyze([[
@@ -315,6 +330,20 @@ if not ok then return end
 local n = value + 1
 ]])
 	test.equal(#guarded.diagnostics, 0, messages(guarded))
+end)
+
+test.it("reads several values from a generic overload", function()
+	-- An overload can name its own generic and return more than one value. `pcall`'s success
+	-- shape is exactly that: a status and the called function's result.
+	local result = analyze([[
+---@overload fun<T>(f: fun(...): T): boolean, T
+---@overload fun(f: function, ...: any): boolean, any
+local function invoke(f, ...) return true, f(...) end
+local ok, value = invoke(function() return "x" end)
+if ok then local upper = value:upper() end
+]])
+	test.equal(#result.diagnostics, 0, messages(result))
+	test.equal(typeOf(result, "value"), "string", "the overload's T is the called function's result")
 end)
 
 test.it("reads negative select indices", function()

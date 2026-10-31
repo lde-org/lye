@@ -79,6 +79,7 @@ local ANNOTATION_BYTES_PER_BYTE = 64
 ---@field current string? the document whose analysis, parse and predecessor are never evicted
 ---@field maxBytes integer the byte budget, 32 MiB unless a test forces it
 ---@field maxEntries integer the most analyses held, 4 unless a test forces it
+---@field traceGarbage boolean? something was dropped that compiled traces may still reach
 
 local AnalysisCache = {}
 AnalysisCache.__index = AnalysisCache
@@ -90,7 +91,7 @@ AnalysisCache.__index = AnalysisCache
 function AnalysisCache.new(lye)
 	local cache = setmetatable({
 		analysis = {}, names = {}, parsed = {}, previous = {}, annotations = {},
-		order = {}, spans = {}, epochs = {}, current = nil,
+		order = {}, spans = {}, epochs = {}, current = nil, traceGarbage = false,
 		maxBytes = MAX_BYTES, maxEntries = MAX_ANALYSES,
 	}, AnalysisCache)
 	lye.analysis = cache.analysis
@@ -192,6 +193,12 @@ end
 ---@param uri string
 ---@param self lye.AnalysisCache
 function AnalysisCache:drop(uri)
+	if self.analysis[uri] or self.names[uri] or self.parsed[uri] or self.previous[uri] then
+		-- JIT-compiled traces keep the tables they were built from alive until the traces are
+		-- flushed. An evicted analysis that was collected but still reachable from a trace is
+		-- memory the budget believes it has already given back.
+		self.traceGarbage = true
+	end
 	self.analysis[uri] = nil
 	self.names[uri] = nil
 	self.parsed[uri] = nil
@@ -220,6 +227,9 @@ end
 ---@param self lye.AnalysisCache
 function AnalysisCache:store(uri, names, view, epoch)
 	local result = names.parser
+	-- The predecessor this replaces is how the next analysis reuses items; once replaced, a trace
+	-- that read it can be the only thing still holding it.
+	if self.previous[uri] and self.previous[uri] ~= names then self.traceGarbage = true end
 	self.analysis[uri] = result
 	self.names[uri] = names
 	self.previous[uri] = names
@@ -328,6 +338,7 @@ function AnalysisCache:_evictUnheld(field)
 	if not chosen then return false end
 	self[field][chosen] = nil
 	if field == "parsed" then self.spans[chosen] = nil end
+	self.traceGarbage = true
 	return true
 end
 

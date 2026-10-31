@@ -1811,14 +1811,27 @@ local function parseFn(text, resolve)
 	if not openAt then return nil end
 
 	local returns = types.ANY_TYPE
+	local isSpread = false
+	local values
 	local rest = text:sub(closeAt + 1):gsub("^%s*", "")
 	local returned = rest:match("^[-:]?>%s*(.*)$") or rest:match("^:%s*(.*)$")
 	if returned and returned ~= "" then
-		-- Several values are written `integer, V`. A signature carries one, so the first is read
-		-- and the rest are dropped rather than glued into one name that means nothing. A `...`
-		-- return says several values of no particular type, which is `any`.
-		local first = types.splitValues(returned)[1]
-		if first ~= "..." then returns = types.parse(first, resolve) or types.ANY_TYPE end
+		-- Several values are written `integer, V`; the call gives them in order. A trailing `...`
+		-- makes the list a spread, so every value after it is the last type. Keeping all of them
+		-- is what lets an overload say `boolean, T` rather than only its first result.
+		local written = types.splitValues(returned)
+		if written[#written] and written[#written]:sub(-3) == "..." then
+			written[#written] = (written[#written]:sub(1, -4):gsub("%s+$", ""))
+			if written[#written] == "" then written[#written] = nil end
+			isSpread = true
+		end
+		if #written > 1 then
+			values = {}
+			for index, textValue in ipairs(written) do
+				values[index] = types.parse(textValue, resolve) or types.UNKNOWN_TYPE
+			end
+		end
+		if written[1] then returns = types.parse(written[1], resolve) or types.ANY_TYPE end
 	end
 
 	local params, isVariadic, variadic, method = {}, false, nil, false
@@ -1846,7 +1859,8 @@ local function parseFn(text, resolve)
 			params[#params + 1] = paramType
 		end
 	end
-	local signature = types.fn(params, returns, isVariadic, nil, variadic)
+	local signature = types.fn(params, returns, isVariadic, isSpread, variadic)
+	if values then signature.values = values end
 	if method then signature.isMethod = true end
 	if declared then
 		signature.generics, signature.constraints = readGenericNames(declared)

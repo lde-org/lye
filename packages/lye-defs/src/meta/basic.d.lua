@@ -129,6 +129,8 @@ function pairs<T: table, K, V>(t: T) end
 
 ---Calls the function `f` with the given arguments in *protected mode*. This means that any error inside `f` is not propagated; instead, `pcall` catches the error and returns a status code. Its first result is the status code (a boolean), which is true if the call succeeds without errors. In such case, `pcall` also returns all results from the call, after this first result. In case of any error, `pcall` returns `false` plus the error object.
 ---
+---@overload fun<T>(f: fun(...): T): boolean, T
+---@overload fun(f: function, ...: any): boolean, any
 ---@return boolean success
 ---@return any result
 ---@return any ...
@@ -208,6 +210,8 @@ _VERSION = "Lua 5.1"
 
 
 ---Calls function `f` with the given arguments in protected mode with a new message handler.
+---@overload fun<T>(f: fun(...): T, msgh: fun(message: any): any, ...: any): boolean, T
+---@overload fun(f: function, msgh: fun(message: any): any, ...: any): boolean, any
 ---@return boolean success
 ---@return any result
 ---@return any ...

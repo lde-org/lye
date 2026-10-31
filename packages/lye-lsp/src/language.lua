@@ -258,37 +258,197 @@ end
 --- The spans of an answer for a text, with one edit applied. Spans wholly before it stand, spans
 --- wholly after it move by the edit's delta, and spans it overlaps are dropped: the inserted text
 --- is coloured by what it says of itself, and the next type pass colours the rest.
----@param spans { from: integer, to: integer, kind: string, modifiers: integer? }[]
+---@param spans (integer|string)[] four entries per span: from, to, kind, modifiers
 ---@param from integer the first byte the edit replaces
 ---@param to integer the last byte it replaces
 ---@param delta integer inserted bytes minus replaced bytes
 ---@param inserted string
 local function shiftTokenSpans(spans, from, to, delta, inserted)
-	-- The list is the caller's to consume: the answer it described is being replaced by this one.
-	-- Compacting in place keeps a keystroke from allocating a table per token.
+	-- The list is four numbers per span — from, to, kind and modifiers — rather than a table per
+	-- token. Sixty thousand spans of a large document cost one array instead of sixty thousand
+	-- tables, and the shift still happens in place.
 	local kept, insertAt = 0, nil
-	for index = 1, #spans do
-		local span = spans[index]
-		if span.to < from then
-			kept += 1
-			spans[kept] = span
-		elseif span.from > to then
-			span.from += delta
-			span.to += delta
-			kept += 1
-			spans[kept] = span
+	for index = 1, #spans, 4 do
+		local spanFrom, spanTo = spans[index], spans[index + 1]
+		-- Where a span the edit did not touch starts, the inserted text goes before it. The
+		-- position is the count of spans kept so far, taken before this span is kept.
+		if not insertAt and spanTo >= from then insertAt = kept / 4 + 1 end
+		if spanTo < from then
+			kept += 4
+			spans[kept - 3], spans[kept - 2] = spanFrom, spanTo
+			spans[kept - 1], spans[kept] = spans[index + 2], spans[index + 3]
+		elseif spanFrom >= to then
+			-- A span starting exactly where a replacement ends is after it; at a zero-width
+			-- insertion, the span starting at the cursor moves with the text after it.
+			spanFrom += delta
+			spanTo += delta
+			kept += 4
+			spans[kept - 3], spans[kept - 2] = spanFrom, spanTo
+			spans[kept - 1], spans[kept] = spans[index + 2], spans[index + 3]
 		end
-		if not insertAt and span.from >= from then insertAt = kept + 1 end
 	end
 	for index = kept + 1, #spans do spans[index] = nil end
-	local at = insertAt or (kept + 1)
 	if inserted:match("^%s*%-%-") then
-		table.insert(spans, at, {
-			from = from, to = from + #inserted - 1,
-			kind = "comment", modifiers = TOKEN_MODIFIER.documentation,
-		})
+		local at = (insertAt or (kept / 4 + 1)) * 4 - 3
+		table.insert(spans, at, 0)
+		table.insert(spans, at, "comment")
+		table.insert(spans, at, from + #inserted - 1)
+		table.insert(spans, at, from)
 	end
 	return spans
+end
+
+--- Merge plugin spans over the scanner's spans. A plugin colours ranges of the editor's own
+--- text, while the scanner's list is in source order; both are flat quadruples. The overlay is
+--- normalized first — a later plugin span wins on overlap, as painting them in order did — and
+--- then merged in one pass, so no per-byte map and no second sort is needed.
+---@param spans (integer|string)[] from, to, kind, modifiers
+---@param asked table[] what the plugins answered
+---@param limit integer the last byte of the editor's text
+---@return (integer|string)[] pieces
+---@return integer count spans in the result
+local function overlaySpans(spans, asked, limit)
+	if #asked == 0 then return spans, #spans / 4 end
+	---@type { from: integer, to: integer, kind: string, modifiers: integer }[]
+	local valid = {}
+	for _, span in ipairs(asked) do
+		local from, to = span.from, span.to
+		if TOKEN_TYPE[span.type] and type(from) == "number" and type(to) == "number" then
+			from, to = math.max(from, 1), math.min(to, limit)
+			if to >= from then
+				valid[#valid + 1] = { from = from, to = to, kind = span.type, modifiers = span.modifiers or 0 }
+			end
+		end
+	end
+	if #valid == 0 then return spans, #spans / 4 end
+
+	-- Every start and one-past-end is a boundary; between two of them the set of plugin spans is
+	-- constant, so one winner decides the whole segment.
+	---@type integer[]
+	local points = {}
+	for _, span in ipairs(valid) do
+		points[#points + 1] = span.from
+		points[#points + 1] = span.to + 1
+	end
+	table.sort(points)
+	local overlay = {}
+	local overlayCount = 0
+	---@param from integer
+	---@param to integer
+	---@param kind string
+	---@param modifiers integer
+	local function addOverlay(from, to, kind, modifiers)
+		-- Adjacent segments are kept apart: two plugin spans meeting at a byte are two answers,
+		-- and the editor's test asks for each piece a plugin named.
+		overlayCount += 4
+		overlay[overlayCount - 3], overlay[overlayCount - 2] = from, to
+		overlay[overlayCount - 1], overlay[overlayCount] = kind, modifiers
+	end
+	---@type integer?
+	local previousPoint
+	for _, point in ipairs(points) do
+		if point ~= previousPoint then
+			if previousPoint and point > previousPoint then
+				local from, to = previousPoint, point - 1
+				---@type { from: integer, to: integer, kind: string, modifiers: integer }?
+				local winner
+				for _, span in ipairs(valid) do
+					if span.from <= from and span.to >= to then winner = span end
+				end
+				if winner then
+					addOverlay(from --[[@as integer]], to --[[@as integer]],
+						winner.kind --[[@as string]], winner.modifiers --[[@as number]])
+				end
+			end
+			previousPoint = point
+		end
+	end
+	local overlayTotal = overlayCount / 4
+	if overlayTotal == 0 then return spans, #spans / 4 end
+
+	-- The scanner's spans with the overlay cut out of them, in source order.
+	local pieces = {}
+	local pieceCount = 0
+	---@param from integer
+	---@param to integer
+	---@param kind string
+	---@param modifiers integer
+	local function addPiece(from, to, kind, modifiers)
+		if from > to then return end
+		pieceCount += 4
+		pieces[pieceCount - 3], pieces[pieceCount - 2] = from, to
+		pieces[pieceCount - 1], pieces[pieceCount] = kind, modifiers
+	end
+	local overlayAt = 1
+	for index = 1, #spans, 4 do
+		local spanFrom, spanTo = spans[index], spans[index + 1]
+		local spanKind, spanMods = spans[index + 2], spans[index + 3]
+		---@cast spanFrom integer
+		---@cast spanTo integer
+		---@cast spanKind string
+		---@cast spanMods integer
+		while overlayAt <= overlayTotal and overlay[(overlayAt - 1) * 4 + 2] < spanFrom do
+			overlayAt += 1
+		end
+		local cursor = spanFrom
+		local at = overlayAt
+		while at <= overlayTotal do
+			local base = (at - 1) * 4
+			local from, to = overlay[base + 1], overlay[base + 2]
+			if from > spanTo then break end
+			if to >= cursor then
+				addPiece(cursor, math.min(from - 1, spanTo), spanKind, spanMods)
+				if to >= spanTo then
+					cursor = spanTo + 1
+					break
+				end
+				cursor = to + 1
+			end
+			at += 1
+		end
+		addPiece(cursor, spanTo, spanKind, spanMods)
+		if at > overlayAt then overlayAt = at end
+	end
+
+	-- Interleave the cut-out scanner spans and the overlay spans. Both are already in order, so a
+	-- merge is enough; the sort the old per-byte path needed is gone.
+	local out = {}
+	local outCount = 0
+	local pieceTotal, pieceAt, overlayIndex = pieceCount / 4, 1, 1
+	---@param from integer
+	---@param to integer
+	---@param kind string
+	---@param modifiers integer
+	local function addOut(from, to, kind, modifiers)
+		outCount += 4
+		out[outCount - 3], out[outCount - 2] = from, to
+		out[outCount - 1], out[outCount] = kind, modifiers
+	end
+	while pieceAt <= pieceTotal or overlayIndex <= overlayTotal do
+		local useOverlay
+		if pieceAt > pieceTotal then
+			useOverlay = true
+		elseif overlayIndex > overlayTotal then
+			useOverlay = false
+		else
+			local pieceBase, overlayBase = (pieceAt - 1) * 4, (overlayIndex - 1) * 4
+			local pieceFrom, overlayFrom = pieces[pieceBase + 1], overlay[overlayBase + 1]
+			useOverlay = overlayFrom < pieceFrom
+			if overlayFrom == pieceFrom then
+				useOverlay = overlay[overlayBase + 2] > pieces[pieceBase + 2]
+			end
+		end
+		if useOverlay then
+			local base = (overlayIndex - 1) * 4
+			addOut(overlay[base + 1], overlay[base + 2], overlay[base + 3], overlay[base + 4])
+			overlayIndex += 1
+		else
+			local base = (pieceAt - 1) * 4
+			addOut(pieces[base + 1], pieces[base + 2], pieces[base + 3], pieces[base + 4])
+			pieceAt += 1
+		end
+	end
+	return out, outCount / 4
 end
 
 --- The words that are grammar inside a type rather than the name of one.
@@ -312,6 +472,15 @@ local GC_FULL_MILLISECONDS = 1000
 -- One step is a bounded slice of the collector's work, not a full walk: enough to keep a typing
 -- session from piling garbage up, small enough not to be the pause the user feels.
 local GC_STEP_UNITS = 100
+-- LuaJIT traces keep the objects they were compiled against alive: an analysis dropped by the
+-- cache still costs its parse tree and types until the trace that read it is flushed. The cache
+-- marks a drop, and a checkpoint at or above this heap size flushes the traces before collecting
+-- again. Small sessions never reach it, so their warm traces are left alone.
+local TRACE_HEAP_BYTES = 64 * 1024 * 1024
+-- Closing is the one pass that has no next edit to recompile for, so a document large enough to
+-- leave this much behind gives its traces back at once. Small sessions stay under it and keep
+-- their warm code.
+local TRACE_CLOSE_BYTES = 8 * 1024 * 1024
 
 -- The features a plugin extension has to join when its language is not Lua. The selector is
 -- registered for each file extension a plugin claims, so an editor that supports dynamic document
@@ -493,9 +662,9 @@ local DOC_TAG_NAME = "[%a_][%w_]*"
 ---@field lastHeap number? the heap size at the last collection checkpoint
 ---@field dirtyAt table<string, number>? when each dirty document last changed, so the newest is analysed first
 ---@field dirtyEpoch table<string, integer>? which change count last marked each dirty document, breaking a tie on the clock
----@field tokens_ table<string, { text: string, answer: table, spans: table[]? }>? the token answer
+---@field tokens_ table<string, { text: string, answer: table, spans: (integer|string)[]? }>? the token answer
 --- for a document that has not changed since it was worked out
----@field fastTokens_ table<string, { text: string, answer: table, spans: table[]? }>? a lexical answer
+---@field fastTokens_ table<string, { text: string, answer: table, spans: (integer|string)[]? }>? a lexical answer
 --- for a text whose type pass is still pending
 ---@field lastTexts table<string, string> the text each document held at the last change
 ---@field lastIndexes table<string, lye.framework.LineIndex> the line index of that text
@@ -526,7 +695,9 @@ function Lye.new(server)
 	-- synthetic list is long enough for the trace to be worth compiling.
 	local warm = {}
 	for index = 1, 96 do
-		warm[index] = { from = index * 8, to = index * 8 + 3, kind = "variable" }
+		local at = (index - 1) * 4
+		warm[at + 1], warm[at + 2] = index * 8, index * 8 + 3
+		warm[at + 3], warm[at + 4] = "variable", 0
 	end
 	shiftTokenSpans(warm, 100, 120, 7, "-- warm\n")
 	return lye
@@ -570,6 +741,19 @@ function Lye:checkpoint(force)
 	if collect then
 		if full then collectgarbage("collect") else collectgarbage("step", GC_STEP_UNITS) end
 		self.lastHeap = timing.heap()
+	end
+	-- A document the cache evicted is unreachable from Lua but not from the traces that read it.
+	-- The collection above has just measured what is still held; if that is large enough to be
+	-- worth the recompilation, flushing the traces is what actually gives the analysis back.
+	local traceBytes = timing.heap() * 1024
+	if self.cache.traceGarbage
+		and (traceBytes >= TRACE_HEAP_BYTES or (force and traceBytes >= TRACE_CLOSE_BYTES)) then
+		jit.flush()
+		collectgarbage("collect")
+		self.lastHeap = timing.heap()
+		self.lastFull = timing.now()
+		self.cache.traceGarbage = false
+		collect, full = true, true
 	end
 	timing.memory(started, collect)
 	return collect, full
@@ -1356,7 +1540,9 @@ local function typeOfExpression(result, idx, offset)
 	if node.kind == "prefix" and node.group then return typeOfExpression(result, node.group, offset) end
 	if node.kind == "string" then return types.base("string") end
 	if node.kind == "prefix" then
-		local variable = node.callee and analyzer.lookupAt(result, node.callee, offset)
+		local variable = node.callee
+			and (result.byStart and result.byStart[node.start]
+				or analyzer.lookupAt(result, node.callee, offset))
 		return variable and analyzer.typeAt(result, variable, offset) or nil
 	end
 	if node.kind == "index" and node.target then
@@ -1531,9 +1717,12 @@ end
 ---@param names lye.analyzer.Result
 ---@param name string
 ---@param offset integer
+---@param at integer? the node's start, when the analysis already recorded the name there
 ---@return string?
-local function readAsName(names, name, offset)
-	local variable = analyzer.lookupAt(names, name, offset)
+local function readAsName(names, name, offset, at)
+	---@type lye.analyzer.Variable?
+	local variable = (at and names.byStart and names.byStart[at])
+		or analyzer.lookupAt(names, name, offset)
 	if variable then
 		local held = analyzer.typeAt(names, variable, offset)
 		if types.isFn(held) then return "function" end
@@ -1869,6 +2058,13 @@ function Lye:onHover(params)
 		---@cast signature lye.analyzer.Signature
 		label = signatureText(signature, writtenName(result, node, text),
 			node.kind == "call" and held or nil)
+		-- The other shapes a call may take are part of the answer: `pcall`'s generic success
+		-- shape is where its result type comes from, and showing only the primary `any` hid it.
+		if signature.overloads and #signature.overloads > 0 then
+			local lines = { label }
+			for _, overload in ipairs(signature.overloads) do lines[#lines + 1] = overload end
+			label = table.concat(lines, "\n")
+		end
 	end
 	local described = label
 	if described == nil then
@@ -2104,9 +2300,17 @@ function Lye:fastSemanticTokens(uri, patchedOnly)
 		local inserted = change.text or ""
 		local delta = #inserted - (to - from)
 		local spans = shiftTokenSpans(cached.spans, from, to, delta, inserted)
-		timing.detail("tokens-fast-shift", started, "spans=%d", #spans)
+		timing.detail("tokens-fast-shift", started, "spans=%d", #spans / 4)
 		local write, finish = tokenEncoder(view.source, view.sourceIndex, self.server.encoding)
-		for _, span in ipairs(spans) do write(span.from, span.to, span.kind, span.modifiers) end
+		for index = 1, #spans, 4 do
+			local spanFrom, spanTo = spans[index], spans[index + 1]
+			local spanKind, spanMods = spans[index + 2], spans[index + 3]
+			---@cast spanFrom number
+			---@cast spanTo number
+			---@cast spanKind string
+			---@cast spanMods number
+			write(spanFrom, spanTo, spanKind, spanMods)
+		end
 		local data, count = finish()
 		local answer = { data = data }
 		self.fastTokens_[uri] = { text = document.text, answer = answer, spans = spans }
@@ -2136,10 +2340,7 @@ function Lye:fastSemanticTokens(uri, patchedOnly)
 		elseif token.kind == KIND.name then
 			kind = "variable"
 		end
-		if kind then
-			write(token.start, token.stop, kind,
-				kind == "comment" and TOKEN_MODIFIER.documentation or nil)
-		end
+		if kind then write(token.start, token.stop, kind) end
 	end
 	local data, count = finish()
 	local answer = { data = data }
@@ -2247,7 +2448,7 @@ function Lye:onSemanticTokens(params)
 	if names then
 		for _, node in ipairs(result.nodes) do
 			if node.kind == "prefix" and node.callee and not kinds[node.start] then
-				local read = readAsName(names, node.callee, node.start)
+				local read = readAsName(names, node.callee, node.start, node.start)
 				if read then kinds[node.start] = read end
 			elseif node.kind == "index" and node.field and node.isDynamic ~= true then
 				local fieldStart = node.stop - #node.field + 1
@@ -2278,7 +2479,9 @@ function Lye:onSemanticTokens(params)
 	-- carried back through the map and written down.
 	timing.detail("token-kinds", stageStarted)
 	stageStarted = timing.now()
-	---@type { from: integer, to: integer, kind: string, modifiers: integer? }[]
+	-- Four numbers per span, from the first one written: this list is walked once and merged, so
+	-- a table per token would only be garbage the collector has to find and the traces keep.
+	---@type (integer|string)[]
 	local spans = {}
 	local spanCount = 0
 
@@ -2288,14 +2491,18 @@ function Lye:onSemanticTokens(params)
 	---@param modifiers integer?
 	local function emitSpan(spanStart, spanStop, target, modifiers)
 		if spanStop < spanStart then return end
-		spanCount += 1
-		spans[spanCount] = { from = spanStart, to = spanStop, kind = target, modifiers = modifiers }
+		spanCount += 4
+		spans[spanCount - 3], spans[spanCount - 2] = spanStart, spanStop
+		spans[spanCount - 1], spans[spanCount] = target, modifiers or 0
 	end
 
 	-- What the parser calls a token, in the vocabulary this server advertises.
 
 	--- A doc comment is emitted as the comment it is, with the tags, parameter names and types
 	--- inside it marked out. The spans are cut at newlines because a token may not cross one.
+	--- Tokens and annotations are both in source order, so the annotations a comment can hold
+	--- start at or after the last cursor: a comment walks only its own annotations, not the file's.
+	local annotationAt = 1
 	---@param token lye.lexer.ffi.token
 	---@param written string
 	local function emitComment(token, written)
@@ -2342,8 +2549,13 @@ function Lye:onSemanticTokens(params)
 		-- The name of a parameter reads as a parameter, and the identifiers in a type read as a
 		-- type. A string literal inside a type stays a string; the punctuation around them is
 		-- grammar and stays part of the comment.
-		for _, annotation in ipairs(annotations) do
-			if annotation.start >= token.start and annotation.stop <= token.stop then
+		while annotations[annotationAt] and annotations[annotationAt].start < token.start do
+			annotationAt += 1
+		end
+		for index = annotationAt, #annotations do
+			local annotation = annotations[index]
+			if annotation.start > token.stop then break end
+			if annotation.stop <= token.stop then
 				-- A bracketed annotation — `--[[@as T]]` — is one comment token whose tag is not
 				-- at the start of a `---` line, so the keyword carve above never saw it. Find
 				-- the `@` inside the annotation's own span.
@@ -2381,6 +2593,10 @@ function Lye:onSemanticTokens(params)
 					typeWords(text, typeStart, typeStop, carve)
 				end
 			end
+		end
+		annotationAt = math.min(annotationAt, #annotations + 1)
+		while annotations[annotationAt] and annotations[annotationAt].stop <= token.stop do
+			annotationAt += 1
 		end
 
 		if count_ == 0 then
@@ -2455,10 +2671,6 @@ function Lye:onSemanticTokens(params)
 	-- language it reads, so its spans are already in the offsets the editor holds and need no map.
 	-- A kind the legend does not have is left out rather than advertised to an editor that cannot
 	-- know it.
-	---@type table<integer, string>
-	local askedKind = {}
-	---@type table<integer, integer>
-	local askedMods = {}
 	local pluginStarted = timing.now()
 	---@param nodeIdx integer?
 	---@return lye.doc.Type?
@@ -2481,6 +2693,20 @@ function Lye:onSemanticTokens(params)
 	timing.detail("plugin-tokens", pluginStarted, "plugins=%d spans=%d", #view.specs, #asked)
 	timing.detail("token-plugin", stageStarted)
 	stageStarted = timing.now()
+
+	-- Every span in the editor's own offsets, in order, with what a plugin coloured cut out of what
+	-- the walk found: a `%d` inside a string is a conversion, and the string is written around it.
+	-- Flat from the start, because this list is the other half of what a colour cache holds.
+	local flat, total
+	if view.map:isEmpty() then
+		-- The walk's offsets are already the editor's: plugin spans are the only thing that can
+		-- cut them, and that overlay is merged in one pass over both lists.
+		flat, total = overlaySpans(spans, asked, #view.source)
+	else
+	---@type table<integer, string>
+	local askedKind = {}
+	---@type table<integer, integer>
+	local askedMods = {}
 	for _, span in ipairs(asked) do
 		local from, to, kind = span.from, span.to, span.type
 		if type(from) == "number" and type(to) == "number" and TOKEN_TYPE[kind] and to >= from then
@@ -2490,39 +2716,49 @@ function Lye:onSemanticTokens(params)
 			end
 		end
 	end
-
-	-- Every span in the editor's own offsets, in order, with what a plugin coloured cut out of what
-	-- the walk found: a `%d` inside a string is a conversion, and the string is written around it.
-	---@type { from: integer, to: integer, kind: string, modifiers: integer? }[]
+	---@type (integer|string)[]
 	local pieces = {}
+	local pieceCount = 0
 	---@param from integer
 	---@param to integer
 	---@param kind string
 	---@param modifiers integer?
 	local function collect(from, to, kind, modifiers)
 		if from > to then return end
-		pieces[#pieces + 1] = { from = from, to = to, kind = kind, modifiers = modifiers }
+		pieceCount += 4
+		pieces[pieceCount - 3], pieces[pieceCount - 2] = from, to
+		pieces[pieceCount - 1], pieces[pieceCount] = kind, modifiers or 0
 	end
-	for _, span in ipairs(spans) do
+	for index = 1, #spans, 4 do
+		local spanFrom, spanTo = spans[index], spans[index + 1]
+		local spanKind, spanMods = spans[index + 2], spans[index + 3]
+		---@cast spanFrom integer
+		---@cast spanTo integer
+		---@cast spanKind string
+		---@cast spanMods integer
 		-- What lye read out of the text a plugin wrote has nowhere to be pointed at: `---@type
 		-- number` exists in the lowered text, not in the line the reader wrote.
-		if not view.map:rangeIsWritten(span.from, span.to) then
-			local from, to = originalRange(view.map, span.from, span.to)
+		if not view.map:rangeIsWritten(spanFrom, spanTo) then
+			local from, to = originalRange(view.map, spanFrom, spanTo)
 			---@cast from integer
 			---@cast to integer
 			local at = from
 			while at <= to do
-				local kind = askedKind[at] or span.kind
-				local modifiers = askedKind[at] and askedMods[at] or span.modifiers
+				local asked = askedKind[at]
+				local kind = asked or spanKind
+				local modifiers = asked and askedMods[at] or spanMods
 				local stop = at
-				while stop < to
-					and (askedKind[stop + 1] or span.kind) == kind
-					and ((askedKind[stop + 1] and askedMods[stop + 1] or span.modifiers) == modifiers) do
+				while stop < to do
+					local nextAsked = askedKind[stop + 1]
+					if (nextAsked or spanKind) ~= kind
+						or ((nextAsked and askedMods[stop + 1] or spanMods) ~= modifiers) then
+						break
+					end
 					stop += 1
 				end
 				-- A span a plugin covers is the plugin's: the walk writes up to it and carries on
 				-- after it, and the plugin's own span is written from its own list below.
-				if not askedKind[at] then collect(at, stop, kind, modifiers) end
+				if not asked then collect(at, stop, kind, modifiers) end
 				at = stop + 1
 			end
 		end
@@ -2532,21 +2768,44 @@ function Lye:onSemanticTokens(params)
 			collect(math.max(span.from, 1), math.min(span.to, #view.source), span.type, span.modifiers)
 		end
 	end
-	table.sort(pieces, function(left, right)
-		if left.from ~= right.from then return left.from < right.from end
-		return left.to > right.to
+
+	-- Sorting the flat list in place would need an order over four fields; sorting the positions
+	-- of its spans is one small array and keeps the spans themselves flat.
+	local order = {}
+	total = pieceCount / 4
+	for index = 1, total do order[index] = index end
+	table.sort(order, function(left, right)
+		local leftAt, rightAt = (left - 1) * 4, (right - 1) * 4
+		local leftFrom, rightFrom = pieces[leftAt + 1], pieces[rightAt + 1]
+		if leftFrom ~= rightFrom then return leftFrom < rightFrom end
+		return pieces[leftAt + 2] > pieces[rightAt + 2]
 	end)
+	flat = {}
+	for index = 1, total do
+		local fromAt, toAt = (order[index] - 1) * 4, (index - 1) * 4
+		flat[toAt + 1], flat[toAt + 2] = pieces[fromAt + 1], pieces[fromAt + 2]
+		flat[toAt + 3], flat[toAt + 4] = pieces[fromAt + 3], pieces[fromAt + 4]
+	end
+	end
 	timing.detail("token-merge", stageStarted)
 	stageStarted = timing.now()
 
 	local write, finish = tokenEncoder(view.source, view.sourceIndex, encoding)
-	for _, piece in ipairs(pieces) do write(piece.from, piece.to, piece.kind, piece.modifiers) end
+	for index = 1, #flat, 4 do
+		local spanFrom, spanTo = flat[index], flat[index + 1]
+		local spanKind, spanMods = flat[index + 2], flat[index + 3]
+		---@cast spanFrom number
+		---@cast spanTo number
+		---@cast spanKind string
+		---@cast spanMods number
+		write(spanFrom, spanTo, spanKind, spanMods)
+	end
 	local data, count = finish()
-	timing.detail("token-encode", stageStarted, "tokens=%d spans=%d", count / 5, #pieces)
+	timing.detail("token-encode", stageStarted, "tokens=%d spans=%d", count / 5, total)
 
 	local answer = { data = data }
-	self.tokens_[uri] = { text = document.text, answer = answer, spans = pieces }
-	timing.detail("tokens", started, "cached=0 tokens=%d spans=%d", count / 5, #pieces)
+	self.tokens_[uri] = { text = document.text, answer = answer, spans = flat }
+	timing.detail("tokens", started, "cached=0 tokens=%d spans=%d", count / 5, total)
 	timing.detail("tokens-request", started, "fast=0")
 	return answer
 end

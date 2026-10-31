@@ -358,6 +358,25 @@ test.it("colours a changed text before the type pass, and the settled answer aft
 		"the answer after the pass is the one a cold session gives")
 end)
 
+test.it("shifts the colour it already has when a comment is inserted above it", function()
+	-- The first answer leaves the analysed spans in the cache; the next edit is only a comment
+	-- above them, so the patch has to move every span and write the comment before the first one.
+	-- A cold session over the new text is the answer the patch has to match exactly.
+	local changed = "-- note\n" .. INITIAL
+	local warm = run(endingWithShutdown({
+		didOpen(INITIAL),
+		tokens(11),
+		didChangeMany(2, {
+			{ range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 0 } },
+				text = "-- note\n" },
+		}),
+		tokens(12),
+	}))
+	local cold = run(endingWithShutdown({ didOpen(changed), tokens(13) }))
+	test.equal(canonical(assert(response(warm, 12))), canonical(assert(response(cold, 13))),
+		"the shifted answer is the one a cold session gives")
+end)
+
 test.it("resumes an edit after the first statement, and does not when asked not to", function()
 	local _, _, stderr = run(endingWithShutdown({
 		didOpen(INITIAL),
