@@ -51,6 +51,8 @@ literally clean rather than "errors and warnings only".
   declaring file is itself analysed. The real signature is used where the declaration is in the
   analysed document.
 - The formatter spaces tokens and fixes indentation; it does not wrap long lines or reorder code.
+  `lye format [paths...]` runs the same formatter from the command line, and `lye format -` reads
+  stdin and writes stdout.
 - `@async` is a marker in the type display; it does not change a call's return type.
 - Multi-root file watching updates the root an event belongs to, but an event whose root index was
   never loaded falls back to full invalidation.

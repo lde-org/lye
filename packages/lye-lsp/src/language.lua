@@ -21,6 +21,7 @@ local KIND = lexer.KIND
 local types = require("lye-doc.type")
 local rapidhash = require("rapidhash")
 local fs = require("fs")
+local format = require("lye-lsp.format")
 local cache = require("lye-lsp.cache")
 local plugin = require("lye-plugin")
 -- A package of its own, but linked into this server: the static `require` is what a bundler can
@@ -4620,168 +4621,6 @@ function Lye:onCallHierarchyOutgoing(params)
 	return out
 end
 
---- How deep a line is written: the number of blocks the parser recorded around it. The tree knows
---- which blocks are bodies, so nothing is guessed from the text.
----@param parsed lye.parser.Result
----@param offset integer
----@return integer
-local function indentAt(parsed, offset)
-	local depth, seen = 0, {}
-	for _, scope in ipairs(parsed.scopes) do
-		-- Keyed by the scope itself: an `if` clause and the block it opens begin at the same
-		-- offset when the clause is the block's first statement, and keying by the offset counted
-		-- one of them and threw the other away — which is a body at the depth of its own header.
-		if scope.start <= offset and offset <= scope.stop and not seen[scope] then
-			seen[scope] = true
-			depth = depth + 1
-		end
-	end
-	-- A line at the top of the file is inside no block at all: the chunk is not among the scopes the
-	-- parser records, so what is counted here is exactly the nesting a reader sees.
-	return depth
-end
-
---- Whether a line starts inside a string that runs over more than one line, which no formatter can
---- reindent without changing what the string says.
----@param parsed lye.parser.Result
----@param source string
----@param from integer
----@param to integer
----@return boolean
-local function insideLongString(parsed, source, from, to)
-	local tokens = parsed.tokens
-	for index = 1, tokens.count do
-		local token = tokens.arena[index]
-		if token.kind == KIND.string and token.start <= from and from <= token.stop then
-			return true
-		end
-	end
-	_ = source
-	_ = to
-	return false
-end
-
--- The operators a formatter puts one space on either side of. `-`, `+`, `~` and `#` are also
--- unary, and the scanner decides from the token before them which spelling this is.
-local SPACED_OPERATORS = {
-	"=", "==", "~=", "!=", "<", ">", "<=", ">=", "..", "//", "<<", ">>", "~>>",
-	"+=", "-=", "*=", "/=", "%=", "^=", "..=", "&&", "||", "??", "->",
-	"+", "-", "*", "/", "%", "^", "&", "|", "~",
-}
-table.sort(SPACED_OPERATORS, function(left, right) return #left > #right end)
-
----@param word string?
----@return boolean
-local function unaryWord(word)
-	return word == "return" or word == "and" or word == "or" or word == "not"
-		or word == "then" or word == "else" or word == "elseif" or word == "do"
-		or word == "until" or word == "in" or word == "local"
-end
-
---- Space a line of code the way the rest of the formatter writes it, leaving literals and a
---- trailing comment alone. The line is the content after indentation; the caller puts the
---- indentation back.
----@param line string
----@return string
-local function spaceCodeLine(line)
-	local out = {}
-	local count = 0
-	---@param text string
-	local function append(text)
-		count += 1
-		out[count] = text
-	end
-	---@return string
-	local function text() return table.concat(out) end
-	---@param start integer
-	local function trimTrailing(start)
-		while start >= 1 and out[start] == " " do
-			out[start] = nil
-			start -= 1
-		end
-		count = start
-	end
-
-	local index = 1
-	while index <= #line do
-		local char = line:sub(index, index)
-		---@cast char string
-		if char == '"' or char == "'" then
-			local quote = char
-			local from = index
-			index += 1
-			while index <= #line do
-				local held = line:sub(index, index)
-				if held == "\\" then index += 2
-				elseif held == quote then index += 1 break
-				else index += 1 end
-			end
-			append(line:sub(from, index - 1))
-		elseif char == "-" and line:sub(index + 1, index + 1) == "-" then
-			local before = text():gsub("%s+$", "")
-			out, count = {}, 0
-			append(before)
-			if before ~= "" then append(" ") end
-			append(line:sub(index))
-			return text()
-		elseif char == "[" and (line:sub(index + 1, index + 1) == "["
-			or line:match("^%[=+%[", index)) then
-			local level = line:match("^%[(=*)%[", index) or ""
-			local close = "]" .. level .. "]"
-			local found = line:find(close, index + 2 + #level, true)
-			local stop = found and (found + #close - 1) or #line
-			append(line:sub(index, stop))
-			index = stop + 1
-		else
-			local operator
-			for _, candidate in ipairs(SPACED_OPERATORS) do
-				if line:sub(index, index + #candidate - 1) == candidate then
-					operator = candidate
-					break
-				end
-			end
-			---@cast operator string
-			if operator then
-				local before = text():gsub("%s+$", "")
-				local previousWord = before:match("([%a_][%w_]*)$")
-				local previousChar = before:sub(-1)
-				local unary = (operator == "-" or operator == "+" or operator == "~")
-					and (previousChar == "" or previousChar:match("[%(%[%{%,%;%:%=%<%>%+%-%*%/%%%^%&%|~!%?]") ~= nil
-						or unaryWord(previousWord))
-				if unary then
-					append(operator)
-				else
-					trimTrailing(count)
-					if before ~= "" and not previousChar:match("[%(%[%{%,%;%:]") then append(" ") end
-					append(operator)
-					append(" ")
-				end
-				index += #operator
-				while line:sub(index, index):match("%s") do index += 1 end
-			elseif char == "," or char == ";" then
-				trimTrailing(count)
-				append(char)
-				index += 1
-				while line:sub(index, index):match("%s") do index += 1 end
-				local nextChar = line:sub(index, index)
-				if nextChar ~= "" and nextChar ~= ")" and nextChar ~= "]" and nextChar ~= "}" then append(" ") end
-			elseif char == ")" or char == "]" or char == "}" then
-				trimTrailing(count)
-				append(char)
-				index += 1
-			elseif char == " " then
-				-- One space between words is the style; a run is not alignment the formatter keeps.
-				if count > 0 and out[count] ~= " " then append(" ") end
-				index += 1
-			else
-				append(char)
-				index += 1
-			end
-		end
-	end
-	return (text():gsub("%s+$", ""))
-end
-
 --- The edits a formatter would make to the lines in a range: the indentation a line is written at
 --- and the spaces the engine's own style puts between tokens. A line inside a long string is left
 --- alone, and so is anything after a `--` comment.
@@ -4789,63 +4628,23 @@ end
 ---@param uri string
 ---@param firstLine integer 0-based
 ---@param lastLine integer 0-based
+---@param whole boolean? apply the document-level rules as well
 ---@return table[]
-function Lye:formatRange(uri, firstLine, lastLine)
+function Lye:formatRange(uri, firstLine, lastLine, whole)
 	---@type lye.framework.Document?
 	local document = self.server.documents:get(uri)
 	local parsed = self.analysis[uri]
 	if not document or not parsed then return json.array() end
 
-	local text, index, encoding = document.text, document.lineIndex, self.server.encoding
-	local edits = json.array()
-	-- What the project asks for, and lye's own style where it asks nothing: tabs, one blank line
-	-- between things, a trailing newline, nothing left hanging at the end of a line.
+	local text = document.text
 	local settings = self:editorSettings(uri)
-	local unit = settings.indent_style == "space" and (" "):rep(tonumber(settings.indent_size) or 2) or "\t"
-	local line, at = 0, 1
-	while at <= #text do
-		local newline = text:find("\n", at, true)
-		local stop = (newline and newline - 1) or #text
-		local written = text:sub(at, stop)
-		if line >= firstLine and line <= lastLine then
-			local trimmed = written:gsub("%s+$", "")
-			if not insideLongString(parsed, text, at, stop) then
-				-- The offset of the line's own text, not of the line: a block opens *after* the
-				-- newline, so the leading whitespace sits outside it and every body came out at the
-				-- depth of the thing it was written inside.
-				local body = written:find("[^ \t]")
-				local first = body and (at + body - 1) or at
-				-- A blank line holds nothing, so it stays empty rather than indented to whatever
-				-- depth it happens to sit at.
-				local content = trimmed:gsub("^[ \t]+", "")
-				if content ~= "" then content = spaceCodeLine(content) end
-				local wanted = trimmed == "" and ""
-					or unit:rep(indentAt(parsed, math.min(first, #text))) .. content
-				if wanted ~= written then
-					edits[#edits + 1] = {
-						range = {
-							start = { line = line, character = 0 },
-							["end"] = { line = line, character = #written },
-						},
-						newText = wanted,
-					}
-				end
-			elseif trimmed ~= written then
-				edits[#edits + 1] = {
-					range = {
-						start = { line = line, character = #trimmed },
-						["end"] = { line = line, character = #written },
-					},
-					newText = "",
-				}
-			end
-		end
-		line = line + 1
-		at = stop + 2
-		if not newline then break end
+	local edits = json.array()
+	for _, edit in ipairs(format.edits(text, parsed, settings, firstLine, lastLine, whole)) do
+		edits[#edits + 1] = {
+			range = self:toRange(text, document.lineIndex, edit.from, edit.to),
+			newText = edit.text,
+		}
 	end
-	_ = index
-	_ = encoding
 	return edits
 end
 
@@ -4864,54 +4663,7 @@ function Lye:onFormatting(params)
 	local text = document.text
 	local lines = 0
 	for _ in text:gmatch("\n") do lines += 1 end
-	local edits = self:formatRange(uri, 0, lines)
-
-	-- The rest of the style is about the document rather than one line, so it is applied only when the
-	-- whole file is asked for: one blank line between things, and a single newline at the end.
-	local settings = self:editorSettings(uri)
-	local blankRun, at = 0, 1
-	local line = 0
-	while at <= #text do
-		local newline = text:find("\n", at, true)
-		local stop = (newline and newline - 1) or #text
-		local written = text:sub(at, stop)
-		if written:match("^%s*$") then
-			blankRun += 1
-			if blankRun > 1 then
-				edits[#edits + 1] = {
-					range = {
-						start = { line = line, character = 0 },
-						["end"] = { line = line + 1, character = 0 },
-					},
-					newText = "",
-				}
-			end
-		else
-			blankRun = 0
-		end
-		line += 1
-		at = stop + 2
-		if not newline then
-			-- The last line, when the file does not end where it should. The indentation may have
-			-- rewritten this very line, so the newline joins that edit rather than racing it.
-			if settings.insert_final_newline ~= "false" and written ~= "" then
-				local existing = edits[#edits]
-				if existing and existing.range.start.line == line - 1 then
-					existing.newText = existing.newText .. "\n"
-				else
-					edits[#edits + 1] = {
-						range = {
-							start = { line = line - 1, character = #written },
-							["end"] = { line = line - 1, character = #written },
-						},
-						newText = "\n",
-					}
-				end
-			end
-			break
-		end
-	end
-	return edits
+	return self:formatRange(uri, 0, lines, true)
 end
 
 ---@param self lye.Server

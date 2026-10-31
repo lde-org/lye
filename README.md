@@ -186,6 +186,12 @@ one). Results are cached under `./.lye`; `--cache <dir>` or `LYE_CACHE_DIR` move
 file extensions the workspace's plugins claim, which is what an editor wrapper needs to attach a
 dialect's buffers.
 
+`lye format [paths...]` lays out Lua files in place: indentation from the parser, one space
+between the tokens of an expression, no trailing whitespace, one blank line between things and a
+final newline. `--check` prints the files that would change and exits 1 without writing anything;
+`lye format -` reads stdin and writes the result to stdout. `.editorconfig` indentation and
+`insert_final_newline` are honoured, and a line inside a long string is left alone.
+
 An editor that supports LSP pull diagnostics gets `textDocument/diagnostic` for the open document
 and `workspace/diagnostic` for every Lua file in the workspace; either is a full check of the files
 it names. Clients without workspace pull still publish the open document's diagnostics, and

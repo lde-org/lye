@@ -18,6 +18,7 @@ usage: lye [options] [files...]
   --stdio          the same, and what editors pass
   init [dir]       write a lye.json there, or in the working directory, if there is not one already
   check [paths...] check every Lua file under the paths, or the working directory
+  format [paths...] lay out Lua files in place; `-` reads stdin and writes stdout
   extensions [dir] print the file extensions the workspace's plugins claim
   --check <file>   the same for the files named, kept for scripts that pass it
   --cache <dir>    keep what a run worked out there, instead of ./.lye
@@ -62,6 +63,85 @@ elseif args[1] == "extensions" then
 	local dir = args[2] or "."
 	local extensions = check.extensions(dir)
 	for _, extension in ipairs(extensions) do print(extension) end
+	return
+elseif args[1] == "format" then
+	local formatter = require("lye-lsp.format")
+	local Parser = require("lye-parser")
+	local editorconfig = require("lye-lsp.editorconfig")
+	local fs = require("fs")
+	local checkOnly, toStdout, named = false, false, {}
+	local at = 2
+	while args[at] do
+		local value = args[at]
+		if value == "--check" then
+			checkOnly = true
+		elseif value == "--stdout" then
+			toStdout = true
+		elseif value == "--no-color" or value == "--color" then
+			-- A formatter has no report to colour.
+		elseif value == "-h" or value == "--help" then
+			io.stdout:write(USAGE)
+			return
+		elseif value:sub(1, 1) == "-" and value ~= "-" then
+			io.stderr:write(string.format("lye: unknown format option '%s'\n", value) .. USAGE)
+			os.exit(2)
+		else
+			named[#named + 1] = value
+		end
+		at += 1
+	end
+	if #named == 0 then named[1] = "." end
+
+	---@param path string
+	---@param source string
+	---@return string
+	local function layout(path, source)
+		local dir = path:match("^(.*)/[^/]*$") or "."
+		local settings = editorconfig.forFile(dir, path)
+		local parsed = Parser.new(source):parse()
+		return formatter.text(source, parsed, settings)
+	end
+
+	if #named == 1 and named[1] == "-" then
+		local source = io.stdin:read("*a") or ""
+		local formatted = layout("-", source)
+		if checkOnly then os.exit(formatted == source and 0 or 1) end
+		io.stdout:write(formatted)
+		return
+	end
+	if toStdout and #named > 1 then
+		io.stderr:write("lye: --stdout takes one file, or `-` for stdin\n")
+		os.exit(2)
+	end
+
+	local files = {}
+	for _, path in ipairs(check.expand(named)) do
+		if path:match("%.lua$") then files[#files + 1] = path end
+	end
+	if #files == 0 then
+		io.stderr:write("lye: no Lua files to format\n")
+		os.exit(1)
+	end
+	local changed = 0
+	for _, path in ipairs(files) do
+		local source = fs.read(path)
+		if type(source) == "string" then
+			local formatted = layout(path, source)
+			if formatted ~= source then
+				changed += 1
+				if checkOnly then
+					print(path)
+				elseif toStdout then
+					io.stdout:write(formatted)
+				else
+					fs.write(path, formatted)
+				end
+			elseif toStdout then
+				io.stdout:write(source)
+			end
+		end
+	end
+	if checkOnly then os.exit(changed == 0 and 0 or 1) end
 	return
 elseif args[1] == "init" then
 	-- A workspace says what it wants in a file beside it, and the file has a shape worth getting
