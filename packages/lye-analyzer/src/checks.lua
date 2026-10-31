@@ -286,9 +286,13 @@ local function declaredMismatches(ctx)
 				end
 				return held
 			end
-			local message = types.strictMismatch(declared, withoutReceiver(variable.initializer), variable.name)
-			if message then
-				diagnostic.add(self, message, declaration.start, declaration.stop, nil, "type")
+			-- A declaration with no value writes no initializer: the annotation is the value, and
+			-- the placeholder beside it is the typing pass's, not a promise about a written one.
+			if declaration.valueIdx ~= nil then
+				local message = types.strictMismatch(declared, withoutReceiver(variable.initializer), variable.name)
+				if message then
+					diagnostic.add(self, message, declaration.start, declaration.stop, nil, "type")
+				end
 			end
 			for _, assignment in ipairs(variable.assignments) do
 				local assigned = types.strictMismatch(declared, withoutReceiver(assignment.type), variable.name)

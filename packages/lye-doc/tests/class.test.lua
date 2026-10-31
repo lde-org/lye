@@ -218,6 +218,17 @@ test.it("substitutes a class's parameters into a method added after it was built
 	test.equal(doctype.display(get.returns), "number")
 end)
 
+test.it("uses a generic parameter's default when none is written", function()
+	local namespace = read("---@alias Box<T = number> { value: T }\n")
+	local resolve = classes.resolver(namespace)
+	local box = resolve("Box")
+	local boxedBoolean = resolve("Box<boolean>")
+	---@cast box lye.doc.Type
+	---@cast boxedBoolean lye.doc.Type
+	test.equal(doctype.display(doctype.fieldOf(box, "value")), "number")
+	test.equal(doctype.display(doctype.fieldOf(boxedBoolean, "value")), "boolean")
+end)
+
 test.it("reads an alias that names a class declared below it", function()
 	local namespace = read(table.concat({
 		"---@alias Ids Point[]\n",

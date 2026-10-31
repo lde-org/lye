@@ -21,12 +21,13 @@ local types = {}
 ---| { variant: "unknown", isMutable: boolean? }
 ---| { variant: "extern", name: string }
 ---| { variant: "array", type: lye.doc.Type, indexed: { key: string, type: lye.doc.Type }? }
+---| { variant: "length", type: lye.doc.Type }
 ---| { variant: "object", fields: table<string, lye.doc.Type>, indexed: { key: string, type: lye.doc.Type }?, metatable: lye.doc.Type? }
 ---| { variant: "union", types: lye.doc.Type[], aliasName: string? }
 ---| { variant: "intersection", types: lye.doc.Type[], aliasName: string? }
 ---| { variant: "keyof", type: lye.doc.Type }
 ---| { variant: "indexed", object: lye.doc.Type, key: lye.doc.Type }
----| { variant: "conditional", check: lye.doc.Type, extends: lye.doc.Type, thenType: lye.doc.Type, elseType: lye.doc.Type }
+---| { variant: "conditional", check: lye.doc.Type, extends: lye.doc.Type, thenType: lye.doc.Type?, elseType: lye.doc.Type?, thenText: string?, elseText: string?, bindings: table<string, lye.doc.Type>? }
 ---| { variant: "mapped", key: string, source: lye.doc.Type, value: lye.doc.Type }
 ---| { variant: "infer", name: string }
 ---| { variant: "operation", op: string, left: lye.doc.Type, right: lye.doc.Type }
@@ -239,6 +240,30 @@ function types.infer(name) return make("infer", { name = name }) end
 ---@param inner lye.doc.Type
 function types.array(inner) return make("array", { type = inner }) end
 
+--- The length of a value whose length a type can know: a table's numeric fields or a string
+--- literal's bytes. An array or a bare string only says it is a number.
+---@param type lye.doc.Type
+---@return lye.doc.Type
+function types.length(type)
+	if type.variant == "object" then
+		if type.indexed and (type.indexed.key == "integer" or type.indexed.key == "number") then
+			return types.NUMBER
+		end
+		local count = 0
+		while type.fields[tostring(count + 1)] ~= nil do count += 1 end
+		return types.numberValue(count)
+	end
+	if type.variant == "extern" then
+		local first, last = type.name:sub(1, 1), type.name:sub(-1)
+		if (first == '"' or first == "'") and last == first then
+			return types.numberValue(#type.name:sub(2, -2))
+		end
+	end
+	if type.variant == "string" or type.variant == "array" then return types.NUMBER end
+	if types.isSymbolic(type) then return make("length", { type = type }) end
+	return types.NUMBER
+end
+
 ---@param fields table<string, lye.doc.Type>
 ---@param indexed { key: string, type: lye.doc.Type }? what any other key holds
 function types.object(fields, indexed) return make("object", { fields = fields, indexed = indexed }) end
@@ -392,6 +417,7 @@ function types.isSymbolic(type)
 		return false
 	end
 	if type.variant == "array" then return types.isSymbolic(type.type) end
+	if type.variant == "length" then return types.isSymbolic(type.type) end
 	if type.variant == "keyof" then return types.isSymbolic(type.type) end
 	if type.variant == "indexed" then return types.isSymbolic(type.object) or types.isSymbolic(type.key) end
 	if type.variant == "operation" then
@@ -419,7 +445,8 @@ function types.keyof(type)
 		local keys = {}
 		for name in pairs(fields) do
 			---@cast name string
-			keys[#keys + 1] = types.stringValue(name)
+			local number = name:match("^%d+$") and tonumber(name)
+			keys[#keys + 1] = number and types.numberValue(number) or types.stringValue(name)
 		end
 		local indexed = type.indexed
 		if indexed then
@@ -446,6 +473,10 @@ end
 ---@param object lye.doc.Type
 ---@param key lye.doc.Type
 function types.indexedAccess(object, key)
+	if object.variant == "unknown" or object.variant == "any"
+		or key.variant == "unknown" or key.variant == "any" then
+		return types.mutable()
+	end
 	if key.variant == "union" then
 		local members = {}
 		for index, member in ipairs(key.types) do
@@ -467,6 +498,32 @@ function types.indexedAccess(object, key)
 			return make("indexed", { object = object, key = key })
 		end
 		return types.indexResult(object, name)
+	end
+	if key.variant == "number" then
+		if object.variant == "object" and key.value ~= nil then
+			local found = object.fields[tostring(key.value)]
+			if found then return found end
+			if object.indexed and object.indexed.key ~= "string" then return object.indexed.type end
+			return types.NIL_TYPE
+		end
+		if object.variant == "object" and object.indexed
+			and (object.indexed.key == "integer" or object.indexed.key == "number"
+				or object.indexed.key == "any") then
+			return object.indexed.type
+		end
+		if object.variant == "array" then return object.type end
+	end
+	---@cast key lye.doc.Type
+	if key.variant == "string" then
+		if object.variant == "object" and object.indexed
+			and (object.indexed.key == "string" or object.indexed.key == "any") then
+			return object.indexed.type
+		end
+		if object.variant == "class" and object.indexed
+			and (object.indexed.key == "string" or object.indexed.key == "any") then
+			return object.indexed.type
+		end
+		return make("indexed", { object = object, key = key })
 	end
 	if key.variant == "keyof" then
 		local values = {}
@@ -494,7 +551,9 @@ function types.mapped(key, source, value)
 	local fields = {}
 	local keys = source.variant == "union" and source.types or { source }
 	for _, one in ipairs(keys) do
-		if one.variant == "extern" then
+		if one.variant == "number" and one.value ~= nil then
+			fields[tostring(one.value)] = types.substitute(value, { [key] = one })
+		elseif one.variant == "extern" then
 			local first, last = one.name:sub(1, 1), one.name:sub(-1)
 			if (first == '"' or first == "'") and last == first then
 				local name = one.name:sub(2, -2)
@@ -545,6 +604,25 @@ function types.template(parts)
 	return make("template", { parts = parts })
 end
 
+--- Conditional branches are kept as text until the condition decides which one is needed. Parsing
+--- both branches eagerly made a recursive alias read its own unbound tail forever: `Length<Nil>`
+--- parsed the `Length<Nil["tail"]>` it would never take. The resolver is kept beside the type
+--- rather than inside it, so a type graph written to a cache is still plain data.
+---@type table<lye.doc.Type, fun(text: string): lye.doc.Type?>
+local conditionalResolvers = setmetatable({}, { __mode = "k" })
+
+---@type fun(type: lye.doc.Type, bindings: table<string, lye.doc.Type>?, seen: table<lye.doc.Type, lye.doc.Type>?): lye.doc.Type
+local settleConditional
+
+--- The text a string literal type spells, or nil when the type is not one.
+---@param type lye.doc.Type?
+---@return string?
+local function literalText(type)
+	if not type or type.variant ~= "extern" then return nil end
+	local first, last = type.name:sub(1, 1), type.name:sub(-1)
+	if (first == '"' or first == "'") and last == first then return type.name:sub(2, -2) end
+end
+
 --- Whether a pattern names an `infer` variable anywhere.
 ---@param type lye.doc.Type?
 ---@return boolean
@@ -566,6 +644,12 @@ local function hasInfer(type)
 	end
 	if type.variant == "object" then
 		for _, field in pairs(type.fields or {}) do if hasInfer(field) then return true end end
+		return false
+	end
+	if type.variant == "template" then
+		for _, part in ipairs(type.parts) do
+			if _G.type(part) ~= "string" and hasInfer(part) then return true end
+		end
 		return false
 	end
 	return false
@@ -616,6 +700,53 @@ local function matchPattern(pattern, actual, bindings)
 		end
 		return matchPattern(pattern.returns, actual.returns, bindings)
 	end
+	if pattern.variant == "template" then
+		local text = literalText(actual)
+		if not text then return false end
+		---@cast text string
+		local at, index = 1, 1
+		while index <= #pattern.parts do
+			local part = pattern.parts[index]
+			if _G.type(part) == "string" then
+				if part ~= "" then
+					if text:sub(at, at + #part - 1) ~= part then return false end
+					at += #part
+				end
+				index += 1
+			elseif part.variant == "infer" then
+				local nextPart = pattern.parts[index + 1]
+				local capture
+				if _G.type(nextPart) == "string" and nextPart ~= "" then
+					---@cast nextPart string
+					local found = text:find(nextPart, at, true)
+					if not found then return false end
+					capture = text:sub(at, found - 1)
+					at = found + #nextPart
+					index += 2
+				else
+					-- A final infer takes the rest; one before another infer takes a single
+					-- character, as TypeScript's matcher does.
+					if index == #pattern.parts then
+						capture = text:sub(at)
+						at = #text + 1
+					else
+						capture = text:sub(at, at)
+						at += 1
+					end
+					index += 1
+				end
+				local held = bindings[part.name]
+				if held then
+					if types.display(held) ~= types.display(types.stringValue(capture)) then return false end
+				else
+					bindings[part.name] = types.stringValue(capture)
+				end
+			else
+				return false
+			end
+		end
+		return at > #text
+	end
 	return types.satisfies(actual, pattern)
 end
 
@@ -648,6 +779,22 @@ function types.conditional(check, extends, thenType, elseType)
 	return make("conditional", {
 		check = check, extends = extends, thenType = thenType, elseType = elseType,
 	})
+end
+
+--- A conditional whose branches have not been read yet. Only the branch the condition selects is
+--- parsed, which is what lets a recursive alias terminate instead of expanding both sides.
+---@param check lye.doc.Type
+---@param extends lye.doc.Type
+---@param thenText string
+---@param elseText string
+---@param resolve (fun(text: string): lye.doc.Type?)?
+---@return lye.doc.Type
+function types.lazyConditional(check, extends, thenText, elseText, resolve)
+	local held = make("conditional", {
+		check = check, extends = extends, thenText = thenText, elseText = elseText,
+	})
+	conditionalResolvers[held] = resolve
+	return held
 end
 
 --- Combine two types. An unknown operand contributes nothing, so evolving a variable from
@@ -808,6 +955,17 @@ function fits(type, constraint, depth, seen)
 	if constraint.variant == "any" or constraint.variant == "unknown" then return true end
 	if type.variant == "unknown" or type.variant == "any" then return true end
 
+	-- A conditional with text branches is settled before the value-specific checks: `3` has to
+	-- see the number the recursive expression gives, not the expression it was written as.
+	if type.variant == "conditional" and type.thenText then
+		local settled = types.settleConditional(type)
+		if settled ~= type then return fits(settled, constraint, depth + 1, seen) end
+	end
+	if constraint.variant == "conditional" and constraint.thenText then
+		local settled = types.settleConditional(constraint)
+		if settled ~= constraint then return fits(type, settled, depth + 1, seen) end
+	end
+
 	-- A C number is a cdata the engine converts wherever a number is wanted, so refusing it would
 	-- report code the engine runs. The class keeps the name it was written with, marker and all.
 	if isCNumber(type) and (constraint.variant == "number" or constraint.variant == "integer"
@@ -877,9 +1035,19 @@ function fits(type, constraint, depth, seen)
 	end
 	if constraint.variant == "conditional" or type.variant == "conditional" then
 		local decided = constraint.variant == "conditional" and constraint or type
-		if not types.isSymbolic(decided.check) and not types.isSymbolic(decided.extends) then
-			local answer = types.satisfies(decided.check, decided.extends)
+		if decided.thenText then
+			local settled = types.settleConditional(decided)
+			if settled ~= decided then
+				if constraint.variant == "conditional" then return fits(type, settled, depth + 1, seen) end
+				return fits(settled, constraint, depth + 1, seen)
+			end
+		end
+		local decidedCheck, decidedExtends = decided.check, decided.extends
+		if decidedCheck and decidedExtends
+			and not types.isSymbolic(decidedCheck) and not types.isSymbolic(decidedExtends) then
+			local answer = types.satisfies(decidedCheck, decidedExtends)
 				and decided.thenType or decided.elseType
+			if not answer then return true end
 			if constraint.variant == "conditional" then return fits(type, answer, depth + 1, seen) end
 			return fits(answer, constraint, depth + 1, seen)
 		end
@@ -893,6 +1061,17 @@ function fits(type, constraint, depth, seen)
 		local value = types.operation(decided.op, decided.left, decided.right)
 		if value ~= decided then
 			if constraint.variant == "operation" then return fits(type, value, depth + 1, seen) end
+			return fits(value, constraint, depth + 1, seen)
+		end
+		return true
+	end
+	-- A length is known once its operand is. Like an operation, a symbolic one is a promise.
+	if constraint.variant == "length" or type.variant == "length" then
+		local decided = constraint.variant == "length" and constraint or type
+		if types.isSymbolic(decided) then return true end
+		local value = types.length(decided.type)
+		if value ~= decided then
+			if constraint.variant == "length" then return fits(type, value, depth + 1, seen) end
 			return fits(value, constraint, depth + 1, seen)
 		end
 		return true
@@ -1822,6 +2001,7 @@ function types.indexResult(target, field)
 		-- A string index signature answers for a name as well as for a key: `table<string, integer>`
 		-- says what reading one gives, so a field the table does not list holds that rather than
 		-- nil — reading one as nil reported every `flags.anything` as a number that was not there.
+		if field == "length" then return types.length(target) end
 		if target.indexed and target.indexed.key == "string" then return target.indexed.type end
 		return types.NIL_TYPE
 	end
@@ -1860,17 +2040,28 @@ end
 ---@return string[]
 local function splitTopLevel(text, separator)
 	local parts, depth, from = {}, 0, 1
-	for at = 1, #text do
+	local quote, template = nil, false
+	local at = 1
+	while at <= #text do
+		local char = text:sub(at, at)
 		local byte = text:byte(at)
-		if byte == 40 or byte == 123 or byte == 60 then
+		if template then
+			if char == "`" then template = false end
+		elseif quote then
+			if char == "\\" then at += 1
+			elseif char == quote then quote = nil end
+		elseif char == "`" then template = true
+		elseif char == '"' or char == "'" then quote = char
+		elseif byte == 40 or byte == 123 or byte == 60 or byte == 91 then
 			depth += 1
-		elseif byte == 41 or byte == 125 or byte == 62 then
+		elseif byte == 41 or byte == 125 or byte == 62 or byte == 93 then
 			-- `->` carries a `>`, so the depth never goes below the text it was read from.
 			if depth > 0 then depth -= 1 end
 		elseif byte == separator and depth == 0 then
 			parts[#parts + 1] = text:sub(from, at - 1)
 			from = at + 1
 		end
+		at += 1
 	end
 	parts[#parts + 1] = text:sub(from)
 	return parts
@@ -1899,42 +2090,49 @@ local CONTINUES = {
 ---@param text string
 ---@return integer? stop
 local function typeEndScan(text)
-	local depth, template = 0, false
+	local depth, template, quote = 0, false, nil
 	-- A conditional is a type for its whole length: `A extends B ? X : Y` has spaces at every
 	-- keyword, and cutting at the first one left the annotation meaning `A`.
 	local conditional = text:find("%f[%w_]extends%f[^%w_]") ~= nil
-	for at = 1, #text do
+	local at = 1
+	while at <= #text do
 		local char = text:sub(at, at)
-		-- A `--` is never part of a type, wherever it appears: what follows one is prose. The two hyphens
-		-- otherwise read as the arrow of a signature, and the sentence's first words became the type.
-		if char == "-" and text:sub(at + 1, at + 1) == "-" and depth == 0 and not template then return at - 1 end
-		if char == "`" then
-			template = not template
-		elseif template then
-			-- Everything inside a template literal is text, including its spaces.
-		elseif char == "<" or char == "{" or char == "(" or char == "[" then
-			depth += 1
-		elseif char == ">" or char == "}" or char == ")" or char == "]" then
-			depth -= 1
-		elseif char == " " and depth == 0 then
-			-- A marker on either side of the space keeps the type going: `fun(a): string` has one
-			-- after the colon, `nil | string` one before the bar. An operator on either side does
-			-- the same for a const expression: `A .. B` and `A + B` are one type.
-			local after = text:sub(at + 1):match("^(%S)")
-			local before = text:sub(at - 1, at - 1)
-			local rest = text:sub(at + 1)
-			local left = text:sub(1, at - 1)
-			-- Only a spaced operator continues the type. `ffi.cdata*` and `...` end in characters
-			-- that are operators too, and prose after them is not an operand.
-			local expression = rest:match("^%.%.%s") ~= nil or rest:match("^[%+%-%*/%%%^]%s") ~= nil
-				or left:match("%s%.%.$") ~= nil or left:match("%s[%+%-%*/%%%^]$") ~= nil
-			if not (conditional or CONTINUES[before] or (after and CONTINUES[after]) or expression) then
-				return at - 1
+		if template then
+			if char == "`" then template = false end
+		elseif quote then
+			if char == "\\" then at += 1
+			elseif char == quote then quote = nil end
+		elseif char == "`" then
+			template = true
+		elseif char == '"' or char == "'" then
+			quote = char
+		else
+			-- A `--` is never part of a type, wherever it appears: what follows one is prose.
+			if char == "-" and text:sub(at + 1, at + 1) == "-" then return at - 1 end
+			if char == "<" or char == "{" or char == "(" or char == "[" then
+				depth += 1
+			elseif char == ">" or char == "}" or char == ")" or char == "]" then
+				depth -= 1
+			elseif char == " " and depth == 0 then
+				-- A marker on either side of the space keeps the type going: `fun(a): string` has one
+				-- after the colon, `nil | string` one before the bar. An operator on either side does
+				-- the same for a const expression: `A .. B` and `A + B` are one type.
+				local after = text:sub(at + 1):match("^(%S)")
+				local before = text:sub(at - 1, at - 1)
+				local rest = text:sub(at + 1)
+				local left = text:sub(1, at - 1)
+				-- Only a spaced operator continues the type. `ffi.cdata*` and `...` end in characters
+				-- that are operators too, and prose after them is not an operand.
+				local expression = rest:match("^%.%.%s") ~= nil or rest:match("^[%+%-%*/%%%^]%s") ~= nil
+					or left:match("%s%.%.$") ~= nil or left:match("%s[%+%-%*/%%%^]$") ~= nil
+				if not (conditional or CONTINUES[before] or (after and CONTINUES[after]) or expression) then
+					return at - 1
+				end
 			end
 		end
+		at += 1
 	end
 end
-
 --- Text read over and over — a signature's parameters at every call site, an annotation at every
 --- analysis — costs its scan each time, and the scans answer with plain text and numbers that
 --- nothing writes to. The first answer is kept for the same text; the keys are weak, so the text
@@ -2274,6 +2472,9 @@ local function substituted(type, bindings, seen)
 		end
 		return out
 	end
+	if type.variant == "length" then
+		return types.length(substituted(type.type, bindings, seen))
+	end
 	if type.variant == "array" then
 		local seenHere = seen[type]
 		if seenHere then return seenHere end
@@ -2326,10 +2527,11 @@ local function substituted(type, bindings, seen)
 			substituted(type.key, bindings, seen))
 	end
 	if type.variant == "conditional" then
+		if type.thenText then return settleConditional(type, bindings, seen) end
+		local thenType = type.thenType and substituted(type.thenType, bindings, seen) or types.UNKNOWN_TYPE
+		local elseType = type.elseType and substituted(type.elseType, bindings, seen) or types.UNKNOWN_TYPE
 		return types.conditional(substituted(type.check, bindings, seen),
-			substituted(type.extends, bindings, seen),
-			substituted(type.thenType, bindings, seen),
-			substituted(type.elseType, bindings, seen))
+			substituted(type.extends, bindings, seen), thenType, elseType)
 	end
 	if type.variant == "mapped" then
 		return types.mapped(type.key, substituted(type.source, bindings, seen),
@@ -2385,6 +2587,87 @@ function types.substitute(type, bindings)
 	return substituted(type, bindings, {})
 end
 
+--- Replace the names a conditional bound in the text of the branch it chose. Parsing first and
+--- substituting afterwards left a recursive alias application written as `Run<Tail, ...>` with
+--- the variable still in its argument, and the alias resolver built the unrestricted body.
+---@param text string
+---@param bindings table<string, lye.doc.Type>
+---@return string
+local function substituteText(text, bindings)
+	local out = text
+	for name, bound in pairs(bindings) do
+		local replacement = types.display(bound)
+		out = out:gsub("%f[%w_](" .. name .. ")%f[^%w_]", function() return replacement end)
+	end
+	return out
+end
+
+---@param type lye.doc.Type
+---@param bindings table<string, lye.doc.Type>?
+---@param seen table<lye.doc.Type, lye.doc.Type>?
+---@return lye.doc.Type
+local function settleConditionalImpl(type, bindings, seen)
+	seen = seen or {}
+	local check = bindings and substituted(type.check, bindings, seen) or type.check
+	local extends = bindings and substituted(type.extends, bindings, seen) or type.extends
+	if types.isSymbolic(check) or types.isSymbolic(extends) then
+		if check == type.check and extends == type.extends then return type end
+		local held = types.lazyConditional(check, extends, type.thenText or "", type.elseText or "",
+			conditionalResolvers[type])
+		held.bindings = type.bindings
+		if bindings then
+			local merged = {}
+			for name, value in pairs(type.bindings or {}) do merged[name] = value end
+			for name, value in pairs(bindings) do merged[name] = value end
+			held.bindings = merged
+		end
+		return held
+	end
+	local inferBindings = {}
+	local branchText
+	if hasInfer(extends) then
+		if check.variant == "union" then
+			local members = {}
+			for index, member in ipairs(check.types) do
+				local held = types.lazyConditional(member, extends, type.thenText or "", type.elseText or "",
+					conditionalResolvers[type])
+				members[index] = settleConditional(held, bindings, seen)
+			end
+			return types.union(members)
+		end
+		if matchPattern(extends, check, inferBindings) then
+			branchText = type.thenText
+		else
+			branchText = type.elseText
+		end
+	else
+		branchText = types.satisfies(check, extends) and type.thenText or type.elseText
+	end
+	if not branchText then return types.UNKNOWN_TYPE end
+	---@cast branchText string
+	---@type table<string, lye.doc.Type>
+	local combined = {}
+	for name, value in pairs(type.bindings or {}) do combined[name] = value end
+	if bindings then for name, value in pairs(bindings) do combined[name] = value end end
+	for name, value in pairs(inferBindings) do combined[name] = value end
+	if next(combined) then
+		---@cast branchText string
+		branchText = substituteText(branchText, combined) end
+	local resolver = conditionalResolvers[type]
+	local parsed = types.parse(branchText, resolver)
+	if not parsed then return types.UNKNOWN_TYPE end
+	return parsed
+end
+settleConditional = settleConditionalImpl
+
+--- Evaluate a conditional from outside type substitution, when it still has text branches.
+---@param type lye.doc.Type
+---@return lye.doc.Type
+function types.settleConditional(type)
+	if type.variant == "conditional" and type.thenText then return settleConditional(type, nil, nil) end
+	return type
+end
+
 --- A string written out in an annotation or in code, quoted the way the annotation language
 --- writes one: the value of a literal, so `"a" .. "b"` and `"ab"` are the same string.
 ---@param text string the text of the string, without quotes
@@ -2425,9 +2708,17 @@ end
 ---@return string? elseText
 local function conditionalParts(text)
 	local depth, extendsAt, extendsStop = 0, nil, nil
+	local template, quote = false, nil
 	for at = 1, #text do
 		local char = text:sub(at, at)
-		if char == "<" or char == "{" or char == "(" or char == "[" then depth += 1
+		if template then
+			if char == "`" then template = false end
+		elseif quote then
+			if char == "\\" then at += 1
+			elseif char == quote then quote = nil end
+		elseif char == "`" then template = true
+		elseif char == '"' or char == "'" then quote = char
+		elseif char == "<" or char == "{" or char == "(" or char == "[" then depth += 1
 		elseif char == ">" or char == "}" or char == ")" or char == "]" then depth -= 1
 		elseif depth == 0 and text:sub(at, at + 8) == " extends " then
 			extendsAt, extendsStop = at, at + 8
@@ -2436,21 +2727,38 @@ local function conditionalParts(text)
 	end
 	if not extendsAt then return nil end
 	local question, condDepth
-	for at = extendsStop + 1, #text do
+	local at = extendsStop + 1
+	while at <= #text do
 		local char = text:sub(at, at)
-		if char == "<" or char == "{" or char == "(" or char == "[" then depth += 1
+		if template then
+			if char == "`" then template = false end
+		elseif quote then
+			if char == "\\" then at += 1
+			elseif char == quote then quote = nil end
+		elseif char == "`" then template = true
+		elseif char == '"' or char == "'" then quote = char
+		elseif char == "<" or char == "{" or char == "(" or char == "[" then depth += 1
 		elseif char == ">" or char == "}" or char == ")" or char == "]" then depth -= 1
 		elseif depth == 0 and char == "?" then
 			question = at
 			break
 		end
+		at += 1
 	end
 	if not question then return nil end
 	local colon
 	condDepth = 0
-	for at = question + 1, #text do
+	at = question + 1
+	while at <= #text do
 		local char = text:sub(at, at)
-		if char == "<" or char == "{" or char == "(" or char == "[" then depth += 1
+		if template then
+			if char == "`" then template = false end
+		elseif quote then
+			if char == "\\" then at += 1
+			elseif char == quote then quote = nil end
+		elseif char == "`" then template = true
+		elseif char == '"' or char == "'" then quote = char
+		elseif char == "<" or char == "{" or char == "(" or char == "[" then depth += 1
 		elseif char == ">" or char == "}" or char == ")" or char == "]" then depth -= 1
 		elseif depth == 0 and char == "?" then
 			-- A `?` that follows a type with no space is its optional marker (`V? : never`), not
@@ -2464,6 +2772,7 @@ local function conditionalParts(text)
 			if condDepth == 0 then colon = at break end
 			condDepth -= 1
 		end
+		at += 1
 	end
 	if not colon then return nil end
 	return (text:sub(1, extendsAt - 1):gsub("^%s+", ""):gsub("%s+$", "")),
@@ -2582,6 +2891,35 @@ local function expressionParts(text)
 	return bestAt, bestOp
 end
 
+--- The pieces of a mapped member `{ [K in Source]: Value }`, with the closing bracket found by
+--- nesting rather than by the first `]`: a source such as `keyof SetTable<..., 1>` may contain
+--- an indexed access of its own.
+---@param text string
+---@return string? key
+---@return string? source
+---@return string? value
+local function mappedParts(text)
+	local key, from = text:match("^{%s*%[%s*([%w_]+)%s+in%s+()")
+	if not key then return nil end
+	---@cast from integer
+	local depth, close = 0, nil
+	local at = from
+	while at <= #text do
+		local char = text:sub(at, at)
+		if char == "[" then depth += 1
+		elseif char == "]" then
+			if depth == 0 then close = at break end
+			depth -= 1
+		end
+		at += 1
+	end
+	if not close then return nil end
+	local source = text:sub(from, close - 1):gsub("^%s+", ""):gsub("%s+$", "")
+	local value = text:sub(close + 1):match("^%s*:?%s*(.-)%s*}$")
+	if not value then return nil end
+	return key, source, value
+end
+
 ---@param text string?
 ---@param resolve (fun(text: string): lye.doc.Type?)?
 ---@return lye.doc.Type?
@@ -2614,12 +2952,12 @@ function types.parse(text, resolve)
 		local check = types.parse(checkText, resolve)
 		---@type lye.doc.Type?
 		local wanted = types.parse(extendsText, resolve)
-		---@type lye.doc.Type?
-		local thenType = types.parse(thenText, resolve)
-		---@type lye.doc.Type?
-		local elseType = types.parse(elseText, resolve)
-		if check and wanted and thenType and elseType then
-			return types.conditional(check, wanted, thenType, elseType)
+		if check and wanted then
+			local held = types.lazyConditional(check, wanted, thenText, elseText, resolve)
+			if not types.isSymbolic(check) and not types.isSymbolic(wanted) then
+				return types.settleConditional(held)
+			end
+			return held
 		end
 	end
 
@@ -2675,12 +3013,24 @@ function types.parse(text, resolve)
 				break
 			end
 			parts[#parts + 1] = content:sub(at, open - 1)
-			local stop = content:find("}", close + 1, true)
-			if not stop then parts[#parts + 1] = content:sub(open) break end
-			local inner = types.parse(content:sub(close + 1, stop - 1), resolve)
+			-- The closing brace belongs to the substitution, not to a table literal inside it:
+			-- `${ { 0, 0, 0 }[1] }` has a brace pair of its own before the one that ends `${`.
+			local depth, stop = 1, close + 1
+			while stop <= #content and depth > 0 do
+				local char = content:sub(stop, stop)
+				if char == "{" then depth += 1
+				elseif char == "}" then depth -= 1 end
+				stop += 1
+			end
+			if depth > 0 then parts[#parts + 1] = content:sub(open) break end
+			local inner = types.parse(content:sub(close + 1, stop - 2), resolve)
 			if inner then parts[#parts + 1] = inner end
-			at = stop + 1
+			at = stop
 		end
+		-- The scan always leaves one empty static piece after the last substitution. It is not a
+		-- part the matcher can use: keeping it made a final `${infer Rest}` look as though another
+		-- piece followed, so the matcher captured one character instead of the rest.
+		while #parts > 0 and parts[#parts] == "" do table.remove(parts) end
 		return types.template(parts)
 	end
 
@@ -2712,6 +3062,13 @@ function types.parse(text, resolve)
 	-- is prose, and reading it as part of the type would make the annotation mean nothing.
 	local stop = typeEnd(trimmed)
 	if stop then trimmed = (trimmed:sub(1, stop):gsub("%s+$", "")) end
+
+	-- `#T` is its length: a table's numeric fields, a string literal's bytes, or a number for
+	-- an array or a bare string.
+	if trimmed:sub(1, 1) == "#" then
+		local operand = types.parse(trimmed:sub(2), resolve)
+		if operand then return types.length(operand) end
+	end
 
 	-- An operation over type variables: `A .. B` is a value the call's bindings decide. It is
 	-- read before the suffixes so `A .. B[]` is the concatenation of A and a list, not a list of
@@ -2756,8 +3113,7 @@ function types.parse(text, resolve)
 	if trimmed:sub(1, 1) == "{" and trimmed:sub(-1) == "}" then
 		-- `{ [K in keyof T]: U }` maps every key of T. The value is read with K standing for the
 		-- key a member is built for, so `{ [K in "a"|"b"]: K }` is `{ a: "a", b: "b" }`.
-		local keyVar, sourceText, valueText =
-			trimmed:match("^{%s*%[%s*([%w_]+)%s+in%s+(.-)%]%s*:?%s*(.*)%s*}$")
+		local keyVar, sourceText, valueText = mappedParts(trimmed)
 		if keyVar then
 			local source = types.parse(sourceText, resolve) or types.UNKNOWN_TYPE
 			local value = types.parse(valueText, function(text)
@@ -2770,28 +3126,60 @@ function types.parse(text, resolve)
 		local fields = {}
 		---@type { key: string, type: lye.doc.Type }?
 		local indexed
+		---@return integer
+		local function nextIndex()
+			local at = 1
+			while fields[tostring(at)] ~= nil do at += 1 end
+			return at
+		end
 		-- Split at the commas that separate fields, not at every comma there is: a field whose type
 		-- is `table<string, number>` carries one of its own, and cutting there leaves two fields —
 		-- `fields: table<string` and `number>` — which is a shape nothing can use.
 		for _, field in ipairs(splitTopLevel(trimmed:sub(2, -2), 44)) do
-			-- `[integer]: T` is an index signature: every key of that kind holds T, which is how
-			-- a list is written. It is the only thing that makes a generic element reachable.
-			-- The capture is trimmed: a field's text carries the spaces around it, and one left
-			-- on the end of a type becomes part of it — `string ?` ends where the space is, so the
-			-- marker a caller appended was dropped.
-			local key, value = field:match("^%s*%[%s*([%w_]+)%s*%]%s*:?%s*(.-)%s*$")
-			if key then
-				---@cast key string
-				indexed = { key = key, type = types.parse(value, resolve) or types.UNKNOWN_TYPE }
+			local spread = field:match("^%s*%.%.%.(.+)$")
+			if spread then
+				-- `{ ...Memory, 0 }` copies the fields the spread names and appends the members
+				-- written after it. A spread of an array keeps that element type at every key.
+				local held = types.parse(spread, resolve)
+				if held and held.variant == "object" then
+					for name, value in pairs(held.fields) do fields[name] = value end
+					if held.indexed then indexed = held.indexed end
+				elseif held and held.variant == "array" then
+					indexed = { key = "integer", type = held.type }
+				end
 			else
-				-- `kind?: string` marks the field optional with a `?` on its own name, which is
-				-- how LuaLS writes it and what the definitions use; `kind: string?` says the same
-				-- thing with the marker on the type. Reading the name's marker as part of the type
-				-- left the field required and its type spelled `?: string`.
-				local name, marker, held = field:match("^%s*([%w_]+)%s*(%??)%s*:?%s*(.-)%s*$")
-				if name then
-					fields[name] = types.parse(marker == "?" and (held .. "?") or held, resolve)
-						or types.UNKNOWN_TYPE
+				-- `[integer]: T` is an index signature; `[1]: T` and `[#Memory + 1]: T` name one
+				-- key, and the key may be a type-level number.
+				local keyText, value = field:match("^%s*%[%s*([^%]]*)%s*%]%s*:?%s*(.-)%s*$")
+				if keyText then
+					---@cast keyText string
+					local keyType = types.parse(keyText, resolve)
+					if keyText == "integer" or keyText == "number" or keyText == "string" or keyText == "any" then
+						indexed = { key = keyText, type = types.parse(value, resolve) or types.UNKNOWN_TYPE }
+					elseif keyType and keyType.variant == "number" and keyType.value ~= nil then
+						fields[tostring(keyType.value)] = types.parse(value, resolve) or types.UNKNOWN_TYPE
+					elseif keyType and keyType.variant == "extern" then
+						local first, last = keyType.name:sub(1, 1), keyType.name:sub(-1)
+						if (first == '"' or first == "'") and last == first then
+							fields[keyType.name:sub(2, -2)] = types.parse(value, resolve) or types.UNKNOWN_TYPE
+						end
+					end
+				else
+					-- `kind?: string` marks the field optional with a `?` on its own name, which is
+					-- how LuaLS writes it and what the definitions use; `kind: string?` says the same
+					-- thing with the marker on the type. Reading the name's marker as part of the type
+					-- left the field required and its type spelled `?: string`.
+					local name, marker, held = field:match("^%s*([%w_]+)%s*(%??)%s*:%s*(.-)%s*$")
+					if name then
+						fields[name] = types.parse(marker == "?" and (held .. "?") or held, resolve)
+							or types.UNKNOWN_TYPE
+					else
+						-- A bare member is a value at the next array position: `{0, 1, 2}` is the
+						-- const table a list is written as, and `{ ...Array, 0 }` appends to it.
+						local bare = field:gsub("^%s+", ""):gsub("%s+$", "")
+						local held = bare ~= "" and types.parse(bare, resolve)
+						if held then fields[tostring(nextIndex())] = held end
+					end
 				end
 			end
 		end
@@ -2882,6 +3270,7 @@ function types.displayOf(type)
 		return table.concat(parts, " & ")
 	end
 	if type.variant == "infer" then return "infer " .. type.name end
+	if type.variant == "length" then return "#" .. types.display(type.type) end
 	if type.variant == "operation" then
 		local left, right = types.display(type.left), types.display(type.right)
 		if type.left.variant == "union" then left = "(" .. left .. ")" end
@@ -2893,8 +3282,10 @@ function types.displayOf(type)
 		return types.display(type.object) .. "[" .. types.display(type.key) .. "]"
 	end
 	if type.variant == "conditional" then
+		local thenShown = type.thenType and types.display(type.thenType) or type.thenText or "?"
+		local elseShown = type.elseType and types.display(type.elseType) or type.elseText or "?"
 		return types.display(type.check) .. " extends " .. types.display(type.extends)
-			.. " ? " .. types.display(type.thenType) .. " : " .. types.display(type.elseType)
+			.. " ? " .. thenShown .. " : " .. elseShown
 	end
 	if type.variant == "mapped" then
 		return "{ [" .. type.key .. " in " .. types.display(type.source) .. "]: "

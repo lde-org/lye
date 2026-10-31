@@ -2719,6 +2719,26 @@ test.it("binds const generic arguments into an operation result", function()
 	test.includes(result.diagnostics[1].message, '"barbaz"')
 end)
 
+test.it("interprets Brainfuck with tables, templates and recursive aliases", function()
+	-- A compact run of the type-level interpreter: const tables are memory, a template pattern
+	-- reads one instruction, and the alias recurses until the program is empty. The loop sets the
+	-- second cell to six, and a separate check reads the cell without any diagnostics.
+	local source = table.concat({
+		"---@alias Inc<V> V + 1\n",
+		"---@alias Dec<V> V - 1\n",
+		"---@alias Set<T, V, P> { [K in keyof T]: K extends P ? V : T[K] }\n",
+		"---@alias App<T, V> { ...T, V }\n",
+		"---@alias Skip<P, D = 0> P extends \"\" ? \"\" : P extends `[${infer R}` ? Skip<R, D + 1> : P extends `]${infer R}` ? D extends 0 ? R : Skip<R, D - 1> : P extends `${infer _}${infer R}` ? Skip<R, D> : \"\"\n",
+		"---@alias BF<P, M = { 0, 0, 0 }, I = 0, At = 1, O = \"\", L = {}, D = 0> P extends \"\" ? O : P extends `>${infer T}` ? BF<T, App<M, 0>, I, At + 1, O, L, D> : P extends `+${infer T}` ? BF<T, Set<M, Inc<M[At]>, At>, I, At, O, L, D> : P extends `-${infer T}` ? BF<T, Set<M, Dec<M[At]>, At>, I, At, O, L, D> : P extends `<${infer T}` ? BF<T, M, I, At - 1, O, L, D> : P extends `[${infer T}` ? M[At] extends 0 ? BF<Skip<T>, M, I, At, O, L, D> : BF<T, M, I, At, O, App<L, T>, D + 1> : P extends `]${infer T}` ? M[At] extends 0 ? BF<T, M, I, At, O, L, D - 1> : BF<L[D], M, I, At, O, L, D> : P extends `.${infer T}` ? BF<T, M, I, At, `${O}${M[At]}`, L, D> : \"\"\n",
+		"---@type BF<\"+++[>++<-]>.\">\n",
+		"local out\n",
+		"return out\n",
+	})
+	local result = analyzer.analyze(source)
+	test.equal(typeOf(source, "out"), '"6"')
+	test.equal(#result.diagnostics, 0)
+end)
+
 test.it("checks a mapped parameter's shape at the call site", function()
 	-- A mapped parameter is a shape, not an operation left for the reader: every key of the
 	-- source has to hold the mapped value, and a string in a number field is a mistake.

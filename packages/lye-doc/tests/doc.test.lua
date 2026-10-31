@@ -503,6 +503,26 @@ test.it("folds arithmetic between const generic arguments", function()
 	end
 end)
 
+test.it("reads a const table's numeric fields, length and spread", function()
+	local table_ = parse("{ 0, 1, 2 }")
+	test.equal(doctype.display(table_), "{ 1: 0, 2: 1, 3: 2 }")
+	test.equal(doctype.display(doctype.length(table_)), "3")
+	test.equal(doctype.display(doctype.indexedAccess(table_, doctype.numberValue(2))), "1")
+	test.equal(doctype.display(doctype.indexedAccess(table_, doctype.stringValue("length"))), "3")
+	local spread = parse("{ ...{ 0, 1 }, 2 }")
+	test.equal(doctype.display(doctype.length(spread)), "3")
+	test.equal(doctype.display(doctype.indexedAccess(spread, doctype.numberValue(3))), "2")
+end)
+
+test.it("matches a template literal and binds the inferred text", function()
+	local pattern = parse("`>${infer Tail}`")
+	local result = doctype.conditional(parse('">++"'), pattern, doctype.extern("Tail"), parse('""'))
+	test.equal(doctype.display(result), '"++"')
+	local pair = parse("`[${infer Loop}]${infer Tail}`")
+	local split = doctype.conditional(parse('"[-+]x"'), pair, doctype.extern("Tail"), parse('""'))
+	test.equal(doctype.display(split), '"x"')
+end)
+
 test.it("binds the variable a conditional's extends names", function()
 	-- `T extends Option<infer V> ? V : never` is how a descriptor's value type is read. The
 	-- variable is bound by the match, and an optional marker in the branch belongs to `V`, not to

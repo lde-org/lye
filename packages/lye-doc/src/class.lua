@@ -14,6 +14,7 @@ local classes = {}
 ---@class lye.doc.Alias
 ---@field params string[] the names it takes, `ArrayOfNumberLike<T>` written `<T>`
 ---@field body string the type it stands for, read where it is used
+---@field defaults table<string, string>? the type a parameter takes when omitted
 
 ---@class lye.doc.Field
 ---@field name string
@@ -26,6 +27,7 @@ local classes = {}
 ---@class lye.doc.Class
 ---@field consts table<string, boolean>? the parameters that take a value rather than a type
 ---@field constraints table<string, string>? what each parameter is limited to
+---@field defaults table<string, string>? the type a parameter takes when omitted
 ---@field name string
 ---@field params string[] type parameters, empty when the class is not generic
 ---@field parent string? the parent as written, `Foo<number>` included
@@ -43,10 +45,17 @@ local classes = {}
 ---@param from integer
 ---@return integer?
 local function closeAngle(text, from)
-	local depth = 0
+	local depth, quote, template = 0, nil, false
 	for index = from, #text do
 		local char = text:sub(index, index)
-		if char == "<" then
+		if template then
+			if char == "`" then template = false end
+		elseif quote then
+			if char == "\\" then index += 1
+			elseif char == quote then quote = nil end
+		elseif char == "`" then template = true
+		elseif char == '"' or char == "'" then quote = char
+		elseif char == "<" then
 			depth += 1
 		elseif char == ">" then
 			depth -= 1
@@ -74,21 +83,31 @@ end
 ---@return string[] names
 ---@return table<string, string> constraints
 ---@return table<string, boolean> consts the names that must be given a value
+---@return table<string, string> defaults the type a parameter takes when omitted
 function classes.readParams(text)
-	local names, constraints, consts = {}, {}, {}
+	local names, constraints, consts, defaults = {}, {}, {}, {}
 	for _, part in ipairs(classes.splitList(text)) do
 		local name = (part:gsub("^%s+", ""):gsub("%s+$", ""))
 		local marked = name:match("^const[%s]") ~= nil
 		if marked then name = (name:sub(6):gsub("^%s+", "")) end
+		local equals = name:find("=", 1, true)
+		local default
+		if equals then
+			default = (name:sub(equals + 1):gsub("^%s+", ""))
+			name = (name:sub(1, equals - 1):gsub("%s+$", ""))
+		end
 		local colon = name:find(":", 1, true)
 		if colon then
 			constraints[(name:sub(1, colon - 1):gsub("%s+$", ""))] = (name:sub(colon + 1):gsub("^%s+", ""))
 			name = (name:sub(1, colon - 1):gsub("%s+$", ""))
 		end
 		if marked and name ~= "" then consts[name] = true end
-		if name ~= "" then names[#names + 1] = name end
+		if name ~= "" then
+			names[#names + 1] = name
+			if default then defaults[name] = default end
+		end
 	end
-	return names, constraints, consts
+	return names, constraints, consts, defaults
 end
 
 --- Split a comma-separated list, ignoring commas inside angles or braces.
@@ -111,6 +130,7 @@ end
 ---@return string? parent
 ---@return table<string, boolean> consts
 ---@return table<string, string> constraints
+---@return table<string, string> defaults
 local function readClass(text)
 	-- The colon that names a parent is the one outside the parameters. `Box<T: number>` has one
 	-- inside them, so splitting at the first colon would name the class `Box<T`.
@@ -129,9 +149,9 @@ local function readClass(text)
 	local head, parent = text, nil
 	if colonAt then head, parent = text:sub(1, colonAt - 1), text:sub(colonAt + 1) end
 	local name, args = splitGeneric((head:gsub("%s+$", "")))
-	local params, consts, constraints = {}, {}, {}
-	if args then params, constraints, consts = classes.readParams(args) end
-	return (name:gsub("%s+$", "")), params, parent and (parent:gsub("^%s+", "")) or nil, consts, constraints
+	local params, consts, constraints, defaults = {}, {}, {}, {}
+	if args then params, constraints, consts, defaults = classes.readParams(args) end
+	return (name:gsub("%s+$", "")), params, parent and (parent:gsub("^%s+", "")) or nil, consts, constraints, defaults
 end
 
 --- The parameters and the body of an `---@alias`: `<T: number> T[]` is `T` and `T[]`.
@@ -140,13 +160,14 @@ end
 ---@return string body
 ---@return table<string, boolean> consts
 ---@return table<string, string> constraints
+---@return table<string, string> defaults
 local function readAlias(text)
 	local trimmed = text:gsub("^%s+", "")
-	local params, constraints, consts, body = {}, {}, {}, trimmed
+	local params, constraints, consts, defaults, body = {}, {}, {}, {}, trimmed
 	if trimmed:sub(1, 1) == "<" then
 		local closeAt = closeAngle(trimmed, 1)
 		if closeAt then
-			params, constraints, consts = classes.readParams(trimmed:sub(2, closeAt - 1))
+			params, constraints, consts, defaults = classes.readParams(trimmed:sub(2, closeAt - 1))
 			body = (trimmed:sub(closeAt + 1):gsub("^%s+", ""))
 		end
 	end
@@ -155,7 +176,7 @@ local function readAlias(text)
 	-- `>"r"`, so `io.open(path, "r")` was rejected while every later mode worked. The comments
 	-- after members are prose, not part of the values.
 	body = body:gsub("%s*#[^|]*", ""):gsub("|>%s*", "|"):gsub("^>%s*", "")
-	return params, body, consts, constraints
+	return params, body, consts, constraints, defaults
 end
 
 
@@ -291,6 +312,7 @@ end
 function classes.resolver(namespace, elsewhere)
 	local types = require("lye-doc.type")
 	local active = {}
+	local aliasDepth = 0
 	-- A class grows as its methods are declared, so what a method adds is remembered on the
 	-- namespace and merged into every variant of that class, including the ones already built.
 	namespace.evolved = namespace.evolved or {}
@@ -313,8 +335,10 @@ function classes.resolver(namespace, elsewhere)
 			if built[text] then return built[text] end
 
 			local argTypes = {}
-			for index, argText in ipairs(args) do
-				argTypes[index] = types.parse(argText, resolve) or types.UNKNOWN_TYPE
+			for index, param in ipairs(found.params or {}) do
+				local argText = args[index] or (found.defaults and found.defaults[param])
+				argTypes[index] = argText and (types.parse(argText, resolve) or types.UNKNOWN_TYPE)
+					or types.UNKNOWN_TYPE
 			end
 			-- Built once per spelling, so a class type is the same table every time it is read
 			-- and a method declared later can reach it. It goes into `built` before its fields
@@ -421,7 +445,10 @@ function classes.resolver(namespace, elsewhere)
 		local aliasName, argsText = splitGeneric(text)
 		aliasName = (aliasName:gsub("%s+$", ""))
 		local alias = namespace.aliases[bareName(aliasName)]
-		if alias and not active[aliasName] then
+		-- Recursion is keyed by the spelling, not the alias name: `Length<Cons<...>>` and the
+		-- `Length<tail>` its body reads are different applications, and stopping at the name made
+		-- every recursive computation an unknown. The exact spelling still sees its placeholder.
+		if alias and aliasDepth < 512 and not active[text] then
 			if built[text] then return built[text] end
 			-- A body may name the alias being read: `---@alias Tree { children: Tree[] }` is how a
 			-- recursive shape is written. A placeholder is what the body sees while it is being
@@ -429,13 +456,26 @@ function classes.resolver(namespace, elsewhere)
 			-- reference the body made to the alias is the alias itself rather than `any`.
 			local placeholder = types.mutable()
 			built[text] = placeholder
-			active[aliasName] = placeholder
+			active[text] = placeholder
+			aliasDepth += 1
 			local body = alias.body
 			if #alias.params > 0 then
-				body = substitute(body, alias.params, argsText and classes.splitList(argsText) or {})
+				local written = argsText and classes.splitList(argsText) or {}
+				local effective = {}
+				for index, param in ipairs(alias.params) do
+					local argText = written[index] or (alias.defaults and alias.defaults[param]) or "unknown"
+					-- An argument read as a type is one table, not the spelling that made it:
+					-- `SetTable<..., 1>` passed through a recursive alias as text grew on every
+					-- step, while its value is a small table. Substituting the rendering keeps a
+					-- recursive computation from carrying its whole history in its text.
+					local evaluated = types.parse(argText, resolve)
+					effective[index] = evaluated and types.display(evaluated) or argText
+				end
+				body = substitute(body, alias.params, effective)
 			end
 			local resolved = types.parse(body, resolve)
-			active[aliasName] = nil
+			aliasDepth -= 1
+			active[text] = nil
 			-- The body is built once per spelling, the way a class is: an alias named by a hundred
 			-- signatures is one type, and reading it again is a tree per read. `Foo<number>` and
 			-- `Foo<string>` are two spellings and two types, which is what the arguments say.
@@ -580,10 +620,10 @@ function classes.read(file)
 
 	for _, annotation in ipairs(file.annotations) do
 		if annotation.tag == "class" then
-			local name, params, parent, consts, constraints = readClass(annotation.text or "")
+			local name, params, parent, consts, constraints, defaults = readClass(annotation.text or "")
 			current = {
 				name = name, params = params, parent = parent, fields = {}, consts = consts,
-				constraints = constraints,
+				constraints = constraints, defaults = defaults,
 			}
 			namespace.classes[bareName(name)] = current
 			enumOwner = current
@@ -638,7 +678,7 @@ function classes.read(file)
 						name = field, type = "table<string, number>", visibility = visibility,
 					}
 				end
-				namespace.aliases[name] = { params = {}, body = "number", consts = {}, constraints = {} }
+				namespace.aliases[name] = { params = {}, body = "number", consts = {}, constraints = {}, defaults = {} }
 			end
 		elseif annotation.tag == "alias" then
 			-- `---@alias ArrayOfNumberLike<T: number> T[]`: the doc reader hands the parameters over
@@ -650,9 +690,10 @@ function classes.read(file)
 				-- splits the name off at the star and leaves the star in front of the text that
 				-- follows, which read as a first member of `*`.
 				local written = (annotation.type or "any"):gsub("^%s*%*%s*", "")
-				local params, body, consts, constraints = readAlias(written)
+				local params, body, consts, constraints, defaults = readAlias(written)
 				namespace.aliases[bareName(annotation.name)] = {
 					params = params, body = body, consts = consts, constraints = constraints,
+					defaults = defaults,
 				}
 			end
 			current = nil
