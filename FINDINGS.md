@@ -44,9 +44,9 @@ literally clean rather than "errors and warnings only".
 
 ## Known limits
 
-- `lye check` does not build the workspace method index. Missing-method diagnostics are therefore
-  an editor feature; a method call whose class is declared in another file is not checked by the
-  CI command. The call check is deliberately gated on the index being present.
+- `lye check` does not build the workspace method index. Missing-method diagnostics are an editor
+  feature; a method call whose class is declared in another file is not checked by the CI command.
+  The call check is gated on the index being present.
 - A cross-file method's placeholder callable accepts any arguments and returns `unknown` until the
   declaring file is itself analysed. The real signature is used where the declaration is in the
   analysed document.
