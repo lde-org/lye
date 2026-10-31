@@ -33,6 +33,11 @@ local nodesOf = require("lye-parser").nodesOf
 ---@field signatureOfDecl table<lye.parser.Declaration, lye.analyzer.Signature> the signature each declaration was read as
 ---@field lookupIn fun(scope: lye.analyzer.Scope, name: string, offset: integer): lye.analyzer.Variable?
 ---@field scopeAt fun(self: lye.analyzer.Result, offset: integer): lye.analyzer.Scope
+---@field nodeReads table<string, integer[]>? nodes that read each name
+---@field functionNodes lye.parser.Node[]? the function bodies, in source order
+---@field callNodes lye.parser.Node[]? the call expressions, in source order
+---@field functionOfParam table<lye.parser.Declaration, lye.parser.Node>? the body each parameter belongs to
+---@field bodyNodesByFunction table<lye.parser.Node, lye.parser.Node[]>? the nodes inside each body
 ---@field checkMetatable fun(self: lye.analyzer.Result, parsed: lye.parser.Result, metatable: lye.doc.Type?, held: lye.doc.Type?, nodeIdx: integer)
 
 local typing = {}
@@ -104,6 +109,95 @@ end
 	end
 
 
+--- The per-pass indexes every typing walk shares: name reads, function bodies and the body each
+--- parameter belongs to. Built once on the context rather than rescanned by each function.
+---@param ctx lye.analyzer.TypingContext
+local function indexes(ctx)
+	local parsed = ctx.parsed
+	---@type table<string, integer[]>?
+	local nodeReads = ctx.nodeReads
+	---@type lye.parser.Node[]?
+	local functionNodes = ctx.functionNodes
+	local callNodes = ctx.callNodes
+	---@type table<lye.parser.Declaration, lye.parser.Node>?
+	local functionOfParam = ctx.functionOfParam
+	if not nodeReads then
+		nodeReads = {}
+		for _, node in ipairs(parsed.nodes) do
+			local name = node.callee or (node.kind == "name" and node.name) or nil
+			if name then
+				local list = nodeReads[name]
+				if not list then list = {} nodeReads[name] = list end
+				list[#list + 1] = node.index
+			end
+		end
+		ctx.nodeReads = nodeReads
+	end
+	if not functionNodes then
+		functionNodes = nodesOf(parsed, "function")
+		functionOfParam = {}
+		for _, node in ipairs(functionNodes) do
+			for _, param in ipairs(node.params or {}) do functionOfParam[param] = node end
+		end
+		ctx.functionNodes, ctx.functionOfParam = functionNodes, functionOfParam
+	end
+	if not callNodes then
+		callNodes = nodesOf(parsed, "call")
+		---@cast callNodes lye.parser.Node[]
+		ctx.callNodes = callNodes
+	end
+	---@cast nodeReads table<string, integer[]>
+	---@cast functionNodes lye.parser.Node[]
+	---@cast callNodes lye.parser.Node[]
+	---@cast functionOfParam table<lye.parser.Declaration, lye.parser.Node>
+end
+
+--- The nodes inside functions whose parameters need their body read, built in one pass. The
+--- active spans nest, so a walk over the arena knows which functions contain each node; only the
+--- functions that need it pay for a list.
+---@param ctx lye.analyzer.TypingContext
+---@param needed table<lye.parser.Node, boolean>
+---@return table<lye.parser.Node, lye.parser.Node[]>
+local function buildBodyNodes(ctx, needed)
+	if ctx.bodyNodesByFunction then return ctx.bodyNodesByFunction end
+	local parsed = ctx.parsed
+	local functions = ctx.functionNodes or nodesOf(parsed, "function")
+	local ordered = {}
+	for _, node in ipairs(functions) do ordered[#ordered + 1] = node end
+	table.sort(ordered, function(left, right) return left.start < right.start end)
+	local byFunction = {}
+	for _, node in ipairs(ordered) do if needed[node] then byFunction[node] = {} end end
+	local allNodes = {}
+	for _, node in ipairs(parsed.nodes) do allNodes[#allNodes + 1] = node end
+	table.sort(allNodes, function(left, right)
+		if left.start ~= right.start then return left.start < right.start end
+		return (left.stop or left.start) > (right.stop or right.start)
+	end)
+	local active, nextFunction = {}, 1
+	for _, node in ipairs(allNodes) do
+		local startAt = node.start
+		while nextFunction <= #ordered and ordered[nextFunction].start <= startAt do
+			active[#active + 1] = ordered[nextFunction]
+			nextFunction += 1
+		end
+		while #active > 0 and active[#active].stop < startAt do active[#active] = nil end
+		local stopAt = node.stop or startAt
+		for index = 1, #active do
+			local functionNode = active[index]
+			if stopAt <= functionNode.stop then
+				local list = byFunction[functionNode]
+				if list then list[#list + 1] = node end
+			end
+		end
+	end
+	for _, list in pairs(byFunction) do
+		---@cast list lye.parser.Node[]
+		table.sort(list, function(left, right) return left.index < right.index end)
+	end
+	ctx.bodyNodesByFunction = byFunction
+	return byFunction
+end
+
 	--- What an unannotated parameter is, from what the body does with it and what callers hand
 	--- it. Lua is written without parameter annotations most of the time, and a solver that
 	--- leaves every such name `any` reports the body's own arithmetic and every caller's
@@ -119,6 +213,21 @@ end
 		local lookupIn, scopeAt = ctx.lookupIn, ctx.scopeAt
 		if not lookupIn or not scopeAt then return false end
 		local changed = false
+		indexes(ctx)
+		---@type table<string, integer[]>
+		local nodeReads = ctx.nodeReads or {}
+		---@type lye.parser.Node[]
+		local functionNodes = ctx.functionNodes or {}
+		---@type table<lye.parser.Declaration, lye.parser.Node>
+		local functionOfParam = ctx.functionOfParam or {}
+		local needed = {}
+		for _, variable in ipairs(self.variables) do
+			if variable.qualifier == "param" and not variable.declaredExplicit then
+				local owner = functionOfParam[variable.declaration]
+				if owner then needed[owner] = true end
+			end
+		end
+		local bodyNodesByFunction = buildBodyNodes(ctx, needed)
 
 		-- A name read before the parameter's type was learned is cached as `any`; the node has to
 		-- be read again or the body keeps the type the first pass invented for it. The names are
@@ -252,30 +361,22 @@ end
 		-- What the body does with a parameter no caller named: a local helper called through a
 		-- field, or a function only handed to a callback signature this pass did not reach.
 		for _, variable in ipairs(self.variables) do
-			if variable.qualifier == "param" and not variable.declaredExplicit
-				and (only == nil or only[variable]) then
+			if variable.qualifier == "param" and not variable.declaredExplicit then
 				-- The function that declares the parameter is the one whose span holds it and
 				-- whose own parameters include it.
 				---@type lye.parser.Node?
-				local functionNode
-				for _, node in ipairs(nodesOf(parsed, "function")) do
-					for _, param in ipairs(node.params or {}) do
-						if param == variable.declaration then functionNode = node break end
-					end
-					if functionNode then break end
-				end
+				local functionNode = functionOfParam[variable.declaration]
 				if functionNode ~= nil then
 					---@type lye.doc.Type?
 					local bodyType
-					for _, node in ipairs(parsed.nodes) do
-						if node.start >= functionNode.start and node.stop <= functionNode.stop then
-							local found = fromBody(node, variable.name, functionNode)
-							if found ~= nil then
-								if bodyType ~= nil then
-									bodyType = types.combine(bodyType, found)
-								else
-									bodyType = found
-								end
+					local bodyNodes = bodyNodesByFunction[functionNode] or {}
+					for _, node in ipairs(bodyNodes) do
+						local found = fromBody(node, variable.name, functionNode)
+						if found ~= nil then
+							if bodyType ~= nil then
+								bodyType = types.combine(bodyType, found)
+							else
+								bodyType = found
 							end
 						end
 					end
@@ -293,16 +394,14 @@ end
 			end
 		end
 		if next(forgotten) then
-			for _, node in ipairs(parsed.nodes) do
-				if node.callee and forgotten[node.callee]
-					or (node.kind == "name" and forgotten[node.name]) then
-					inferCtx.cache[node.index] = nil
-				end
+			for name in pairs(forgotten) do
+				for _, read in ipairs(nodeReads[name] or {}) do inferCtx.cache[read] = nil end
 			end
 		end
 		-- The callable a function stands for keeps the parameters this pass learned, so a call
 		-- through a name sees `fn(number)`, not the `fn(any)` the body was typed with.
-		for _, node in ipairs(nodesOf(parsed, "function")) do
+		for _, node in ipairs(functionNodes) do
+			---@type lye.parser.Declaration?
 			local declaration = ctx.bodyOwner and ctx.bodyOwner[node.index]
 			local method = declaration and declaration.name:find(":", 1, true)
 			local fnType = inferCtx.fnTypes[node.index]
@@ -321,11 +420,7 @@ end
 				-- inferred; reading it again is what gives the returned callable its shape.
 				local name = declaration and declaration.name
 				if name then
-					for _, read in ipairs(parsed.nodes) do
-						if read.callee == name or (read.kind == "name" and read.name == name) then
-							inferCtx.cache[read.index] = nil
-						end
-					end
+					for _, read in ipairs(nodeReads[name] or {}) do inferCtx.cache[read] = nil end
 				end
 			end
 		end
@@ -460,10 +555,16 @@ end
 	function typing.typeAll(ctx, only, reused)
 	local parsed, self = ctx.parsed, ctx.self
 	local inferCtx, signatures = ctx.inferCtx, ctx.signatures
+	indexes(ctx)
+	---@type lye.parser.Node[]
+	local functionNodes = ctx.functionNodes or {}
+	---@type lye.parser.Node[]
+	local callNodes = ctx.callNodes or {}
+
 	-- Every function body has a callable before the walk asks for one. Inference makes these
 	-- lazily, and a callback written straight into a call may only be reached at a point after
 	-- the loop over bodies, which left its result `any` for every check that read the call.
-	for _, node in ipairs(nodesOf(parsed, "function")) do
+	for _, node in ipairs(functionNodes) do
 		local called = inferCtx.fnTypes[node.index]
 		if not called then
 			called = types.fn({}, types.mutable(), node.isVariadic == true)
@@ -775,10 +876,10 @@ end
 		end
 			-- Generic names are bound from the arguments before the results are read, so `id(5)` is
 		-- number and `unpack(t)` is whatever `t` holds.
-		for _, node in ipairs(parsed.nodes) do
+		for _, node in ipairs(callNodes) do
 			if not (reused and reused(node.start, node.stop)) then
 			---@type lye.analyzer.Signature?
-			local signature = node.kind == "call" and signatureOfCall(node) or nil
+			local signature = signatureOfCall(node)
 			-- A metatable is a relationship of the value it is set on rather than a replacement for its type,
 			-- but a class used as one is how a Lua object is written, so `setmetatable({}, Point)` is a `Point`.
 			if node.kind == "call" and node.args then

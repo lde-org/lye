@@ -2361,14 +2361,24 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 	local byEnd
 	if #castLines > 0 then
 		byEnd = {}
+		table.sort(castLines, function(left, right) return left.from < right.from end)
 		for _, node in ipairs(parsed.nodes) do
 			local stop = node.stop
-			for _, line in ipairs(castLines) do
-				if stop >= line.from and stop <= line.to then
-					byEnd[#byEnd + 1] = node
-					break
+			-- The cast lines do not overlap, so the one containing this node is the last whose
+			-- start is at or before the node's end. A binary search replaces a scan of every cast
+			-- annotation for every node in the arena.
+			local low, high, found = 1, #castLines, nil
+			while low <= high do
+				local middle = math.floor((low + high) / 2)
+				local line = castLines[middle]
+				if line.from <= stop then
+					found = line
+					low = middle + 1
+				else
+					high = middle - 1
 				end
 			end
+			if found and stop <= found.to then byEnd[#byEnd + 1] = node end
 		end
 		table.sort(byEnd, function(a, b)
 			if a.stop ~= b.stop then return a.stop < b.stop end
@@ -3804,6 +3814,8 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 			end
 		end
 	end
+	types.enableDisplayCache()
+	types.enableCompareCache()
 	typeVariables(only)
 	-- What an unannotated parameter holds, from its callers and its body. The first pass has the
 	-- argument types needed to answer it, and the second types the bodies with the answer. With
@@ -3946,6 +3958,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		if counters then counters.checkCalls = os.clock() - started end
 	end
 	types.disableDisplayCache()
+	types.disableCompareCache()
 	if counters then mark("checks") end
 	-- What each call was bound to, by node: a generic result is settled per call, and a reader
 	-- asking what `f()` is — a completion after `f().` — has no other way to that answer.

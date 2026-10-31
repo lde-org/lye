@@ -80,6 +80,7 @@ end
 function types.promote(target, actual)
 	if not types.isMutable(target) then return false end
 	if displayCache then displayCache = {} end
+	if compareCache then compareCache = setmetatable({}, { __mode = "k" }) end
 	if actual.variant == "unknown" then return false end
 	target.variant = actual.variant
 	target.isMutable = nil
@@ -297,15 +298,24 @@ function types.widenLiteral(held)
 	return held
 end
 
---- Whether `held` is the base type a literal belongs to. Compared by shape rather than identity:
---- `number` parsed from text and the `types.NUMBER` singleton answer the same question.
----@param held lye.doc.Type
----@param base lye.doc.Type
-local function isLiteralBase(held, base)
-	if base == types.NUMBER then return held.variant == "number" and held.value == nil end
-	if base == types.BOOLEAN then return held.variant == "boolean" and held.value == nil end
-	if base == types.STRING then return held.variant == "string" end
-	return false
+--- A cheap identity for a union member. Primitive variants are the common case and their display
+--- is a string allocation; shapes and callables keep the full rendering so equal copies collapse.
+---@param member lye.doc.Type
+---@return string
+local function unionKey(member)
+	if member.aliasName then return types.display(member) end
+	local variant = member.variant
+	if variant == "number" then return "n" .. (member.text or tostring(member.value)) end
+	if variant == "boolean" then
+		return member.value == true and "bt" or member.value == false and "bf" or "b"
+	end
+	if variant == "extern" then return "e" .. member.name end
+	if variant == "class" then return types.display(member) end
+	if variant == "string" or variant == "nil" or variant == "void" or variant == "table"
+		or variant == "never" or variant == "any" or variant == "unknown" then
+		return variant
+	end
+	return types.display(member)
 end
 
 --- Flatten nested unions and drop duplicates. An unknown member absorbs the whole union,
@@ -330,7 +340,7 @@ function types.union(members)
 		end
 		-- A member that cannot exist adds nothing to the set of what a value may be.
 		if member.variant == "never" then return end
-		local key = types.display(member)
+		local key = unionKey(member)
 		if not seen[key] then
 			seen[key] = true
 			flat[#flat + 1] = member
@@ -343,26 +353,21 @@ function types.union(members)
 	-- base absorbs a literal; literals alone keep their exact values, which is what a discriminant
 	-- needs. This cannot be a general subtype sweep: a string intentionally satisfies a string
 	-- literal, so `satisfies` would let the literal absorb the base in the other direction.
-	local absorbed = {}
-	for index, member in ipairs(flat) do
-		local base = baseOfLiteral(member)
-		if base then
-			for otherIndex, other in ipairs(flat) do
-				if otherIndex ~= index and isLiteralBase(other, base) then
-					absorbed[index] = true
-					break
-				end
-			end
-		end
+	---@type table<string, boolean>
+	local bases = {}
+	for _, member in ipairs(flat) do
+		if member.variant == "number" and member.value == nil then bases.number = true
+		elseif member.variant == "boolean" and member.value == nil then bases.boolean = true
+		elseif member.variant == "string" then bases.string = true end
 	end
-	if next(absorbed) then
+	if next(bases) then
 		local kept = {}
-		for index, member in ipairs(flat) do
-			if not absorbed[index] then kept[#kept + 1] = member end
+		for _, member in ipairs(flat) do
+			local base = baseOfLiteral(member)
+			if not (base and bases[base.variant]) then kept[#kept + 1] = member end
 		end
 		flat = kept
 	end
-
 	if #flat == 1 then return flat[1] end
 	return make("union", { types = flat })
 end
@@ -388,7 +393,7 @@ function types.intersection(members)
 		end
 		if member.variant == "unknown" then return end
 		if member.variant == "any" then flat = { member } return end
-		local key = types.display(member)
+		local key = unionKey(member)
 		if not seen[key] then
 			seen[key] = true
 			flat[#flat + 1] = member
@@ -878,10 +883,31 @@ local function methodFits(have, wanted, owner, depth, seen)
 		depth + 1, seen)
 end
 
+---@type table<lye.doc.Type, table<lye.doc.Type, boolean>>?
+local compareCache
+function types.enableCompareCache() compareCache = setmetatable({}, { __mode = "k" }) end
+function types.disableCompareCache() compareCache = nil end
+
 ---@param type lye.doc.Type
 ---@param constraint lye.doc.Type
 function types.satisfies(type, constraint)
-	return fits(type, constraint, 0, {})
+	if compareCache then
+		local row = compareCache[type]
+		if row then
+			local held = row[constraint]
+			if held ~= nil then return held end
+		end
+	end
+	local result = fits(type, constraint, 0, {})
+	if compareCache then
+		local row = compareCache[type]
+		if not row then
+			row = setmetatable({}, { __mode = "k" })
+			compareCache[type] = row
+		end
+		row[constraint] = result
+	end
+	return result
 end
 
 --- The required data fields a class shape asks for and an object literal does not carry. A
@@ -927,6 +953,7 @@ end
 ---@param depth integer
 ---@param seen table<lye.doc.Type, table<lye.doc.Type, boolean>>
 function fits(type, constraint, depth, seen)
+	if type == constraint then return true end
 	if depth >= MAX_COMPARE_DEPTH then return true end
 	-- Two recursive types — a class holding itself, an alias whose body names it — would otherwise
 	-- be asked the same pair again and again, branch by branch. A pair already being compared is
@@ -2349,7 +2376,8 @@ end
 --- Write a string value the way an annotation would, choosing quotes the text does not use.
 ---@param text string
 local function quoted(text)
-	if text:find('"', 1, true) and not text:find("'", 1, true) then return "'" .. text .. "'" end
+	if not text:find('"', 1, true) then return '"' .. text .. '"' end
+	if not text:find("'", 1, true) then return "'" .. text .. "'" end
 	return '"' .. (text:gsub('"', '\\"')) .. '"'
 end
 
@@ -2932,21 +2960,50 @@ function types.parse(text, resolve)
 	local inferred = trimmed:match("^infer%s+([%w_%.]+)$")
 	if inferred then return types.infer(inferred) end
 
+	-- The common annotation is one name. It cannot be a conditional, an operator or an indexed
+	-- access, so resolving it here skips every scan below.
+	if not trimmed:match("^%d") and trimmed:match("^[%w_%.%*]+$") then
+		if trimmed == "true" then return types.booleanValue(true) end
+		if trimmed == "false" then return types.booleanValue(false) end
+		if trimmed == "integer" then return types.base("number") end
+		if trimmed == "never" then return types.NEVER end
+		if trimmed == "table" then return types.TABLE end
+		if trimmed == "function" then return types.FUNCTION end
+		if SIMPLE[trimmed] then return types.base(trimmed) end
+		if resolve then
+			local declared = resolve(trimmed)
+			if declared then return declared end
+		end
+		return types.extern(trimmed)
+	end
+
 	-- A signature is read before the bar and the marker that may follow its return, because both
 	-- follow the *return type* and belong to it: `fun(): T?` returns a `T?` rather than being a
 	-- function that may be absent. `fun()?` writes no return at all, so that stays the optional function.
 	local shaped = trimmed:sub(1, 6) == "async " and trimmed:sub(7) or trimmed
 	local stop = typeEnd(shaped)
 	if stop then shaped = (shaped:sub(1, stop):gsub("%s+$", "")) end
-	if hasReturn(shaped) then
-		local signature = parseFn(shaped, resolve)
-		if signature then return signature end
+	if shaped:sub(1, 2) == "fn" or shaped:sub(1, 3) == "fun" or shaped:find("->", 1, true) then
+		if hasReturn(shaped) then
+			local signature = parseFn(shaped, resolve)
+			if signature then return signature end
+		end
 	end
 
 	-- A conditional is read before the bar: its branches may be unions, so splitting the whole
 	-- text at `|` first would cut the conditional in half. A name still unresolved keeps the
 	-- conditional until a substitution supplies it.
-	local checkText, extendsText, thenText, elseText = conditionalParts(trimmed)
+	---@type string?
+	local checkText
+	---@type string?
+	local extendsText
+	---@type string?
+	local thenText
+	---@type string?
+	local elseText
+	if trimmed:find("%f[%w_]extends%f[^%w_]") then
+		checkText, extendsText, thenText, elseText = conditionalParts(trimmed)
+	end
 	if checkText and extendsText and thenText and elseText then
 		---@type lye.doc.Type?
 		local check = types.parse(checkText, resolve)
@@ -3054,9 +3111,14 @@ function types.parse(text, resolve)
 
 	-- Arithmetic written in a type: a const parameter substituted with what it was given leaves `5 + 2`
 	-- behind, and the type says what that is. A name still unbound leaves the expression alone.
-	local kind, value = foldExpression(trimmed)
-	if kind == "number" and type(value) == "number" then return types.numberValue(value) end
-	if kind == "string" and type(value) == "string" then return types.extern(quoted(value)) end
+	-- An expression can only start with a number, a quote, `#` or a negative sign; every ordinary
+	-- name skipped this walk before it had to scan itself.
+	local first = trimmed:sub(1, 1)
+	if first:match("[%d\"\'#%-]") then
+		local kind, value = foldExpression(trimmed)
+		if kind == "number" and type(value) == "number" then return types.numberValue(value) end
+		if kind == "string" and type(value) == "string" then return types.extern(quoted(value)) end
+	end
 
 	-- Annotations often carry a description after the type. Everything past where the type ends
 	-- is prose, and reading it as part of the type would make the annotation mean nothing.
@@ -3073,7 +3135,13 @@ function types.parse(text, resolve)
 	-- An operation over type variables: `A .. B` is a value the call's bindings decide. It is
 	-- read before the suffixes so `A .. B[]` is the concatenation of A and a list, not a list of
 	-- concatenations.
-	local opAt, op = expressionParts(trimmed)
+	---@type integer?
+	local opAt
+	---@type string?
+	local op
+	if trimmed:find("[%+%-%*/%%%^]") or trimmed:find("%.%.") then
+		opAt, op = expressionParts(trimmed)
+	end
 	if opAt and op then
 		local left = types.parse(trimmed:sub(1, opAt - 1), resolve)
 		local right = types.parse(trimmed:sub(opAt + #op), resolve)
@@ -3093,7 +3161,11 @@ function types.parse(text, resolve)
 
 	-- `T["field"]`, `T[K]` and `keyof T`: an indexed access is the value at that key. A key that
 	-- is still a name keeps the access until the substitution answers both sides.
-	local baseText, keyText = indexedParts(trimmed)
+	---@type string?
+	local baseText
+	---@type string?
+	local keyText
+	if trimmed:find("[", 1, true) then baseText, keyText = indexedParts(trimmed) end
 	if baseText and keyText and keyText ~= "" then
 		local object = types.parse(baseText, resolve)
 		local key = types.parse(keyText, resolve)
@@ -3204,8 +3276,10 @@ function types.parse(text, resolve)
 	if trimmed == "table" then return types.TABLE end
 	if trimmed == "function" then return types.FUNCTION end
 
-	local parsedFn = parseFn(trimmed, resolve)
-	if parsedFn then return parsedFn end
+	if trimmed:sub(1, 2) == "fn" or trimmed:sub(1, 3) == "fun" then
+		local parsedFn = parseFn(trimmed, resolve)
+		if parsedFn then return parsedFn end
+	end
 	if resolve then
 		local declared = resolve(trimmed)
 		if declared then return declared end

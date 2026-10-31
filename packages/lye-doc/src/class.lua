@@ -15,6 +15,7 @@ local classes = {}
 ---@field params string[] the names it takes, `ArrayOfNumberLike<T>` written `<T>`
 ---@field body string the type it stands for, read where it is used
 ---@field defaults table<string, string>? the type a parameter takes when omitted
+---@field recursive boolean? whether the body names the alias itself
 
 ---@class lye.doc.Field
 ---@field name string
@@ -445,6 +446,11 @@ function classes.resolver(namespace, elsewhere)
 		local aliasName, argsText = splitGeneric(text)
 		aliasName = (aliasName:gsub("%s+$", ""))
 		local alias = namespace.aliases[bareName(aliasName)]
+		local recursive = alias and alias.recursive
+		if alias and recursive == nil then
+			recursive = alias.body:find("%f[%w_]" .. aliasName .. "%f[^%w_]") ~= nil
+			alias.recursive = recursive
+		end
 		-- Recursion is keyed by the spelling, not the alias name: `Length<Cons<...>>` and the
 		-- `Length<tail>` its body reads are different applications, and stopping at the name made
 		-- every recursive computation an unknown. The exact spelling still sees its placeholder.
@@ -468,8 +474,11 @@ function classes.resolver(namespace, elsewhere)
 					-- `SetTable<..., 1>` passed through a recursive alias as text grew on every
 					-- step, while its value is a small table. Substituting the rendering keeps a
 					-- recursive computation from carrying its whole history in its text.
-					local evaluated = types.parse(argText, resolve)
-					effective[index] = evaluated and types.display(evaluated) or argText
+					if recursive then
+						local evaluated = types.parse(argText, resolve)
+						argText = evaluated and types.display(evaluated) or argText
+					end
+					effective[index] = argText
 				end
 				body = substitute(body, alias.params, effective)
 			end
