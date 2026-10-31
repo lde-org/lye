@@ -28,8 +28,13 @@ server.METHOD = {
 	logMessage = "window/logMessage",
 	hover = "textDocument/hover",
 	definition = "textDocument/definition",
+	declaration = "textDocument/declaration",
+	documentLink = "textDocument/documentLink",
+	linkedEditingRange = "textDocument/linkedEditingRange",
+	moniker = "textDocument/moniker",
 	documentSymbol = "textDocument/documentSymbol",
 	semanticTokens = "textDocument/semanticTokens/full",
+	semanticTokensDelta = "textDocument/semanticTokens/full/delta",
 	semanticTokensRange = "textDocument/semanticTokens/range",
 	completion = "textDocument/completion",
 	signatureHelp = "textDocument/signatureHelp",
@@ -54,6 +59,16 @@ server.METHOD = {
 	typeFormatting = "textDocument/onTypeFormatting",
 	workspaceDidChangeWatchedFiles = "workspace/didChangeWatchedFiles",
 	workspaceDidChangeConfiguration = "workspace/didChangeConfiguration",
+	workspaceDidChangeWorkspaceFolders = "workspace/didChangeWorkspaceFolders",
+	workspaceWillRenameFiles = "workspace/willRenameFiles",
+	workspaceExecuteCommand = "workspace/executeCommand",
+	typeHierarchyPrepare = "textDocument/prepareTypeHierarchy",
+	typeHierarchySupertypes = "typeHierarchy/supertypes",
+	typeHierarchySubtypes = "typeHierarchy/subtypes",
+	inlineValue = "textDocument/inlineValue",
+	completionResolve = "completionItem/resolve",
+	codeActionResolve = "codeAction/resolve",
+	inlayHintResolve = "inlayHint/resolve",
 	registerCapability = "client/registerCapability",
 }
 
@@ -87,7 +102,8 @@ end
 ---@field encoding string
 ---@field isInitialized boolean
 ---@field isShutdown boolean
----@field rootPath string? the folder the client opened, as a path
+---@field rootPath string? the first folder the client opened, as a path
+---@field rootPaths string[]? every folder the client opened, in the order it sent them
 ---@field clientCapabilities table the `capabilities` the client sent with `initialize`
 ---@field handlers table<string, fun(self: lye.framework.Server, params: table?, id: any)>
 ---@field answered table<any, boolean> the requests a handler answered itself
@@ -182,10 +198,42 @@ end
 ---@param self lye.framework.Server
 ---@param params table
 local function rememberRoot(self, params)
-	local uri = params.rootUri
+	local roots, seen = {}, {}
+	---@param uri string?
+	local function add(uri)
+		if type(uri) ~= "string" then return end
+		local path = uri:gsub("^file://", ""):gsub("[/\\]+$", "")
+		if path == "" or seen[path] then return end
+		seen[path] = true
+		roots[#roots + 1] = path
+	end
 	local folders = params.workspaceFolders
-	if type(folders) == "table" and folders[1] then uri = folders[1].uri end
-	if type(uri) == "string" then self.rootPath = (uri:gsub("^file://", "")) end
+	if type(folders) == "table" then
+		---@cast folders { uri: string }[]
+		for _, folder in ipairs(folders) do add(folder.uri) end
+	end
+	add(params.rootUri)
+	self.rootPaths = roots
+	self.rootPath = roots[1]
+end
+
+--- The folder a document belongs to: the longest open root that contains it, or the first when
+--- the document is outside every root. A window may open more than one folder, and a document is
+--- resolved against its own.
+---@param self lye.framework.Server
+---@param uri string?
+---@return string?
+function Server:rootFor(uri)
+	local roots = self.rootPaths or (self.rootPath and { self.rootPath } or {})
+	if not uri then return roots[1] end
+	local path = uri:gsub("^file://", "")
+	local best
+	for _, root in ipairs(roots) do
+		if path == root or path:sub(1, #root + 1) == root .. "/" then
+			if not best or #root > #best then best = root end
+		end
+	end
+	return best or roots[1]
 end
 
 ---@param self lye.framework.Server

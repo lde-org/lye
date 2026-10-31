@@ -23,6 +23,7 @@ local infer = {}
 ---@field modules fun(name: string): lye.doc.Type? what `require("name")` is, when the caller can say
 ---@field ctypes fun(node: lye.parser.Node): lye.doc.Type? what a call naming a C type is worth
 ---@field varargAt table<integer, lye.doc.Type> the `...` type of each literal `...`, by node index
+---@field narrowed table<integer, boolean>? the reads narrowed while a condition was read
 ---@field casts table<integer, lye.doc.Type|{ exclude: lye.doc.Type }>? an inline cast written beside an expression, by node index
 
 local KNOWN = {

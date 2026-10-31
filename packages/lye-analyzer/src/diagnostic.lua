@@ -9,7 +9,8 @@ local diagnostic = {}
 ---@param start integer
 ---@param stop integer
 ---@param severity integer? 1 error, 2 warning, 3 hint
-function diagnostic.add(self, message, start, stop, severity)
+---@param code string? the stable name a directive or a policy can name
+function diagnostic.add(self, message, start, stop, severity, code)
 	-- Narrowing records a contradiction through the end of its scope: no value can satisfy the
 	-- guards there, so code after it cannot run and nothing it does is worth reporting.
 	local unreachable = self.unreachable
@@ -20,7 +21,9 @@ function diagnostic.add(self, message, start, stop, severity)
 		end
 	end
 	local list = self.diagnostics
-	list[#list + 1] = { message = message, start = start, stop = stop, severity = severity or 1 }
+	list[#list + 1] = {
+		message = message, start = start, stop = stop, severity = severity or 1, code = code,
+	}
 end
 
 return diagnostic

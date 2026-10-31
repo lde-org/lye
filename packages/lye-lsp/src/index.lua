@@ -931,6 +931,7 @@ end
 
 --- The files the current entry holds, each with its hash, metadata, annotations and types.
 ---@param self lye.lsp.Index
+---@return table<string, lye.lsp.IndexFile>
 function Index:files()
 	return self.entry_ and self.entry_.files or {}
 end

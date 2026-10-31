@@ -10,6 +10,10 @@ be read and where an editor has asked something about one:
 | `lower(context)` | the edits that turn a document into Lua | a language that is not Lua: the plugin compiles what it can, lye reads the result |
 | `tokens(context)` | extra semantic tokens | colours for a language or a library lye does not know |
 | `types(context)` | classes, aliases and provider hooks | a dialect whose types the analyzer does not know: the shipped `ffi` plugin is one |
+| `hover(context)` | markdown or `{ contents, from, to }` | what a dialect construct means, where the lowered Lua says nothing |
+| `definition(context)` | `{ uri?, from, to }` | where a dialect name is declared |
+| `references(context)` | `{ uri?, from, to }[]` | every place a dialect name is written |
+| `codeAction(context)` | code actions | a quickfix for a dialect diagnostic |
 | `extensions` | a list like `{ "moon" }` | the files a language is written in, so `lye check .` checks them |
 
 A plugin is handed a **context** and nothing else — the document, the text lye reads, and what the
@@ -186,6 +190,13 @@ no ffi code in it at all.
 | `map` | the way from the text lye reads back to the document (`tokens` only) |
 | `typeOf(nodeIdx)` | the type the analyzer gave a node, or nil (`tokens` only) |
 | `ownerOf(type)` | the name a value's fields are found under: a class's name, or `string` (`tokens` only) |
+| `offset` | the byte offset a hover, definition, reference or action is about, in `source` |
+| `diagnostics` | the diagnostics a code-action request carried (`codeAction` only) |
+
+A navigation hook answers in the offsets of `source`. A plugin that reads `parsed` is reading the
+lowered text; `map:toLowered(offset)` takes the question there and `map:toOriginalRange` brings an
+answer back. The server asks every plugin in workspace order and uses the first answer.
+
 
 ## The plugins lye ships
 

@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x86-64
+            asset: lye-linux-x86-64
+            mingw: false
+          - os: ubuntu-22.04-arm
+            target: linux-aarch64
+            asset: lye-linux-aarch64
+            mingw: false
+          - os: macos-15-intel
+            target: macos-x86-64
+            asset: lye-macos-x86-64
+            mingw: false
+          - os: macos-15
+            target: macos-aarch64
+            asset: lye-macos-aarch64
+            mingw: false
+          - os: windows-latest
+            target: windows-x86-64
+            asset: lye-windows-x86-64.exe
+            mingw: true
+          - os: windows-11-arm
+            target: windows-aarch64
+            asset: lye-windows-aarch64.exe
+            mingw: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: lde-org/setup-lde@v1
+
+      - name: Build ${{ matrix.asset }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+          MINGW: ${{ matrix.mingw }}
+        run: |
+          if [ "$MINGW" = "true" ]; then
+            tools/compile.sh --ensure-mingw --target "$TARGET" --outfile "$RUNNER_TEMP/$ASSET"
+          else
+            tools/compile.sh --target "$TARGET" --outfile "$RUNNER_TEMP/$ASSET"
+          fi
+          chmod +x "$RUNNER_TEMP/$ASSET"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ runner.temp }}/${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

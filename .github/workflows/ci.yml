@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: lde-org/setup-lde@v1
+
+      - name: Run the test suite
+        run: lde test --jobs 1
+
+      - name: Cold self-check with the current source
+        run: lde run -C packages/lye-lsp src/main.lua check ../../packages --cold --no-color
+
+      - name: Compile from a clean tree
+        run: |
+          tools/compile.sh --outfile "$RUNNER_TEMP/lye-lsp"
+          "$RUNNER_TEMP/lye-lsp" --version

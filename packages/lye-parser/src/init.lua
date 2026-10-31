@@ -88,6 +88,7 @@ local newTable = require("table.new")
 ---@field stop integer
 ---@field statementStart integer?
 ---@field severity integer?
+---@field code string? the stable name a directive or policy can name
 
 ---@class lye.parser.Result
 ---@field root integer index of the chunk node, which contains everything
@@ -101,7 +102,7 @@ local newTable = require("table.new")
 ---@field diagnostics lye.parser.Problem[]
 ---@field resumeStats lye.parser.ResumeStats how much of the parse came from a previous one
 ---@field source string the text the tree was read from
----@field tableFieldValues table<integer, table>
+---@field tableFieldValues table<integer, table<string, integer>> field values per table literal
 ---@field tableIndexes table<integer, integer[]> positional element indices per table literal
 
 ---@class lye.parser.ResumeStats
@@ -111,6 +112,7 @@ local newTable = require("table.new")
 ---@class lye.parser.Frame
 ---@field start integer
 ---@field conditionIdx integer?
+---@field record lye.parser.Scope? the scope this frame opened, for a caller that reads it back
 
 ---@class lye.parser.Parser
 ---@field KIND table? the lexical kinds, as the lexer names them
@@ -133,7 +135,7 @@ local newTable = require("table.new")
 ---@field depth integer
 ---@field scopes string[][]
 ---@field count_ integer how many nodes have been emitted, which the next one's index is
----@field tableFieldValues table<integer, table>
+---@field tableFieldValues table<integer, table<string, integer>>
 ---@field lastKind string?
 ---@field lastFields table<string, string>? the field kinds of the table just read
 ---@field lastDeclaration integer?

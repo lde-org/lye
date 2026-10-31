@@ -294,10 +294,18 @@ local function parse(comment, start, stop)
 		annotation.type = rest
 		annotation.typeText = rest
 	elseif tag == "meta" or tag == "diagnostic" then
-		-- `---@meta name value`, used for identifiers and severity names.
-		local name, value = rest:match("^([%w_]+)%s+(.*)$")
-		annotation.name = name
-		annotation.type = trim(value or "")
+		-- `---@meta name value` names a global and its kind. A diagnostic directive is
+		-- `---@diagnostic disable-next-line: unused-local`: the action is the name, and the codes
+		-- after the optional colon are the type text.
+		if tag == "diagnostic" then
+			local action, value = rest:match("^([%w_%-]+)%s*:?%s*(.*)$")
+			annotation.name = action
+			annotation.type = trim(value or "")
+		else
+			local name, value = rest:match("^([%w_]+)%s+(.*)$")
+			annotation.name = name
+			annotation.type = trim(value or "")
+		end
 		annotation.typeText = annotation.type
 	end
 

@@ -310,6 +310,13 @@ test.it("fails a file whose annotation contradicts its value", function()
 	test.equal(tonumber(ok), 0)
 end)
 
+test.it("honours a diagnostic directive in a checked file", function()
+	local fault = "local x = 1 + \"s\"\nreturn x\n"
+	test.equal(exitCode(fault, "--check"), 1, "the arithmetic fault is an error")
+	local quiet = "---@diagnostic disable-next-line\n" .. fault
+	test.equal(exitCode(quiet, "--check"), 0, "and the next line's directive keeps it out")
+end)
+
 test.it("rejects an unknown option instead of checking a file named after it", function()
 	-- A stray flag used to be treated as a path, so an editor that passes its own conventions
 	-- got a usage error dressed as a failed file check.

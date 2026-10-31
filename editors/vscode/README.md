@@ -12,8 +12,13 @@ full path. The extension reports the path it tried when the server does not star
 Install `lye` by building it from the repository:
 
 ```sh
-lde compile -C packages/lye-lsp   # writes the binary into the package's target directory
+tools/compile.sh   # writes packages/lye-lsp/lye-lsp
 ```
+
+The script compiles a snapshot of the working tree in a temporary directory. Use
+`lde compile -C packages/lye-lsp` directly only in a checkout that has never run the tests: the
+test suite writes fixtures into `packages/lye-lsp/target/`, and the compiler would read them as
+source.
 
 ## Settings
 

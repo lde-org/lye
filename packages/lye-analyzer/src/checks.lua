@@ -77,7 +77,7 @@ local function anyFunctionHints(ctx)
 		if not text:match("^%s*%(?%s*fu?n%s*%(") then return end
 		local held = memo.parse(text, resolve)
 		if held and types.isAnyFn(held) then
-			diagnostic.add(self, string.format("`%s` is identical to `function`", text), start, stop, 3)
+			diagnostic.add(self, string.format("`%s` is identical to `function`", text), start, stop, 3, "redundant-function")
 		end
 	end
 
@@ -208,7 +208,7 @@ local function returnHints(ctx)
 			if held.variant == inferred.variant
 				and types.display(held) == types.display(inferred)
 				and not reused(ctx, annotation.start, annotation.stop) then
-				diagnostic.add(self, string.format("`---@return %s` says what the body already infers", annotation.type), annotation.start, annotation.stop, 3)
+				diagnostic.add(self, string.format("`---@return %s` says what the body already infers", annotation.type), annotation.start, annotation.stop, 3, "redundant-return")
 			end
 		end
 		end
@@ -226,7 +226,7 @@ local function constWrites(ctx)
 			and not reused(ctx, variable.declaration.start, variable.declaration.stop or variable.declaration.start) then
 			for _, assignment in ipairs(variable.assignments) do
 				diagnostic.add(ctx.self, string.format("`%s` is const, so it cannot be assigned to", variable.name),
-					assignment.at, assignment.at + #variable.name - 1)
+					assignment.at, assignment.at + #variable.name - 1, nil, "const")
 			end
 		end
 	end
@@ -268,14 +268,14 @@ local function declaredMismatches(ctx)
 			end
 			local message = types.strictMismatch(declared, withoutReceiver(variable.initializer), variable.name)
 			if message then
-				diagnostic.add(self, message, declaration.start, declaration.stop)
+				diagnostic.add(self, message, declaration.start, declaration.stop, nil, "type")
 			end
 			for _, assignment in ipairs(variable.assignments) do
 				local assigned = types.strictMismatch(declared, withoutReceiver(assignment.type), variable.name)
 				if assigned then
 					local value = parsed.nodes[assignment.valueIdx]
 					diagnostic.add(self, assigned, value and value.start or assignment.at,
-						value and value.stop or assignment.at)
+						value and value.stop or assignment.at, nil, "type")
 				end
 			end
 		end
@@ -352,7 +352,7 @@ local function fieldWrites(ctx)
 			local value = parsed.nodes[node.valueIdx]
 			if not wanted then
 				diagnostic.add(self, string.format("`%s` is not a field of %s", field,
-						destination.name or types.display(destination)), target.start, target.stop)
+						destination.name or types.display(destination)), target.start, target.stop, nil, "missing-field")
 			elseif value then
 				local actual = infer.at(inferCtx, node.valueIdx)
 				if value.kind == "function" then
@@ -380,7 +380,7 @@ local function fieldWrites(ctx)
 				end
 				local message = actual and types.strictMismatch(expected, actual, field)
 				if message then
-					diagnostic.add(self, message, value.start, value.stop)
+					diagnostic.add(self, message, value.start, value.stop, nil, "type")
 				end
 			end
 		end
@@ -419,7 +419,7 @@ local function metatableChecks(ctx)
 					end
 					if not allowed then
 						diagnostic.add(self, string.format("'%s' is %s to %s", node.field, visibility,
-								targetType.name), node.start, node.stop)
+								targetType.name), node.start, node.stop, nil, "visibility")
 					end
 				end
 			end
@@ -491,7 +491,7 @@ local function deadCode(ctx)
 				---@cast stopped string
 				---@cast stopping lye.parser.Node
 				if node.start > stopping.stop then
-					diagnostic.add(self, string.format("%s never returns, so this cannot run", stopped), node.start, node.stop, 1)
+					diagnostic.add(self, string.format("%s never returns, so this cannot run", stopped), node.start, node.stop, 1, "dead-code")
 					break
 				end
 			end
@@ -521,14 +521,28 @@ local function arithmeticChecks(ctx)
 			-- metamethod's parameters are what is checked.
 			local metamethod = left and right and types.metamethodFor(op, left, right)
 			if metamethod then
+				-- A binary operator written with one parameter names the *other* operand:
+				-- `---@operator add(number): number` is `self + number` or `number + self`, so the
+				-- operand that declared the operator is the class itself and the parameter is what
+				-- the operand written beside it has to be.
+				local single = #metamethod.params == 1
+				local name = types.metamethodName(op)
+				local onLeft = name ~= nil and left ~= nil and types.metamethod(left, name) == metamethod
 				for position, operandIdx in ipairs({ node.left, node.right }) do
 					local operand = parsed.nodes[operandIdx]
-					local wanted = metamethod.params[position]
+					---@type lye.doc.Type?
+					local wanted
+					if single then
+						local other = onLeft and 2 or 1
+						if position == other then wanted = metamethod.params[1] end
+					else
+						wanted = metamethod.params[position]
+					end
 					local actual = position == 1 and left or right
 					if operand and wanted and actual and types.mismatch(wanted, actual, op) then
 						diagnostic.add(self, string.format("'%s' takes %s on the %s, but this is %s", node.op,
 								types.display(wanted), position == 1 and "left" or "right",
-								types.display(actual)), operand.start, operand.stop, 1)
+								types.display(actual)), operand.start, operand.stop, 1, "operator")
 					end
 				end
 			else
@@ -537,7 +551,7 @@ local function arithmeticChecks(ctx)
 					local operandType = operand and infer.at(inferCtx, operandIdx)
 					if operandType and isNeverNumeric(operandType) then
 						diagnostic.add(self, string.format("'%s' needs numbers, but this is a %s",
-								node.op, types.display(operandType)), operand.start, operand.stop, 1)
+								node.op, types.display(operandType)), operand.start, operand.stop, 1, "operator")
 					end
 				end
 			end
@@ -568,7 +582,7 @@ local function indexedReads(ctx)
 				and key and key.variant == "number" then
 				local at = parsed.nodes[node.key]
 				diagnostic.add(self, string.format("%s cannot be indexed by a number", types.describe(base)),
-					at.start, at.stop)
+					at.start, at.stop, nil, "index")
 			end
 		end
 		end
@@ -616,7 +630,7 @@ local function globalNames(ctx)
 				-- The reference is recorded whether or not the item is reused: an unused local is
 				-- judged by all of its readers, and the reading items may be different ones.
 				diagnostic.add(self, string.format("undefined global `%s`", name),
-					node.start, node.start + #name - 1, 2)
+					node.start, node.start + #name - 1, 2, "undefined-global")
 			end
 		end
 	end
@@ -653,12 +667,14 @@ local function paramNames(ctx)
 						and not reused(ctx, annotation.nameStart or annotation.start,
 							annotation.nameStop or annotation.stop) then
 						diagnostic.add(self, string.format("`%s` is not a parameter of this function", name),
-							annotation.nameStart or annotation.start, annotation.nameStop or annotation.stop)
-					end
+							annotation.nameStart or annotation.start, annotation.nameStop or annotation.stop,
+							nil, "unknown-param")
 				end
 			end
 		end
+		end
 	end
+
 end
 
 ---@param ctx lye.analyzer.CheckContext
@@ -670,7 +686,7 @@ local function unusedLocals(ctx)
 			local declaration = variable.declaration
 			if not ctx.self.isDefinition then
 				diagnostic.add(ctx.self, string.format("unused local `%s`", variable.name),
-					declaration.start, declaration.stop, 2)
+					declaration.start, declaration.stop, 2, "unused-local")
 			end
 		end
 	end
@@ -864,7 +880,7 @@ local function comparisonChecks(ctx)
 						local message = other.kind == "call" and other.callee == "type"
 							and string.format("%s is not a type `type` can return", written)
 							or string.format("%s is not one of the values this comparison allows", written)
-						diagnostic.add(self, message, literal.start, literal.stop, 1)
+						diagnostic.add(self, message, literal.start, literal.stop, 1, "type")
 					end
 				end
 			end
@@ -921,7 +937,7 @@ local function nilReads(ctx)
 		local message = isNil(target)
 			and string.format("%s is nil", what)
 			or string.format("%s may be nil", what)
-		diagnostic.add(self, message, node.start, node.stop, 1)
+		diagnostic.add(self, message, node.start, node.stop, 1, "nil-read")
 	end
 
 	-- A field the document writes a value to before the read is not read as absent at that
@@ -1082,14 +1098,33 @@ local function missingFieldReads(ctx)
 					end
 					if missing and has then
 						diagnostic.add(self, string.format("`%s` is not a field of every member of this union",
-							node.field), node.start, node.stop, 1)
+							node.field), node.start, node.stop, 1, "missing-field")
 					elseif missing and (target.variant == "object" or target.variant == "class") then
 						diagnostic.add(self, string.format("`%s` is not a field of %s",
-							node.field, types.display(target)), node.start, node.stop, 1)
+							node.field, types.display(target)), node.start, node.stop, 1, "missing-field")
 					end
 				end
 			end
 		end
+		end
+	end
+
+	-- A method call is a call node with a field, not an index node: `p:missing()` reaches the
+	-- class's field table the same way a read does. A class may answer through `__index`, and a
+	-- method another file declares is in the table the class was seeded with, so only a class
+	-- whose table is complete and has no answer is reported.
+	for _, node in ipairs(ctx.nodesOf("call")) do
+		if not reused(ctx, node.start, node.stop) and node.field and node.target and not node.isSafe then
+			local target = infer.at(inferCtx, node.target)
+			if self.methodsComplete and target and target.variant == "class"
+				and not types.isOpaque(target)
+				and (target.fromDocument or target.hasWorkspaceMethods) then
+				local known = fieldKnown(target, node.field)
+				if known == false then
+					diagnostic.add(self, string.format("`%s` is not a field of %s",
+						node.field, types.display(target)), node.start, node.stop, 1, "missing-field")
+				end
+			end
 		end
 	end
 end
@@ -1108,7 +1143,7 @@ local function unknownUses(ctx)
 	---@param message string
 	local function reportUnknown(node, message)
 		if reused(ctx, node.start, node.stop) then return end
-		diagnostic.add(self, message, node.start, node.stop, 1)
+		diagnostic.add(self, message, node.start, node.stop, 1, "unknown")
 	end
 
 	-- The type of an expression as the analysis now has it. A name is read through its variable,
@@ -1170,6 +1205,27 @@ local function unknownUses(ctx)
 	end
 end
 
+--- A field the class marks `---@deprecated` is reported where it is read. A read that is the
+--- target of a call is left to the call check, which reports the call itself rather than the
+--- field name it is written through.
+---@param ctx lye.analyzer.CheckContext
+local function deprecatedReads(ctx)
+	local parsed, inferCtx, self = ctx.parsed, ctx.inferCtx, ctx.self
+	for _, node in ipairs(ctx.nodesOf("index")) do
+		if node.field and node.target and not reused(ctx, node.start, node.stop) then
+			local parent = node.parent and parsed.nodes[node.parent]
+			local called = parent ~= nil and parent.kind == "call" and parent.target == node.index
+			if not called then
+				local target = infer.at(inferCtx, node.target)
+				if target and types.deprecatedField(target, node.field) then
+					diagnostic.add(self, string.format("`%s` is deprecated", node.field),
+						node.start, node.stop, 3, "deprecated")
+				end
+			end
+		end
+	end
+end
+
 ---@param ctx lye.analyzer.CheckContext
 local CHECK_LIST = {
 	{ "returnHints", returnHints }, { "anyFunctionHints", anyFunctionHints },
@@ -1180,6 +1236,7 @@ local CHECK_LIST = {
 	{ "globalNames", globalNames }, { "paramNames", paramNames },
 	{ "unusedLocals", unusedLocals }, { "callbackReturns", callbackReturns },
 	{ "nilReads", nilReads }, { "missingFieldReads", missingFieldReads },
+	{ "deprecatedReads", deprecatedReads },
 	{ "unknownUses", unknownUses }, { "moduleExport", moduleExport },
 }
 

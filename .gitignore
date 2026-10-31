@@ -1,4 +1,8 @@
 target
+# The fixtures below are source: tests read the dependency modules lde would
+# have linked into their target/.
+!packages/lye-lsp/tests/fixtures/*/target/
+!packages/lye-lsp/tests/fixtures/*/target/**
 .lye
 *.exe
 .scratch

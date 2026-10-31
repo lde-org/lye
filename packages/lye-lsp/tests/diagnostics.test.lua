@@ -97,6 +97,7 @@ local function run(messages, root, cache, capabilities)
 		params = { capabilities = capabilities or {}, rootUri = root and ("file://" .. root) or nil },
 	}))
 	for _, message in ipairs(messages) do
+		if type(message) == "function" then message = message() end
 		handle:write(frame(message))
 	end
 	handle:close()
@@ -579,6 +580,45 @@ test.it("answers workspace and document pull diagnostics", function()
 	test.truthy(document, "textDocument/diagnostic is answered")
 	test.equal(document.kind, "full")
 	test.truthy(#document.items > 0, "with the open document's diagnostic")
+	os.execute("rm -rf " .. string.format("%q", project))
+end)
+
+test.it("honours diagnostic directives written in the document", function()
+	local project = WORK .. "/directives"
+	os.execute("rm -rf " .. string.format("%q", project))
+	local uri = "file://" .. project .. "/main.lua"
+	local source = table.concat({
+		"---@diagnostic disable-next-line\n",
+		"local x = 1 + \"s\"\n",
+		"---@diagnostic disable\n",
+		"local y = 1 + \"t\"\n",
+		"---@diagnostic enable\n",
+		"local z = 1 + \"u\"\n",
+		"return x, y, z\n",
+	}, "")
+	local published = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project))
+	test.equal(#published, 1, "the open document publishes once")
+	local entries = published[1] and published[1].diagnostics or {}
+	test.equal(#entries, 1, "the two disabled lines were kept out and the enabled one was not")
+	test.truthy(entries[1].message:find("+", 1, true), "and the one left is the arithmetic fault")
+	os.execute("rm -rf " .. string.format("%q", project))
+end)
+
+test.it("applies the workspace's diagnostic severity and disable list", function()
+	local project = WORK .. "/severity"
+	os.execute("rm -rf " .. string.format("%q", project))
+	local uri = "file://" .. project .. "/main.lua"
+	local source = "local x = 1 + \"s\"\nreturn x\n"
+	writeFile(project .. "/lye.json", "{\"diagnostics\":{\"severity\":{\"operator\":\"hint\"}}}\n")
+	local hinted = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project))
+	test.equal(#hinted, 1, "the document is published")
+	test.equal(#hinted[1].diagnostics, 1, "the operator fault is still reported")
+	test.equal(hinted[1].diagnostics[1].severity, 3, "at the severity the workspace asked for")
+
+	writeFile(project .. "/lye.json", "{\"diagnostics\":{\"disable\":[\"operator\"]}}\n")
+	local off = publishedDiagnostics(run(endingWithShutdown({ didOpen(source, uri) }), project))
+	test.equal(#off, 1, "the document is still published")
+	test.equal(#off[1].diagnostics, 0, "and the disabled code is not")
 	os.execute("rm -rf " .. string.format("%q", project))
 end)
 

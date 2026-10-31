@@ -34,7 +34,6 @@ do
 	if clock then
 		local CLOCK_MONOTONIC = 1
 		local held = ffi.new("lye_timespec")
-		---@cast held lye.timespec
 		---@return number
 		function now()
 			if ffi.C.clock_gettime(CLOCK_MONOTONIC, held) ~= 0 then return os.clock() * 1000 end

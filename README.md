@@ -10,9 +10,10 @@
 </div>
 
 `lye` is a language server for [LuaJIT](https://luajit.org): inferred types, completion, hover,
-definitions, references, rename, symbols, signature help, inlay hints, semantic tokens, formatting
-and diagnostics. It is written in LuaJIT: it parses the engine's 3.0 syntax backports and needs no
-Lua runtime, no `lde`, and no packages to install.
+declaration and definition, references, rename, document links, linked editing, monikers, document
+and workspace symbols, signature help, type hierarchy, inlay hints, inline values, code actions and
+lenses, semantic tokens and diagnostics. It is written in LuaJIT: it parses the engine's 3.0 syntax
+backports and needs no Lua runtime, no `lde`, and no packages to install.
 
 ## Why lye
 
@@ -141,13 +142,41 @@ types and autocomplete. `packages/lye-plugin` documents the interface.
 dependency. `lye` finds the nearest `lde.json`, resolves `require` through the same target layout,
 indexes the types linked into `target/`, and offers those modules in completion — with nothing to
 configure. A document resolves against its own package, so siblings, dependencies and monorepo
-packages all work.
+packages all work. A window may open several folders; each document is read against the folder
+that contains it, and workspace symbols and pull diagnostics cover all of them.
 
 For a project not laid out that way, `lye.json` can name search paths the way `package.path` does:
 
 ```json
 { "requirePaths": ["lib/?.lua", "vendor/?/init.lua"] }
 ```
+
+## Diagnostics
+
+A diagnostic has a stable code — `unused-local`, `type`, `missing-field`, `operator`,
+`redundant-return`, `deprecated`, `discard`, and so on. A workspace can set a code's severity or
+turn it off in `lye.json`, and a file can control a line or a range with a directive:
+
+```json
+{
+	"diagnostics": {
+		"severity": { "redundant-return": "off", "undefined-global": "warning" },
+		"disable": ["visibility"]
+	}
+}
+```
+
+```lua
+---@diagnostic disable-next-line: unused-local
+local deliberate = 1
+
+---@diagnostic disable
+local quiet = 2
+---@diagnostic enable
+```
+
+`error`, `warning`, `hint` and `off` are the severity names. A directive with no codes applies to
+every diagnostic on the line or range. The editor and `lye check` read the same policy.
 
 ## Command line
 
@@ -161,6 +190,21 @@ An editor that supports LSP pull diagnostics gets `textDocument/diagnostic` for 
 and `workspace/diagnostic` for every Lua file in the workspace; either is a full check of the files
 it names. Clients without workspace pull still publish the open document's diagnostics, and
 `lye check` is the whole-tree pass for CI.
+
+## Building
+
+The editor packages use a standalone executable. Build it from a snapshot of the working tree:
+
+```sh
+tools/compile.sh                     # packages/lye-lsp/lye-lsp
+tools/compile.sh --target linux-aarch64 --outfile lye-linux-aarch64
+```
+
+The wrapper exists because `lde compile -C packages/lye-lsp` reads the package directory itself:
+after `lde test`, generated fixtures under `packages/lye-lsp/target/` are picked up as source and
+the build fails. The wrapper copies the tracked tree (local edits included, ignored build output
+excluded) to a temporary directory and compiles there, leaving your `target/` alone. It needs
+[lde](https://lde.sh/docs/general/getting-started/installation) on `PATH`.
 
 ## Editors
 

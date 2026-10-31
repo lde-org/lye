@@ -21,6 +21,7 @@ local classes = {}
 ---@field optional boolean? the field is one a value may leave out, written `name?`
 ---@field visibility lye.doc.Visibility
 ---@field comment string? the prose written after the type, as `# comment`
+---@field deprecated boolean? the field's own `---@deprecated`
 
 ---@class lye.doc.Class
 ---@field consts table<string, boolean>? the parameters that take a value rather than a type
@@ -29,6 +30,7 @@ local classes = {}
 ---@field params string[] type parameters, empty when the class is not generic
 ---@field parent string? the parent as written, `Foo<number>` included
 ---@field fields lye.doc.Field[]
+---@field operators table<string, string>? the operators written under it, keyed by the LuaLS name
 
 ---@class lye.doc.Namespace
 ---@field classes table<string, lye.doc.Class>
@@ -274,6 +276,7 @@ function classes.fieldsOf(namespace, text)
 				type = substitute(field.type, class.params, args),
 				optional = field.optional,
 				visibility = field.visibility,
+				deprecated = field.deprecated,
 			}
 		end
 	end
@@ -320,6 +323,10 @@ function classes.resolver(namespace, elsewhere)
 			-- unresolved name, and the cycle ends because there is nothing left to build.
 			local classType = types.classType(found.name, argTypes)
 			classType.visibility = classType.visibility or {}
+			-- A class declared by this document's own annotations is checked for a missing method;
+			-- one that comes from a package or a definition may have methods the index never saw.
+			classType.fromDocument = rawget(namespace.classes, found.name) ~= nil
+				or rawget(namespace.classes, bareName(found.name)) ~= nil
 			built[text] = classType
 			for name, field in pairs(classes.fieldsOf(namespace, text)) do
 				---@cast name string
@@ -328,6 +335,12 @@ function classes.resolver(namespace, elsewhere)
 				-- A field a value may leave out is nil as well as what it says, which is what the
 				-- `?` means: reading it gives the type or nil.
 				if field.optional then held = types.union({ held, types.NIL_TYPE }) end
+				-- A deprecated field has to be recognisable from the class it belongs to: its type
+				-- is shared — `number` is one table — so the marker cannot live on the type itself.
+				if field.deprecated then
+					classType.deprecatedFields = classType.deprecatedFields or {}
+					classType.deprecatedFields[name] = true
+				end
 				local key = name:match("^%[([^%]]+)%]$")
 				if key then
 					-- An index signature, kept where a read with a computed key can find it.
@@ -335,6 +348,18 @@ function classes.resolver(namespace, elsewhere)
 				else
 					classType.fields[name] = held
 					classType.visibility[name] = field.visibility
+				end
+			end
+			-- The operators the class writes are callables of their own, keyed by the LuaLS name:
+			-- `add(number): number` is what `a + 1` runs, and reading `+` asks for `add`.
+			local written = found.operators
+			if written then
+				for operator, signature in pairs(written) do
+					local shape = types.parse("fun" .. signature, resolve)
+					if shape and shape.variant == "fn" then
+						classType.operators = classType.operators or {}
+						classType.operators[operator] = shape
+					end
 				end
 			end
 			local methods = found.name
@@ -352,6 +377,7 @@ function classes.resolver(namespace, elsewhere)
 				end
 			end
 			for name, field in pairs(methods or {}) do
+				---@cast field lye.doc.Type
 				local bindings = methodBindings
 				-- A method that declares its own variables shadows the class's: `Box<T>` with
 				-- `---@generic T` on `Box.new` has a constructor variable of its own, and binding
@@ -478,6 +504,9 @@ end
 function classes.read(file)
 	local namespace = { classes = {}, aliases = {} }
 	local current, visibility = nil, "public"
+	-- A `---@deprecated` marks the declaration below it rather than naming anything itself, so it
+	-- is held here until that declaration is read.
+	local pendingDeprecated = false
 	-- An enum block may have aliases between its declarations, and those end `current`. The class
 	-- that owns the enums is still the last class declared in the file.
 	local enumOwner
@@ -492,6 +521,19 @@ function classes.read(file)
 			namespace.classes[bareName(name)] = current
 			enumOwner = current
 			visibility = "public"
+			pendingDeprecated = false
+		elseif annotation.tag == "deprecated" then
+			pendingDeprecated = true
+		elseif annotation.tag == "operator" then
+			-- `---@operator add(number): number` is a callable of the class, written as a
+			-- signature without the `fun` a type needs; the resolver adds that word back.
+			if current then
+				local name, signature = (annotation.text or ""):match("^([%w_]+)%s*(.*)$")
+				if name and signature and signature ~= "" then
+					current.operators = current.operators or {}
+					current.operators[name] = signature
+				end
+			end
 		elseif annotation.tag == "field" then
 			if current then
 				-- `---@field [integer] T` is an index signature rather than a field: what a value
@@ -505,8 +547,12 @@ function classes.read(file)
 					}
 				else
 					local field = readField(annotation, visibility)
-					if field then current.fields[#current.fields + 1] = field end
+					if field then
+						field.deprecated = pendingDeprecated or nil
+						current.fields[#current.fields + 1] = field
+					end
 				end
+				pendingDeprecated = false
 			end
 		elseif annotation.tag == "private" or annotation.tag == "protected" or annotation.tag == "public" then
 			visibility = annotation.tag

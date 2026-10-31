@@ -137,6 +137,7 @@ end
 ---@field start integer
 ---@field stop integer
 ---@field severity integer
+---@field code string? the stable name a directive or a workspace policy can name
 ---@field range table? the LSP range, once that layer has converted the offsets
 
 --- What the annotations above a declaration say about it. The generic names a declaration
@@ -176,6 +177,9 @@ end
 ---@field overloads string[] the shapes a call may take besides the parameters, as written
 ---@field declaration lye.parser.Declaration? the declaration it was read from, in this document
 ---@field doc string? the prose written above the declaration, as markdown
+---@field deprecated boolean? the declaration carries `---@deprecated`
+---@field nodiscard boolean? a call whose result is dropped should be reported
+---@field async boolean? the callable may yield
 
 ---@class lye.analyzer.Prelude
 ---@field classes table<string, lye.doc.Class>
@@ -198,6 +202,7 @@ end
 ---@field rebase boolean? allow items after the edit to be rebased
 ---@field declarationsVersion integer? the caller's declaration generation, for the reuse fast path
 ---@field modulesVersion integer? the caller's module-cache generation, for the reuse fast path
+---@field methods table<string, table<string, lye.doc.Type>>? methods declared in other files, by class
 
 ---@class lye.analyzer.ClassField
 ---@field isFunction boolean
@@ -209,6 +214,9 @@ end
 ---@field overloads string[]
 ---@field values string[]?
 ---@field doc string?
+---@field deprecated boolean?
+---@field nodiscard boolean?
+---@field async boolean?
 
 --- A write to a named field: where it was written, the value it assigned, and the scope that holds it.
 ---@class lye.analyzer.FieldWrite
@@ -264,6 +272,7 @@ end
 ---@field foreignNames table<string, boolean> every name asked of `elsewhere`, true when it named a type
 ---@field requiredModules table<string, boolean> names passed to the `modules` callback
 ---@field counters table<string, number>? the phase timings, when the caller asked for them
+---@field methodsComplete boolean? the analysis was handed the workspace's method index
 
 local ARITHMETIC = {
 	["+"] = true, ["-"] = true, ["*"] = true, ["/"] = true, ["%"] = true, ["^"] = true,
@@ -802,6 +811,82 @@ end
 
 
 
+--- The expressions whose value another construct reads without the parser recording a parent link:
+--- a parenthesised group, the key of a computed index, the values of an assignment with several
+--- targets, and the condition a scope is guarded by. The rest of the tree reparents what it holds.
+---@param parsed lye.parser.Result
+---@return table<integer, boolean> used
+local function unparentedUses(parsed)
+	local used = {}
+	for _, node in ipairs(parsed.nodes) do
+		if node.group then used[node.group] = true end
+		if node.isDynamic and node.key then used[node.key] = true end
+		local values = node.targetValues
+		if values then
+			for _, idx in ipairs(values) do used[idx] = true end
+		end
+	end
+	for _, scope in ipairs(parsed.scopes or {}) do
+		if scope.conditionIdx then used[scope.conditionIdx] = true end
+	end
+	return used
+end
+
+--- The byte span of each numeric `for`'s bounds. The parser reads them for their types but keeps
+--- no node link to them, so a call written there would otherwise look like a statement of the chunk.
+---@param parsed lye.parser.Result
+---@return { from: integer, to: integer }[]
+local function numericForBounds(parsed)
+	local out = {}
+	local tokens = parsed.tokens
+	for _, node in ipairs(nodesOf(parsed, "for")) do
+		if node.isNumeric then
+			-- The `do` closing the header is the first `do` token of the loop: a bound is an
+			-- expression, so it holds no keyword of its own.
+			local low, high = 1, tokens.count
+			while low <= high do
+				local mid = math.floor((low + high) / 2)
+				local midToken = tokens.arena[mid]
+				if midToken and midToken.start < node.start then low = mid + 1 else high = mid - 1 end
+			end
+			local index = low
+			while index <= tokens.count do
+				local token = tokens.arena[index]
+				if not token or token.start > node.stop then break end
+				-- Only a keyword's text is written exactly `do`: a string literal keeps its quotes,
+				-- a comment its dashes, so the text alone identifies the token.
+				if tokens.texts[token.index] == "do" then
+					out[#out + 1] = { from = node.start, to = token.start }
+					break
+				end
+				index += 1
+			end
+		end
+	end
+	return out
+end
+
+--- Whether a call's result is thrown away: the call is a statement of its own rather than the
+--- value of an assignment, an argument, a condition or a return. A call used as a value was
+--- adopted by the node that holds it; one left without a parent is a statement of its block.
+---@param parsed lye.parser.Result
+---@param node lye.parser.Node
+---@param used table<integer, boolean>
+---@param bounds { from: integer, to: integer }[]
+---@return boolean
+local function discardedCall(parsed, node, used, bounds)
+	local parent = node.parent
+	if parent ~= nil then
+		local owner = parsed.nodes[parent]
+		if owner ~= nil and owner.kind ~= "chunk" then return false end
+	end
+	if used[node.index] then return false end
+	for _, span in ipairs(bounds) do
+		if node.start >= span.from and node.stop <= span.to then return false end
+	end
+	return true
+end
+
 --- Check the arguments a call passes against the parameters the callee declares, and collect
 --- what a named callee returns so a later `local x = f()` can be typed.
 ---@param self lye.analyzer.Result
@@ -1048,9 +1133,11 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 				types.display(wanted), types.display(actual))
 		end
 		---@cast message string
-		diagnostic.add(self, message, argument.start, argument.stop, 1)
+		diagnostic.add(self, message, argument.start, argument.stop, 1, "type")
 	end
 
+	-- What a call's result is worth is asked once for the whole document rather than per call.
+	local used, bounds = unparentedUses(parsed), numericForBounds(parsed)
 	for _, node in ipairs(nodesOf(parsed, "call")) do
 		if not (reused and reused(node.start, node.stop)) then
 		do
@@ -1088,6 +1175,41 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 				end
 				checkArgs(node, name, params, nil, receiver, variadic,
 					receiverParamOf(nil, calleeType, params, receiver))
+			end
+			-- What the declaration said about calling it: an old call, or one whose result nobody
+			-- reads. A `---@deprecated` on a class field is kept beside the class, so it is asked
+			-- of the value the call is written on as well as of the callable itself.
+			local deprecated = (signature and signature.deprecated)
+				or (calleeType ~= nil and calleeType.deprecated == true)
+			if not deprecated then
+				-- `api.old(1)` writes the call on an index node, whose field names the member; the
+				-- type to ask is the value that index was read from, not the callable itself.
+				local field = node.field
+				local owner = target
+				if field == nil then
+					local read = node.target and parsed.nodes[node.target]
+					if read and read.kind == "index" and read.field then
+						field = read.field
+						owner = read.target and infer.at(inferCtx, read.target) or nil
+					end
+				end
+				if field ~= nil and owner ~= nil then
+					deprecated = types.deprecatedField(owner, field)
+				end
+			end
+			local label
+			if deprecated or (signature and signature.nodiscard)
+				or (calleeType ~= nil and calleeType.nodiscard == true) then
+				label = name or callLabel(parsed, node)
+			end
+			if deprecated then
+				diagnostic.add(self, string.format("%s is deprecated", label), node.start, node.stop, 3, "deprecated")
+			end
+			if label and ((signature and signature.nodiscard)
+				or (calleeType ~= nil and calleeType.nodiscard == true))
+				and discardedCall(parsed, node, used, bounds) then
+				diagnostic.add(self, string.format("the result of %s is discarded", label),
+					node.start, node.stop, 2, "discard")
 			end
 		end
 		end
@@ -1223,9 +1345,10 @@ local function prelude(sources)
 			local globalName, field = declaration.name:match("^([%w_]+)[%.:]([%w_]+)$")
 			local owner = globalName and backing[globalName]
 			if owner and not classFields[owner] then classFields[owner] = {} end
-			local params, returned, generics, constraints, predicates, overloads =
+			local params, returned, generics, constraints, predicates, overloads, flags =
 				signatureOf(parsed, file, declaration)
 			---@cast overloads string[]
+			---@cast flags table<string, boolean>
 			-- A definition file may write its types inline — `function f(x: number): string` — and
 			-- the definitions a document is read through are read the same way.
 			local inlineBody = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
@@ -1239,12 +1362,14 @@ local function prelude(sources)
 					params = params, returns = returned, generics = generics, constraints = constraints,
 					predicates = predicates, overloads = overloads,
 					doc = documentationOf(parsed, declaration),
+					deprecated = flags.deprecated, nodiscard = flags.nodiscard, async = flags.async,
 				}
 			end
 			if declaration.qualifier == "global" then
 				prepared.globalNames[declaration.name] = true
 			end
-			if #params > 0 or returned or #predicates > 0 or #overloads > 0 then
+			if #params > 0 or returned or #predicates > 0 or #overloads > 0
+				or flags.deprecated or flags.nodiscard or flags.async then
 				-- A global the definitions declare, remembered by name: the signatures are reached through the
 				-- document's own table, so a pass asking whether a name is known cannot iterate it.
 				if not declaration.name:find("[%.:]") then
@@ -1255,6 +1380,7 @@ local function prelude(sources)
 					constraints = constraints, predicates = predicates, overloads = overloads,
 					values = annotationValues(returned),
 					doc = documentationOf(parsed, declaration),
+					deprecated = flags.deprecated, nodiscard = flags.nodiscard, async = flags.async,
 				}
 				if returned and returned.type and not next(generics) then
 					-- A generic return is known only once the arguments are, so it is left out: a recorded `T` would
@@ -1290,6 +1416,10 @@ local function prelude(sources)
 				local fnType = types.fn(params,
 					(bare and parseType(bare, local_)) or types.ANY_TYPE, isVariadic, nil, variadic)
 				fnType.generics, fnType.constraints = entry.generics, entry.constraints
+				-- The markers a call site acts on travel with the callable, whether it was reached
+				-- by name or through the class field it is stored as.
+				fnType.deprecated, fnType.nodiscard, fnType.async =
+					entry.deprecated, entry.nodiscard, entry.async
 				-- The overloads a definition writes are call shapes, and their returns are what a
 				-- matching call gets: `file:read("*a")` is a string even though the primary return
 				-- is `any`, because the mode decided it. Kept on the callable so an analysis can
@@ -1391,7 +1521,7 @@ local function checkMetatable(self, parsed, metatable, held, nodeIdx)
 			end
 			if report then
 				self.diagnostics[#self.diagnostics + 1] = {
-					message = report, severity = severity,
+					message = report, severity = severity, code = "metamethod",
 					start = node.start, stop = node.stop,
 				}
 			end
@@ -1517,6 +1647,22 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 	-- class type one analysis grows is never handed to the next.
 	local annotationDigest = reuse.annotationsDigest(source, annotations)
 	local namespace, namespaceReused = memo.namespace(annotations, annotationDigest, prepared)
+	-- Methods declared in other files are part of their classes. The caller that read the
+	-- workspace hands them over; this analysis seeds them before a class type is built, so a
+	-- reader in one file sees a method another file declares. A method declared here replaces the
+	-- seeded placeholder below.
+	if options and options.methods then
+		for className, fields in pairs(options.methods) do
+			local held = namespace.evolved[className]
+			if not held then
+				held = {}
+				namespace.evolved[className] = held
+			end
+			for method, fn in pairs(fields) do
+				if held[method] == nil then held[method] = fn end
+			end
+		end
+	end
 	if counters then counters.namespaceReused = namespaceReused and 1 or 0 end
 	---@param node lye.parser.Node
 	local function calledName(node) return callName(parsed, node) end
@@ -1674,6 +1820,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		-- A definition file — one marked `---@meta`, or named `.d.lua` — declares a library: what it
 		-- writes is the whole of a function, so the checks that read a body have nothing to read.
 		isDefinition = isDefinition or (type(annotations) == "table" and annotations.isDefinition) or false,
+		methodsComplete = options ~= nil and options.methods ~= nil,
 	}
 	---@cast self lye.analyzer.Result
 	-- What plugins answer about this document after it is typed: `ffi.C`, a call that names a C
@@ -1837,7 +1984,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 									"`%s` is a const parameter, so it takes a literal %s rather than `%s`",
 									param, (held.constraints and held.constraints[param]) or "value", given),
 								start = at or annotation.start, stop = at and (at + #given - 1) or annotation.stop,
-								severity = 1,
+								severity = 1, code = "annotation",
 							}
 						end
 					end
@@ -1897,7 +2044,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 				validationDiagnostics[#validationDiagnostics + 1] = {
 					message = string.format("unknown type `%s`", name),
 					start = at or annotation.start, stop = at and (at + #name - 1) or annotation.stop,
-					severity = 1,
+					severity = 1, code = "annotation",
 				}
 			end
 		end
@@ -1958,15 +2105,18 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 				isFunction = true, anchorIdx = node.anchorIdx, depth = node.depth or 0,
 				qualifier = name:find("[%.:]") and "field" or "local",
 			}
-			local params, returned, generics, constraints, predicates, overloads =
+			local params, returned, generics, constraints, predicates, overloads, flags =
 				signatureOf(parsed, annotations, synthetic)
 			---@cast overloads string[]
-			if #params > 0 or returned or next(generics) or #predicates > 0 or #overloads > 0 then
+			---@cast flags table<string, boolean>
+			if #params > 0 or returned or next(generics) or #predicates > 0 or #overloads > 0
+				or flags.deprecated or flags.nodiscard or flags.async then
 				bodyOwner[node.valueIdx] = synthetic
 				signatureOfDecl[synthetic] = {
 					params = params, returns = returned, generics = generics,
 					constraints = constraints, predicates = predicates, overloads = overloads,
 					values = annotationValues(returned),
+					deprecated = flags.deprecated, nodiscard = flags.nodiscard, async = flags.async,
 				}
 				local list = {}
 				for _, param in ipairs(value.params or {}) do
@@ -1982,28 +2132,33 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 	-- gives something else, or nothing at all, contradicts the type a caller was promised.
 	local fieldReturns = {}
 	for _, declaration in ipairs(parsed.declarations) do
-		local params, returned, generics, constraints, predicates, overloads =
+		local params, returned, generics, constraints, predicates, overloads, flags =
 			signatureOf(parsed, annotations, declaration)
 		---@cast overloads string[]
+		---@cast flags table<string, boolean>
 		local inlineBody = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
 		if isDefinition and inlineBody and inlineBody.isFunction then
 			params, returned = withInline(params, returned, generics, constraints, inlineBody)
 		end
-		if #params > 0 or returned or #predicates > 0 or #overloads > 0 then
+		if #params > 0 or returned or #predicates > 0 or #overloads > 0
+			or flags.deprecated or flags.nodiscard or flags.async then
 			signatures[declaration.name] = {
 				params = params, returns = returned, generics = generics, constraints = constraints,
 				predicates = predicates, overloads = overloads, declaration = declaration,
 				values = annotationValues(returned),
 				doc = documentationOf(parsed, declaration),
+				deprecated = flags.deprecated, nodiscard = flags.nodiscard, async = flags.async,
 			}
 		end
 		local body = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
 		if declaration.isFunction or (body and body.kind == "function") then
-			if #params > 0 or returned or next(generics) or #predicates > 0 then
+			if #params > 0 or returned or next(generics) or #predicates > 0
+				or flags.deprecated or flags.nodiscard or flags.async then
 				signatureOfDecl[declaration] = {
 					params = params, returns = returned, generics = generics,
 					constraints = constraints, predicates = predicates,
 					overloads = overloads, values = annotationValues(returned),
+					deprecated = flags.deprecated, nodiscard = flags.nodiscard, async = flags.async,
 				}
 				annotatedBodies[declaration.valueIdx] = true
 			end
@@ -2138,6 +2293,10 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		-- The variables the signature declares travel with it: a call binds them from the
 		-- arguments, and a method of a generic class is not the class's variables.
 		fnType.generics, fnType.constraints = signature.generics, signature.constraints
+		-- What the declaration says about using it travels with the callable too, which is how a
+		-- hover reads it and how a call site knows to report a deprecated or discarded use.
+		fnType.deprecated, fnType.nodiscard, fnType.async =
+			signature.deprecated, signature.nodiscard, signature.async
 		-- The shapes a call may take besides this one travel with the callable: `read("*a")`
 		-- picks the shape that names the mode, and its return is the call's result.
 		if signature.overloads and #signature.overloads > 0 then
@@ -3806,7 +3965,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 					message = record.message,
 					start = reusedStart(item, entry.splitRel, entry.shift, record.relStart),
 					stop = reusedStart(item, entry.splitRel, entry.shift, record.relStop),
-					severity = record.severity,
+					severity = record.severity, code = record.code,
 				}
 			end
 		end
@@ -3897,6 +4056,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 				cache.diagnostics[#cache.diagnostics + 1] = {
 					message = entry.message, relStart = entry.start - item.start,
 					relStop = (entry.stop or entry.start) - item.start, severity = entry.severity,
+					code = entry.code,
 				}
 			end
 		end

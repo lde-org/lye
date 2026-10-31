@@ -743,7 +743,7 @@ end
 					local message = types.strictMismatch(promise, inferred, "the result")
 					if message then
 						self.diagnostics[#self.diagnostics + 1] = {
-							message = message, severity = 1,
+							message = message, severity = 1, code = "type",
 							start = parsed.nodes[index].start, stop = parsed.nodes[index].stop,
 						}
 					end
@@ -767,7 +767,7 @@ end
 				self.diagnostics[#self.diagnostics + 1] = {
 					message = string.format("the type says this returns %s, but nothing is returned",
 						types.display(promised)),
-					severity = 1,
+					severity = 1, code = "return",
 					start = parsed.nodes[index].start, stop = parsed.nodes[index].stop,
 				}
 			end

@@ -42,6 +42,7 @@ end
 ---@field detail string
 ---@field documentation string?
 ---@field kind integer?
+---@field message string?
 
 ---@class lye.test.Signature
 ---@field label string
@@ -78,6 +79,7 @@ end
 ---@field signatures lye.test.Signature[]
 ---@field uri string
 ---@field range lye.test.Range
+---@field changes table<string, lye.test.Edit[]>?
 
 ---@class lye.test.WireMessage
 ---@field id integer|string?
@@ -87,14 +89,18 @@ end
 ---@param source string?
 ---@param root string? a workspace to open, when what is being tested is where a `require` looks
 ---@param uri string? the document to open, for the same reason
-local function run(requests, source, root, uri)
+local function run(requests, source, root, uri, folders)
 	uri = uri or "file:///f.lua"
 	local handle = assert(io.open(INPUT, "wb"))
 	handle:write(frame({
 		jsonrpc = "2.0",
 		id = 1,
 		method = "initialize",
-		params = { capabilities = {}, rootUri = root and ("file://" .. root) or nil },
+		params = {
+			capabilities = {},
+			rootUri = root and ("file://" .. root) or nil,
+			workspaceFolders = folders,
+		},
 	}))
 	handle:write(frame({
 		jsonrpc = "2.0",
@@ -1415,6 +1421,257 @@ test.it("narrows the parameter type as the arguments select an overload", functi
 	test.truthy(all and all.label:match("number"), "including a byte count")
 	test.truthy(one and one.label:match("%*a"), "the first argument keeps only its mode")
 	test.truthy(one and one.label:match("%-> string"), "and its return is the overload's")
+end)
+
+test.it("finds references and renames a method another file declares", function()
+	-- The class and its method live in one file; the call is written in another. The lexical
+	-- workspace index is what lets find-references and rename cross that boundary.
+	local root = PACKAGE_DIR .. "/target/workspace-refs"
+	os.execute("rm -rf " .. string.format("%q", root)
+		.. " && mkdir -p " .. string.format("%q", root))
+	local function write(name, text)
+		local handle = assert(io.open(root .. "/" .. name, "wb"))
+		handle:write(text)
+		handle:close()
+	end
+	write("a.lua", table.concat({
+		"---@class CrossPoint\n",
+		"---@field x number\n",
+		"local CrossPoint = {}\n",
+		"---@param dx number\n",
+		"function CrossPoint:move(dx)\n",
+		"\tself.x = self.x + dx\n",
+		"end\n",
+		"return CrossPoint\n",
+	}, ""))
+	local used = table.concat({
+		"local M = {}\n",
+		"---@param p CrossPoint\n",
+		"function M.use(p)\n",
+		"\tp:move(1)\n",
+		"\tp:missing()\n",
+		"\treturn p\n",
+		"end\n",
+		"return M\n",
+	}, "")
+	write("b.lua", used)
+	local uri = "file://" .. root .. "/b.lua"
+	local results = run({
+		{ jsonrpc = "2.0", id = 2, method = "textDocument/references", params = {
+			textDocument = { uri = uri }, position = { line = 3, character = 3 },
+			context = { includeDeclaration = true },
+		} },
+		{ jsonrpc = "2.0", id = 3, method = "textDocument/rename", params = {
+			textDocument = { uri = uri }, position = { line = 3, character = 3 }, newName = "shift",
+		} },
+		{ jsonrpc = "2.0", id = 4, method = "textDocument/diagnostic", params = {
+			textDocument = { uri = uri },
+		} },
+	}, used, root, uri)
+	local references = results["2"] or {}
+	---@cast references { uri: string, range: table }[]
+	test.equal(#references, 2, "the declaration and the call")
+	local byUri = {}
+	for _, reference in ipairs(references) do byUri[reference.uri] = true end
+	test.truthy(byUri["file://" .. root .. "/a.lua"], "the declaration's file")
+	test.truthy(byUri[uri], "the caller's file")
+	local changes = (results["3"] and results["3"].changes) or {}
+	test.truthy(changes["file://" .. root .. "/a.lua"], "the method is renamed where it is declared")
+	test.truthy(changes[uri], "and where it is called")
+	for _, edits in pairs(changes) do
+		for _, edit in ipairs(edits) do test.equal(edit.newText, "shift") end
+	end
+	local items = (results["4"] and results["4"].items) or {}
+	local missing = {}
+	for _, item in ipairs(items) do missing[item.message] = true end
+	for message in pairs(missing) do
+		test.falsy(message:find("`move`", 1, true), "a method another file declares is known: " .. message)
+	end
+	test.truthy(missing["`missing` is not a field of CrossPoint"], "a method no file declares is still reported")
+end)
+
+test.it("links a require, edits a module rename, and answers the small protocol extras", function()
+	local root = PACKAGE_DIR .. "/target/workspace-extras"
+	os.execute("rm -rf " .. string.format("%q", root)
+		.. " && mkdir -p " .. string.format("%q", root))
+	local function write(name, text)
+		local handle = assert(io.open(root .. "/" .. name, "wb"))
+		handle:write(text)
+		handle:close()
+	end
+	write("dep.lua", "return { value = 1 }\n")
+	local source = "local dep = require(\"dep\")\nreturn dep\n"
+	write("main.lua", source)
+	local uri = "file://" .. root .. "/main.lua"
+	local function at(id, method, position)
+		local request = { jsonrpc = "2.0", id = id, method = method, params = {
+			textDocument = { uri = uri },
+		} }
+		if position then request.params.position = position end
+		return request
+	end
+	local results = run({
+		at(2, "textDocument/documentLink"),
+		at(3, "textDocument/linkedEditingRange", { line = 0, character = 6 }),
+		at(4, "textDocument/moniker", { line = 0, character = 6 }),
+		at(5, "textDocument/declaration", { line = 0, character = 6 }),
+		{ jsonrpc = "2.0", id = 6, method = "workspace/willRenameFiles", params = {
+			files = { { oldUri = "file://" .. root .. "/dep.lua", newUri = "file://" .. root .. "/other.lua" } },
+		} },
+		{ jsonrpc = "2.0", id = 7, method = "textDocument/inlineValue", params = {
+			textDocument = { uri = uri },
+			range = { start = { line = 0, character = 0 }, ["end"] = { line = 1, character = 0 } },
+			context = {
+				frameId = 1,
+				stoppedLocation = {
+					uri = uri,
+					range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 0 } },
+				},
+			},
+		} },
+		{ jsonrpc = "2.0", id = 8, method = "completionItem/resolve", params = { label = "dep" } },
+		at(9, "textDocument/references", { line = 0, character = 6 }),
+	}, source, root, uri)
+	local links = results["2"] or {}
+	---@cast links { target: string? }[]
+	test.equal(#links, 1, "the require string is linked")
+	test.truthy((links[1] or {}).target == "file://" .. root .. "/dep.lua", "to the file it names")
+	local editing = results["3"] or {}
+	---@cast editing { ranges: table[], wordPattern: string? }
+	local references = results["9"] or {}
+	---@cast references table[]
+	test.equal(#references, 2, "references finds the declaration and the read")
+	test.equal(#(editing.ranges or {}), 2, "the name is linked to its other write in the file")
+	test.truthy(editing.wordPattern, "with a pattern a client can enforce")
+	local monikers = results["4"] or {}
+	---@cast monikers { scheme: string }[]
+	test.truthy(monikers[1] and monikers[1].scheme == "lye", "a moniker is named")
+	local declaration = results["5"]
+	test.truthy(declaration and declaration.range, "declaration answers like definition")
+	local changes = (results["6"] and results["6"].changes) or {}
+	test.truthy(changes[uri], "the require string is edited when the module file moves")
+	test.equal((changes[uri] or {})[1] and changes[uri][1].newText, "other")
+	local inline = results["7"] or {}
+	---@cast inline table[]
+	test.equal(#inline, 0, "inline values are empty")
+	local resolved = results["8"] --[[@as { label: string }?]]
+	test.equal(resolved and resolved.label, "dep", "a completion item resolves to itself")
+end)
+
+test.it("offers fixes for a diagnostic and a reference lens", function()
+	local source = "local function f() return 1 end\nlocal a = f()\nreturn a\n"
+	local range = {
+		start = { line = 0, character = 6 },
+		["end"] = { line = 0, character = 7 },
+	}
+	local results = run({
+		{ jsonrpc = "2.0", id = 2, method = "textDocument/codeAction", params = {
+			textDocument = { uri = "file:///f.lua" }, range = range,
+			context = { diagnostics = { {
+				range = range, severity = 2, code = "unused-local", source = "lye",
+				message = "unused local `x`",
+			} } },
+		} },
+		{ jsonrpc = "2.0", id = 3, method = "textDocument/codeLens", params = {
+			textDocument = { uri = "file:///f.lua" },
+		} },
+	}, source)
+	local actions = results["2"] or {}
+	---@cast actions { title: string, kind: string?, edit: table? }[]
+	test.truthy(#actions >= 3, "mark, remove and suppress are offered")
+	local titles = {}
+	for _, action in ipairs(actions) do titles[action.title] = true end
+	test.truthy(titles["Remove unused local `x`"], "the line can be removed")
+	test.truthy(titles["Disable `unused-local` on this line"], "the code can be turned off for one line")
+	local lenses = results["3"] or {}
+	---@cast lenses { command: { command: string, title: string } }[]
+	test.equal(#lenses, 1, "the function has a lens")
+	test.equal(lenses[1].command.command, "lye.showReferences")
+	test.truthy(lenses[1].command.title:match("reference"), "with the count as its title")
+end)
+
+test.it("walks the class hierarchy across workspace files", function()
+	local root = PACKAGE_DIR .. "/target/workspace-types"
+	os.execute("rm -rf " .. string.format("%q", root)
+		.. " && mkdir -p " .. string.format("%q", root))
+	local function write(name, text)
+		local handle = assert(io.open(root .. "/" .. name, "wb"))
+		handle:write(text)
+		handle:close()
+	end
+	write("base.lua", "---@class Base\n---@field id number\nlocal Base = {}\nreturn Base\n")
+	local child = "---@class Child: Base\nlocal Child = {}\nreturn Child\n"
+	write("child.lua", child)
+	local uri = "file://" .. root .. "/child.lua"
+	local function at(id, method, position)
+		return { jsonrpc = "2.0", id = id, method = method, params = {
+			textDocument = { uri = uri }, position = position,
+		} }
+	end
+	local results = run({
+		at(2, "textDocument/prepareTypeHierarchy", { line = 0, character = 10 }),
+	}, child, root, uri)
+	local items = results["2"] or {}
+	---@cast items { name: string, data: { name: string }, uri: string }[]
+	test.equal(items[1] and items[1].name, "Child")
+	local prepared = run({
+		{ jsonrpc = "2.0", id = 3, method = "typeHierarchy/supertypes", params = { item = items[1] } },
+		{ jsonrpc = "2.0", id = 4, method = "typeHierarchy/subtypes", params = {
+			item = { name = "Base", uri = uri, data = { name = "Base" } },
+		} },
+	}, child, root, uri)
+	local parents = prepared["3"] or {}
+	---@cast parents { name: string }[]
+	test.equal(parents[1] and parents[1].name, "Base", "the parent class is found")
+	local children = prepared["4"] or {}
+	---@cast children { name: string }[]
+	test.equal(children[1] and children[1].name, "Child", "and the class that extends it")
+end)
+
+test.it("lists symbols from every workspace folder", function()
+	local base = "/tmp/lye-workspace-roots"
+	local first, second = base .. "/one", base .. "/two"
+	os.execute("rm -rf " .. string.format("%q", base)
+		.. " && mkdir -p " .. string.format("%q", first)
+		.. " " .. string.format("%q", second))
+	local function write(root, name, text)
+		local handle = assert(io.open(root .. "/" .. name, "wb"))
+		handle:write(text)
+		handle:close()
+	end
+	write(first, "a.lua", "function alpha() return 1 end\nreturn alpha\n")
+	write(second, "b.lua", "function beta() return 2 end\nreturn beta\n")
+	local uri = "file://" .. first .. "/main.lua"
+	local results = run({
+		{ jsonrpc = "2.0", id = 2, method = "workspace/symbol", params = { query = "" } },
+	}, "return 1\n", first, uri, {
+		{ uri = "file://" .. first, name = "one" },
+		{ uri = "file://" .. second, name = "two" },
+	})
+	local symbols = results["2"] or {}
+	---@cast symbols { name: string }[]
+	local names = {}
+	for _, symbol in ipairs(symbols) do names[symbol.name] = true end
+	test.truthy(names.alpha, "the first root's function")
+	test.truthy(names.beta, "and the second root's")
+end)
+
+test.it("spaces a formatted line without touching a string", function()
+	local source = "local x=1+2\nlocal  y =  \"a  b\"\nreturn x,  y\n"
+	local results = run({ {
+		jsonrpc = "2.0", id = 2, method = "textDocument/formatting",
+		params = {
+			textDocument = { uri = "file:///f.lua" },
+			options = { tabSize = 2, insertSpaces = true },
+		},
+	} }, source)
+	local edits = results["2"] or {}
+	---@cast edits { newText: string, range: { start: { line: integer } } }[]
+	local text = {}
+	for _, edit in ipairs(edits) do text[edit.range.start.line] = edit.newText end
+	test.equal(text[0], "local x = 1 + 2")
+	test.equal(text[1], "local y = \"a  b\"", "the literal keeps the spaces it holds")
+	test.equal(text[2], "return x, y")
 end)
 
 return true

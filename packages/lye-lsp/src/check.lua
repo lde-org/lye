@@ -16,6 +16,8 @@ local timing = require("lye-lsp.timing")
 local plugin = require("lye-plugin")
 local json = require("lye-json")
 local Parser = require("lye-parser")
+local config = require("lye-lsp.config")
+local directives = require("lye-analyzer.directives")
 
 local check = {}
 
@@ -798,6 +800,10 @@ end
 local function reportEntries(reporter, path, source, entries)
 	local index
 	local isOk = true
+	-- Severity and enablement are the workspace's to say, and a cached answer is held to the
+	-- policy in force now rather than the one that wrote it.
+	local policy = config.policy(config.forPath(packageOf(path), absolute(env.cwd())))
+	if policy then entries = directives.apply(entries, source, nil, policy) end
 	for _, entry in ipairs(entries) do
 		index = index or position.buildLineIndex(source)
 		local line, character = position.toPosition(source, index, entry.start, position.UTF8)
@@ -899,7 +905,8 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 					message = suggestion
 						and string.format("module `%s` is not found; did you mean `%s`?", writtenName, suggestion)
 						or string.format("module `%s` is not found", writtenName),
-					severity = 1, start = argument.start, stop = argument.stop,
+					severity = 1, code = "missing-module",
+					start = argument.start, stop = argument.stop,
 				}
 			end
 		end
@@ -909,15 +916,26 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 	-- read by the parser once per check rather than twice.
 	local all = {}
 	local parsed = names.parser
-	for _, entry in ipairs(parsed and parsed.diagnostics or {}) do all[#all + 1] = entry end
+	for _, entry in ipairs(parsed and parsed.diagnostics or {}) do
+		all[#all + 1] = {
+			message = entry.message, severity = entry.severity,
+			start = entry.start, stop = entry.stop, code = entry.code or "syntax",
+		}
+	end
 	for _, entry in ipairs(names.diagnostics) do all[#all + 1] = entry end
+	-- A directive written in the file is part of what the file says, so it is applied before
+	-- findings are carried back to the document the reader wrote.
+	all = directives.apply(all, written, names.doc, nil)
 	-- Every finding travels back to the file it was found in, as a copy: what is held here is the
 	-- analysis of the *lowered* text, and a finding of it that a report has already carried back
 	-- would be carried back again the next time the same text is checked in this run.
 	local mapped = {}
 	for _, entry in ipairs(all) do
 		local from, to = map:toOriginalRange(entry.start, entry.stop or entry.start)
-		mapped[#mapped + 1] = { message = entry.message, severity = entry.severity, start = from, stop = to }
+		mapped[#mapped + 1] = {
+			message = entry.message, severity = entry.severity, code = entry.code,
+			start = from, stop = to,
+		}
 	end
 	all = mapped
 	table.sort(all, function(a, b) return a.start < b.start end)

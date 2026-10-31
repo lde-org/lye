@@ -16,7 +16,7 @@ local types = {}
 ---| { variant: "nil" }
 ---| { variant: "void" }
 ---| { variant: "table" }
----| { variant: "fn", params: lye.doc.Type[], returns: lye.doc.Type, isVariadic: boolean?, variadic: lye.doc.Type?, values: lye.doc.Type[]?, overloads: lye.doc.Type[]?, generics: table<string, boolean>?, constraints: table<string, string>?, isMethod: boolean?, isSpread: boolean? }
+---| { variant: "fn", params: lye.doc.Type[], returns: lye.doc.Type, isVariadic: boolean?, variadic: lye.doc.Type?, values: lye.doc.Type[]?, overloads: lye.doc.Type[]?, generics: table<string, boolean>?, constraints: table<string, string>?, isMethod: boolean?, isSpread: boolean?, deprecated: boolean?, nodiscard: boolean?, async: boolean? }
 ---| { variant: "any" }
 ---| { variant: "unknown", isMutable: boolean? }
 ---| { variant: "extern", name: string }
@@ -29,7 +29,7 @@ local types = {}
 ---| { variant: "conditional", check: lye.doc.Type, extends: lye.doc.Type, thenType: lye.doc.Type, elseType: lye.doc.Type }
 ---| { variant: "mapped", key: string, source: lye.doc.Type, value: lye.doc.Type }
 ---| { variant: "template", parts: (string|lye.doc.Type)[] }
----| { variant: "class", name: string, args: lye.doc.Type[], fields: table<string, lye.doc.Type>, parents: lye.doc.Type[], indexed: { key: string, type: lye.doc.Type }?, metatable: lye.doc.Type?, visibility: table<string, string>? }
+---| { variant: "class", name: string, args: lye.doc.Type[], fields: table<string, lye.doc.Type>, parents: lye.doc.Type[], indexed: { key: string, type: lye.doc.Type }?, metatable: lye.doc.Type?, visibility: table<string, string>?, fromDocument: boolean?, hasWorkspaceMethods: boolean?, operators: table<string, lye.doc.Type>?, deprecatedFields: table<string, boolean>? }
 ---| { variant: "never" }
 
 types.UNKNOWN = "unknown"
@@ -1361,11 +1361,10 @@ function types.unaryResult(op, operand)
 	local value = types.numericValue(operand)
 	if value and op == "-" then return types.numberValue(-value) end
 	-- `#` is the length of a table whatever its metatable says: LuaJIT honours `__len` only for
-	-- userdata, which lye does not model. Every other unary operator asks the metamethod.
-	if op ~= "#" then
-		local metamethod = types.metamethodFor("unary-", operand, operand)
-		if metamethod then return metamethod.returns end
-	end
+	-- userdata, which lye does not model. A class may still declare a `len` operator, and then that
+	-- is what the length is — as a `unm` operator is what a negated class is worth.
+	local metamethod = types.metamethodFor(op == "-" and "unary-" or op, operand, operand)
+	if metamethod then return metamethod.returns end
 	if op == "#" then return types.NUMBER end
 	if operand.variant == "unknown" then return types.mutable() end
 	if op == "-" or op == "~" then
@@ -1380,7 +1379,7 @@ end
 local METAMETHODS = {
 	["+"] = "__add", ["-"] = "__sub", ["*"] = "__mul", ["/"] = "__div", ["%"] = "__mod",
 	["^"] = "__pow", [".."] = "__concat", ["=="] = "__eq", ["<"] = "__lt", ["<="] = "__le",
-	["unary-"] = "__unm",
+	["unary-"] = "__unm", ["#"] = "__len",
 }
 
 --- The same type, with the metatable Lua consults for what it does not define itself. A copy,
@@ -1404,6 +1403,82 @@ function types.metatableOf(type)
 	return type and type.metatable
 end
 
+--- The LuaLS name of each metamethod, so a class's `---@operator` declaration can answer for a
+--- value the way a metatable field does.
+---@type table<string, string>
+local OPERATOR_NAMES = {
+	__add = "add", __sub = "sub", __mul = "mul", __div = "div", __mod = "mod", __pow = "pow",
+	__concat = "concat", __len = "len", __eq = "eq", __lt = "lt", __le = "le", __unm = "unm",
+	__call = "call", __index = "index", __newindex = "newindex",
+}
+
+--- The operator a value declares under a LuaLS name, its parents' included. A class writes these
+--- in its annotations rather than in a metatable, so they are read from the type itself.
+---@param type lye.doc.Type?
+---@param name string
+---@return lye.doc.Type?
+function types.operatorOf(type, name)
+	local depth = 0
+	while type and depth < 8 do
+		if type.variant == "union" then
+			for _, member in ipairs(type.types) do
+				local found = types.operatorOf(member, name)
+				if found then return found end
+			end
+			return nil
+		end
+		if type.variant == "class" then
+			local operators = type.operators
+			local found = operators and operators[name]
+			if found then return found end
+			for _, parent in ipairs(type.parents or {}) do
+				local inherited = types.operatorOf(parent, name)
+				if inherited then return inherited end
+			end
+		end
+		local metatable = type.metatable
+		if not metatable then return nil end
+		type = metatable
+		depth = depth + 1
+	end
+	return nil
+end
+
+--- Whether a field is marked `---@deprecated` on the value its read is written on. The marker is
+--- kept beside the fields rather than on the field's type, because a type as plain as `number` is
+--- shared by every field that holds one.
+---@param type lye.doc.Type?
+---@param name string
+---@return boolean
+function types.deprecatedField(type, name)
+	local depth = 0
+	while type and depth < 8 do
+		if type.variant == "union" or type.variant == "intersection" then
+			for _, member in ipairs(type.types) do
+				if types.deprecatedField(member, name) then return true end
+			end
+			return false
+		end
+		if type.variant == "class" then
+			local marked = type.deprecatedFields
+			if marked and marked[name] then return true end
+			for _, parent in ipairs(type.parents or {}) do
+				if types.deprecatedField(parent, name) then return true end
+			end
+			local held = type.fields[name]
+			if held and held.variant == "fn" and held.deprecated == true then return true end
+		elseif type.variant == "object" then
+			local held = type.fields[name]
+			if held and held.variant == "fn" and held.deprecated == true then return true end
+		end
+		local metatable = type.metatable
+		if not metatable then return false end
+		type = metatable
+		depth = depth + 1
+	end
+	return false
+end
+
 --- The metamethod a value answers an operation with: the field of its metatable, read the way Lua
 --- reads it. A metatable that names no `__index` is read as the table itself, which is what a
 --- class written `Point.__index = Point` means.
@@ -1417,7 +1492,12 @@ function types.metamethod(type, name)
 	-- A type may also declare the metamethod it answers with as a field of its own, which is how
 	-- the definitions describe a C number: it is cdata the engine gives `__add` and the rest to,
 	-- and a check for "this operand has to be a number" has to see that rather than report it.
-	return type and type.fields and type.fields[name] or nil
+	local field = type and type.fields and type.fields[name]
+	if field then return field end
+	-- And a class may declare the same operation as an annotation, which is what `@operator` is.
+	local operator = OPERATOR_NAMES[name]
+	if operator then return types.operatorOf(type, operator) end
+	return nil
 end
 
 --- The type a field read gives, following the metatable when the type does not carry the field.
@@ -1478,6 +1558,15 @@ function types.fieldOf(type, name)
 		end
 	end
 	return nil
+end
+
+--- The metamethod Lua consults for an operator, such as `__add` for `+`. A checker that found a
+--- metamethod has to know which operand declared it, since an operator written with one parameter
+--- names the other operand.
+---@param op string
+---@return string?
+function types.metamethodName(op)
+	return METAMETHODS[op]
 end
 
 --- The metamethod an operator runs for these operands, when either side declares one. Lua asks the
@@ -2349,7 +2438,10 @@ function types.parse(text, resolve)
 			end) or types.UNKNOWN_TYPE
 			return types.mapped(keyVar, source, value)
 		end
-		local fields, indexed = {}, nil
+		---@type table<string, lye.doc.Type>
+		local fields = {}
+		---@type { key: string, type: lye.doc.Type }?
+		local indexed
 		-- Split at the commas that separate fields, not at every comma there is: a field whose type
 		-- is `table<string, number>` carries one of its own, and cutting there leaves two fields —
 		-- `fields: table<string` and `number>` — which is a shape nothing can use.
@@ -2361,6 +2453,7 @@ function types.parse(text, resolve)
 			-- marker a caller appended was dropped.
 			local key, value = field:match("^%s*%[%s*([%w_]+)%s*%]%s*:?%s*(.-)%s*$")
 			if key then
+				---@cast key string
 				indexed = { key = key, type = types.parse(value, resolve) or types.UNKNOWN_TYPE }
 			else
 				-- `kind?: string` marks the field optional with a `?` on its own name, which is
@@ -2489,7 +2582,10 @@ function types.displayOf(type)
 	if type.variant == "boolean" and type.value ~= nil then return tostring(type.value) end
 	if type.variant == "number" and type.text then return type.text end
 	if type.variant == "fn" then
-		if types.isAnyFn(type) then return "function" end
+		-- A function marked `---@async` may yield; the marker is part of how it reads, so a hover
+		-- and a diagnostic say so before the signature.
+		local prefix = type.async and "async " or ""
+		if types.isAnyFn(type) then return prefix .. "function" end
 		local parts = {}
 		local params = type.params or {}
 		local shown = math.min(#params, 6)
@@ -2501,14 +2597,15 @@ function types.displayOf(type)
 		if type.values and #type.values > 1 and not type.isSpread then
 			local values = {}
 			for _, value in ipairs(type.values) do values[#values + 1] = types.display(value) end
-			return string.format("fn(%s) -> %s", table.concat(parts, ", "), table.concat(values, ", "))
+			return string.format("%sfn(%s) -> %s", prefix, table.concat(parts, ", "), table.concat(values, ", "))
 		end
 		local spread = type.isSpread and "..." or ""
 		-- A function that returns nothing has no result to write down, so the arrow goes too.
 		if type.returns == types.VOID then
-			return "fn(" .. table.concat(parts, ", ") .. ")" .. spread
+			return prefix .. "fn(" .. table.concat(parts, ", ") .. ")" .. spread
 		end
-		return "fn(" .. table.concat(parts, ", ") .. ") -> " .. types.display(type.returns) .. spread
+		return string.format("%sfn(%s) -> %s%s", prefix, table.concat(parts, ", "),
+			types.display(type.returns), spread)
 	end
 	if type.variant == "array" then
 		-- A union and a signature need their own brackets, or `(number|string)[]` reads as

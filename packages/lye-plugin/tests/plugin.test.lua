@@ -56,6 +56,28 @@ local function about(said, piece)
 	end
 end
 
+test.it("asks a plugin for navigation and code actions", function()
+	local specs = { plugin.spec({
+		hover = function(context)
+			---@cast context lye.plugin.NavigationContext
+			return "value at " .. context.offset
+		end,
+		definition = function() return { uri = "file:///decl.lua", from = 1, to = 4 } end,
+		references = function() return { { from = 1, to = 4 }, { from = 9, to = 12 } } end,
+		codeAction = function() return { { title = "Rewrite it", kind = "quickfix" } } end,
+	}, "dialect", function() end) }
+	local context = { uri = "file:///x.toy", offset = 7 } --[[@as lye.plugin.NavigationContext]]
+	test.equal(plugin.hover(specs, context), "value at 7")
+	local definition, name = plugin.definition(specs, context)
+	test.equal(name, "dialect")
+	test.equal(definition and definition.from, 1)
+	test.equal(#plugin.references(specs, context), 2)
+	local actions = plugin.codeActions(specs, context)
+	---@cast actions { title: string }[]
+	test.equal(#actions, 1)
+	test.equal(actions[1].title, "Rewrite it")
+end)
+
 test.it("hands back the document itself when a plugin has nothing to say", function()
 	local map = source.lower("local x = 1\n", {})
 	test.equal(map.text, "local x = 1\n")

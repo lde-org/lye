@@ -235,11 +235,15 @@ end
 ---@return lye.analyzer.Predicate[] predicates what the call narrows
 local function signatureOf(parsed, file, declaration)
 	local params, generics, constraints, predicates, overloads = {}, {}, {}, {}, {}
+	-- The markers that describe how the callable is used rather than what it takes or gives:
+	-- `---@deprecated` and `---@nodiscard` are about the call site, and `---@async` about what a
+	-- caller may do with the result.
+	local flags = {}
 	---@type lye.doc.Annotation[]
 	local returns = {}
 	local spanStart = annotationSpan(parsed, declaration)
 	if not spanStart then
-		return params, nil, generics, constraints, predicates, overloads
+		return params, nil, generics, constraints, predicates, overloads, flags
 	end
 
 	-- Annotations are in source order, so the ones in the block end where the declaration starts.
@@ -302,6 +306,9 @@ local function signatureOf(parsed, file, declaration)
 			if annotation.type then table.insert(overloads, 1, annotation.type) end
 		elseif annotation.tag == "type" or annotation.tag == "class" then
 			break
+		elseif annotation.tag == "deprecated" or annotation.tag == "nodiscard"
+			or annotation.tag == "async" then
+			flags[annotation.tag] = true
 		end
 	end
 	local returned = returns[1]
@@ -320,7 +327,7 @@ local function signatureOf(parsed, file, declaration)
 			start = returns[1].start, stop = returns[#returns].stop, values = values,
 		}
 	end
-	return params, returned, generics, constraints, predicates, overloads
+	return params, returned, generics, constraints, predicates, overloads, flags
 end
 
 --- A generic name is a type variable, not a name to look up: `---@generic T` says the function

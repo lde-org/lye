@@ -205,7 +205,6 @@ end)
 
 test.it("a version mismatch or a damaged entry is a miss", function()
 	local lye = prepare({ pony = PONY })
-	local modules = Modules.new(lye)
 	local key = keyOf(lye, lye.paths.pony, PONY)
 	local textKey = rapidhash.hex(PONY)
 	local known = { names = {}, tables = {} }

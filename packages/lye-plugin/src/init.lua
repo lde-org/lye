@@ -117,6 +117,30 @@ local SHIPPED_ORDER = { "patterns", "formats", "ffi" }
 ---@field workspace string?
 ---@field packageRoot string?
 
+--- What a plugin is handed when an editor asks about a position: the document as the editor holds
+--- it, what lye read, and the offset the question is about. `offset` is in `source`; a plugin that
+--- reads `parsed` needs `map:toLowered(offset)` and maps what it finds back with `map`.
+---@class lye.plugin.NavigationContext
+---@field uri string
+---@field source string the document as the editor holds it
+---@field text string the text lye reads
+---@field offset integer byte offset into `source`, 1-based
+---@field parsed lye.parser.Result
+---@field analysis lye.analyzer.Result?
+---@field map lye.plugin.Map?
+---@field diagnostics table[]? the diagnostics a code-action request carried
+---@field specs lye.plugin.Spec[] the plugins this document is read with
+
+--- What a plugin answers for a position. `from` and `to` are byte offsets into `source` (or into
+--- the file `uri` names, when it is another one), with `to` inclusive.
+---@class lye.plugin.NavigationAnswer
+---@field uri string? another file the answer points into
+---@field from integer
+---@field to integer
+---@field contents string? the markdown a hover shows
+---@field title string? a code action's title
+---@field kind string? a code action's kind
+
 --- The hooks a plugin file returns. A plugin of a workspace writes these; the loader adds the name
 --- and path it was loaded under and protects each hook.
 ---@class lye.plugin.Hooks
@@ -126,6 +150,10 @@ local SHIPPED_ORDER = { "patterns", "formats", "ffi" }
 ---@field tokens fun(context: lye.plugin.TokenContext): lye.plugin.Span[]?
 ---@field types fun(context: lye.plugin.TypeContext): lye.plugin.Types?
 ---@field complete fun(context: lye.plugin.CompletionContext): lye.plugin.Completion[]?
+---@field hover fun(context: lye.plugin.NavigationContext): string|lye.plugin.NavigationAnswer?
+---@field definition fun(context: lye.plugin.NavigationContext): lye.plugin.NavigationAnswer?
+---@field references fun(context: lye.plugin.NavigationContext): lye.plugin.NavigationAnswer[]?
+---@field codeAction fun(context: lye.plugin.NavigationContext): table[]?
 
 --- A loaded plugin: the hooks it answered with, and what a fault in one costs.
 ---@class lye.plugin.Spec: lye.plugin.Hooks
@@ -184,7 +212,8 @@ local function protect(hooks, name, path, report)
 		end
 		if #list > 0 then spec.extensions = list end
 	end
-	for _, hook in ipairs({ "lower", "tokens", "types", "complete" }) do
+	for _, hook in ipairs({ "lower", "tokens", "types", "complete",
+		"hover", "definition", "references", "codeAction" }) do
 		local asked = hooks[hook]
 		if type(asked) == "function" then
 			local broken = false
@@ -367,6 +396,73 @@ function plugin.complete(specs, context)
 		end
 	end
 	return modules
+end
+
+--- The first plugin that can say what a position means. A dialect knows its own constructs, so
+--- its answer comes before the analyzer's fallback.
+---@param specs lye.plugin.Spec[]
+---@param context lye.plugin.NavigationContext
+---@return string|lye.plugin.NavigationAnswer? answer
+---@return string? name the plugin that answered
+function plugin.hover(specs, context)
+	for _, spec in ipairs(specs) do
+		if spec.hover then
+			local asked = spec.hover(context)
+			if asked ~= nil then return asked, spec.name end
+		end
+	end
+end
+
+---@param specs lye.plugin.Spec[]
+---@param context lye.plugin.NavigationContext
+---@return lye.plugin.NavigationAnswer? answer
+---@return string? name
+function plugin.definition(specs, context)
+	for _, spec in ipairs(specs) do
+		if spec.definition then
+			local asked = spec.definition(context)
+			if type(asked) == "table" then return asked, spec.name end
+		end
+	end
+end
+
+--- Every reference a plugin can name, in plugin order. A dialect may describe places the
+--- analyzer's name resolution has no token for.
+---@param specs lye.plugin.Spec[]
+---@param context lye.plugin.NavigationContext
+---@return lye.plugin.NavigationAnswer[] answers
+function plugin.references(specs, context)
+	local answers = {}
+	for _, spec in ipairs(specs) do
+		if spec.references then
+			local asked = spec.references(context)
+			if type(asked) == "table" then
+				for _, answer in ipairs(asked) do
+					if type(answer) == "table" then answers[#answers + 1] = answer end
+				end
+			end
+		end
+	end
+	return answers
+end
+
+--- The code actions a plugin offers for a position, merged after the server's own.
+---@param specs lye.plugin.Spec[]
+---@param context lye.plugin.NavigationContext
+---@return table[] actions
+function plugin.codeActions(specs, context)
+	local actions = {}
+	for _, spec in ipairs(specs) do
+		if spec.codeAction then
+			local asked = spec.codeAction(context)
+			if type(asked) == "table" then
+				for _, action in ipairs(asked) do
+					if type(action) == "table" then actions[#actions + 1] = action end
+				end
+			end
+		end
+	end
+	return actions
 end
 
 --- What each plugin contributes to the type side of a document, in the order it was asked. The

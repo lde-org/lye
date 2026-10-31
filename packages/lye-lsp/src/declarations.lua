@@ -70,6 +70,16 @@ end
 --- The module name of a path, in the layout lde builds from: `packages/lye-doc/src/type.lua` is
 --- `lye-doc.type`, a leading `src.` is dropped, an `init` file is its directory, and separators
 --- become dots. The same transform the workspace walk always applied, so completions do not move.
+--- The folder a document belongs to. A session uses `Server:rootFor`; a test may hand a smaller
+--- table with one `rootPath`, and that root is the answer.
+---@param server table
+---@param uri string?
+---@return string?
+local function rootFor(server, uri)
+	if server.rootFor then return server:rootFor(uri) end
+	return server.rootPath
+end
+
 ---@param root string
 ---@param path string
 local function moduleName(root, path)
@@ -112,8 +122,11 @@ end
 ---@field lye lye.Server
 ---@field open table<string, table<string, boolean|lye.doc.Type>> what each open document declares
 ---@field generation integer bumped whenever the layer a view is built from changes
----@field workspaceIndex lye.lsp.Index? the index of the workspace root
+---@field workspaceIndex lye.lsp.Index? the index of the first workspace root
 ---@field workspaceRoot string? the root that index was loaded for
+---@field workspaceIndexes table<string, lye.lsp.Index> the index of every open workspace root
+---@field knownByRoot table<string, table<string, boolean|lye.doc.Type>> what each root declares
+---@field digestByRoot table<string, string> each root's annotation digest
 ---@field packageIndexes table<string, lye.lsp.Index> the loaded package index per root
 ---@field packageOrder string[] loaded package roots, least recently used first
 ---@field views table<string, { generation: integer, view: table<string, boolean|lye.doc.Type> }> the view per open document
@@ -121,6 +134,15 @@ end
 ---@field base fun(self: lye.Declarations, uri: string?): table<string, boolean|lye.doc.Type> the layers without open buffers
 local Declarations = {}
 Declarations.__index = Declarations
+
+--- The module name a path has under a root, in the layout lde builds from. Exposed for a file
+--- rename: the name a moved file answers to is the one its `require` strings have to become.
+---@param root string
+---@param path string
+---@return string?
+function Declarations:moduleNameFor(root, path)
+	return moduleName(root, path)
+end
 
 ---@param lye lye.Server
 ---@param indexes { workspace: fun(root: string): lye.lsp.Index?, package: fun(root: string): lye.lsp.Index? }?
@@ -131,6 +153,9 @@ function Declarations.new(lye, indexes)
 		generation = 0,
 		packageIndexes = {},
 		packageOrder = {},
+		workspaceIndexes = {},
+		knownByRoot = {},
+		digestByRoot = {},
 		views = {},
 		indexes = indexes,
 	}, Declarations)
@@ -162,7 +187,7 @@ function Declarations:mergeLocations()
 			if merged[name] == nil then merged[name] = held end
 		end
 	end
-	add(self.workspaceIndex)
+	for _, index in pairs(self.workspaceIndexes) do add(index) end
 	local roots = {}
 	for root in pairs(self.packageIndexes) do roots[#roots + 1] = root end
 	table.sort(roots)
@@ -177,33 +202,76 @@ function Declarations:mergeLocations()
 	self.lye.typeLocations = merged
 end
 
---- Load the workspace entry, build and write it when there is none, and fill what the session
---- reads from it. A load that does not have to read anything is the warm start; `lye.known` is
---- set to nil by the watcher's full invalidation, and that rebuilds rather than trusts.
+--- Rebuild the one table the analyzer and the type lookups read from the loaded roots. A single
+--- root is its own table; several are layered in the order the client opened them, so the first
+--- declaration of a name wins without copying every name into a new map.
 ---@param self lye.Declarations
-function Declarations:ensureWorkspace()
+function Declarations:mergeKnown()
+	local roots = {}
+	for _, root in ipairs(self.lye.server.rootPaths or {}) do
+		local held = self.knownByRoot[root]
+		if held then roots[#roots + 1] = held end
+	end
+	for _, held in pairs(self.knownByRoot) do
+		local listed = false
+		for _, known in ipairs(roots) do
+			if known == held then listed = true break end
+		end
+		if not listed then roots[#roots + 1] = held end
+	end
+	if #roots == 0 then
+		self.lye.known = self.lye.known or {}
+	elseif #roots == 1 then
+		self.lye.known = roots[1]
+	else
+		self.lye.known = setmetatable({}, {
+			__index = function(_, name)
+				for _, held in ipairs(roots) do
+					local value = held[name]
+					if value ~= nil then return value end
+				end
+				return nil
+			end,
+		})
+	end
+	local digests = {}
+	for root, digest in pairs(self.digestByRoot) do digests[#digests + 1] = root .. "\0" .. digest end
+	table.sort(digests)
+	self.lye.annotationsDigest = table.concat(digests, "\0")
+end
+
+--- Load one workspace root's entry, build and write it when there is none, and fill what the
+--- session reads from it. A load that does not have to read anything is the warm start;
+--- `lye.known` is set to nil by the watcher's full invalidation, and that rebuilds rather than
+--- trusts.
+---@param self lye.Declarations
+---@param requested string? the root to read; the client's first root when nil
+function Declarations:ensureWorkspace(requested)
 	local lye = self.lye
 	lye:useWorkspaceCache()
-	local root = lye.server.rootPath --[[@as string? ]]
+	local root = requested or lye.server.rootPath --[[@as string? ]]
 	if not root or root == "" then
 		lye.known = lye.known or {}
 		return self.workspaceIndex
 	end
-	local index = self.workspaceIndex
-	if index and self.workspaceRoot == root and lye.known then return index end
+	root = root:gsub("[/\\]+$", "")
+	local index = self.workspaceIndexes[root]
+	if index and lye.known and self.knownByRoot[root] then
+		if root == lye.server.rootPath then self.workspaceIndex = index end
+		return index
+	end
 	local started = timing.now()
-	local rebuild = index ~= nil and self.workspaceRoot == root and lye.known == nil
-	if not index or self.workspaceRoot ~= root then
+	local rebuild = index ~= nil and lye.known == nil
+	if not index then
 		index = self:newIndex("workspace", root)
+		self.workspaceIndexes[root] = index
+		-- A new root brings a view that may have read the old set of roots; its own package
+		-- entries are still this session's, so only the views are dropped.
+		self.views = {}
+	end
+	if not self.workspaceIndex or root == lye.server.rootPath then
 		self.workspaceIndex = index
 		self.workspaceRoot = root
-		-- A different root is a different project: entries loaded for the old one are not this
-		-- workspace's packages and must not be merged into its locations.
-		self.packageIndexes = {}
-		self.packageOrder = {}
-		self.views = {}
-		lye.packageNames = {}
-		lye.packageDigests = {}
 	end
 	if rebuild then
 		index:save(index:build(root, { kind = "workspace" }))
@@ -214,8 +282,9 @@ function Declarations:ensureWorkspace()
 	local stats = index:stats()
 	timing.mark("workspace-scan", started, string.format(
 		"files=%d built=%d loaded=%d reads=%d", stats.files, stats.built, stats.loaded, stats.reads))
-	lye.known = index:known()
-	lye.annotationsDigest = index:digest()
+	self.knownByRoot[root] = index:known()
+	self.digestByRoot[root] = index:digest()
+	self:mergeKnown()
 	self.generation += 1
 	self:mergeLocations()
 	return index
@@ -225,7 +294,10 @@ end
 --- stands for. Read once from the index: a warm session touches no source file.
 ---@param self lye.Declarations
 function Declarations:workspace()
-	self:ensureWorkspace()
+	local roots = self.lye.server.rootPaths or { self.lye.server.rootPath }
+	for _, root in ipairs(roots) do
+		if root then self:ensureWorkspace(root) end
+	end
 	local known = self.lye.known or {}
 	self.lye.known = known
 	return known
@@ -299,8 +371,18 @@ end
 ---@return { name: string, path: string?, detail: string? }[] a workspace file has a path, a module of the engine a detail
 ---@param self lye.Declarations
 function Declarations:moduleNames(prefix, from)
-	local root = self.lye.server.rootPath
-	local found, seen = {}, {}
+	local root = from and rootFor(self.lye.server, from) or self.lye.server.rootPath
+	---@cast root string?
+	---@type { name: string, path: string?, detail: string? }[]
+	local found = {}
+	---@type table<string, boolean>
+	local seen = {}
+	---@param name string
+	---@param path string?
+	---@param detail string?
+	local function addModule(name, path, detail)
+		found[#found + 1] = { name = name, path = path, detail = detail }
+	end
 	-- A project lde built resolves through `<package>/target/`, and listing every file of the
 	-- workspace beside it offers the same modules twice under names lde does not use. The target
 	-- scan is the require plugin's job; here only the engine's own modules remain.
@@ -309,14 +391,14 @@ function Declarations:moduleNames(prefix, from)
 		usesLde = fs.exists(root .. "/lde.json")
 	end
 	if root and root ~= "" and not usesLde then
-		local index = self:ensureWorkspace()
+		local index = self:ensureWorkspace(root)
 		if index then
 			for path in pairs(index:files()) do
 				---@cast path string
 				local name = moduleName(root, path)
 				if name and name:sub(1, #prefix) == prefix and not seen[name] then
 					seen[name] = true
-					found[#found + 1] = { name = name, path = path }
+					addModule(name, path, nil)
 				end
 			end
 		end
@@ -329,7 +411,7 @@ function Declarations:moduleNames(prefix, from)
 		---@cast name string
 		if name:sub(1, #prefix) == prefix and not seen[name] then
 			seen[name] = true
-			found[#found + 1] = { name = name, detail = "LuaJIT" }
+			addModule(name, nil, "LuaJIT")
 		end
 	end
 
@@ -344,7 +426,7 @@ end
 ---@param from string? the document the require is written in
 ---@param self lye.Declarations
 function Declarations:moduleFile(name, from)
-	local root = self.lye.server.rootPath
+	local root = from and rootFor(self.lye.server, from) or self.lye.server.rootPath
 
 	-- A `lye.json` beside a package or workspace adds search paths of its own, in the shape
 	-- `package.path` uses. Asked first, because a project that says where its modules are wins.
@@ -409,8 +491,9 @@ function Declarations:view(uri)
 	local key = uri or ""
 	local cached = self.views[key]
 	if cached and cached.generation == self.generation then return cached.view end
-	self:ensureWorkspace()
-	local top = self.lye.known or {}
+	local workspaceRoot = rootFor(self.lye.server, uri)
+	self:ensureWorkspace(workspaceRoot)
+	local top = (workspaceRoot and self.knownByRoot[workspaceRoot]) or {}
 	local root = uri and self.lye:packageRoot(uri) --[[@as string? ]]
 	if root then top = layer(self:package(root), top) end
 	for _, declarations in pairs(self.open) do top = layer(declarations, top) end
@@ -427,8 +510,9 @@ end
 ---@return table<string, boolean|lye.doc.Type>
 ---@param self lye.Declarations
 function Declarations:base(uri)
-	self:ensureWorkspace()
-	local top = self.lye.known or {}
+	local workspaceRoot = rootFor(self.lye.server, uri)
+	self:ensureWorkspace(workspaceRoot)
+	local top = (workspaceRoot and self.knownByRoot[workspaceRoot]) or {}
 	local root = uri and self.lye:packageRoot(uri) --[[@as string? ]]
 	if root then top = layer(self:package(root), top) end
 	return top
@@ -462,6 +546,26 @@ function Declarations:invalidate()
 	self.views = {}
 end
 
+--- The client changed the folders it has open. A root that left is dropped with what it declared;
+--- one that arrived is read on the next view or symbol request.
+---@param self lye.Declarations
+---@param roots string[]
+function Declarations:setRoots(roots)
+	local keep = {}
+	for _, root in ipairs(roots) do keep[root:gsub("[/\\]+$", "")] = true end
+	for root in pairs(self.workspaceIndexes) do
+		if not keep[root] then
+			self.workspaceIndexes[root] = nil
+			self.knownByRoot[root] = nil
+			self.digestByRoot[root] = nil
+		end
+	end
+	self.views = {}
+	self.generation += 1
+	self:mergeKnown()
+	self:mergeLocations()
+end
+
 --- The document is closed: its layer went with `documentChanged`, and a view built while it was
 --- open cannot stand in for one built without it.
 ---@param uri string
@@ -490,21 +594,27 @@ end
 ---@param self lye.Declarations
 function Declarations:watchedFiles(params)
 	local lye = self.lye
-	local root = lye.server.rootPath --[[@as string? ]]
-	if not root or root == "" then return false end
-	root = root:gsub("[/\\]+$", "")
+	local roots = lye.server.rootPaths or { lye.server.rootPath }
+	if #roots == 0 then return false end
 	local changes = type(params) == "table" and params.changes or nil
 	if type(changes) ~= "table" then return false end
 
 	-- Every event is attributed before anything is applied, so a partial update never stands in
 	-- for an invalidation the caller was told to do.
-	local source, packages = {}, {}
+	local sourceByRoot, packages = {}, {}
 	for _, change in ipairs(changes) do
 		if type(change) ~= "table" then return false end
 		local path = pathOfChange(change)
 		local kind = change.type
 		if not path or (kind ~= 1 and kind ~= 2 and kind ~= 3) then return false end
-		if path:sub(1, #root + 1) ~= root .. "/" then return false end
+		local root
+		for _, candidate in ipairs(roots) do
+			if candidate and candidate ~= ""
+				and (path == candidate or path:sub(1, #candidate + 1) == candidate .. "/") then
+				if not root or #candidate > #root then root = candidate end
+			end
+		end
+		if not root or path == root then return false end
 		local relative = path:sub(#root + 2)
 		local packageRoot
 		if relative:sub(1, 7) == "target/" then
@@ -523,27 +633,31 @@ function Declarations:watchedFiles(params)
 			end
 			list[#list + 1] = entry
 		else
-			source[#source + 1] = entry
+			local list = sourceByRoot[root]
+			if not list then
+				list = {}
+				sourceByRoot[root] = list
+			end
+			list[#list + 1] = entry
 		end
 	end
 
-	if #source > 0 then
-		local index = self:ensureWorkspace()
+	for root, list in pairs(sourceByRoot) do
+		local index = self.workspaceIndexes[root]
 		if not index then return false end
-		index:update(root, source, { kind = "workspace" })
+		index:update(root, list, { kind = "workspace" })
+		self.knownByRoot[root] = index:known()
+		self.digestByRoot[root] = index:digest()
 	end
 	for packageRoot, list in pairs(packages) do
 		self.packageIndexes[packageRoot]:update(packageRoot, list, { kind = "package" })
 	end
 
-	if self.workspaceIndex then
-		lye.known = self.workspaceIndex:known()
-		lye.annotationsDigest = self.workspaceIndex:digest()
-	end
+	self:mergeKnown()
 	lye.packageNames = lye.packageNames or {}
 	lye.packageDigests = lye.packageDigests or {}
 
-	if #source > 0 then
+	if next(sourceByRoot) ~= nil then
 		-- A source file can be linked into any number of packages' `target/`, so a package's
 		-- answer may no longer be the one its links give. Every loaded root is cleared and read
 		-- again by the next `package` call, and what a module resolved through those
@@ -558,7 +672,7 @@ function Declarations:watchedFiles(params)
 		lye.packageNames[packageRoot] = index:known()
 		lye.packageDigests[packageRoot] = index:linkDigest() or ""
 	end
-	if #source > 0 and lye.modules then lye.modules:clear() end
+	if next(sourceByRoot) ~= nil and lye.modules then lye.modules:clear() end
 	-- Whatever a view was built from has moved: the workspace, a package, or both.
 	self:invalidate()
 	self:mergeLocations()
@@ -671,7 +785,9 @@ end
 function Declarations:stats()
 	local lye = self.lye
 	local known, packages = 0, 0
-	if lye.known then for _ in pairs(lye.known) do known += 1 end end
+	for _, held in pairs(self.knownByRoot) do
+		for _ in pairs(held) do known += 1 end
+	end
 	if lye.packageNames then for _ in pairs(lye.packageNames) do packages += 1 end end
 	local locations = 0
 	if lye.typeLocations then for _ in pairs(lye.typeLocations) do locations += 1 end end
@@ -691,7 +807,7 @@ function Declarations:stats()
 		workers += held.workers or 0
 		fellBack += held.fellBack or 0
 	end
-	add(self.workspaceIndex)
+	for _, index in pairs(self.workspaceIndexes) do add(index) end
 	for _, index in pairs(self.packageIndexes) do add(index) end
 	return {
 		known = known,

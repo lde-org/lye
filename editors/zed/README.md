@@ -40,8 +40,11 @@ version that runs is the one you installed.
 `lye-lsp` on your `PATH`:
 
 ```
-lde install lye-lsp      # or build it: lde compile -C packages/lye-lsp
+lde install lye-lsp      # or, from the repository root: tools/compile.sh
 ```
+
+`tools/compile.sh` builds `packages/lye-lsp/lye-lsp` from a clean snapshot of the working tree;
+`lde compile -C packages/lye-lsp` only works in a checkout whose `target/` holds no test fixtures.
 
 If it lives somewhere else, point Zed at it rather than moving it:
 

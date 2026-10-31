@@ -285,3 +285,37 @@ test.it("substitutes an argument into arithmetic in a type", function()
 	test.equal(types.display(resolve("F<string, 40 + 2>")), "{ x: string[], y: 44 }",
 		"and an argument may be an expression itself")
 end)
+
+test.it("reads the operators a class declares", function()
+	local namespace = read(table.concat({
+		"---@class Vec\n",
+		"---@operator add(number): number\n",
+		"---@operator unm(): Vec\n",
+		"---@field x number\n",
+		"local Vec = {}\n",
+	}, ""))
+	local vecClass = namespace.classes.Vec
+	---@cast vecClass { operators: table<string, string> }
+	test.equal(vecClass.operators.add, "(number): number")
+	local resolve = classes.resolver(namespace)
+	---@cast resolve fun(name: string): lye.doc.Type
+	local vec = resolve("Vec")
+	---@cast vec { operators: table<string, lye.doc.Type> }
+	test.equal(doctype.display(assert(vec.operators.add)), "fn(number) -> number",
+		"the signature is read as the callable the operator is")
+	test.equal(doctype.display(assert(vec.operators.unm)), "fn() -> Vec")
+end)
+
+test.it("marks a field the annotation above it deprecates", function()
+	local namespace = read(table.concat({
+		"---@class Config\n",
+		"---@field name string\n",
+		"---@deprecated\n",
+		"---@field legacy number\n",
+		"local Config = {}\n",
+	}, ""))
+	local found = classes.fieldsOf(namespace, "Config")
+	---@cast found table<string, lye.doc.Field>
+	test.equal(found.legacy and found.legacy.deprecated, true, "the marker belongs to the field below it")
+	test.equal(found.name and found.name.deprecated, nil, "and not to the one above")
+end)

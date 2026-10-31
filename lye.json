@@ -6,5 +6,10 @@
     "packages/lye-analyzer/target/?/init.lua",
     "editors/neovim/lua/?.lua",
     "editors/neovim/lua/?/init.lua"
-  ]
+  ],
+  "diagnostics": {
+    "severity": {
+      "redundant-return": "off"
+    }
+  }
 }

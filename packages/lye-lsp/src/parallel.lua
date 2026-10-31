@@ -178,7 +178,7 @@ end
 ---@param pid integer
 local function waitFor(pid)
 	local status = ffi.new("int[1]")
-	---@cast status integer[]
+	---@cast status ffi.ptr<ffi.int>
 	while true do
 		local waited = ffi.C.waitpid(pid, status, 0)
 		if waited == pid then
