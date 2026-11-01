@@ -185,7 +185,7 @@ test.it("prints the extensions the workspace's plugins claim", function()
 	-- This is what an editor wrapper asks before it can map a `.toy` buffer to a filetype: the
 	-- same loader a check uses, without checking a file.
 	local workspace = TESTS_DIR .. "/fixtures/syntax"
-	local output = run(string.format("lye extensions %q 2>&1", workspace))
+	local output = run(string.format("lde run %q -- extensions %q 2>&1", MAIN, workspace))
 	test.equal((output:gsub("%s+$", "")), "toy")
 end)
 

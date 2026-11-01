@@ -100,6 +100,12 @@ fi
 	exit 1
 }
 
+# `--ensure-mingw` is a command of its own: lde installs the toolchain and
+# returns, ignoring the rest of the line, so it cannot prefix `compile`.
+if [ "$ensure_mingw" = 1 ]; then
+	lde --ensure-mingw
+fi
+
 (
 	# lde does not treat a Windows drive path as absolute: it prepends its
 	# working directory to both -C and --outfile. Work from the snapshot with
@@ -107,7 +113,6 @@ fi
 	cd "$tmp"
 	set -- compile -C packages/lye-lsp --outfile ../../lye-lsp
 	[ -n "$target" ] && set -- "$@" --target "$target"
-	[ "$ensure_mingw" = 1 ] && set -- --ensure-mingw "$@"
 
 	lde "$@"
 )
