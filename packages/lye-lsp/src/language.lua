@@ -1060,7 +1060,7 @@ end
 --- What one document declares, which `declaredBy` keeps after its analysis is dropped.
 ---@param file lye.doc.File
 local function declarationsOf(file)
-	return classes.declare({ file })
+	return classes.declare({ file }, PRELUDE --[[@as lye.doc.Namespace]])
 end
 
 --- The classes and aliases every file in the workspace declares, each resolved to the type it

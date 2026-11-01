@@ -754,7 +754,7 @@ function cdef.notation(namespace, type, where)
 			and resolved.target.kind == "function" then
 			return type.name
 		end
-		return resolved and cdef.notation(namespace, resolved, where) or "ffi.cdata"
+		return resolved and cdef.notation(namespace, resolved, where) or "ffi.cdata*"
 	end
 	if kind == "array" then
 		-- An array is indexed with a number and knows its length, which is what the C says. Its
@@ -771,22 +771,24 @@ function cdef.notation(namespace, type, where)
 		-- is how the code that uses one is written.
 		if target and target.kind == "typedef" then
 			local named = target.name and cdef.resolve(namespace, target.name)
-			if named and (named.kind == "struct" or named.kind == "union") then return target.name end
+			if named and (named.kind == "struct" or named.kind == "union") then
+				return string.format("ffi.ptr<%s>", target.name)
+			end
 		end
 		local pointed = target and cdef.resolve(namespace, target.name or "") or target
 		if pointed and (pointed.kind == "struct" or pointed.kind == "union") and pointed.name then
-			return pointed.name
+			return string.format("ffi.ptr<%s>", pointed.name)
 		end
 		-- A pointer to a function is the callback it is, and is not indexed at all.
-		if target and target.kind == "function" then return "ffi.cb" end
+		if target and target.kind == "function" then return "ffi.cb*" end
 		-- Anything else is the pointer it is: a `char *` is not a Lua string, it is what
 		-- `ffi.string` reads, and a `void *` points at something the header does not name.
-		if target and target.kind == "void" then return "ffi.ptr<ffi.cdata>" end
+		if target and target.kind == "void" then return "ffi.ptr<ffi.cdata*>" end
 		local held = target and (SCALAR_CLASS[target.name or ""]
-			or cdef.notation(namespace, target, where)) or "ffi.cdata"
+			or cdef.notation(namespace, target, where)) or "ffi.cdata*"
 		return string.format("ffi.ptr<%s>", held)
 	end
-	if kind == "function" then return "ffi.cb" end
+	if kind == "function" then return "ffi.cb*" end
 	if kind == "float" then return "number" end
 	if kind == "bool" then return "boolean" end
 	if kind == "int" then
@@ -809,9 +811,9 @@ function cdef.notation(namespace, type, where)
 			end
 			return "{ " .. table.concat(parts, ", ") .. " }"
 		end
-		return type.name or "ffi.cdata"
+		return type.name or "ffi.cdata*"
 	end
-	return "ffi.cdata"
+	return "ffi.cdata*"
 end
 
 --- The classes and aliases a cdef block declares, as `---@` text the analyzer already knows how to
@@ -831,7 +833,10 @@ function cdef.annotations(namespace)
 		local fields = {}
 		for _, field in ipairs(resolved.fields or {}) do
 			if not fields[field.name] then
-				fields[field.name] = cdef.notation(namespace, field.type)
+				local notation = cdef.notation(namespace, field.type)
+				-- A C pointer field may be NULL, which is what setting it to nil writes.
+				if field.type.kind == "pointer" then notation = notation .. "?" end
+				fields[field.name] = notation
 			end
 		end
 		return fields
@@ -850,7 +855,7 @@ function cdef.annotations(namespace)
 				or (resolved.kind == "pointer" and resolved.target
 					and (cdef.resolve(namespace, resolved.target.name or "") or resolved.target).kind == "function")
 			local lines = {
-				string.format("---@class %s: %s", name, isFunction and "ffi.cb" or "ffi.cdata"),
+				string.format("---@class %s: %s", name, isFunction and "ffi.cb*" or "ffi.cdata*"),
 			}
 			local fields = fieldsOf(namespace.types[name])
 			local sorted = {}

@@ -28,7 +28,7 @@ local parallel = require("lye-lsp.parallel")
 local timing = require("lye-lsp.timing")
 
 -- The shape of an entry. A reader of another one rebuilds rather than guesses.
-local SCHEMA = 3
+local SCHEMA = 5
 
 -- A cold build of fewer files than this is cheaper in one process: the fork and the record file
 -- cost more than a handful of comment lexes.
@@ -78,6 +78,7 @@ local sep = string.sub(package.config, 1, 1)
 ---@field mtime number
 ---@field isDefinition boolean
 ---@field annotations lye.lsp.IndexAnnotation[]
+---@field pluginAnnotations lye.lsp.IndexAnnotation[]? the classes and aliases its plugins declare
 ---@field types table<string, lye.lsp.IndexType>
 ---@field methods lye.WorkspaceMethod[]
 
@@ -102,6 +103,8 @@ local sep = string.sub(package.config, 1, 1)
 ---@field minBytes integer? the source bytes below which a build stays serial; 0 forks on file count alone
 ---@field fork fun(): integer? process creation, injectable for a test that counts or refuses it
 ---@field onShard fun(slice: lye.parallel.Slice, index: integer): string? a test hook
+---@field declarations fun(path: string, source: string, annotations: lye.doc.File?): lye.doc.File[]? what the file's plugins declare
+---@field base lye.doc.Namespace? the definitions every class is read through
 --- "fail" makes a child end without a record; "short" makes it write one that does not read.
 
 ---@class lye.lsp.Index
@@ -205,6 +208,26 @@ local function collectTypes(into, path, source, annotations)
 	end
 end
 
+---@param into lye.lsp.IndexAnnotation[]
+---@param annotations lye.doc.Annotation[]
+local function appendAnnotations(into, annotations)
+	for _, annotation in ipairs(annotations) do
+		into[#into + 1] = {
+			tag = annotation.tag,
+			name = annotation.name,
+			text = annotation.text,
+			type = annotation.type,
+			typeText = annotation.typeText,
+			start = annotation.start,
+			stop = annotation.stop,
+			typeStart = annotation.typeStart,
+			typeStop = annotation.typeStop,
+			nameStart = annotation.nameStart,
+			nameStop = annotation.nameStop,
+		}
+	end
+end
+
 ---@param entry lye.lsp.IndexEntry
 ---@return string[]
 local function pathsOf(entry)
@@ -220,12 +243,18 @@ end
 ---@param entry lye.lsp.IndexEntry
 local function digestOf(entry)
 	local parts = {}
-	for _, path in ipairs(pathsOf(entry)) do
-		for _, annotation in ipairs(entry.files[path].annotations) do
+	---@param annotations lye.lsp.IndexAnnotation[]?
+	local function addAnnotations(annotations)
+		for _, annotation in ipairs(annotations or {}) do
 			parts[#parts + 1] = annotation.tag .. "\0" .. (annotation.name or "") .. "\0"
 				.. (annotation.text or "") .. "\0" .. (annotation.type or "")
 		end
-		for _, method in ipairs(entry.files[path].methods or {}) do
+	end
+	for _, path in ipairs(pathsOf(entry)) do
+		local record = entry.files[path]
+		addAnnotations(record.annotations)
+		addAnnotations(record.pluginAnnotations)
+		for _, method in ipairs(record.methods or {}) do
 			parts[#parts + 1] = "method\0" .. (method.class or method.owner) .. "\0" .. method.name
 		end
 	end
@@ -244,14 +273,26 @@ local function linkDigestOf(entry)
 end
 
 ---@param entry lye.lsp.IndexEntry
-local function knownOf(entry)
+---@param entry lye.lsp.IndexEntry
+---@param base lye.doc.Namespace?
+local function knownOf(entry, base)
 	local files = {} ---@type lye.doc.File[]
 	for _, path in ipairs(pathsOf(entry)) do
-		files[#files + 1] = {
-			annotations = entry.files[path].annotations --[[@as lye.doc.Annotation[] ]],
-		}
+		local record = entry.files[path]
+		local annotations = record.annotations --[[@as lye.doc.Annotation[] ]]
+		if record.pluginAnnotations and #record.pluginAnnotations > 0 then
+			-- The source's own annotations and the ones its cdef blocks declare are one reading:
+			-- a class in either can name a type from either, and both are workspace-wide.
+			local combined = {} ---@type lye.doc.Annotation[]
+			for _, annotation in ipairs(annotations) do combined[#combined + 1] = annotation end
+			for _, annotation in ipairs(record.pluginAnnotations) do
+				combined[#combined + 1] = annotation --[[@as lye.doc.Annotation]]
+			end
+			annotations = combined
+		end
+		files[#files + 1] = { annotations = annotations }
 	end
-	local found = classes.declare(files)
+	local found = classes.declare(files, base)
 	for _, path in ipairs(pathsOf(entry)) do
 		methodIndex.add(found, entry.files[path].methods or {})
 	end
@@ -505,27 +546,27 @@ function Index:record(path)
 	if type(source) ~= "string" then return nil end
 	self.stats_.reads += 1
 	local isOk, parsed = pcall(doc.parse, source)
-	local record = { hash = rapidhash.hex(source), annotations = {}, types = {}, methods = {} }
+	local record = {
+		hash = rapidhash.hex(source), annotations = {}, pluginAnnotations = {},
+		types = {}, methods = {},
+	}
 	if isOk then
 		---@cast parsed lye.doc.File
 		record.isDefinition = parsed.isDefinition
-		for _, annotation in ipairs(parsed.annotations) do
-			record.annotations[#record.annotations + 1] = {
-				tag = annotation.tag,
-				name = annotation.name,
-				text = annotation.text,
-				type = annotation.type,
-				typeText = annotation.typeText,
-				start = annotation.start,
-				stop = annotation.stop,
-				typeStart = annotation.typeStart,
-				typeStop = annotation.typeStop,
-				nameStart = annotation.nameStart,
-				nameStop = annotation.nameStop,
-			}
-		end
+		appendAnnotations(record.annotations, parsed.annotations)
 		collectTypes(record.types, path, source, parsed.annotations)
 		record.methods = methodIndex.scan(source, parsed.annotations)
+	end
+	-- What the file's plugins declare is part of what the workspace knows. The callback is the
+	-- caller's, because only it knows which plugins read this package; an index that does not get
+	-- one records the source's own annotations alone.
+	if isOk and self.options.declarations then
+		local ok, files = pcall(self.options.declarations, path, source, parsed)
+		if ok and type(files) == "table" then
+			for _, file in ipairs(files) do
+				appendAnnotations(record.pluginAnnotations, file.annotations or {})
+			end
+		end
 	end
 	local held = self.stat(path)
 	-- A stat's fields are integers, which on this runtime are cdata: the cache writes numbers.
@@ -540,7 +581,7 @@ end
 function Index:adopt(entry)
 	self.entry_ = entry
 	self.typeLocations_ = typesOf(entry)
-	if type(entry.known) ~= "table" then entry.known = knownOf(entry) end
+	if type(entry.known) ~= "table" then entry.known = knownOf(entry, self.options.base) end
 	local files = 0
 	for _ in pairs(entry.files) do files += 1 end
 	self.stats_.files = files
@@ -726,7 +767,7 @@ function Index:build(root, opts)
 	end
 	entry.annotationsDigest = digestOf(entry)
 	if kind == "package" then entry.linkDigest = linkDigestOf(entry) end
-	entry.known = knownOf(entry)
+	entry.known = knownOf(entry, self.options.base)
 	self:adopt(entry)
 	self.stats_.built += 1
 	self.stats_.workers += workers
@@ -805,7 +846,7 @@ end
 function Index:refresh(entry, kind)
 	entry.annotationsDigest = digestOf(entry)
 	if kind == "package" then entry.linkDigest = linkDigestOf(entry) end
-	entry.known = knownOf(entry)
+	entry.known = knownOf(entry, self.options.base)
 end
 
 --- Read the entry for a root, or nil when there is none this run can trust. A root whose files

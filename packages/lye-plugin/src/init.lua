@@ -500,6 +500,21 @@ function plugin.types(specs, context, report)
 	return out
 end
 
+--- The classes and aliases a set of plugins declares for a document, without the providers used
+--- while its body is typed. The workspace index reads these with the source's own annotations:
+--- a type a plugin declares is a type of the workspace, exactly like a `---@class` the file wrote.
+---@param specs lye.plugin.Spec[]
+---@param context lye.plugin.TypeContext
+---@param report fun(message: string)
+---@return lye.doc.File[]
+function plugin.declarations(specs, context, report)
+	local files = {}
+	for _, contribution in ipairs(plugin.types(specs, context, report)) do
+		for _, file in ipairs(contribution.types.annotations or {}) do files[#files + 1] = file end
+	end
+	return files
+end
+
 --- A key for what a set of plugins can say. The analyzer's answers are kept between runs, and a
 --- workspace that turned the ffi plugin off must not read what it said when it was on; the file a
 --- plugin of the workspace's own is read from is part of the key for the same reason. The answer is

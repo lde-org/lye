@@ -17,6 +17,7 @@ local timing = require("lye-lsp.timing")
 local plugin = require("lye-plugin")
 local json = require("lye-json")
 local Parser = require("lye-parser")
+local analyzerNames = require("lye-analyzer.names")
 local config = require("lye-lsp.config")
 local directives = require("lye-analyzer.directives")
 
@@ -313,7 +314,7 @@ local function linkedDeclarations(root, cache, paths)
 		end
 		-- What each name means, resolved once for the whole package: a dependency's alias is as
 		-- real to a reader as its own, and a bare name refuses every argument made of it.
-		found = classes.declare(parsedFiles)
+		found = classes.declare(parsedFiles, PRELUDE --[[@as lye.doc.Namespace]])
 		for _, list in ipairs(methodLists) do methodIndex.add(found, list) end
 	end
 	cache[root] = found
@@ -593,6 +594,38 @@ end
 ---@param written string
 local function analysisKey(path, written)
 	return textKey(written .. "\0" .. plugin.digest(pluginsFor(path)))
+end
+
+--- The types a file's plugins declare, for the batch's shared namespace. A type a plugin
+--- contributes is a type of the workspace, exactly like a `---@class` the file wrote: `VkBuffer`
+--- in one file is the `VkBuffer` another file's header declared. The file's own analysis reads
+--- the same contribution; this is what makes it visible to every other file in the run.
+---@param path string
+---@param written string
+---@param annotations lye.doc.File
+---@return lye.doc.File[]
+local function pluginDeclarations(path, written, annotations)
+	local specs = pluginsFor(path)
+	local hasTypes = false
+	for _, spec in ipairs(specs) do
+		if spec.types then hasTypes = true break end
+	end
+	if not hasTypes then return {} end
+	local ok, tree = pcall(function() return Parser.new(written):parse() end)
+	if not ok then return {} end
+	---@cast tree lye.parser.Result
+	---@param node lye.parser.Node
+	local function callNameOf(node) return analyzerNames.callName(tree, node) end
+	local context = {
+		uri = "file://" .. absolute(path),
+		source = written,
+		text = written,
+		parsed = tree,
+		annotations = annotations,
+		callName = callNameOf,
+	}
+	---@cast context lye.plugin.TypeContext
+	return plugin.declarations(specs, context, function() end)
 end
 
 --- What lye reads of a file: the text itself, lowered when the package it belongs to asked for a
@@ -1125,7 +1158,12 @@ function check.files(paths, reporter)
 				end
 				docsByText[key] = held
 			end
-			if held then parsedFiles[#parsedFiles + 1] = held end
+			if type(held) == "table" then
+				parsedFiles[#parsedFiles + 1] = held
+				for _, declaration in ipairs(pluginDeclarations(path, written, held)) do
+					parsedFiles[#parsedFiles + 1] = declaration
+				end
+			end
 		end
 	end
 	stats.documents.loaded += loaded
@@ -1169,7 +1207,8 @@ function check.files(paths, reporter)
 	-- What each name stands for, not only that it exists: a parameter declared with an alias
 	-- another file writes is checked against what the alias means, and a name on its own refuses
 	-- every argument handed to it.
-	local declared = classes.declare(parsedFiles)
+	local prelude = PRELUDE --[[@as lye.doc.Namespace]]
+	local declared = classes.declare(parsedFiles, prelude)
 
 	-- The work, in the units one process has to hold together: a package's files, which read the
 	-- same linked names and resolve one another in the order they are written.

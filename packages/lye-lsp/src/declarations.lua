@@ -13,6 +13,10 @@ local timing = require("lye-lsp.timing")
 local fs = require("fs")
 local definitionsIndex = require("lye-lsp.definitions")
 local Index = require("lye-lsp.index")
+local doc = require("lye-doc")
+local plugin = require("lye-plugin")
+local Parser = require("lye-parser")
+local analyzerNames = require("lye-analyzer.names")
 
 --- How many package entries stay loaded. A monorepo can name more packages than a session needs
 --- at once, and each entry holds every type its links declare; the least recently used is dropped
@@ -161,6 +165,46 @@ function Declarations.new(lye, indexes)
 	}, Declarations)
 end
 
+--- What a file's plugins declare for the workspace, read the way the analyzer reads the same
+--- document. The index calls this for each file it records, so a type a plugin contributes is a
+--- type another file can name, exactly like a `---@class` the file wrote.
+---@param path string
+---@param source string
+---@param annotations lye.doc.File?
+---@return lye.doc.File[]?
+function Declarations:pluginDeclarations(path, source, annotations)
+	local lye = self.lye
+	if not lye or type(lye.plugins) ~= "function" then return nil end
+	local uri = "file://" .. path
+	local ok, specs = pcall(lye.plugins, lye, uri)
+	if not ok or type(specs) ~= "table" or #specs == 0 then return nil end
+	local hasTypes = false
+	for _, spec in ipairs(specs) do
+		if spec.types then hasTypes = true break end
+	end
+	if not hasTypes then return nil end
+	local parsedOk, tree = pcall(function() return Parser.new(source):parse() end)
+	if not parsedOk then return nil end
+	---@cast tree lye.parser.Result
+	local file = annotations
+	if not file then
+		local docOk, held = pcall(doc.parse, source)
+		if not docOk then return nil end
+		file = held --[[@as lye.doc.File]]
+	end
+	---@cast file lye.doc.File
+	local context = {
+		uri = uri,
+		source = source,
+		text = source,
+		parsed = tree,
+		annotations = file,
+		callName = function(node) return analyzerNames.callName(tree, node) end,
+	}
+	---@cast context lye.plugin.TypeContext
+	return plugin.declarations(specs, context, function() end)
+end
+
 --- A fresh index for a root. A test injects a factory that counts what is read; a session gets
 --- the one the cache backs.
 ---@param kind "workspace"|"package"
@@ -171,7 +215,15 @@ function Declarations:newIndex(kind, root)
 	local provider = self.indexes and self.indexes[kind]
 	local injected = provider and provider(root)
 	if injected then return injected end
-	return Index.new(kind == "package" and { kind = "package" } or {})
+	---@type lye.lsp.IndexOptions
+	local options = {
+		base = self.lye and self.lye.prelude or nil,
+		declarations = function(path, source, annotations)
+			return self:pluginDeclarations(path, source, annotations)
+		end,
+	}
+	if kind == "package" then options.kind = "package" end
+	return Index.new(options)
 end
 
 --- Merge where each loaded root writes its types. A name declared twice belongs to the first root

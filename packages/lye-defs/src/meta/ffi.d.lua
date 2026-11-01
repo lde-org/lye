@@ -19,7 +19,7 @@ local cb = {}
 ---A C number: cdata the engine gives arithmetic and the comparisons to. A value of one of the
 ---scalar types below is one of these, and a reader of `size * nmemb` is owed the metamethods that
 ---make that arithmetic legal rather than being told the operands are not numbers.
----@class ffi.cnum*: ffi.cdata
+---@class ffi.cnum*: ffi.cdata*
 ---@field __add fun(self: ffi.cnum*, other: any): ffi.cnum*
 ---@field __sub fun(self: ffi.cnum*, other: any): ffi.cnum*
 ---@field __mul fun(self: ffi.cnum*, other: any): ffi.cnum*
@@ -60,18 +60,18 @@ local cb = {}
 ---@class ffi.float: ffi.cnum*
 ---@class ffi.double: ffi.cnum*
 ---@class ffi.wchar_t: ffi.cnum*
----@class ffi.bool: ffi.cdata
+---@class ffi.bool: ffi.cdata*
 
 ---An array of C values: what a cached `ffi.typeof("int[4]")` constructor makes and what a
 ---`T name[N]` member is. It is indexed with a number, which is the one thing an array does that no
 ---other cdata does, and the length the header wrote is carried as the second argument.
----@class ffi.array<T, const N: integer>: ffi.cdata
+---@class ffi.array<T, const N: integer>: ffi.cdata*
 ---@field [integer] T
 
 ---A pointer to a C value: what a cached `ffi.typeof("int *")` constructor makes, what a callback
 ---receives where the header wrote a pointer, and what going through a pointer reads. Like an array
 ---it is indexed with a number, and it is not the value it points at.
----@class ffi.ptr<T: ffi.cdata*>: ffi.cdata
+---@class ffi.ptr<T: ffi.cdata*>: ffi.cdata*
 ---@field [integer] T
 
 ---@class ffilib

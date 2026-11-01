@@ -659,4 +659,28 @@ test.it("an index that cannot be read is parsed as it always was", function()
 	test.equal(findingsOf(warm.output), findingsOf(cold.output), "the findings are the same either way")
 end)
 
+test.it("reads a plugin's types across files", function()
+	-- A type a plugin contributes belongs to the workspace, exactly like a `---@class` written in
+	-- the source. `Foo` is declared by one file's cdef and named by another file's annotation; the
+	-- second file never requires the first and has no cdef of its own.
+	local root = PACKAGE_DIR .. "/target/plugin-types-fixture"
+	writeTree(root, {
+		["lde.json"] = '{ "name": "plugin-types-fixture", "version": "0.1.0" }\n',
+		["src/declares.lua"] = table.concat({
+			'local ffi = require("ffi")\n',
+			'ffi.cdef[[typedef struct { int x; } Foo;]]\n',
+			'return ffi.new("Foo")\n',
+		}),
+		["src/uses.lua"] = table.concat({
+			'---@param f Foo\n',
+			'local function use(f) return f.x end\n',
+			'return use\n',
+		}),
+	})
+	local command = string.format("LYE_CACHE=off lde run %q -- check %q", MAIN, root .. "/src")
+	local output = run(command .. " 2>&1")
+	test.includes(output, "nothing to report", "the cdef type is the workspace's: " .. output)
+	test.falsy(output:find("unknown type", 1, true), "and is not unknown in the other file: " .. output)
+end)
+
 return true

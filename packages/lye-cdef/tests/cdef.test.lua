@@ -63,9 +63,9 @@ end)
 
 test.it("reads a function pointer typedef as a callback", function()
 	local namespace = parse("typedef int (*cmp)(const void *, const void *);")
-	test.equal(cdef.notation(namespace, assert(cdef.resolve(namespace, "cmp"))), "ffi.cb",
+	test.equal(cdef.notation(namespace, assert(cdef.resolve(namespace, "cmp"))), "ffi.cb*",
 		"a pointer to a function is the callback it is")
-	test.truthy(cdef.annotations(namespace):match("---@class cmp: ffi%.cb"))
+	test.truthy(cdef.annotations(namespace):match("---@class cmp: ffi%.cb%*"))
 end)
 
 test.it("reads arrays, of a known and an unknown length", function()
@@ -104,7 +104,7 @@ end)
 
 test.it("reads a struct that holds a pointer to itself", function()
 	local namespace = parse("typedef struct Node { struct Node *next; int value; } Node;")
-	test.equal(memberType(namespace, "Node", "next"), "Node")
+	test.equal(memberType(namespace, "Node", "next"), "ffi.ptr<Node>")
 	test.equal(memberType(namespace, "Node", "value"), "number")
 end)
 

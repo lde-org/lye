@@ -483,6 +483,18 @@ test.it("reads const generic names and folds their result", function()
 	test.equal(doctype.display(folded), '"barbaz"')
 end)
 
+test.it("substitutes a const generic into a template literal", function()
+	-- The template's parts are strings and types; substitution has to tell them apart without
+	-- calling the parameter `type` as if it were the global function.
+	---@param text string
+	local resolver = function(text)
+		if text == "A" then return doctype.extern(text) end
+	end
+	local signature = parse("fn<const A: string>(a: A) -> `prefix-${A}`", resolver)
+	local folded = doctype.substitute(signature.returns, { A = doctype.stringValue("x") })
+	test.equal(doctype.display(folded), '"prefix-x"')
+end)
+
 test.it("folds arithmetic between const generic arguments", function()
 	---@param text string
 	local resolver = function(text)

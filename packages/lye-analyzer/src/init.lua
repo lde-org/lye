@@ -553,6 +553,9 @@ local function declaredTypeFor(parsed, file, declaration, resolve)
 			if annotation.start < spanStart then break end
 			if annotation.tag == "class" then
 				local name = annotation.name or (annotation.text or ""):match("^([%w_%.]+)")
+				-- The table and the class share their last segment: `---@class lde.Package`
+				-- over `local Package = {}`. A class written for another name is still a type
+				-- the workspace knows, but it is not this table's type.
 				return name and resolve(name) or nil
 			end
 		end
@@ -3068,6 +3071,10 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 				local tag = annotation.tag
 				if tag == "class" then
 					local name = annotation.name or (annotation.text or ""):match("^([%w_%.]+)")
+					-- The table and the class share their last segment: `---@class lde.Package`
+					-- over `local Package = {}`. A class written for another name — `---@class
+					-- VkApi` over `local vk = {}` — is still a type the workspace knows, but it is
+					-- not this table's class.
 					if name and namespace.classes[name] then classOfTable[declaration.name] = name end
 					break
 				end

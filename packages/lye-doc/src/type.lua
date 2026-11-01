@@ -32,7 +32,7 @@ local types = {}
 ---| { variant: "infer", name: string }
 ---| { variant: "operation", op: string, left: lye.doc.Type, right: lye.doc.Type }
 ---| { variant: "template", parts: (string|lye.doc.Type)[] }
----| { variant: "class", name: string, args: lye.doc.Type[], fields: table<string, lye.doc.Type>, parents: lye.doc.Type[], indexed: { key: string, type: lye.doc.Type }?, metatable: lye.doc.Type?, visibility: table<string, string>?, fromDocument: boolean?, hasWorkspaceMethods: boolean?, operators: table<string, lye.doc.Type>?, deprecatedFields: table<string, boolean>? }
+---| { variant: "class", name: string, args: lye.doc.Type[], fields: table<string, lye.doc.Type>, parents: lye.doc.Type[], indexed: { key: string, type: lye.doc.Type }?, metatable: lye.doc.Type?, visibility: table<string, string>?, fromDocument: boolean?, hasWorkspaceMethods: boolean?, operators: table<string, lye.doc.Type>?, deprecatedFields: table<string, boolean>?, cNumber: boolean? }
 ---| { variant: "never" }
 
 types.UNKNOWN = "unknown"
@@ -149,6 +149,18 @@ function types.ownerOf(held)
 	end
 end
 
+-- The scalar classes the definitions give a C number. A typedef of one is resolved to the class
+-- itself, but the class is also reachable by the name a header wrote it with.
+local C_NUMBER = {
+	["ffi.cnum"] = true, ["ffi.cnum*"] = true,
+	["ffi.char"] = true, ["ffi.short"] = true, ["ffi.int"] = true, ["ffi.long"] = true,
+	["ffi.longlong"] = true, ["ffi.unsigned"] = true, ["ffi.ulong"] = true, ["ffi.ulonglong"] = true,
+	["ffi.int8_t"] = true, ["ffi.int16_t"] = true, ["ffi.int32_t"] = true, ["ffi.int64_t"] = true,
+	["ffi.uint8_t"] = true, ["ffi.uint16_t"] = true, ["ffi.uint32_t"] = true, ["ffi.uint64_t"] = true,
+	["ffi.size_t"] = true, ["ffi.ssize_t"] = true, ["ffi.ptrdiff_t"] = true, ["ffi.intptr_t"] = true,
+	["ffi.uintptr_t"] = true, ["ffi.float"] = true, ["ffi.double"] = true, ["ffi.wchar_t"] = true,
+}
+
 --- A class this file declares. It is nominal: `Foo<number>` is not `Foo<string>`, and a class
 --- satisfies what it extends. The fields are already resolved, so reading one costs nothing.
 ---@param name string
@@ -157,10 +169,21 @@ end
 ---@param parents lye.doc.Type[]?
 ---@param visibility table<string, string>? who may read each field
 function types.classType(name, args, fields, parents, visibility)
-	return make("class", {
+	local held = make("class", {
 		name = name, args = args or {}, fields = fields or {}, parents = parents or {},
 		visibility = visibility or {},
 	})
+	local cNumber = C_NUMBER[name] == true
+	if not cNumber then
+		for _, parent in ipairs(parents or {}) do
+			if parent and (parent.cNumber or (parent.name and C_NUMBER[parent.name])) then
+				cNumber = true
+				break
+			end
+		end
+	end
+	if cNumber then held.cNumber = true end
+	return held
 end
 
 --- A callable. The parameters and the return type are types, so a function is as hard typed as
@@ -930,18 +953,73 @@ function types.missingRequiredFields(constraint, actual)
 	return missing
 end
 
+
 ---@param candidate lye.doc.Type?
 local function isCNumber(candidate)
-	if not candidate then return false end
-	if candidate.variant == "class" then
-		local name = candidate.name
-		if name == "ffi.cnum" or name == "ffi.cnum*" then return true end
+	if not candidate or candidate.variant ~= "class" then return false end
+	-- The tag is set once, here or when the class is built, so a class that inherits from one
+	-- that inherits from `ffi.cnum*` is answered without walking the chain on every use.
+	if candidate.cNumber ~= nil then return candidate.cNumber end
+	candidate.cNumber = false
+	local result = C_NUMBER[candidate.name] == true
+	if not result then
 		for _, parent in ipairs(candidate.parents or {}) do
-			if parent.variant == "class" then
-				local parentName = parent.name
-				if parentName == "ffi.cnum" or parentName == "ffi.cnum*" then return true end
+			if isCNumber(parent) then
+				result = true
+				break
 			end
 		end
+	end
+	candidate.cNumber = result
+	return result
+end
+
+-- The classes that stand for C memory: a struct, a callback, an array, a pointer, a scalar.
+local C_DATA = {
+	["ffi.cdata*"] = true, ["ffi.ptr"] = true, ["ffi.array"] = true, ["ffi.cb*"] = true,
+	["ffi.cnum"] = true, ["ffi.cnum*"] = true,
+}
+
+---@param candidate lye.doc.Type?
+local function isCData(candidate)
+	if not candidate then return false end
+	if candidate.variant == "class" then
+		if candidate.name and C_DATA[candidate.name] then return true end
+		for _, parent in ipairs(candidate.parents or {}) do
+			if parent.variant == "class" and parent.name and C_DATA[parent.name] then return true end
+		end
+	end
+	return candidate.variant == "array"
+end
+
+--- The element a pointer points at, when the type is one the definitions spell.
+---@param candidate lye.doc.Type?
+---@return lye.doc.Type?
+local function pointerTarget(candidate)
+	if candidate and candidate.variant == "class" and candidate.name == "ffi.ptr" then
+		return candidate.args[1]
+	end
+end
+
+---@param candidate lye.doc.Type?
+local function isChar(candidate)
+	if not candidate or candidate.variant ~= "class" then return false end
+	local name = candidate.name
+	return name == "ffi.char" or name == "ffi.uint8_t"
+end
+
+--- A struct a cdef declared, as opposed to a pointer, an array, or a scalar: a constructor may
+--- leave its fields out and the engine zeroes them.
+---@param candidate lye.doc.Type?
+local function isCObject(candidate)
+	if not candidate or candidate.variant ~= "class" then return false end
+	local name = candidate.name
+	if name == "ffi.cdata*" or name == "ffi.ptr" or name == "ffi.array"
+		or name == "ffi.cb*" or name == "ffi.cnum" or name == "ffi.cnum*" then
+		return false
+	end
+	for _, parent in ipairs(candidate.parents or {}) do
+		if parent.variant == "class" and parent.name == "ffi.cdata*" then return true end
 	end
 	return false
 end
@@ -1002,7 +1080,45 @@ function fits(type, constraint, depth, seen)
 
 	-- And the other way: a Lua number written into a C number is converted by the engine, which is
 	-- what assigning `32` to a `size_t` does. The difference shows in what a value *is*.
-	if isCNumber(constraint) and (type.variant == "number" or type.variant == "integer") then
+	if isCNumber(constraint) and (type.variant == "number" or type.variant == "integer"
+		or type.variant == "boolean") then
+		return true
+	end
+
+	-- A C array is cdata, and the engine lets one stand where a pointer is wanted: a struct field
+	-- or a function parameter written `T *` is filled by the `T[]` the caller built.
+	if type.variant == "array" and constraint.variant == "class" and constraint.name == "ffi.cdata*" then
+		return true
+	end
+	local target = pointerTarget(constraint)
+	if target then
+		-- Assigning nil to a pointer is assigning NULL, and LuaJIT converts a Lua string to a
+		-- `char *` for a parameter written that way.
+		if type.variant == "nil" then return true end
+		if type.variant == "number" and type.value == 0 then return true end
+		if type.variant == "string" and isChar(target) then return true end
+		if type.variant == "array" and fits(type.type, target, depth + 1, seen) then return true end
+		if type.variant == "class" and type.name == "ffi.ptr" then
+			local held = type.args[1]
+			if held and target.variant == "class" and target.name == "ffi.cdata*" and isCData(held) then
+				return true
+			end
+			if held and fits(held, target, depth + 1, seen) then return true end
+		end
+		-- A struct is cdata, and passing one where a `void *` is wanted is how `pNext` chains.
+		if type.variant == "class" and isCData(type)
+			and target.variant == "class" and target.name == "ffi.cdata*" then
+			return true
+		end
+		if type.variant == "class" and fits(type, target, depth + 1, seen) then return true end
+	end
+	if constraint.variant == "class" and constraint.name == "ffi.cdata*" and isCData(type) then
+		return true
+	end
+	-- A pointer to a struct is read as the struct by the definitions, and an array of that struct
+	-- is the same memory: `pQueueCreateInfos` takes the `VkDeviceQueueCreateInfo[]` the caller built.
+	if isCObject(constraint) and type.variant == "array"
+		and fits(type.type, constraint, depth + 1, seen) then
 		return true
 	end
 
@@ -1165,7 +1281,8 @@ function fits(type, constraint, depth, seen)
 				if have then
 					if not fits(have, wanted, depth + 1, seen)
 						and not methodFits(have, wanted, constraint, depth + 1, seen) then return false end
-				elseif not types.isFn(wanted) and not fits(types.NIL_TYPE, wanted, depth + 1, seen) then
+				elseif not types.isFn(wanted) and not isCObject(constraint)
+					and not fits(types.NIL_TYPE, wanted, depth + 1, seen) then
 					-- A method comes from the metatable an instance is built with, not from the
 					-- literal that holds its data; a data field has to be written.
 					return false
@@ -1911,6 +2028,12 @@ function types.fieldOf(type, name)
 			return nil
 		end
 		if type.variant == "object" or type.variant == "class" then
+			-- A pointer to a struct is dereferenced by a field read: `p.x` is the field of the
+			-- struct the pointer names, which is what the C code writes.
+			if type.name == "ffi.ptr" and type.args[1] then
+				local found = types.fieldOf(type.args[1], name)
+				if found then return found end
+			end
 			---@type table<string, lye.doc.Type>
 			local fields = type.fields
 			if fields then
@@ -2583,7 +2706,7 @@ local function substituted(type, bindings, seen)
 	if type.variant == "template" then
 		local parts = {}
 		for index, part in ipairs(type.parts) do
-			if type(part) == "string" then
+			if _G.type(part) == "string" then
 				parts[index] = part
 			else
 				parts[index] = substituted(part, bindings, seen)

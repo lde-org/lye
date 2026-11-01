@@ -96,7 +96,7 @@ test.it("reads the types an ffi.cdef declares", function()
 		'made.nope = 3\n',
 	}, "")
 	test.equal(typeOf(source, "made"), "Vec", "a struct the cdef declared")
-	test.equal(typeOf(source, "listed"), "Vec", "and a pointer to one is still that struct")
+	test.equal(typeOf(source, "listed"), "ffi.ptr<Vec>", "and a pointer to one is still that struct")
 	test.equal(typeOf(source, "colored"), "Color", "an enum's value is a cdata with a name")
 
 	local messages = {}
@@ -194,8 +194,8 @@ test.it("types a callback from the C signature it was cast to", function()
 		"a char pointer arrives as a pointer to a char")
 	test.equal(typeOf(source, "size"), "ffi.size_t", "a size_t is the cdata type the engine hands over")
 	test.equal(typeOf(source, "nmemb"), "ffi.size_t")
-	test.equal(typeOf(source, "_"), "ffi.ptr<ffi.cdata>", "and a void pointer points at anything")
-	test.equal(typeOf(source, "item"), "Vec", "a struct pointer is the struct the header named")
+	test.equal(typeOf(source, "_"), "ffi.ptr<ffi.cdata*>", "and a void pointer points at anything")
+	test.equal(typeOf(source, "item"), "ffi.ptr<Vec>", "a struct pointer is the struct the header named")
 	test.equal(typeOf(source, "count"), "number")
 
 	-- Not `require`: this suite runs without the definitions, which is a separate matter from what
@@ -254,7 +254,7 @@ test.it("reads a cdef type named as a string, and leaves the rest alone", functi
 		'local builtin = ffi.new("int[4]")\n',
 	}, "")
 	test.equal(typeOf(source, "known"), "Node")
-	test.equal(typeOf(source, "pointer"), "Node")
+	test.equal(typeOf(source, "pointer"), "ffi.ptr<Node>")
 	test.equal(typeOf(source, "missing"), "unknown", "a name the header never declared")
 	-- `ffi.new("int[4]")` is not a class the cdef made, but it is not nothing either: the mapping
 	-- names it, and that is what lets the array be indexed and the length be known.

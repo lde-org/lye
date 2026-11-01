@@ -347,7 +347,24 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 	local function valueOf(written)
 		local found, declared = cTypeNamed(written)
 		if not found or not declared then found, declared = builtinType(written) end
-		if not found or not declared then return nil end
+		if not found or not declared then
+			-- The name may be one another file's cdef declared: the workspace's types are the
+			-- same types here, so `ffi.new("VkCommandBuffer[1]")` in a module with no cdef of its
+			-- own reads what the package's header declared.
+			local global = resolve(written)
+			if global then return global end
+			local pointer = written:match("^(.-)%s*%*$")
+			if pointer and pointer ~= "" and resolve(pointer) then
+				return types.parse("ffi.ptr<" .. pointer .. ">", resolve)
+			end
+			local base, dimensions = written:match("^(.-)%s*(%[[^%]]*%])$")
+			if base and base ~= "" and resolve(base) then
+				local length = dimensions:match("^%[(%d+)%]$")
+				local text = "ffi.array<" .. base .. (length and (", " .. length) or "") .. ">"
+				return types.parse(text, resolve)
+			end
+			return nil
+		end
 		-- A struct, a union, an enum or a typedef of one is a class this file declares, and looking the
 		-- name up lets the document's own class win over the generated one. Everything else is mapped.
 		local className = cdef.className(found)
@@ -431,13 +448,16 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 	return answer
 end
 
----@param context lye.plugin.TypeContext
----@return lye.plugin.Types?
-function ffiPlugin.types(context)
-	local source, parsed_, callName = context.source, context.parsed, context.callName
-	-- A file that writes a cdef declares C; one that only calls `ffi.new("uint8_t[?]")` names a
-	-- builtin type. Both are the plugin's, and a file that mentions neither pays for no scan.
-	if not source:find("ffi", 1, true) then return nil end
+--- The C every `ffi.cdef` block in a file declares: the parsed namespaces, the annotations they
+--- write for the analyzer, and the problems that could not be read. A file that mentions neither
+--- `ffi` nor `cdef` pays for no walk.
+---@param source string
+---@param parsed_ lye.parser.Result
+---@param callName fun(node: lye.parser.Node): string?
+---@return lye.cdef.Namespace[]
+---@return lye.doc.File[]
+---@return { message: string, severity: integer, start: integer, stop: integer }[]
+local function collect(source, parsed_, callName)
 	local cdefs, files, diagnostics = {}, {}, {}
 	for _, node in ipairs(parsed_.byKind.call or {}) do
 		local argument = cdefArgument(parsed_, node, callName)
@@ -460,6 +480,30 @@ function ffiPlugin.types(context)
 			end
 		end
 	end
+	return cdefs, files, diagnostics
+end
+
+--- The classes and aliases a file's `ffi.cdef` blocks declare, for a caller that reads the whole
+--- workspace rather than one document. A cdef type is a type of the workspace: `VkBuffer` written
+--- in one file means the `VkBuffer` another file's header declared.
+---@param source string
+---@param parsed_ lye.parser.Result
+---@param callName fun(node: lye.parser.Node): string?
+---@return lye.doc.File[]
+function ffiPlugin.annotations(source, parsed_, callName)
+	if not source:find("ffi", 1, true) or not source:find("cdef", 1, true) then return {} end
+	local _, files = collect(source, parsed_, callName)
+	return files
+end
+
+---@param context lye.plugin.TypeContext
+---@return lye.plugin.Types?
+function ffiPlugin.types(context)
+	local source, parsed_, callName = context.source, context.parsed, context.callName
+	-- A file that writes a cdef declares C; one that only calls `ffi.new("uint8_t[?]")` names a
+	-- builtin type. Both are the plugin's, and a file that mentions neither pays for no scan.
+	if not source:find("ffi", 1, true) then return nil end
+	local cdefs, files, diagnostics = collect(source, parsed_, callName)
 	-- A cdef call adds to the engine's one type namespace: a later block may name a type an
 	-- earlier one declared. Each block is parsed on its own for its colours and annotations, so
 	-- that reference reads as unknown inside the block; it is not a problem if some block here

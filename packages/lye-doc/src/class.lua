@@ -724,9 +724,16 @@ end
 --- nothing stands for. `lye check` reads a batch of files this way and the LSP reads the whole
 --- workspace this way, so both hand an analysis the same types.
 ---@param files lye.doc.File[]
+---@param base lye.doc.Namespace? the definitions the file is read through, so a class whose
+--- parent is `ffi.cdata*` or a field naming `ffi.size_t` resolves against the same prelude the
+--- analysis uses
 ---@return table<string, lye.doc.Type|boolean> the type where one can be built, `true` where not
-function classes.declare(files)
+function classes.declare(files, base)
 	local merged = { classes = {}, aliases = {} }
+	if base then
+		for name, class in pairs(base.classes or {}) do merged.classes[name] = class end
+		for name, alias in pairs(base.aliases or {}) do merged.aliases[name] = alias end
+	end
 	for _, file in ipairs(files) do
 		local namespace = classes.read(file)
 		for name, class in pairs(namespace.classes) do merged.classes[name] = merged.classes[name] or class end

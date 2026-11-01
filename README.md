@@ -136,6 +136,10 @@ A plugin answers one or more hooks:
 | `types` | classes, aliases and providers for calls, fields, parameters and callback returns |
 | `complete` | module names inside `require("...")` |
 
+A type a plugin contributes through `types` is indexed with the workspace's own annotations, so a
+class or alias one file's plugin declares is a type another file can name — the same rule a
+`---@class` written in the source follows.
+
 The built-in `lye-plugin-require` supplies the `require` completion hook. A plugin's
 `extensions = { "moon" }` makes `lye check .` walk a dialect's files, and an editor that supports
 LSP dynamic registration receives those extensions as document selectors, so a `.moon` document gets
