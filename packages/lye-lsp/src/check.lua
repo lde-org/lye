@@ -301,10 +301,10 @@ local function linkedDeclarations(root, cache, paths)
 				local isOk, one = pcall(doc.parse, source)
 				---@cast one lye.doc.File
 				if isOk then docsByText[key] = one end
-				parsed = isOk and one or nil
+				if isOk then parsed = one else parsed = nil end
 			end
-			if parsed then
-				parsedFiles[#parsedFiles + 1] = parsed --[[@as lye.doc.File ]]
+			if type(parsed) == "table" then
+				parsedFiles[#parsedFiles + 1] = parsed
 				for _, declaration in ipairs(pluginDeclarations(file, source, parsed)) do
 					parsedFiles[#parsedFiles + 1] = declaration
 				end
@@ -321,7 +321,7 @@ local function linkedDeclarations(root, cache, paths)
 		end
 		-- What each name means, resolved once for the whole package: a dependency's alias is as
 		-- real to a reader as its own, and a bare name refuses every argument made of it.
-		found = classes.declare(parsedFiles, PRELUDE --[[@as lye.doc.Namespace]])
+		found = classes.declare(parsedFiles, PRELUDE)
 		for _, list in ipairs(methodLists) do methodIndex.add(found, list) end
 	end
 	cache[root] = found
@@ -525,12 +525,9 @@ local function packageNameOf(owner)
 	return name
 end
 
----@param owner string the package root
----@param name string
----@return string?
 --- Whether a `require` names a C library lde installed beside the Lua modules: a `.so`, `.dll`
 --- or `.dylib` under the package's `target/`. Those have no source to read, but the module exists.
----@param owner string?
+---@param owner string
 ---@param name string
 ---@return boolean
 local function binaryModulePath(owner, name)
@@ -1235,8 +1232,7 @@ function check.files(paths, reporter)
 	-- What each name stands for, not only that it exists: a parameter declared with an alias
 	-- another file writes is checked against what the alias means, and a name on its own refuses
 	-- every argument handed to it.
-	local prelude = PRELUDE --[[@as lye.doc.Namespace]]
-	local declared = classes.declare(parsedFiles, prelude)
+	local declared = classes.declare(parsedFiles, PRELUDE)
 
 	-- The work, in the units one process has to hold together: a package's files, which read the
 	-- same linked names and resolve one another in the order they are written.
@@ -1282,6 +1278,7 @@ function check.files(paths, reporter)
 		end
 	end
 
+	---@type table<string, lye.Report.Finding[]>
 	local found = parallel.run(groups, parallel.workers(#paths), checkSlice)
 	local isOk = true
 	for _, path in ipairs(paths) do

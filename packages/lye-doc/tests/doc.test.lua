@@ -454,11 +454,11 @@ end)
 
 test.it("narrows every member of a union to the value the branch holds", function()
 	local optional = doctype.union({ doctype.BOOLEAN, doctype.NIL_TYPE })
-	test.equal(doctype.display(doctype.narrowTruthiness(optional, false)), "false?",
+	test.equal(doctype.display(assert(doctype.narrowTruthiness(optional, false))), "false?",
 		"a whole boolean in a union becomes the value that side holds")
-	test.equal(doctype.display(doctype.narrowTruthiness(optional, true)), "true",
+	test.equal(doctype.display(assert(doctype.narrowTruthiness(optional, true))), "true",
 		"and the truthy side is the other one")
-	test.equal(doctype.display(doctype.narrowTruthiness(doctype.BOOLEAN, false)), "false")
+	test.equal(doctype.display(assert(doctype.narrowTruthiness(doctype.BOOLEAN, false))), "false")
 end)
 
 test.it("reads const generic names and folds their result", function()
@@ -562,7 +562,7 @@ test.it("reads a mapped value indexed through two keys", function()
 	local mapped = doctype.mapped("K", doctype.keyof(shape),
 		doctype.indexedAccess(doctype.indexedAccess(shape, doctype.extern("K")),
 			doctype.stringValue("value")))
-	test.equal(doctype.display(doctype.fieldOf(mapped, "name")), "string")
+	test.equal(doctype.display(assert(doctype.fieldOf(mapped, "name"))), "string")
 end)
 
 test.it("checks a mapped shape where a parameter is declared", function()

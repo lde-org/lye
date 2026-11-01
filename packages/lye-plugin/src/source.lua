@@ -17,6 +17,11 @@
 	  be read there answers with the start of the replacement, which is the nearest honest place.
 ]]
 
+---@class lye.plugin.SourceModule
+---@field lower fun(text: string, edits: lye.plugin.Edit[]): lye.plugin.Map
+---@field chain fun(maps: lye.plugin.Map[]): lye.plugin.Map
+
+---@type lye.plugin.SourceModule
 local source = {}
 
 ---@class lye.plugin.Edit
@@ -222,6 +227,7 @@ end
 --- one that moves nothing.
 ---@param text string the original
 ---@param edits lye.plugin.Edit[]
+---@return lye.plugin.Map
 function source.lower(text, edits)
 	local kept = ordered(text, edits or {})
 	local out, starts = {}, {}
@@ -297,6 +303,7 @@ end
 
 --- The lowerings a document went through, as one that a caller cannot tell from a single one.
 ---@param maps lye.plugin.Map[]
+---@return lye.plugin.Map
 function source.chain(maps)
 	if #maps == 1 then return maps[1] end
 	return setmetatable({ maps = maps, text = maps[#maps].text, edits = {}, starts = {} }, Chain)

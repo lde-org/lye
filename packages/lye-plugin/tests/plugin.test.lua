@@ -334,10 +334,11 @@ test.it("asks a plugin for the types it contributes, and calls its providers", f
 	test.equal(#got, 1, "one contribution")
 	test.equal(got[1].name, "typed", "named for the plugin that answered")
 	---@cast got { name: string, types: lye.plugin.Types }[]
-	local providers = assert(got[1].types.attach(function(name) return name end))
+	local providers = assert(got[1].types.attach(function(name) return types.parse(name) end))
 	local node = {}
 	---@cast node lye.parser.Node
-	test.equal(providers.call(node), "T", "the provider is built with the document's resolver")
+	local provided = assert(providers.call(node))
+	test.equal(types.display(provided), "T", "the provider is built with the document's resolver")
 end)
 
 test.it("colours a pattern's escapes and a format's conversion through the shipped plugins", function()

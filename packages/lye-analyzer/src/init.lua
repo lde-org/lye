@@ -181,9 +181,10 @@ end
 ---@field nodiscard boolean? a call whose result is dropped should be reported
 ---@field async boolean? the callable may yield
 
----@class lye.analyzer.Prelude
+---@class lye.analyzer.Prelude: lye.doc.Namespace
 ---@field classes table<string, lye.doc.Class>
----@field aliases table<string, string>
+---@field aliases table<string, lye.doc.Alias>
+---@field built table<string, lye.doc.Type>?
 ---@field signatures table<string, lye.analyzer.Signature>
 ---@field fields table<lye.doc.Type, lye.analyzer.Signature> the annotations a field's type was built from
 ---@field returns table<string, lye.doc.Type>
@@ -194,6 +195,7 @@ end
 --- What a caller may tell an analysis beyond its arguments. Every field is optional.
 ---@class lye.analyzer.Options
 ---@field uri string? the document's URI, used by structural item IDs and cache keys
+---@field root string? the package root, for plugins that read files beside it
 ---@field previous lye.analyzer.Result? the last result for this text's predecessor
 ---@field from integer? 1-based byte where the edit starts
 ---@field incremental boolean? false runs the cold path, whatever `previous` and `from` hold
@@ -937,6 +939,7 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 	-- The type a written text came to, read through the analysis's memo: a generic signature is read
 	-- at every call site of the function, and one resolution context covers the whole analysis.
 	---@param text string
+	---@return lye.doc.Type?
 	local function typeOfText(text)
 		return parseType(text, resolve)
 	end
@@ -1727,11 +1730,16 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 	-- reader in one file sees a method another file declares. A method declared here replaces the
 	-- seeded placeholder below.
 	if options and options.methods then
+		local evolved = namespace.evolved
+		if not evolved then
+			evolved = {}
+			namespace.evolved = evolved
+		end
 		for className, fields in pairs(options.methods) do
-			local held = namespace.evolved[className]
+			local held = evolved[className]
 			if not held then
 				held = {}
-				namespace.evolved[className] = held
+				evolved[className] = held
 			end
 			for method, fn in pairs(fields) do
 				if held[method] == nil then held[method] = fn end

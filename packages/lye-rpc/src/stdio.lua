@@ -80,6 +80,7 @@ end
 ---@param chunk lye.rpc.Chunk
 ---@param from integer
 ---@param to integer
+---@return string
 function stdio.slice(chunk, from, to)
 	return ffi.string(chunk.buf + (from - 1), to - from + 1)
 end

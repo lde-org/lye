@@ -69,6 +69,7 @@ end
 	--- crosses back into C, so the same question is asked of it here.
 	---@param ctx lye.analyzer.TypingContext
 	---@param index integer
+	---@return lye.doc.Type[]
 	function typing.inferredValuesOf(ctx, index)
 	local parsed = ctx.parsed
 	local inferCtx = ctx.inferCtx
@@ -618,6 +619,7 @@ end
 	-- A written type, read once per document where the analysis gave a cache for it: a context
 	-- built by hand — a test's — has none, and parses as it always did.
 	---@param text string
+	---@return lye.doc.Type?
 	local function parseOne(text) return memo.parse(text, resolve) end
 	local parseType = ctx.typeOfText or parseOne
 
@@ -653,6 +655,7 @@ end
 		local bestScore = -1
 		local args = node.args or {}
 		for _, text in ipairs(writtenList) do
+			---@type lye.doc.Type?
 			local shape = parseType(text)
 			if shape and shape.variant == "fn" and not (shape.generics and next(shape.generics))
 				and shape.returns and shape.returns.variant ~= "any"
@@ -676,7 +679,8 @@ end
 				if fits and score > bestScore then best, bestScore = shape, score end
 			end
 		end
-		if not best then return nil end
+		if not best or best.variant ~= "fn" then return nil end
+		---@type lye.doc.Type?
 		local value = best.values and best.values[position]
 		if not value and position == 1 then value = best.returns end
 		if not value and best.isSpread then
@@ -688,14 +692,19 @@ end
 	-- What a definition that spells alternatives promises this call, when its primary result is
 	-- only optional: `tonumber(cdata)` is the number its `fun(e: ffi.cnum*)` shape names. Inference
 	-- asks this while reading the call, so a return or an argument sees the settled type.
-	inferCtx.overloadResult = function(node, position)
+	---@param node lye.parser.Node
+	---@param position integer
+	---@return lye.doc.Type?
+	local function overloadResult(node, position)
 		local signature = signatureOfCall(node)
-		local primary = signature and signature.returns and signature.returns.type
+		if not signature then return nil end
+		local primary = signature.returns and signature.returns.type
 		local optional = primary and (primary:find("%?%s*$") ~= nil
 			or primary:find("nil%s*|") ~= nil or primary:find("|%s*nil") ~= nil)
 		if not optional then return nil end
 		return overloadValue(signature, node, position)
 	end
+	inferCtx.overloadResult = overloadResult
 
 	---@param signature lye.analyzer.Signature
 	---@param node lye.parser.Node
@@ -764,6 +773,8 @@ end
 				---@param yielded lye.doc.Type
 				---@return lye.doc.Type?
 				local function valueAt(yielded)
+					---@param fn lye.doc.Type
+					---@return lye.doc.Type?
 					local function fromFn(fn)
 						local value = fn.values and fn.values[position]
 						if value == nil and position == 1 then value = fn.returns end
@@ -939,15 +950,16 @@ end
 				if signature and not signature.returns and variable and variable.declared then
 					-- In place, so a call typed before this round reads the return the body turned
 					-- out to have rather than the unknown it was given.
-					if types.isFn(variable.declared) then
-						types.promote(variable.declared.returns, inferred)
-						variable.declared.values = values
+					local declared = variable.declared
+					if declared.variant == "fn" then
+						types.promote(declared.returns, inferred)
+						declared.values = values
 					end
 				end
 				-- A field promised its callers a result, and the body written for it has to give that: compared
 				-- against what the function turned out to be, once the body is typed.
 				local promise = fieldReturns[index]
-				if promise then
+				if promise and inferred then
 					local message = types.strictMismatch(promise, inferred, "the result")
 					if message then
 						self.diagnostics[#self.diagnostics + 1] = {
@@ -1035,8 +1047,13 @@ end
 					end
 					if next(bindings) then
 						local bound = types.substitute(callee.returns, bindings)
+						---@type lye.doc.Type?
 						local cached = inferCtx.cache[node.index]
-						if bound and (not cached or types.display(cached) ~= types.display(bound)) then
+						local differs = true
+						if cached and bound then
+							differs = types.display(cached) ~= types.display(bound)
+						end
+						if bound and differs then
 							inferCtx.callTypes[node.index] = bound
 							inferCtx.cache[node.index] = nil
 							for _, variable in ipairs(self.variables) do
@@ -1063,6 +1080,7 @@ end
 				local base = held and metatable and (metatable.variant == "class" and metatable or held)
 				local bound = base and types.withMetatable(base, metatable)
 				if bound then
+					---@type lye.doc.Type?
 					local cached = inferCtx.cache[node.index]
 					if cached and types.isMutable(cached) then types.promote(cached, bound) end
 					inferCtx.callTypes[node.index] = bound

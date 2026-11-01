@@ -28,6 +28,7 @@ end
 --- The values a `@return` name, as text, in order. Several `---@return` lines are one
 --- signature's values in order; the synthetic annotation carries the flattened list.
 ---@param annotation lye.doc.Annotation?
+---@return string[]?
 local function annotationValues(annotation)
 	if not annotation then return nil end
 	if annotation.values then return annotation.values end

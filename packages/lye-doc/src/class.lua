@@ -269,6 +269,8 @@ end
 --- The class a name refers to, with whatever arguments were written.
 ---@param namespace lye.doc.Namespace
 ---@param text string
+---@return lye.doc.Class? found
+---@return string[] args
 function classes.resolve(namespace, text)
 	local name, argsText = splitGeneric(text)
 
@@ -318,6 +320,7 @@ end
 --- Class fields are resolved once, here, so the type system never has to know about annotations.
 ---@param namespace lye.doc.Namespace
 ---@param elsewhere table<string, lye.doc.Type|boolean>? what another file's names stand for, which the caller is the one that can say
+---@return fun(text: string): lye.doc.Type?
 function classes.resolver(namespace, elsewhere)
 	local types = require("lye-doc.type")
 	local active = {}
@@ -587,8 +590,10 @@ function classes.evolve(namespace, className, field, method)
 		for index, arg in ipairs(classType.args or {}) do args[index] = types.display(arg) end
 		return classType.name .. "<" .. table.concat(args, ",") .. ">"
 	end
+	---@type table<string, lye.doc.Type>
+	local builtTypes = namespace.built or {}
 	local canonical = {}
-	for _, classType in pairs(namespace.built or {}) do
+	for _, classType in pairs(builtTypes) do
 		if classType.variant == "class" and classType.name then
 			local key = classKey(classType)
 			if key and not canonical[key] then canonical[key] = classType end
@@ -621,7 +626,7 @@ function classes.evolve(namespace, className, field, method)
 		return held
 	end
 
-	for _, classType in pairs(namespace.built or {}) do
+	for _, classType in pairs(builtTypes) do
 		if classType.variant == "class" and classType.name and bareName(classType.name) == bare then
 			---@type table<string, lye.doc.Type>?
 			local bindings
@@ -739,6 +744,10 @@ function classes.read(file)
 			-- A class owns the fields written under it, and nothing past the next declaration.
 			if annotation.tag == "param" or annotation.tag == "return" or annotation.tag == "type" then
 				current = nil
+				-- A declaration ends the class block the enums above it belonged to. The last
+				-- class is only the owner while its block is still open, or an enum later in the
+				-- file adds its table as a field of a class that never had one.
+				enumOwner = nil
 			end
 			visibility = "public"
 		end
@@ -753,7 +762,7 @@ end
 --- nothing stands for. `lye check` reads a batch of files this way and the LSP reads the whole
 --- workspace this way, so both hand an analysis the same types.
 ---@param files lye.doc.File[]
----@param base lye.doc.Namespace? the definitions the file is read through, so a class whose
+---@param base lye.doc.Namespace|lye.analyzer.Prelude? the definitions the file is read through, so a class whose
 --- parent is `ffi.cdata*` or a field naming `ffi.size_t` resolves against the same prelude the
 --- analysis uses
 ---@return table<string, lye.doc.Type|boolean> the type where one can be built, `true` where not

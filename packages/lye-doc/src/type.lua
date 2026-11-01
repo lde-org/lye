@@ -25,6 +25,7 @@ local types = {}
 ---| { variant: "object", fields: table<string, lye.doc.Type>, indexed: { key: string, type: lye.doc.Type }?, metatable: lye.doc.Type? }
 ---| { variant: "union", types: lye.doc.Type[], aliasName: string? }
 ---| { variant: "intersection", types: lye.doc.Type[], aliasName: string? }
+---| { variant: "lightuserdata" }
 ---| { variant: "keyof", type: lye.doc.Type }
 ---| { variant: "indexed", object: lye.doc.Type, key: lye.doc.Type }
 ---| { variant: "conditional", check: lye.doc.Type, extends: lye.doc.Type, thenType: lye.doc.Type?, elseType: lye.doc.Type?, thenText: string?, elseText: string?, bindings: table<string, lye.doc.Type>? }
@@ -1978,6 +1979,7 @@ local METAMETHODS = {
 --- because a class type is shared and one `setmetatable` must not reach every other reader.
 ---@param type lye.doc.Type
 ---@param metatable lye.doc.Type?
+---@return lye.doc.Type
 function types.withMetatable(type, metatable)
 	if not metatable or types.isMutable(type) then return type end
 	local copy = {}
@@ -2180,6 +2182,7 @@ end
 ---@param op string
 ---@param left lye.doc.Type
 ---@param right lye.doc.Type
+---@return lye.doc.Type?
 function types.metamethodFor(op, left, right)
 	local name = METAMETHODS[op]
 	if not name then return nil end
@@ -2413,6 +2416,7 @@ end
 --- read: a description after it may hold a comma of its own — `---@return string? kind "number" or
 --- "string"` is one value — and splitting the sentence made a value named `or`.
 ---@param text string
+---@return string[]
 function types.splitValues(text)
 	-- Each value may be written with a name after its type -- `number width, number height` --
 	-- and the name is not part of the type. `typeEnd` continues over a comma because `A, B` is
@@ -2862,6 +2866,7 @@ end
 
 ---@param type lye.doc.Type
 ---@param bindings table<string, lye.doc.Type>
+---@return lye.doc.Type
 function types.substitute(type, bindings)
 	return substituted(type, bindings, {})
 end
@@ -3746,6 +3751,7 @@ end
 --- Whether a value is one the analysis cannot see into: `any` it was handed, or a value nothing
 --- is known about. A mutable unknown is a placeholder rather than an answer, and is not one.
 ---@param type lye.doc.Type?
+---@return boolean
 function types.isOpaque(type)
 	if not type then return false end
 	if type.variant == "any" then return true end

@@ -602,6 +602,7 @@ local function arithmeticChecks(ctx)
 					else
 						wanted = metamethod.params[position]
 					end
+					---@type lye.doc.Type?
 					local actual = position == 1 and left or right
 					if operand and wanted and actual and types.mismatch(wanted, actual, op) then
 						diagnostic.add(self, string.format("'%s' takes %s on the %s, but this is %s", node.op,

@@ -64,7 +64,9 @@ local ROOT = os.getenv("LYE_ROOT") or assert(TOOLS:match("^(.*)/tools$"))
 if ROOT:sub(1, 1) ~= "/" then
 	local pipe = io.popen("cd " .. string.format("%q", ROOT) .. " && pwd -P")
 	if pipe then
-		ROOT = (pipe:read("*a") or ROOT):gsub("%s+$", "")
+		local output = pipe:read("*a")
+		if type(output) ~= "string" then output = ROOT end
+		ROOT = output:gsub("%s+$", "")
 		pipe:close()
 	end
 end
@@ -72,6 +74,7 @@ end
 local PATH = os.getenv("FILE") or ROOT .. "/editors/vscode/tests/fixtures/benchmark-lde.lua.txt"
 
 ---@param path string
+---@return string?
 local function read(path)
 	local handle = io.open(path, "rb")
 	if not handle then return nil end

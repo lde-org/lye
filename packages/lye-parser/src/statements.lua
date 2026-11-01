@@ -209,8 +209,7 @@ function statements.parseLocal(self, start)
 				self:skipComments()
 				if self:accept(":") then
 					local text, from, to = self:skipInlineType()
-					declaration.inlineType, declaration.inlineTypeStart, declaration.inlineTypeStop =
-						text, from, to
+					declaration.inlineType, declaration.inlineTypeStart, declaration.inlineTypeStop = text, from, to
 				end
 			end
 			first = first or self.lastDeclaration

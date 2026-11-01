@@ -24,6 +24,7 @@
 	server down with it, and an editor that repeats the same fault on every keystroke is unusable.
 ]]
 
+---@type lye.plugin.SourceModule
 local source = require("lye-plugin.source")
 local rapidhash = require("rapidhash")
 
@@ -75,7 +76,7 @@ local SHIPPED_ORDER = { "patterns", "formats", "ffi" }
 --- What a plugin can answer about a document after the namespace is complete. Each hook is
 --- optional; the first answer in plugin order wins.
 ---@class lye.plugin.TypeProviders
----@field call fun(node: lye.parser.Node): any what a call to a construct this plugin knows gives, as a `lye.doc.Type`
+---@field call fun(node: lye.parser.Node): lye.doc.Type? what a call to a construct this plugin knows gives, as a `lye.doc.Type`
 ---@field field fun(base: any, baseName: string?, field: string, offset: integer): any what a field read gives; `base` is a `lye.doc.Type`
 ---@field parameter fun(declaration: lye.parser.Declaration): any what a declaration's annotation does not say, as a `lye.doc.Type`
 ---@field callbackReturns table<integer, any>? what a function literal given to C returns, by node
@@ -333,6 +334,12 @@ end
 function plugin.lower(specs, context, report)
 	local maps = {}
 	local text = context.source
+	---@param lowered lye.plugin.Map
+	local function addLowering(lowered)
+		maps[#maps + 1] = lowered
+		text = lowered.text
+		context.text = text
+	end
 	context.text = text
 	for _, spec in ipairs(specs) do
 		if spec.lower then
@@ -343,10 +350,8 @@ function plugin.lower(specs, context, report)
 				-- document survives. `source.lower` is what raises it, since making a text of the
 				-- list is where the list has to make sense.
 				local ok, map = pcall(source.lower, text, edits)
-				if ok then
-					maps[#maps + 1] = map
-					text = map.text
-					context.text = text
+				if ok and map then
+					addLowering(map)
 				else
 					report(string.format("plugin `%s`: %s", spec.name, map))
 				end

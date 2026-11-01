@@ -328,6 +328,13 @@ test.it("an entry of an older schema is a miss", function()
 	test.equal(Index.new():load(ROOT), nil, "an older schema is not trusted")
 end)
 
+---@param value boolean|lye.doc.Type|nil
+---@return lye.doc.Type?
+local function declaredType(value)
+	if value == true or value == false or value == nil then return nil end
+	return value
+end
+
 test.it("a package index follows its links and not the workspace", function()
 	reset({ "src", "target", ".deps" })
 	local link = ROOT .. "/target/dep.lua"
@@ -347,10 +354,12 @@ test.it("a package index follows its links and not the workspace", function()
 	local pkg = Index.new({ kind = "package" })
 	test.truthy(pkg:save(pkg:build(ROOT)))
 	test.truthy(pkg:known().First, "the package reads what it links")
-	local firstClass = pkg:known().First
-	test.truthy(firstClass and firstClass.fields.run, "and the methods its classes declare")
-	local run = firstClass and firstClass.fields.run
-	test.equal(run and types.display(run), "fn(First, number) -> string",
+	local firstClass = declaredType(pkg:known().First)
+	if firstClass == nil then error("the package did not resolve its First class") end
+	local run = firstClass.fields.run
+	if run == nil then error("the package did not read the method First:run") end
+	test.truthy(run, "and the methods its classes declare")
+	test.equal(types.display(run), "fn(First, number) -> string",
 		"with the signature written above the method")
 	test.falsy(pkg:known().Second)
 	test.truthy(pkg:linkDigest(), "the links have a digest")

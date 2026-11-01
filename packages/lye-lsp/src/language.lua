@@ -51,10 +51,7 @@ local CHECKPOINT_QUIET = 400
 --- The LuaJIT definitions, prepared once: they are the same for every document, and parsing
 --- them per keystroke would be absurd.
 local PRELUDE = analyzer.prelude(require("lye-defs"))
--- The prelude is a namespace by content; its own class spells `aliases` too loosely for the
--- resolver's parameter.
----@type lye.doc.Namespace
-local PRELUDE_NS = PRELUDE --[[@as lye.doc.Namespace]]
+local PRELUDE_NS = PRELUDE
 local PRELUDE_RESOLVE = doc.classes.resolver(PRELUDE_NS)
 
 --- The plugin map answers a span as two values, which the checker cannot split across files; the
@@ -668,7 +665,10 @@ local DOC_TAG_NAME = "[%a_][%w_]*"
 ---@field cache lye.AnalysisCache the analyses, parses, predecessors and annotations this session holds
 ---@field epoch integer how many changes this session has seen, which a held result is recorded against
 ---@field definitions lye.Definitions? the definitions, indexed by name, built once
+---@field plugins table<string, lye.plugin.Spec[]>? the plugins each package asked for, loaded once
 ---@field plugins_ table<string, lye.plugin.Spec[]>? the plugins each package asked for, loaded once
+---@field lastFull integer? the epoch of the last full workspace scan
+---@field tokenResults_ table<string, { text: string, answer: table, spans: (integer|string)[]? }>? the token answer by text
 ---@field views table<string, lye.View>? what lye reads of each open document, and the way back
 ---@field dirty table<string, boolean> documents whose analysis is stale
 ---@field lastHeap number? the heap size at the last collection checkpoint
@@ -1060,7 +1060,7 @@ end
 --- What one document declares, which `declaredBy` keeps after its analysis is dropped.
 ---@param file lye.doc.File
 local function declarationsOf(file)
-	return classes.declare({ file }, PRELUDE --[[@as lye.doc.Namespace]])
+	return classes.declare({ file }, PRELUDE)
 end
 
 --- The classes and aliases every file in the workspace declares, each resolved to the type it

@@ -74,7 +74,7 @@ end
 ---@field stop integer
 
 ---@class lye.lexer.Tokens
----@field arena lye.lexer.ffi.token[] the struct array; index 0 is unused
+---@field arena ffi.array<lye.lexer.ffi.token> the struct array; index 0 is unused
 ---@field texts string[] one entry per token, indexed like the arena
 ---@field count integer how many tokens there are, the eof token included
 ---@field problems lye.lexer.Problem[] what a scan could not finish, empty for a whole source
@@ -82,7 +82,7 @@ end
 ---@class lye.lexer.Lexer
 ---@field source string
 ---@field pos integer
----@field arena lye.lexer.ffi.token[] the FFI array of tokens, indexed like a list
+---@field arena ffi.array<lye.lexer.ffi.token> the FFI array of tokens, indexed like a list
 ---@field texts string[]
 ---@field capacity integer
 ---@field count integer

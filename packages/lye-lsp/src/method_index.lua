@@ -143,13 +143,9 @@ local preludeResolve
 ---@return fun(text: string): lye.doc.Type?
 local function definitions()
 	if preludeResolve then return preludeResolve end
-	local ok, analyzer = pcall(require, "lye-analyzer")
-	local okDefs, defs = pcall(require, "lye-defs")
-	if ok and okDefs then
-		preludeResolve = doc.classes.resolver(analyzer.prelude(defs))
-	else
-		preludeResolve = function() end
-	end
+	local analyzer = require("lye-analyzer")
+	local defs = require("lye-defs")
+	preludeResolve = doc.classes.resolver(analyzer.prelude(defs))
 	return preludeResolve
 end
 

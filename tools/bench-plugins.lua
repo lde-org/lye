@@ -33,6 +33,7 @@ local ROOT = os.getenv("LYE_ROOT") or "."
 local PRELUDE = analyzer.prelude(require("lye-defs") --[[@as table<string, string>]])
 
 ---@param path string
+---@return string?
 local function read(path)
 	local handle = io.open(path, "rb")
 	if not handle then return nil end
@@ -125,12 +126,22 @@ end
 local targets = {}
 for index = 1, #arg do
 	local text = read(arg[index])
-	if text then targets[#targets + 1] = { name = arg[index], text = text } end
+	if text then
+		---@type { name: string, text: string }
+		local entry = { name = arg[index], text = text }
+		targets[#targets + 1] = entry
+	end
 end
 if #targets == 0 then
 	local text = read("../../packages/lye-lsp/src/language.lua")
-	if text then targets[#targets + 1] = { name = "lye-lsp/src/language.lua", text = text } end
-	targets[#targets + 1] = { name = "synthetic cdef", text = syntheticCdef() }
+	if text then
+		---@type { name: string, text: string }
+		local entry = { name = "lye-lsp/src/language.lua", text = text }
+		targets[#targets + 1] = entry
+	end
+	---@type { name: string, text: string }
+	local synthetic = { name = "synthetic cdef", text = syntheticCdef() }
+	targets[#targets + 1] = synthetic
 end
 
 print(string.format("%-30s %8s %14s %14s %14s %14s %8s", "document", "analyze", "all",

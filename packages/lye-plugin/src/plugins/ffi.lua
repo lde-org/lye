@@ -17,7 +17,7 @@ local doc = require("lye-doc")
 local types = require("lye-doc.type")
 
 -- Declared here because the colour pass reads a cdef before the type pass is written below.
-local decodeString, cdefText
+local cdefText
 
 local ffiPlugin = {}
 
@@ -481,37 +481,42 @@ end
 --- the newline between the declarations. Long-bracket strings are already exactly what they say.
 ---@param text string
 ---@return string
-function decodeString(text)
+local function decodeString(text)
 	if not text:find("\\", 1, true) then return text end
-	local out, at = {}, 1
+	local out = {} ---@type string[]
+	---@param piece string
+	local function add(piece) out[#out + 1] = piece end
+	local at = 1
 	while at <= #text do
 		local char = text:sub(at, at)
 		if char ~= "\\" then
-			out[#out + 1] = char
+			add(char)
 			at += 1
 		else
 			local following = text:sub(at + 1, at + 1)
-			local simple = ({
+			---@type table<string, string>
+			local escapes = {
 				n = "\n", t = "\t", r = "\r", a = "\a", b = "\b", f = "\f", v = "\v",
 				["\\"] = "\\", ['"'] = '"', ["'"] = "'", ["\n"] = "\n",
-			})[following]
+			}
+			local simple = escapes[following]
 			if simple then
-				out[#out + 1] = simple
+				add(simple)
 				at += 2
 			elseif following:match("%d") then
 				local digits = text:sub(at + 1, at + 3):match("^%d%d?%d?")
-				out[#out + 1] = string.char(tonumber(digits))
+				add(string.char(assert(tonumber(digits))))
 				at += 1 + #digits
 			elseif following == "x" then
 				local hex = text:sub(at + 2, at + 3)
 				local byte = tonumber(hex, 16)
-				if byte then out[#out + 1] = string.char(byte) end
+				if byte then add(string.char(byte)) end
 				at += 4
 			elseif following == "z" then
 				at += 2
 				while text:sub(at, at):match("%s") do at += 1 end
 			else
-				out[#out + 1] = following
+				add(following)
 				at += 2
 			end
 		end
@@ -541,10 +546,13 @@ end
 ---@return lye.doc.File[]
 ---@return { message: string, severity: integer, start: integer, stop: integer }[]
 local function collect(source, parsed_, callName)
-	local cdefs, files, diagnostics = {}, {}, {}
+	local cdefs = {} ---@type lye.cdef.Namespace[]
+	local files = {} ---@type lye.doc.File[]
+	local diagnostics = {} ---@type { message: string, severity: integer, start: integer, stop: integer }[]
 	-- Every `ffi.cdef` call adds to the engine's one namespace. Parse each block for its own
 	-- annotations and problems, then again into an accumulating namespace so a later block can
 	-- name a typedef, struct or function the first one declared.
+	---@type lye.cdef.Namespace?
 	local merged
 	for _, node in ipairs(parsed_.byKind.call or {}) do
 		local argument = cdefArgument(parsed_, node, callName)
@@ -567,7 +575,11 @@ local function collect(source, parsed_, callName)
 			end
 		end
 	end
-	if merged then cdefs[1] = merged end
+	if merged then
+		---@type lye.cdef.Namespace
+		local namespace = merged
+		cdefs[1] = namespace
+	end
 	return cdefs, files, diagnostics
 end
 

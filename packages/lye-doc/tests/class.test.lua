@@ -225,8 +225,8 @@ test.it("uses a generic parameter's default when none is written", function()
 	local boxedBoolean = resolve("Box<boolean>")
 	---@cast box lye.doc.Type
 	---@cast boxedBoolean lye.doc.Type
-	test.equal(doctype.display(doctype.fieldOf(box, "value")), "number")
-	test.equal(doctype.display(doctype.fieldOf(boxedBoolean, "value")), "boolean")
+	test.equal(doctype.display(assert(doctype.fieldOf(box, "value"))), "number")
+	test.equal(doctype.display(assert(doctype.fieldOf(boxedBoolean, "value"))), "boolean")
 end)
 
 test.it("reads an alias that names a class declared below it", function()

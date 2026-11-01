@@ -32,6 +32,9 @@ local infer = {}
 ---@field varargAt table<integer, lye.doc.Type> the `...` type of each literal `...`, by node index
 ---@field narrowed table<integer, boolean>? the reads narrowed while a condition was read
 ---@field casts table<integer, lye.doc.Type|{ exclude: lye.doc.Type }>? an inline cast written beside an expression, by node index
+---@field mutableSet table<integer, boolean>? nodes whose cached type is a mutable placeholder
+---@field tableFieldOwner table<integer, integer>? the table a field node was read from
+---@field children table<integer, integer[]>? children by parent node index
 
 local KNOWN = {
 	number = true, string = true, literal = true, table = true, ["function"] = true,
@@ -264,6 +267,7 @@ end
 
 ---@param ctx lye.infer.Context
 ---@param idx integer?
+---@return lye.doc.Type
 local function of(ctx, idx)
 	if not idx then return types.mutable() end
 	local cached = ctx.cache[idx]
@@ -621,6 +625,7 @@ end
 --- The type of the expression at an arena index.
 ---@param ctx lye.infer.Context
 ---@param idx integer?
+---@return lye.doc.Type
 function infer.at(ctx, idx)
 	return of(ctx, idx)
 end
@@ -647,6 +652,7 @@ end
 ---@param ctx lye.infer.Context
 ---@param idx integer?
 ---@param position integer which value is wanted, 1 for the first
+---@return lye.doc.Type
 function infer.valuesAt(ctx, idx, position)
 	if position <= 1 then return of(ctx, idx) end
 	local node = idx and ctx.parser.nodes[idx]
@@ -673,7 +679,19 @@ function infer.valuesAt(ctx, idx, position)
 	-- been typed after that.
 	if (node.callee == "pcall" or node.callee == "xpcall") and position > 1 and node.args
 		and node.args[1] then
+		-- `pcall(require, "module")` gives the module as its second result: the call the status
+		-- guards is the require itself, not a function value.
+		local targetNode = ctx.parser.nodes[node.args[1]]
+		if position == 2 and targetNode and targetNode.kind == "call" then
+			local targetName = writtenCallName(ctx.parser.nodes, targetNode)
+			if targetName == "require" then return of(ctx, node.args[1]) end
+		end
 		local called = of(ctx, node.args[1])
+		if called and called.variant == "union" then
+			for _, member in ipairs(called.types) do
+				if types.isFn(member) then called = member break end
+			end
+		end
 		if types.isFn(called) then
 			local given = called.values or { called.returns }
 			local value = given[position - 1]

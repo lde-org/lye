@@ -997,6 +997,7 @@ end
 
 --- Each name the root declares, resolved to the type it stands for.
 ---@param self lye.lsp.Index
+---@return table<string, boolean|lye.doc.Type>
 function Index:known()
 	return self.entry_ and self.entry_.known or {}
 end

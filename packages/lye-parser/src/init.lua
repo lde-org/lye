@@ -151,6 +151,7 @@ local newTable = require("table.new")
 ---@field resumeStats lye.parser.ResumeStats how much of the parse came from a previous one
 ---@field lastLiteral integer? the last literal node emitted
 ---@field rootIdx integer? the chunk node the parse produced
+---@field skipInlineType fun(self: lye.parser.Parser): string?, integer?, integer?
 ---@field parseIf fun(self: lye.parser.Parser): void
 ---@field parseDoBlock fun(self: lye.parser.Parser): void
 ---@field parseWhile fun(self: lye.parser.Parser): void
