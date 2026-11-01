@@ -106,7 +106,7 @@ function ffi.metatype(ct: ffi.ctype*|ffi.cdata*, metatable: table): ffi.ctype* e
 function ffi.gc<T: ffi.cdata*>(cdata: T, finalizer?: fun(obj: T)): T end
 
 ---@nodiscard
-function ffi.sizeof(value: any): integer? end
+function ffi.sizeof(value: any): integer end
 
 ---@nodiscard
 function ffi.alignof(ct: ffi.ct*): integer end

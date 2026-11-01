@@ -540,6 +540,18 @@ function types.indexedAccess(object, key)
 			return object.indexed.type
 		end
 		if object.variant == "array" then return object.type end
+		-- A pointer is read with a number: `p[0]` is the element, and `int[2][1]` written in C is
+		-- how a `int *` out-parameter is handed to a call. The element a `ffi.ptr<T>` points at is
+		-- the T; an opaque `ffi.cdata*` says nothing about what it holds.
+		if object.variant == "class" then
+			if object.name == "ffi.ptr" and object.args and object.args[1] then
+				return object.args[1]
+			end
+			if object.name == "ffi.cdata*" or object.name == "ffi.cb*"
+				or object.name == "ffi.cnum*" then
+				return types.mutable()
+			end
+		end
 	end
 	---@cast key lye.doc.Type
 	if key.variant == "string" then
@@ -908,7 +920,13 @@ end
 
 ---@type table<lye.doc.Type, table<lye.doc.Type, boolean>>?
 local compareCache
-function types.enableCompareCache() compareCache = setmetatable({}, { __mode = "k" }) end
+function types.enableCompareCache()
+	-- A class grows as methods and fields are declared, so a comparison cached before that growth
+	-- can be wrong afterwards. The cache was keyed by the type tables, which made a fit depend on
+	-- the order the analysis happened to ask: the same pointer pair compared as false once stayed
+	-- false for the rest of the run. Correctness wins over the repeated comparisons.
+	compareCache = nil
+end
 function types.disableCompareCache() compareCache = nil end
 
 ---@param type lye.doc.Type
@@ -999,7 +1017,7 @@ local C_DATA = {
 }
 
 ---@param candidate lye.doc.Type?
-local function isCData(candidate)
+function types.isCData(candidate)
 	if not candidate then return false end
 	if candidate.variant == "class" then
 		if candidate.name and C_DATA[candidate.name] then return true end
@@ -1009,6 +1027,8 @@ local function isCData(candidate)
 	end
 	return candidate.variant == "array"
 end
+
+local isCData = types.isCData
 
 --- The element a pointer points at, when the type is one the definitions spell.
 ---@param candidate lye.doc.Type?
@@ -1035,6 +1055,20 @@ end
 ---@param seen table<lye.doc.Type, table<lye.doc.Type, boolean>>
 function fits(type, constraint, depth, seen)
 	if type == constraint then return true end
+	-- Two class values with the same written name and arguments are the same type even when they
+	-- were built by separate resolves (a definition's pointer and a plugin's pointer, say). The
+	-- shape walk below is the general answer; this is the exact-spelling answer that must not
+	-- depend on which one was built first.
+	if type.variant == "class" and constraint.variant == "class" and type.name == constraint.name then
+		local left, right = type.args or {}, constraint.args or {}
+		if #left == #right then
+			local same = true
+			for index = 1, #left do
+				if types.describe(left[index]) ~= types.describe(right[index]) then same = false break end
+			end
+			if same then return true end
+		end
+	end
 	if depth >= MAX_COMPARE_DEPTH then return true end
 	-- Two recursive types — a class holding itself, an alias whose body names it — would otherwise
 	-- be asked the same pair again and again, branch by branch. A pair already being compared is
@@ -1062,6 +1096,10 @@ function fits(type, constraint, depth, seen)
 
 	if constraint.variant == "any" or constraint.variant == "unknown" then return true end
 	if type.variant == "unknown" or type.variant == "any" then return true end
+	-- A function that gives nothing back gives nil to a caller that takes a value. A callback
+	-- written `function() end` is what a handler ignoring its arguments is written as, and it
+	-- fits a signature whose result is optional.
+	if type.variant == "void" then return fits(types.NIL_TYPE, constraint, depth + 1, seen) end
 
 	-- A conditional with text branches is settled before the value-specific checks: `3` has to
 	-- see the number the recursive expression gives, not the expression it was written as.
@@ -1093,6 +1131,11 @@ function fits(type, constraint, depth, seen)
 	if type.variant == "array" and constraint.variant == "class" and constraint.name == "ffi.cdata*" then
 		return true
 	end
+	-- And the other way round: a `T[]` annotation stands where a header's `ffi.array<T>` is wanted.
+	if type.variant == "array" and constraint.variant == "class" and constraint.name == "ffi.array"
+		and constraint.args and constraint.args[1] then
+		return fits(type.type, constraint.args[1], depth + 1, seen)
+	end
 	local target = pointerTarget(constraint)
 	if target then
 		-- Assigning nil to a pointer is assigning NULL, and LuaJIT converts a Lua string to a
@@ -1113,10 +1156,46 @@ function fits(type, constraint, depth, seen)
 			and target.variant == "class" and target.name == "ffi.cdata*" then
 			return true
 		end
+		-- The engine hands a struct value where a pointer to that same struct is wanted by
+		-- taking its address: `int kevent(..., const struct kevent *changelist, ...)` is called
+		-- with the `struct kevent` itself.
+		if type.variant == "class" and isCData(type)
+			and target.variant == "class" and target.name == type.name then
+			return true
+		end
 		if type.variant == "class" and fits(type, target, depth + 1, seen) then return true end
 	end
 	if constraint.variant == "class" and constraint.name == "ffi.cdata*"
 		and (isCData(type) or type.variant == "string" or stringValueOf(type)) then
+		return true
+	end
+	-- A handle the definitions write as an opaque cdata class (`HWND`, `LPCSTR`) carries no fields
+	-- and is a pointer at runtime: it stands where any pointer or any other handle is wanted, and
+	-- moving one between the modules that name it its own way is what the API is built on.
+	if type.variant == "class" and isCData(type) and next(type.fields or {}) == nil
+		and constraint.variant == "class"
+		and (constraint.name == "ffi.ptr" or (isCData(constraint) and next(constraint.fields or {}) == nil)) then
+		return true
+	end
+	-- A C callback cdata is a function at runtime: `ffi.cast("WNDPROC", fn)` hands back the
+	-- pointer the engine calls, and a function that returns one is returning the callable type
+	-- its annotation names.
+	if constraint.variant == "fn" and type.variant == "class" then
+		if type.name == "ffi.cb*" then return true end
+		for _, parent in ipairs(type.parents or {}) do
+			if parent.variant == "class" and parent.name == "ffi.cb*" then return true end
+		end
+	end
+	-- The engine turns a Lua function into a C callback where a function pointer is wanted:
+	-- `ffi.C.luaJIT_profile_start(L, mode, function(data, L, n, vm) ... end, nil)` is the
+	-- documented way to write one. The literal is what the slot takes.
+	if constraint.variant == "class" and constraint.name == "ffi.cb*" and type.variant == "fn" then
+		return true
+	end
+	-- A lightuserdata is a `void *`, and the engine passes one wherever a pointer parameter is
+	-- wanted: a guest thread arrives as a lightuserdata and every raw lua_* call takes it.
+	if type.variant == "lightuserdata" and constraint.variant == "class"
+		and constraint.name == "ffi.ptr" then
 		return true
 	end
 	-- A pointer to a struct is read as the struct by the definitions, and an array of that struct
@@ -1341,7 +1420,13 @@ function fits(type, constraint, depth, seen)
 	end
 
 	if constraint.variant == "fn" then
-		if type.variant ~= "fn" then return false end
+		-- A C type constructor is a ctype whose `__call` is the function it stands for. A
+		-- `---@type fun(): Vec` annotation names that call shape, so the metamethod is what fits.
+		if type.variant ~= "fn" then
+			local call = types.metamethod(type, "__call")
+			if not call or not types.isFn(call) then return false end
+			type = call
+		end
 		-- A callable that takes anything accepts any callable, which is what a bare `function`
 		-- means and what keeps unannotated literals out of trouble.
 		if types.isAnyFn(constraint) then return true end
@@ -1365,6 +1450,11 @@ function fits(type, constraint, depth, seen)
 	end
 
 	if constraint.variant == "array" then
+		-- A cdef's `ffi.array<T>` and an annotation's `T[]` are the same list: the header wrote
+		-- the C array, the annotation writes the Lua one.
+		if type.variant == "class" and type.name == "ffi.array" and type.args and type.args[1] then
+			return fits(type.args[1], constraint.type, depth + 1, seen)
+		end
 		-- `local names = {}` declares a list before it holds anything, so a table fits.
 		if types.isUnknownShape(type) then return true end
 		-- A list literal is an object with an integer index, so whichever way the list was written,
@@ -2324,8 +2414,31 @@ end
 --- "string"` is one value — and splitting the sentence made a value named `or`.
 ---@param text string
 function types.splitValues(text)
-	local stop = typeEnd(text)
-	return splitTopLevel(stop and text:sub(1, stop) or text, 44)
+	-- Each value may be written with a name after its type -- `number width, number height` --
+	-- and the name is not part of the type. `typeEnd` continues over a comma because `A, B` is
+	-- one type list, so the commas are split first and each part's type read on its own.
+	local whole = text:match("^%s*") and text:gsub("^%s+", ""):gsub("%s+$", "") or text
+	if (whole:match("^fu?n%s*[%(<]") or whole:match("^function%s*%(")) and typeEnd(whole) == #whole then
+		return { whole }
+	end
+	---@type string[]
+	local values = {}
+	for _, part in ipairs(splitTopLevel(text, 44)) do
+		local trimmed = part:gsub("^%s+", ""):gsub("%s+$", "")
+		if trimmed ~= "" then
+			local stop = typeEnd(trimmed)
+			local value = stop and trimmed:sub(1, stop):gsub("^%s+", ""):gsub("%s+$", "") or trimmed
+			if value ~= "" then values[#values + 1] = value end
+			local rest = stop and trimmed:sub(stop + 1):gsub("^%s+", "") or ""
+			-- A name is one identifier and nothing more. Anything else after a type is prose,
+			-- and the values end where the prose starts.
+			if rest ~= "" and not rest:match("^[%a_][%w_]*$") and not rest:match("^#") then
+				break
+			end
+		end
+	end
+	if #values == 0 then return { text } end
+	return values
 end
 
 --- The names a signature declares for itself, and what each is limited to: `T, U: number`.
@@ -3719,4 +3832,5 @@ function types.strictMismatch(declared, actual, name)
 	return types.mismatch(declared, actual, name)
 end
 
+types.isCData = isCData
 return types

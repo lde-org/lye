@@ -17,7 +17,9 @@ local targetName = names.targetName
 --- `---@return A, B` names two.
 ---@param annotation lye.doc.Annotation?
 local function returnValues(annotation)
-	local text = annotation and annotation.type
+	if not annotation then return nil end
+	if annotation.values then return annotation.values end
+	local text = annotation.type
 	if not text then return nil end
 	if text:match("^%s*fu?n%s*[%(<]") or text:match("^%s*function%s*%(") then return { text } end
 	return types.splitValues(text)

@@ -31,7 +31,8 @@ local classes = {}
 ---@field defaults table<string, string>? the type a parameter takes when omitted
 ---@field name string
 ---@field params string[] type parameters, empty when the class is not generic
----@field parent string? the parent as written, `Foo<number>` included
+---@field parent string? the first parent as written, `Foo<number>` included
+---@field parents string[]? every parent as written; a class may extend more than one
 ---@field fields lye.doc.Field[]
 ---@field operators table<string, string>? the operators written under it, keyed by the LuaLS name
 
@@ -128,7 +129,7 @@ end
 ---@param text string
 ---@return string name
 ---@return string[] params
----@return string? parent
+---@return string[]? parents
 ---@return table<string, boolean> consts
 ---@return table<string, string> constraints
 ---@return table<string, string> defaults
@@ -152,7 +153,14 @@ local function readClass(text)
 	local name, args = splitGeneric((head:gsub("%s+$", "")))
 	local params, consts, constraints, defaults = {}, {}, {}, {}
 	if args then params, constraints, consts, defaults = classes.readParams(args) end
-	return (name:gsub("%s+$", "")), params, parent and (parent:gsub("^%s+", "")) or nil, consts, constraints, defaults
+	-- `A: B, C` extends both: the parents are the list a comma splits at top level, so a
+	-- `Foo<A, B>` parent keeps its own arguments together.
+	local parents
+	if parent then
+		parents = classes.splitList(parent)
+		if #parents == 0 then parents = nil end
+	end
+	return (name:gsub("%s+$", "")), params, parents, consts, constraints, defaults
 end
 
 --- The parameters and the body of an `---@alias`: `<T: number> T[]` is `T` and `T[]`.
@@ -288,8 +296,8 @@ function classes.fieldsOf(namespace, text)
 	---@param class lye.doc.Class
 	---@param args string[]
 	local function collect(class, args)
-		if class.parent then
-			local parentClass, parentArgs = classes.resolve(namespace, substitute(class.parent, class.params, args))
+		for _, written in ipairs(class.parents or (class.parent and { class.parent }) or {}) do
+			local parentClass, parentArgs = classes.resolve(namespace, substitute(written, class.params, args))
 			if parentClass then collect(parentClass, parentArgs) end
 		end
 		for _, field in ipairs(class.fields) do
@@ -433,9 +441,29 @@ function classes.resolver(namespace, elsewhere)
 				classType.fields[name] = bindings
 					and types.substitute(field, bindings) or field
 			end
-			if found.parent then
-				local parentType = resolve(substitute(found.parent, found.params, args))
-				if parentType then classType.parents[#classType.parents + 1] = parentType end
+			for _, written in ipairs(found.parents or (found.parent and { found.parent }) or {}) do
+				local parentText = substitute(written, found.params, args)
+				-- A parent may be a class name or a shape written where the class is: the
+				-- generic `App<Extra>: Extra` has an object literal for a parent, which the class
+				-- resolver has no name to find. Read it as a type where the name fails.
+				local parentType = resolve(parentText) or types.parse(parentText, resolve)
+				if parentType then
+					classType.parents[#classType.parents + 1] = parentType
+					-- A parent's fields are this class's too. A parent declared in another module may
+					-- not be in the reader's own scope when a field is read, so the inherited shape
+					-- is part of what this class says by itself.
+					-- A generic parent is often a shape rather than a named class: `App<Extra>: Extra`
+					-- says the instance is also whatever the caller passed, and that may be an
+					-- object literal holding the app's own state.
+					if parentType.variant == "class" or parentType.variant == "object" then
+						for field, held in pairs(parentType.fields or {}) do
+							if classType.fields[field] == nil then classType.fields[field] = held end
+						end
+						if parentType.indexed and not classType.indexed then
+							classType.indexed = parentType.indexed
+						end
+					end
+				end
 			end
 			return classType
 		end
@@ -629,10 +657,11 @@ function classes.read(file)
 
 	for _, annotation in ipairs(file.annotations) do
 		if annotation.tag == "class" then
-			local name, params, parent, consts, constraints, defaults = readClass(annotation.text or "")
+			local name, params, parents, consts, constraints, defaults = readClass(annotation.text or "")
 			current = {
-				name = name, params = params, parent = parent, fields = {}, consts = consts,
-				constraints = constraints, defaults = defaults,
+				name = name, params = params, parents = parents,
+				parent = parents and parents[1] or nil,
+				fields = {}, consts = consts, constraints = constraints, defaults = defaults,
 			}
 			namespace.classes[bareName(name)] = current
 			enumOwner = current

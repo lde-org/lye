@@ -177,6 +177,8 @@ function setmetatable<T: table>(table: T, metatable?: any): T end
 ---The conversion of strings can result in integers or floats, according to the lexical conventions of Lua (see §3.1). The string may have leading and trailing spaces and a sign.
 ---
 ---@overload fun(e: string, base: integer):integer
+---@overload fun(e: number): number
+---@overload fun(e: ffi.cnum*): number
 ---@nodiscard
 function tonumber(e: any): number? end
 

@@ -6,6 +6,7 @@
 ]]
 
 local lexer = require("lye-lexer")
+local types = require("lye-doc.type")
 
 local doc = {}
 
@@ -289,7 +290,16 @@ local function parse(comment, start, stop)
 	elseif tag == "return" then
 		-- `---@return v is T` names a parameter and the type it proves rather than a type of its
 		-- own: its words are the annotation, not prose, so it is kept whole.
-		annotation.type = rest:match("^[%w_]+%s+is%s+") and rest or cutType(rest)
+		if rest:match("^[%w_]+%s+is%s+") then
+			annotation.type = rest
+		else
+			-- `---@return A a, B b` names several values on one line, each with a name of its own.
+			-- They are split here, where the text is still whole, so the signature can give every
+			-- name after the first the type written for it.
+			local values = types.splitValues(rest)
+			annotation.values = #values > 1 and values or nil
+			annotation.type = values[1] or cutType(rest)
+		end
 		annotation.typeText = annotation.type
 	elseif tag == "type" or tag == "as" or tag == "overload" then
 		annotation.type = cutType(rest)

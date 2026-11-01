@@ -36,6 +36,7 @@ local cdef = {}
 
 ---@class lye.cdef.Namespace
 ---@field types table<string, lye.cdef.Type> every name a declaration introduced
+---@field tags table<string, lye.cdef.Type> struct, union and enum tags, keyed `struct Name`
 ---@field constants table<string, integer> the values an `enum` named
 ---@field order string[] the names in declaration order, which is the order to write them in
 ---@field problems lye.cdef.Problem[] what could not be read, so a reader can be told where
@@ -55,7 +56,8 @@ local CDATA_SCALAR = {
 --- or not a value of it is handed over as a cdata.
 local SCALAR_CLASS = {}
 for name, class in pairs({
-	["char"] = "ffi.char", ["short"] = "ffi.short", ["int"] = "ffi.int", ["long"] = "ffi.long",
+	["char"] = "ffi.char", ["signed char"] = "ffi.int8_t", ["unsigned char"] = "ffi.uint8_t",
+	["short"] = "ffi.short", ["int"] = "ffi.int", ["long"] = "ffi.long",
 	["long long"] = "ffi.longlong", ["unsigned"] = "ffi.unsigned", ["unsigned long"] = "ffi.ulong",
 	["unsigned long long"] = "ffi.ulonglong", ["float"] = "ffi.float", ["double"] = "ffi.double",
 	int8_t = "ffi.int8_t", int16_t = "ffi.int16_t", int32_t = "ffi.int32_t", int64_t = "ffi.int64_t",
@@ -103,6 +105,10 @@ local BUILTIN = {
 local QUALIFIER = {
 	const = true, volatile = true, restrict = true, register = true, extern = true,
 	inline = true, static = true, auto = true, _Noreturn = true,
+	-- Calling conventions Windows headers write on a function pointer. LuaJIT reads them and
+	-- they change nothing about the type an annotation has to name.
+	__stdcall = true, __cdecl = true, __fastcall = true, __thiscall = true, __vectorcall = true,
+	WINAPI = true, CALLBACK = true, APIENTRY = true,
 }
 
 --- The operators a constant expression and a declaration may write in two characters. Without
@@ -113,7 +119,7 @@ local DOUBLE = {
 }
 
 --- Words an attribute may be written with, dropped with their parenthesised payload.
-local ATTRIBUTE = { ["__attribute__"] = true, ["__declspec"] = true, ["__asm__"] = true }
+local ATTRIBUTE = { ["__attribute__"] = true, ["__declspec"] = true, ["__asm__"] = true, ["asm"] = true }
 
 ---@param text string
 ---@return lye.cdef.Token[] tokens
@@ -246,8 +252,22 @@ end
 ---@param type lye.cdef.Type
 ---@param self lye.cdef.Parser
 function Parser:define(name, type)
-	if not self.namespace.types[name] then self.namespace.order[#self.namespace.order + 1] = name end
 	type.name = type.name or name
+	if type.kind == "struct" or type.kind == "union" or type.kind == "enum" then
+		-- C keeps tags in a namespace of their own: `struct stat` and `int stat(...)` are two
+		-- different names, and a header declaring both must keep both. The tag is stored apart
+		-- so the function does not erase its fields.
+		self.namespace.tags[(type.tag or type.kind) .. " " .. name] = type
+		local held = self.namespace.types[name]
+		if held and (held.kind == "struct" or held.kind == "union" or held.kind == "enum") then
+			self.namespace.types[name] = type
+		elseif not held then
+			self.namespace.types[name] = type
+			self.namespace.order[#self.namespace.order + 1] = name
+		end
+		return
+	end
+	if not self.namespace.types[name] then self.namespace.order[#self.namespace.order + 1] = name end
 	self.namespace.types[name] = type
 end
 
@@ -395,15 +415,21 @@ end
 ---@param self lye.cdef.Parser
 function Parser:tagged(tag)
 	self.at += 1
+	-- A tag may carry attributes before its name or before the body: `typedef struct
+	-- __attribute__((packed)) { ... } Name` is how a header packs an anonymous struct.
+	self:declaratorAttributes()
 	---@type string?
 	local name
 	if self:peek().kind == "name" then name = self:name() end
+	self:declaratorAttributes()
 	if not self:accept("{") then
 		-- `struct Foo;` declares the name and nothing else, which is how a header hides its layout.
 		-- The same words also spell a reference — `int tcgetattr(int fd, struct termios *t)` — and
 		-- defining the forward over the definition dropped every field it had, so a struct mentioned
 		-- by a function that takes one lost its members and read as unknown wherever it was used.
-		local known = name and self.namespace.types[name]
+		local known = name and (self.namespace.tags[tag .. " " .. name]
+			or (self.namespace.types[name]
+				and ((self.namespace.types[name].kind == tag) and self.namespace.types[name] or nil)))
 		if known then return known end
 		local forward = { kind = tag, tag = tag, name = name, incomplete = true }
 		if name then self:define(name, forward) end
@@ -489,7 +515,7 @@ function Parser:declaratorChain()
 			pointers += 1
 		elseif QUALIFIER[word] or ATTRIBUTE[word] then
 			self.at += 1
-			if word == "__attribute__" and self:accept("(") then
+			if ATTRIBUTE[word] and self:accept("(") then
 				local depth = 1
 				while depth > 0 do
 					if self:accept("(") then depth += 1
@@ -603,6 +629,24 @@ function Parser:recover()
 	end
 end
 
+--- The attributes or asm labels that may follow a declarator: `int f(void) __attribute__((...));`
+--- and LuaJIT's `int stat(...) asm("stat$INODE64");`. They say nothing a reader needs and are
+--- dropped with their parenthesised payload.
+---@param self lye.cdef.Parser
+function Parser:declaratorAttributes()
+	while ATTRIBUTE[self:word()] do
+		self.at += 1
+		if self:accept("(") then
+			local depth = 1
+			while depth > 0 do
+				if self:accept("(") then depth += 1
+				elseif self:accept(")") then depth -= 1
+				else self.at += 1 end
+			end
+		end
+	end
+end
+
 --- One declaration: a typedef, a struct, a union, an enum, a function or a variable.
 ---@param self lye.cdef.Parser
 function Parser:declaration()
@@ -627,6 +671,7 @@ function Parser:declaration()
 		elseif self.failed then
 			break
 		end
+		self:declaratorAttributes()
 		if not self:accept(",") then break end
 	end
 	if self.failed then
@@ -639,8 +684,9 @@ end
 --- Parse the text of a `ffi.cdef` call. Nothing is raised: a declaration that cannot be read is
 --- reported in `problems` and the rest of the header is still read.
 ---@param text string
+---@param into lye.cdef.Namespace? a namespace an earlier `ffi.cdef` built, which this one adds to
 ---@return lye.cdef.Namespace
-function cdef.parse(text)
+function cdef.parse(text, into)
 	assert(type(text) == "string", "cdef.parse expects a string")
 	-- Comments are tokens so a reader can colour them, and not part of what is parsed: a
 	-- declaration is the same with or without the prose beside it.
@@ -648,9 +694,11 @@ function cdef.parse(text)
 	for _, token in ipairs(tokenize(text)) do
 		if token.kind ~= "comment" then tokens[#tokens + 1] = token end
 	end
+	local namespace = into or { types = {}, tags = {}, constants = {}, order = {}, problems = {}, text = "" }
+	namespace.text = (namespace.text or "") .. text .. "\n"
 	local self = setmetatable({
 		tokens = tokens, at = 1, problems = {},
-		namespace = { types = {}, constants = {}, order = {}, problems = {}, text = text },
+		namespace = namespace,
 	}, Parser)
 	self.namespace.problems = self.problems
 	while self:peek().kind ~= "eof" do
@@ -684,6 +732,10 @@ end
 ---@param type lye.cdef.Type
 ---@return boolean
 local function isCdata(namespace, type)
+	-- A struct is C data by what it is, before its name is looked up again: a tag may share its
+	-- spelling with a function (`struct kevent` and `kevent(...)`), and resolving the name would
+	-- find the function and lose the fields.
+	if type.kind == "struct" or type.kind == "union" then return true end
 	local resolved = (type.name and cdef.resolve(namespace, type.name)) or type
 	if resolved.kind == "struct" or resolved.kind == "union" then return true end
 	if resolved.kind == "pointer" then
@@ -764,6 +816,9 @@ function cdef.notation(namespace, type, where)
 		-- the Lua number a value read out of one would be.
 		local held = SCALAR_CLASS[type.target and type.target.name or ""]
 			or (type.target and cdef.notation(namespace, type.target, where))
+		-- A parameter written `T[]` is the pointer C passes: it may be NULL, and callers pass
+		-- arrays and pointers alike.
+		if where == "parameter" then return string.format("ffi.ptr<%s>", held) end
 		if type.length then return string.format("ffi.array<%s, %d>", held, type.length) end
 		return string.format("ffi.array<%s>", held)
 	end
@@ -781,6 +836,9 @@ function cdef.notation(namespace, type, where)
 		if pointed and (pointed.kind == "struct" or pointed.kind == "union") and pointed.name then
 			return string.format("ffi.ptr<%s>", pointed.name)
 		end
+		-- A pointer to void is an opaque handle, whether the void was written directly or
+		-- through a typedef such as `typedef void CURL`. It is not a pointer to nil.
+		if pointed and pointed.kind == "void" then return "ffi.ptr<ffi.cdata*>" end
 		-- A pointer to a function is the callback it is, and is not indexed at all.
 		if target and target.kind == "function" then return "ffi.cb*" end
 		-- Anything else is the pointer it is: a `char *` is not a Lua string, it is what
@@ -831,7 +889,7 @@ function cdef.annotations(namespace)
 	---@param type lye.cdef.Type
 	---@return table<string, string>
 	local function fieldsOf(type)
-		local resolved = cdef.resolve(namespace, type.name or "") or type
+		local resolved = (type.fields and type) or cdef.resolve(namespace, type.name or "") or type
 		local fields = {}
 		for _, field in ipairs(resolved.fields or {}) do
 			if not fields[field.name] then
@@ -845,7 +903,9 @@ function cdef.annotations(namespace)
 	end
 
 	for _, name in ipairs(namespace.order) do
-		local resolved = cdef.resolve(namespace, name) or namespace.types[name]
+		local tagType = namespace.tags["struct " .. name] or namespace.tags["union " .. name]
+			or namespace.tags["enum " .. name]
+		local resolved = tagType or cdef.resolve(namespace, name) or namespace.types[name]
 		if resolved.kind == "enum" then
 			-- An enum is a C number with names for some of its values, so it extends the class the
 			-- definitions give a C number: the arithmetic on it is documented there.
@@ -859,7 +919,7 @@ function cdef.annotations(namespace)
 			local lines = {
 				string.format("---@class %s: %s", name, isFunction and "ffi.cb*" or "ffi.cdata*"),
 			}
-			local fields = fieldsOf(namespace.types[name])
+			local fields = fieldsOf(tagType or namespace.types[name])
 			local sorted = {}
 			for field in pairs(fields) do sorted[#sorted + 1] = field end
 			table.sort(sorted)

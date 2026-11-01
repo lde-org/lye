@@ -46,7 +46,7 @@ function io.input(file?: string|file*): file* end
 ---end
 ---```
 ---
----@return fun():any
+---@return fun(): string?
 function io.lines(filename?: string, ...: readmode) end
 
 ---Opens a file, in the mode specified in the string `mode`.
@@ -126,7 +126,7 @@ function file:flush() end
 ---end
 ---```
 ---
----@return fun():any
+---@return fun(): string?
 function file:lines(...: readmode) end
 
 ---Reads the `file`, according to the given formats, which specify what to read.

@@ -321,7 +321,12 @@ local function scanNumber(self)
 	if not hasDigits then fail(self, start, i - 1, "malformed number") end
 	local stop = i - 1
 
-	local suffix = source:match("^[uUlLiI]+", i)
+	-- Only the suffixes LuaJIT reads: `LL`, `ULL` and the imaginary `i`. Matching every letter
+	-- aloud swallowed the start of an identifier written after a number (`1local` became `1l`
+	-- and `ocal`) and typed the number as cdata.
+	local suffix = source:match("^[uU][lL][lL]", i)
+		or source:match("^[lL][lL]", i)
+		or source:match("^[iI]", i)
 	if suffix then
 		-- A cdata literal's value is not a Lua number, so only the span is recorded.
 		i += #suffix

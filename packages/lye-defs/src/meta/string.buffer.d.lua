@@ -126,6 +126,7 @@ local buffer = {}
 ---
 --- The maximum size of a single buffer is the same as the maximum size of a Lua string, which is slightly below two gigabytes. For huge data sizes, neither strings nor buffers are the right data structure — use the FFI library to directly map memory or files up to the virtual memory limit of your OS.
 ---@class string.buffer : table
+---@field putcdata fun(self: string.buffer, cdata: ffi.ptr<ffi.cdata*>, len: integer): string.buffer
 local buf = {}
 
 --- A string, number, or any object obj with a __tostring metamethod to the buffer.
@@ -147,7 +148,6 @@ function buf:putf(format: string, ...: string.buffer.data): string.buffer end
 
 --- Appends the given len number of bytes from the memory pointed to by the FFI cdata object to the buffer. The object needs to be convertible to a (constant) pointer.
 ---
-function buf:putcdata(cdata: ffi.cdata*, len: integer): string.buffer end
 
 
 --- This method allows zero-copy consumption of a string or an FFI cdata object as a buffer. It stores a reference to the passed string str or the FFI cdata object in the buffer. Any buffer space originally allocated is freed. This is not an append operation, unlike the `buf:put*()` methods.

@@ -35,6 +35,7 @@ local isNeverNumeric, callLabel = annotations.isNeverNumeric, annotations.callLa
 ---@field lookupIn fun(scope: lye.analyzer.Scope, name: string, offset: integer): lye.analyzer.Variable?
 ---@field typeAt fun(self: lye.analyzer.Result, variable: lye.analyzer.Variable, offset: integer): lye.doc.Type
 ---@field declaredField fun(held: lye.doc.Type, field: string): lye.doc.Type?
+---@field inheritedField fun(held: lye.doc.Type, field: string): lye.doc.Type?
 ---@field assignments { name: string, at: integer, valueIdx: integer, valuePosition: integer? }[]
 ---@field reusedSpan fun(from: integer, to: integer): boolean?
 ---@field nodes lye.parser.Node[]? the nodes outside reused items, when most of the document is reused
@@ -264,7 +265,11 @@ local function declaredMismatches(ctx)
 		-- A parameter has no initializer to compare with: the type it declares is its value, and
 		-- the placeholder beside it is the typing pass's, not a written one.
 		local declared = variable.declared
-		if declared ~= nil and variable.qualifier ~= "param" and not variable.name:match("^_")
+		-- A field is not a local with an initializer: its synthetic variable carries the method
+		-- body, and the field's own signature is checked where the field is written. Comparing
+		-- that body as a stored value reported every method whose body returns nothing.
+		if declared ~= nil and variable.qualifier ~= "param" and variable.qualifier ~= "field"
+			and not variable.name:match("^_")
 			and not reused(ctx, variable.declaration.start, variable.declaration.stop or variable.declaration.start) then
 			---@cast declared lye.doc.Type
 			declared = bodyTypeOf(declared, ctx.resolve)
@@ -286,9 +291,16 @@ local function declaredMismatches(ctx)
 				end
 				return held
 			end
+			-- `---@class Foo` above `local Foo = ...` declares the class and its prototype table at
+			-- once: the table names the class, it is not an instance of it. Its fields are the
+			-- ones LuaLS and every Lua class writes (`__index`, constructor markers), and the
+			-- instance fields are filled by `setmetatable` on a value this name never holds.
+			local className = declared.variant == "class" and declared.name
+				and declared.name:match("([%w_]+)$")
+			local declaresOwnClass = className == variable.name
 			-- A declaration with no value writes no initializer: the annotation is the value, and
 			-- the placeholder beside it is the typing pass's, not a promise about a written one.
-			if declaration.valueIdx ~= nil then
+			if declaration.valueIdx ~= nil and not declaresOwnClass then
 				local message = types.strictMismatch(declared, withoutReceiver(variable.initializer), variable.name)
 				if message then
 					diagnostic.add(self, message, declaration.start, declaration.stop, nil, "type")
@@ -379,6 +391,7 @@ local function fieldWrites(ctx)
 				and not buildsItsOwnClass(held, base) and destination ~= nil then
 				---@cast destination lye.doc.Type
 				local wanted = declaredField(destination, field)
+					or (ctx.inheritedField and ctx.inheritedField(destination, field))
 				if not wanted then
 					diagnostic.add(self, string.format("`%s` is not a field of %s", field,
 							destination.name or types.display(destination)), target.start, target.stop, nil, "missing-field")
@@ -402,8 +415,11 @@ local function fieldWrites(ctx)
 								params[#params + 1] = (variable and variable.declared) or types.ANY_TYPE
 							end
 						end
-						actual = types.fn(params, infer.at(inferCtx, value.body) or types.VOID,
-							value.isVariadic == true)
+						-- The body's own value is only the fallback: a function with `return`
+						-- statements hands back what those return, which `inferredReturnOf` knows
+						-- and the last statement of the block does not.
+						local returned = ctx.inferredReturnOf(value.index) or types.VOID
+						actual = types.fn(params, returned, value.isVariadic == true)
 					end
 					local expected = wanted
 					-- The field's signature names the receiver and the value written for it does not,
@@ -626,7 +642,10 @@ local function indexedReads(ctx)
 			local parent = node.parent and parsed.nodes[node.parent]
 			local isWrite = parent and parent.kind == "assignment" and parent.target == node.index
 			local answers = base and types.metamethod(base, isWrite and "__newindex" or "__index")
+			-- C memory is read with a number: `int[2][1]` and `p[0]` are what the pointers and
+			-- arrays a cdef declares are for, and the engine allows the index.
 			if base and base.variant == "class" and not base.indexed and not answers
+				and not types.isCData(base)
 				and key and key.variant == "number" then
 				local at = parsed.nodes[node.key]
 				diagnostic.add(self, string.format("%s cannot be indexed by a number", types.describe(base)),

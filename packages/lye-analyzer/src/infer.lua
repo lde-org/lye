@@ -7,6 +7,11 @@
 local types = require("lye-doc.type")
 local pattern = require("lye-doc.pattern")
 
+-- A number literal written with a `ULL`/`LL` suffix is cdata at runtime, not a Lua number:
+-- `0xffffffffffffffffULL` has no Lua number that holds it. One shared type is enough, and it
+-- is a C number — arithmetic on it stays cdata — that also stands where any cdata is wanted.
+local CDATA_LITERAL = types.classType("ffi.cnum*", {}, {}, { types.classType("ffi.cdata*") })
+
 local infer = {}
 
 ---@class lye.infer.Context
@@ -14,6 +19,7 @@ local infer = {}
 ---@field typeOfName fun(name: string, offset: integer): lye.doc.Type
 ---@field typeOfField fun(base: lye.doc.Type, baseName: string?, field: string, offset: integer): lye.doc.Type?
 ---@field returns table<string, lye.doc.Type>
+---@field returnsSpread table<string, boolean>? names whose definition returns `T ...`
 ---@field cache table<integer, lye.doc.Type> what each node was typed as, by arena index
 ---@field mutables integer[] the nodes whose cached type is a placeholder still, in cache order
 ---@field fnTypes table<integer, lye.doc.Type> one callable per function node, filled from its body
@@ -22,6 +28,7 @@ local infer = {}
 ---@field building table<integer, boolean> the nodes being typed now, so a self-reach ends
 ---@field modules fun(name: string): lye.doc.Type? what `require("name")` is, when the caller can say
 ---@field ctypes fun(node: lye.parser.Node): lye.doc.Type? what a call naming a C type is worth
+---@field overloadResult fun(node: lye.parser.Node, position: integer): lye.doc.Type? the matching overload's value, for a definition
 ---@field varargAt table<integer, lye.doc.Type> the `...` type of each literal `...`, by node index
 ---@field narrowed table<integer, boolean>? the reads narrowed while a condition was read
 ---@field casts table<integer, lye.doc.Type|{ exclude: lye.doc.Type }>? an inline cast written beside an expression, by node index
@@ -291,7 +298,15 @@ local function of(ctx, idx)
 	if kind == "number" then
 		-- A literal is the number it spells: `local n = 2149` is 2149, which fits `number`
 		-- wherever a number is wanted and reads back as what was written.
-		result = type(node.value) == "number" and types.numberValue(node.value, node.text) or types.NUMBER
+		if type(node.value) == "number" then
+			result = types.numberValue(node.value, node.text)
+		elseif node.value == nil then
+			-- The lexer records no value for a suffixed literal precisely because it is not a
+			-- Lua number; it is the cdata type the suffix makes.
+			result = CDATA_LITERAL
+		else
+			result = types.NUMBER
+		end
 	elseif kind == "string" then
 		result = types.STRING
 	elseif kind == "literal" then
@@ -408,6 +423,25 @@ local function of(ctx, idx)
 				return cache(ctx, idx, held)
 			end
 		end
+		if ctx.overloadResult then
+			local held = ctx.overloadResult(node, 1)
+			if held then
+				ctx.callTypes[node.index] = held
+				return cache(ctx, idx, held)
+			end
+		end
+		-- `assert(x)` gives x back, and the call that raised when it was nil has proven it is
+		-- there: a value read from a function that may return nothing arrives as its type.
+		if node.callee == "assert" and node.args and node.args[1] then
+			-- The first value of the argument, not its tuple: `assert(f())` hands back what `f`
+			-- returned first, and the rest of `f`'s values were only arguments to `assert`.
+			local held = infer.valuesAt(ctx, node.args[1], 1)
+			local narrowed = held and types.excludeType(held, types.NIL_TYPE)
+			if narrowed then
+				ctx.callTypes[node.index] = narrowed
+				return cache(ctx, idx, narrowed)
+			end
+		end
 		if node.callee == "require" and ctx.modules then
 			local argument = node.args and node.args[1] and ctx.parser.nodes[node.args[1]]
 			if argument and argument.kind == "string" and type(argument.value) == "string" then
@@ -425,7 +459,7 @@ local function of(ctx, idx)
 		-- reading the call as an optional `number` made the next line a mistake the `assert` had
 		-- already ruled out.
 		if node.callee == "assert" and node.args and node.args[1] then
-			local held = of(ctx, node.args[1])
+			local held = infer.valuesAt(ctx, node.args[1], 1)
 			result = types.narrowTruthiness(held, true) or held
 			return cache(ctx, idx, result)
 		end
@@ -591,6 +625,20 @@ function infer.at(ctx, idx)
 	return of(ctx, idx)
 end
 
+--- The dotted name a node is written with, `string.byte` for a field of a prefix. The
+--- definitions are keyed by the name a call spells, and a `.` call has no `callee` of its own.
+---@param nodes lye.parser.Node[]
+---@param node lye.parser.Node
+---@return string?
+local function writtenCallName(nodes, node)
+	if node.callee then return node.callee end
+	local target = node.target and nodes[node.target]
+	if not target then return nil end
+	local base = writtenCallName(nodes, target)
+	if node.field then return base and (base .. "." .. node.field) or nil end
+	return base
+end
+
 --- The values an expression gives where several are wanted. Lua asks this of the last expression
 --- of an assignment and of every expression of a `return`: `local a, b = f()` takes both from `f`,
 --- and a literal gives its one value and nothing after it. A call whose values are not known answers
@@ -603,10 +651,23 @@ function infer.valuesAt(ctx, idx, position)
 	if position <= 1 then return of(ctx, idx) end
 	local node = idx and ctx.parser.nodes[idx]
 	if not node or node.kind ~= "call" then return types.NIL_TYPE end
+	-- The name a definition is reached by: a plain call writes it as its callee, a dotted one
+	-- (`string.byte`) as the field of the prefix it targets.
+	local called = writtenCallName(ctx.parser.nodes, node)
+	-- `assert(f())` is `f()` with its nil removed: the engine hands every value through, so the
+	-- second and later results are the first argument's own second and later results.
+	if called == "assert" and node.args and #node.args == 1 then
+		return infer.valuesAt(ctx, node.args[1], position)
+	end
 	-- What this very call gives back, when the analyzer worked it out from something the signature
 	-- cannot know — a pattern written at the call site, most of all.
 	local callValues = ctx.callValues[node.index]
 	if callValues then return callValues[position] or types.NIL_TYPE end
+	-- A definition written `---@return T ...` gives every value after the first that T, so
+	-- `local a, b, c = string.byte(data, 1, 3)` types all three as the integer they are.
+	if called and ctx.returnsSpread and ctx.returnsSpread[called] then
+		return ctx.returns[called] or types.mutable()
+	end
 	-- `pcall` and `xpcall` give the status and then what the function gave. The callable's own
 	-- result is read here rather than only where the call was typed: the literal's body may have
 	-- been typed after that.
@@ -617,7 +678,13 @@ function infer.valuesAt(ctx, idx, position)
 			local given = called.values or { called.returns }
 			local value = given[position - 1]
 			if not value and called.isSpread then value = called.returns end
-			if value then return value end
+			if value then
+				-- A function that gives nothing back still gives the error object when the call
+				-- fails, so the value after the status is never `void`: it is the error, which
+				-- can be anything the program raised.
+				if value.variant == types.VOID.variant then return types.ANY_TYPE end
+				return value
+			end
 		end
 	end
 	-- A pattern written at the call is read here rather than left to a later pass: a name is typed
@@ -646,6 +713,12 @@ function infer.valuesAt(ctx, idx, position)
 			if value then
 				local bindings = overloadBindings(ctx, node, overload, of)
 				if next(bindings) then value = types.substitute(value, bindings) end
+				-- The success shape of `pcall` is the called function's result; one that returns
+				-- nothing leaves only the error object, so the slot is not `void`.
+				if value.variant == types.VOID.variant
+					and (node.callee == "pcall" or node.callee == "xpcall") then
+					return types.ANY_TYPE
+				end
 				return value
 			end
 		end

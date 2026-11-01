@@ -357,19 +357,41 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 			-- The name may be one another file's cdef declared: the workspace's types are the
 			-- same types here, so `ffi.new("VkCommandBuffer[1]")` in a module with no cdef of its
 			-- own reads what the package's header declared.
-			local global = resolve(written)
+			-- A cdef may be written with its tag: `ffi.new("struct kevent[16]")` names the
+			-- same class an annotation calls `kevent`.
+			local function untagged(name)
+				return (name:gsub("^(struct|union|enum)%s+", ""))
+			end
+			local global = resolve(written) or resolve(untagged(written))
 			if global then return global end
 			local pointer = written:match("^(.-)%s*%*$")
-			if pointer and pointer ~= "" and resolve(pointer) then
-				return types.parse("ffi.ptr<" .. pointer .. ">", resolve)
+			if pointer and pointer ~= "" then
+				pointer = untagged(pointer)
+				if resolve(pointer) then
+					return types.parse("ffi.ptr<" .. pointer .. ">", resolve)
+				end
 			end
 			local base, dimensions = written:match("^(.-)%s*(%[[^%]]*%])$")
-			if base and base ~= "" and resolve(base) then
-				local length = dimensions:match("^%[(%d+)%]$")
-				local text = "ffi.array<" .. base .. (length and (", " .. length) or "") .. ">"
-				return types.parse(text, resolve)
+			if base and base ~= "" then
+				base = untagged(base)
+				if resolve(base) then
+					local length = dimensions:match("^%[(%d+)%]$")
+					local text = "ffi.array<" .. base .. (length and (", " .. length) or "") .. ">"
+					return types.parse(text, resolve)
+				end
 			end
 			return nil
+		end
+		-- A local cdef may only have seen a tag's forward declaration while another file has its
+		-- body. An array or pointer of that tag is the workspace's complete class, not the local
+		-- incomplete one.
+		if found.kind == "array" then
+			local target = found.target
+			local targetName = target and cdef.className(target)
+			local namedTarget = targetName and resolve(targetName)
+			if namedTarget and target and (target.kind == "struct" or target.kind == "union" or target.kind == "enum") then
+				return types.array(namedTarget)
+			end
 		end
 		-- A struct, a union, an enum or a typedef of one is a class this file declares, and looking the
 		-- name up lets the document's own class win over the generated one. Everything else is mapped.
@@ -520,12 +542,16 @@ end
 ---@return { message: string, severity: integer, start: integer, stop: integer }[]
 local function collect(source, parsed_, callName)
 	local cdefs, files, diagnostics = {}, {}, {}
+	-- Every `ffi.cdef` call adds to the engine's one namespace. Parse each block for its own
+	-- annotations and problems, then again into an accumulating namespace so a later block can
+	-- name a typedef, struct or function the first one declared.
+	local merged
 	for _, node in ipairs(parsed_.byKind.call or {}) do
 		local argument = cdefArgument(parsed_, node, callName)
 		if argument then
 			local written = cdefText(source, argument)
 			local held = blockOf(written)
-			cdefs[#cdefs + 1] = held.declared
+			merged = cdef.parse(written, merged)
 			files[#files + 1] = held.annotations
 			-- A declaration that could not be read is reported inside the string, so the offsets
 			-- the parser gives have to be mapped before they mean anything. What *was* readable
@@ -541,6 +567,7 @@ local function collect(source, parsed_, callName)
 			end
 		end
 	end
+	if merged then cdefs[1] = merged end
 	return cdefs, files, diagnostics
 end
 

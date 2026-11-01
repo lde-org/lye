@@ -638,11 +638,74 @@ end
 	-- A value after the first from a signature that names several. A local's callable already
 	-- carries them, but a definition file's function is reached by name and its signature values
 	-- are the only record of the second and later results.
+	--- The overload a definition's signature writes that this exact call matches, when the shape
+	--- names a concrete result. Definitions spell alternatives with `---@overload`, and the result
+	--- of `tonumber(cdata)` is the number its matching shape promises, not the primary `number?`.
+	---@param signature lye.analyzer.Signature
+	---@param node lye.parser.Node
+	---@param position integer
+	---@return lye.doc.Type?
+	local function overloadValue(signature, node, position)
+		local writtenList = signature.overloads
+		if not writtenList or #writtenList == 0 then return nil end
+		---@type lye.doc.Type?
+		local best
+		local bestScore = -1
+		local args = node.args or {}
+		for _, text in ipairs(writtenList) do
+			local shape = parseType(text)
+			if shape and shape.variant == "fn" and not (shape.generics and next(shape.generics))
+				and shape.returns and shape.returns.variant ~= "any"
+				and shape.returns.variant ~= "unknown" and shape.returns.variant ~= "void" then
+				local fits = shape.isVariadic or #args == #shape.params
+				local score = 0
+				if fits then
+					for index, argIdx in ipairs(args) do
+						local wanted = shape.params[index]
+						if not wanted and shape.isVariadic then wanted = shape.variadic end
+						if wanted then
+							local actual = infer.at(inferCtx, argIdx)
+							if actual and not types.satisfies(actual, wanted) then
+								fits = false
+								break
+							end
+							score += 1
+						end
+					end
+				end
+				if fits and score > bestScore then best, bestScore = shape, score end
+			end
+		end
+		if not best then return nil end
+		local value = best.values and best.values[position]
+		if not value and position == 1 then value = best.returns end
+		if not value and best.isSpread then
+			value = best.values and best.values[#best.values] or best.returns
+		end
+		return value
+	end
+
+	-- What a definition that spells alternatives promises this call, when its primary result is
+	-- only optional: `tonumber(cdata)` is the number its `fun(e: ffi.cnum*)` shape names. Inference
+	-- asks this while reading the call, so a return or an argument sees the settled type.
+	inferCtx.overloadResult = function(node, position)
+		local signature = signatureOfCall(node)
+		local primary = signature and signature.returns and signature.returns.type
+		local optional = primary and (primary:find("%?%s*$") ~= nil
+			or primary:find("nil%s*|") ~= nil or primary:find("|%s*nil") ~= nil)
+		if not optional then return nil end
+		return overloadValue(signature, node, position)
+	end
+
 	---@param signature lye.analyzer.Signature
 	---@param node lye.parser.Node
 	---@param position integer
 	local function signatureValue(signature, node, position)
 		local written = signature.values and signature.values[position]
+		if written and written:find("%?%s*$") then
+			local chosen = overloadValue(signature, node, position)
+			if chosen then return chosen end
+		end
 		if not written then return nil end
 		local generics = signature.generics
 		if not generics or not next(generics) then return parseType(written) end
@@ -671,12 +734,12 @@ end
 		return fallbackNow and fallbackNow(text) or nil
 	end
 	-- A loop declares its own control variables: a numeric `for` counts, and a generic `for` takes its
-	-- first name from what the iterator yields. The pass runs twice, so the slot is claimed either way.
-	-- The table a generic `for` walks may not be typed yet on the first pass; the claim is made again
-	-- after refinement, when the field it reads has settled.
+	-- first name from what the iterator yields. The table a generic `for` walks may not be typed on
+	-- the first pass, so a name that is still unknown is read again in the same position after
+	-- refinement, when the field it reads has settled.
 	local function claimLoopVariables()
 		---@type table<integer, integer>
-		local claimed = {}
+		local ordinals = {}
 		for _, variable in ipairs(self.variables) do
 			---@type lye.parser.Node?
 			local loopNode
@@ -684,39 +747,71 @@ end
 				and not (reused and reused(variable.start, variable.stop or variable.start)) then
 				loopNode = loopOf(variable)
 			end
-			-- Two names are typed: the first takes the iterator's value, the second what the table it walks
-			-- holds. A third is left alone, because Lua's `for` makes no promise about it.
+			-- Every name a generic `for` declares is typed: an iterator function names what each
+			-- call gives in turn, and a table walked by `pairs`/`ipairs` says its key and value.
 			if loopNode ~= nil then
 				-- Read once here: a nil check does not narrow a name again in a later `elseif`.
 				local owner = loopNode
-				local claims = claimed[owner.index] or 0
+				-- The position is the name's place among the loop's own names, so a name that is
+				-- still unresolved this round is read again in the same place next round rather
+				-- than letting the next name take its slot.
+				local position = (ordinals[owner.index] or 0) + 1
+				ordinals[owner.index] = position
 				local isNumeric = owner.isNumeric
 				local children = owner.children
-				if claims < 2 then
-					local position = claims + 1
-					claimed[owner.index] = position
-					local current = variable.declared
-					if not current or current.variant == "unknown" or types.isMutable(current) then
-						---@type lye.doc.Type?
-						local wanted
-						if isNumeric then
-							wanted = types.NUMBER
-						elseif position == 1 then
-							-- `pairs(t)` names its key as a generic the call cannot bind; the table
-							-- it walks knows. Everything else takes the iterator's own first result,
-							-- which is what `ipairs` states the index is.
-							wanted = typing.iteratedKeyOf(ctx, owner)
-							if wanted == nil and children ~= nil then
-								local yielded = infer.at(inferCtx, children[1])
-								if types.isFn(yielded) then wanted = yielded.returns end
+				-- What the iterator hands back at this position. A function written with several
+				-- returns carries them as values; the first is also its plain return.
+				---@param yielded lye.doc.Type
+				---@return lye.doc.Type?
+				local function valueAt(yielded)
+					local function fromFn(fn)
+						local value = fn.values and fn.values[position]
+						if value == nil and position == 1 then value = fn.returns end
+						return value
+					end
+					if types.isFn(yielded) then return fromFn(yielded) end
+					if yielded.variant == "union" then
+						for _, member in ipairs(yielded.types or {}) do
+							if types.isFn(member) then
+								local value = fromFn(member)
+								if value then return value end
 							end
-						else
-							wanted = typing.iteratedValueOf(ctx, owner)
 						end
-						if wanted ~= nil and wanted.variant ~= "unknown"
-							and not types.isMutable(wanted) then
-							variable.declared = wanted
+					end
+					return nil
+				end
+				local current = variable.declared
+				if not current or current.variant == "unknown" or types.isMutable(current) then
+					---@type lye.doc.Type?
+					local wanted
+					if isNumeric then
+						if position == 1 then wanted = types.NUMBER end
+					elseif children ~= nil then
+						local yielded = infer.at(inferCtx, children[1])
+						-- A value nothing is known about yet is not an iterator that may be
+						-- optional: leave the name unclaimed and read the call again once the
+						-- typing round has typed it.
+						if yielded == types.nonNilUnknown() or yielded == types.truthyUnknown() then
+							yielded = nil
 						end
+						if yielded ~= nil then
+							-- `pairs(t)` names its key as a generic the call cannot bind; the table
+							-- it walks knows. Everything else takes the iterator's own result.
+							if position == 1 then wanted = typing.iteratedKeyOf(ctx, owner) end
+							if wanted == nil and position == 2 then
+								wanted = typing.iteratedValueOf(ctx, owner)
+							end
+							if wanted == nil then wanted = valueAt(yielded) end
+							-- A generic `for` stops when the first value is nil, so the body only
+							-- runs with the first name present: `for x in iterator()` is not `x?`.
+							if position == 1 and wanted then
+								wanted = types.excludeType(wanted, types.NIL_TYPE) or wanted
+							end
+						end
+					end
+					if wanted ~= nil and wanted.variant ~= "unknown"
+						and not types.isMutable(wanted) then
+						variable.declared = wanted
 					end
 				end
 			end
@@ -773,16 +868,28 @@ end
 					or kindToType(declaration.initializer)
 				-- A spread gives every value after the ones it names, so the second name of
 				-- `local a, b = unpack(list)` is what the call was bound to as much as the first.
-				if position > 1 and declaration.valueIdx then
+				if declaration.valueIdx then
 					local node = parsed.nodes[declaration.valueIdx]
 					local signature = node and node.kind == "call" and signatureOfCall(node)
-					local returned = signature and signature.returns and signature.returns.type
-					if returned and returned:sub(-3) == "..." then
-						variable.initializer = inferCtx.callTypes[node.index] or variable.initializer
+					if position > 1 then
+						local returned = signature and signature.returns and signature.returns.type
+						if returned and returned:sub(-3) == "..." then
+							variable.initializer = inferCtx.callTypes[node.index] or variable.initializer
+						end
+						if signature and (not variable.initializer or types.isMutable(variable.initializer)
+							or variable.initializer.variant == "unknown") then
+							variable.initializer = signatureValue(signature, node, position) or variable.initializer
+						end
 					end
-					if signature and (not variable.initializer or types.isMutable(variable.initializer)
-						or variable.initializer.variant == "unknown") then
-						variable.initializer = signatureValue(signature, node, position) or variable.initializer
+					-- A definition can spell alternatives; when the primary signature can only say
+					-- `number?`, the matching shape says the argument is handled: `tonumber(cdata)`
+					-- is a number. A non-optional primary is the answer already.
+					local primary = signature and signature.returns and signature.returns.type
+					local optional = primary and (primary:find("%?%s*$") ~= nil
+						or primary:find("nil%s*|") ~= nil or primary:find("|%s*nil") ~= nil)
+					if optional then
+						local chosen = overloadValue(signature, node, position)
+						if chosen then variable.initializer = chosen end
 					end
 				end
 				-- A declared type says what the value is, and the initializer may say what Lua
@@ -1125,12 +1232,30 @@ end
 				local variable = self.byStart[param.start]
 				local wanted = expected.params[index]
 				if not wanted and expected.isVariadic then wanted = expected.variadic end
-				if variable and wanted and not variable.declaredExplicit then
-					if variable.declared ~= wanted then changed = true end
-					variable.declared = wanted
-					variable.pending = true
+				---@type lye.doc.Type?
+				local declared = variable and variable.declared
+				if variable and not variable.declaredExplicit then
+					-- `function` and `fun(x: any)` name no type for the parameter. Binding the
+					-- literal to a settled `any` would report every use in its body, but the
+					-- writer declared nothing; keep it a mutable unknown like an unannotated
+					-- parameter.
+					if wanted and wanted.variant == "any" then wanted = types.mutable() end
+					if wanted then
+						declared = wanted
+					elseif declared == nil or declared.variant == "any" or types.isMutable(declared) then
+						declared = types.mutable()
+					end
+					if variable.declared ~= declared then
+						changed = true
+						variable.declared = declared
+						variable.pending = true
+						-- A read of the parameter was typed before this signature arrived; the
+						-- cache holds the `any` it had then, and the body has to see the new type.
+						local reads = ctx.nodeReads and ctx.nodeReads[variable.name]
+						for _, read in ipairs(reads or {}) do inferCtx.cache[read] = nil end
+					end
 				end
-				params[index] = (variable and variable.declared) or types.ANY_TYPE
+				params[index] = declared or types.mutable()
 			end
 			fnType.params = params
 			fnType.variadic = expected.variadic
@@ -1170,6 +1295,17 @@ end
 						hasBody = true
 						break
 					end
+					if argument and argument.kind == "table" then
+						local fields = parsed.tableFieldValues and parsed.tableFieldValues[argIdx]
+						for _, fieldIdx in pairs(fields or {}) do
+							local field = parsed.nodes[fieldIdx]
+							if field and field.kind == "function" then
+								hasBody = true
+								break
+							end
+						end
+						if hasBody then break end
+					end
 				end
 				if not hasBody then goto continue_call end
 				---@type lye.doc.Type?
@@ -1202,7 +1338,7 @@ end
 					end
 					for index, argIdx in ipairs(node.args or {}) do
 						local argument = parsed.nodes[argIdx]
-						if argument and argument.kind == "function" then
+						if argument and (argument.kind == "function" or argument.kind == "table") then
 							local wanted = params[index + shift]
 							if not wanted and calleeType.isVariadic and index + shift > #params then
 								wanted = calleeType.variadic
@@ -1210,8 +1346,26 @@ end
 							if wanted and next(bindings) then
 								wanted = types.substitute(wanted, bindings)
 							end
-							local expected = callableOf(wanted)
-							if expected then apply(argument, expected) end
+							if argument.kind == "function" then
+								local expected = callableOf(wanted)
+								if expected then apply(argument, expected) end
+							elseif wanted then
+								-- A table written for an options shape gives its function fields
+								-- the signatures the shape names: `new(view, { onMessage = function(m) … end })`
+								-- types `m` from `Options.onMessage`.
+								local fields = parsed.tableFieldValues and parsed.tableFieldValues[argIdx]
+								---@cast fields table<string, integer>?
+								for field, fieldIdx in pairs(fields or {}) do
+									---@cast field string
+									local functionNode = parsed.nodes[fieldIdx]
+									local fieldType = types.fieldOf(wanted, field)
+									local callable = fieldType and callableOf(fieldType)
+									if functionNode and functionNode.kind == "function" and callable then
+										---@cast callable lye.doc.Type
+										apply(functionNode, callable)
+									end
+								end
+							end
 						end
 					end
 				end

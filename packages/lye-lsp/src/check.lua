@@ -528,6 +528,20 @@ end
 ---@param owner string the package root
 ---@param name string
 ---@return string?
+--- Whether a `require` names a C library lde installed beside the Lua modules: a `.so`, `.dll`
+--- or `.dylib` under the package's `target/`. Those have no source to read, but the module exists.
+---@param owner string?
+---@param name string
+---@return boolean
+local function binaryModulePath(owner, name)
+	local base = absolute(owner)
+	local tail = name:gsub("%.", "/")
+	for _, suffix in ipairs({ ".so", ".dll", ".dylib" }) do
+		if fs.exists(base .. "/target/" .. tail .. suffix) then return true end
+	end
+	return false
+end
+
 local function modulePath(owner, name)
 	local base = absolute(owner)
 	local tail = (name:gsub("%.", "/"))
@@ -545,6 +559,11 @@ local function modulePath(owner, name)
 	for _, candidate in ipairs({
 		base .. "/target/" .. tail .. ".lua",
 		base .. "/target/" .. tail .. "/init.lua",
+		-- A package's own tests are Lua modules too, and `require("tests.lib.client")`
+		-- names the file as it sits in the checkout — the run copies them under target/
+		-- only when it runs the tests, which a check does not do.
+		base .. "/" .. tail .. ".lua",
+		base .. "/" .. tail .. "/init.lua",
 	}) do
 		if fs.exists(candidate) then return candidate end
 	end
@@ -918,7 +937,8 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 		---@param message string
 		local function reportPlugin(message) io.stderr:write("check: " .. message .. "\n") end
 		names = analyzer.analyze(written, PRELUDE, elsewhere, moduleFor, nil, docsByText[key] --[[@as lye.doc.File? ]],
-			nil, isDefinitionPath(path), pluginsFor(path), reportPlugin)
+			nil, isDefinitionPath(path), pluginsFor(path), reportPlugin,
+			{ uri = path, root = owner })
 		analysesByText[key] = names
 		moduleOnlyByText[key] = nil
 		-- The full analysis says what `require` of this file gives back as well, and it is the
@@ -940,6 +960,7 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 			local argument = names.parser.nodes[node.args[1]]
 			if argument and argument.kind == "string" and type(argument.value) == "string"
 				and not modulePath(owner or env.cwd(), argument.value)
+				and not binaryModulePath(owner or env.cwd(), argument.value)
 				and not builtinModule(argument.value) then
 				local writtenName = argument.value
 				local suggestion

@@ -513,14 +513,16 @@ local function declaredTypeFor(parsed, file, declaration, resolve)
 
 	-- Searching back skips the trailing annotations of earlier lines, which describe those lines,
 	-- and a directive: `---@diagnostic disable-next-line` may sit between the type it silences
-	-- and the declaration the type is for, and it is not the type.
+	-- and the declaration the type is for, and it is not the type. An annotation lye does not
+	-- know — a formatter's `---@format disable-next`, an editor's `---@see` — says nothing about
+	-- the declaration either, so it does not hide the `---@type` written above it.
 	---@type lye.doc.Annotation?
 	local previous
 	for index = high, 1, -1 do
 		local annotation = annotations[index]
 		if annotation.start < spanStart then break end
 		if not trailsCode(parsed, annotation) then
-			if annotation.tag ~= "diagnostic" then
+			if annotation.tag ~= "diagnostic" and annotation.tag ~= "unknown" then
 				previous = annotation
 				break
 			end
@@ -1031,6 +1033,9 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 			end
 		end
 		if not wanted or not actual then return nil end
+		-- Two values written the same way are the same type even when one came from a definition
+		-- and the other from a plugin: a pointer built by separate resolves is still that pointer.
+		if types.display(wanted) == types.display(actual) then return nil end
 		return types.mismatch(wanted, actual, label)
 	end
 
@@ -1307,8 +1312,8 @@ end
 ---@return lye.analyzer.Prelude
 local function prelude(sources)
 	local prepared = {
-		classes = {}, aliases = {}, signatures = {}, returns = {}, globals = {}, fields = {},
-		globalNames = {},
+		classes = {}, aliases = {}, signatures = {}, returns = {}, returnsSpread = {},
+		globals = {}, fields = {}, globalNames = {},
 	}
 	-- Field functions are gathered first: a class has to exist before one is added to it.
 	---@type table<string, table<string, lye.analyzer.ClassField>>
@@ -1406,8 +1411,12 @@ local function prelude(sources)
 				if returned and returned.type and not next(generics) then
 					-- A generic return is known only once the arguments are, so it is left out: a recorded `T` would
 					-- be cached as the answer and never revisited. The call is bound at the call site instead.
+					local spread = returned.type:sub(-3) == "..."
 					local bare = returned.type:gsub("%.%.%.$", "")
 					prepared.returns[declaration.name] = types.parse(bare, resolve)
+					-- `---@return integer ...` gives that type to every name of `local a, b, c = f()`,
+					-- not only to the first: the later positions need to know it is a spread.
+					if spread then prepared.returnsSpread[declaration.name] = true end
 				end
 			end
 		end
@@ -1436,6 +1445,19 @@ local function prelude(sources)
 				local bare = returned and (returned:gsub("%.%.%.$", "")) or nil
 				local fnType = types.fn(params,
 					(bare and parseType(bare, local_)) or types.ANY_TYPE, isVariadic, nil, variadic)
+				-- A definition method can name several results (`buf:reserve` gives a pointer and
+				-- a length); the call sites take the second and later from `values`.
+				local writtenValues = annotationValues(entry.returns) or {}
+				if #writtenValues > 0 then
+					local values = {}
+					for index, text in ipairs(writtenValues) do
+						local value = text:gsub("%.%.%.$", "")
+						values[index] = parseType(value, local_) or types.UNKNOWN_TYPE
+						if text:sub(-3) == "..." then fnType.isSpread = true end
+					end
+					fnType.values = values
+					fnType.returns = values[1]
+				end
 				fnType.generics, fnType.constraints = entry.generics, entry.constraints
 				-- The markers a call site acts on travel with the callable, whether it was reached
 				-- by name or through the class field it is stored as.
@@ -1467,7 +1489,7 @@ end
 --- The metamethods Lua has, and how many arguments each is handed besides the value it was found
 --- on. A `table` entry may be a table rather than a function, which `__index` allows.
 local METAMETHODS = {
-	__index = { arity = 1, table = true }, __newindex = { arity = 2, table = true },
+	__index = { arity = 1, table = true }, __newindex = { arity = 1, table = true },
 	__add = { arity = 2 }, __sub = { arity = 2 }, __mul = { arity = 2 }, __div = { arity = 2 },
 	__mod = { arity = 2 }, __pow = { arity = 2 }, __idiv = { arity = 2 }, __concat = { arity = 2 },
 	__eq = { arity = 2 }, __lt = { arity = 2 }, __le = { arity = 2 }, __band = { arity = 2 },
@@ -1495,8 +1517,20 @@ local function declaredField(held, field)
 		end
 		return nil
 	end
+	-- A pointer reads and writes the fields of what it points at: `p.x` is the struct's field,
+	-- and a write through the pointer lands in the same place.
+	if held.variant == "class" and held.name == "ffi.ptr" and held.args and held.args[1] then
+		local found = declaredField(held.args[1], field)
+		if found then return found end
+	end
 	local fields = held.fields
-	return fields and fields[field]
+	if fields and fields[field] then return fields[field] end
+	-- A class that declares an index signature says every other string field is that type, and a
+	-- write to one is as sound as a read: `---@field [string] any` is how a proxy table says it
+	-- holds arbitrary keys, and `t.answer = 1` is a write the proxy's `__newindex` computes.
+	local indexed = held.indexed
+	if indexed and (indexed.key == "string" or indexed.key == "any") then return indexed.type end
+	return nil
 end
 
 --- A field only the class's parents declare, when a method written here shadows it.
@@ -1715,6 +1749,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 	-- agree about what a name means.
 	local specs = plugins or defaultPlugins()
 	local contributions = plugin.types(specs, {
+		uri = options and options.uri, root = options and options.root,
 		source = source, text = source, parsed = parsed, annotations = annotations,
 		callName = calledName,
 	}, report or function() end)
@@ -2169,6 +2204,56 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 			end
 		end
 	end
+	-- An annotated function returned from another function -- `return function(p, opts) ... end`
+	-- -- has no declaration of its own, so its `@param` block would otherwise be read by nobody.
+	-- The `return` that opens the statement is its anchor, exactly as a declaration's name is.
+	do
+		local tokens = parsed.tokens.arena
+		local tokenCount = parsed.tokens.count
+		local low, high, anchor = 1, tokenCount, nil
+		for index, node in ipairs(parsed.nodes) do
+			if node.kind == "function" and not bodyOwner[index] then
+				low, high, anchor = 1, tokenCount, nil
+				while low <= high do
+					local mid = math.floor((low + high) / 2)
+					if tokens[mid].start < node.start then
+						anchor = mid
+						low = mid + 1
+					else
+						high = mid - 1
+					end
+				end
+				if anchor and parsed.tokens.texts[anchor] == "return" then
+					local synthetic = {
+						name = "", start = node.start, stop = node.stop, valueIdx = index,
+						isFunction = true, anchorIdx = anchor, depth = node.depth or 0,
+						qualifier = "local",
+					}
+					local params, returned, generics, constraints, predicates, overloads, flags =
+						signatureOf(parsed, annotations, synthetic)
+					---@cast overloads string[]
+					---@cast flags table<string, boolean>
+					if #params > 0 or returned or next(generics) or #predicates > 0
+						or #overloads > 0 or flags.deprecated or flags.nodiscard or flags.async then
+						bodyOwner[index] = synthetic
+						signatureOfDecl[synthetic] = {
+							params = params, returns = returned, generics = generics,
+							constraints = constraints, predicates = predicates, overloads = overloads,
+							values = annotationValues(returned),
+							deprecated = flags.deprecated, nodiscard = flags.nodiscard, async = flags.async,
+						}
+						local list = {}
+						for _, param in ipairs(node.params or {}) do
+							list[#list + 1] = param
+							paramOwner[param] = synthetic
+						end
+						declaredParams[synthetic] = list
+						annotatedBodies[index] = true
+					end
+				end
+			end
+		end
+	end
 	-- What a field said its function returns, for the bodies written for that field: a body that
 	-- gives something else, or nothing at all, contradicts the type a caller was promised.
 	local fieldReturns = {}
@@ -2514,6 +2599,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 	inferCtx = infer.context(parsed, typeOfName, returns, function(base, baseName, field, offset)
 		return fieldTypeAt(self, base, baseName, field, offset)
 	end, moduleLookup, providerCall)
+	inferCtx.returnsSpread = prepared and prepared.returnsSpread
 	inferCtx.casts = inlineCasts
 	self.inferCtx = inferCtx
 
@@ -3495,7 +3581,10 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 				-- already added by the method pass, and its untyped parameters here would make
 				-- the field look like an unknown callable. A value or an annotated assignment is
 				-- a real field of the class table.
-				local add = fieldType ~= nil and (annotated or fieldType.variant ~= "fn")
+				-- A metatable key assigned on the class table (`C.__index = C`) is how an instance
+				-- finds its methods; it is never a data field every instance must carry.
+				local add = fieldType ~= nil and field:sub(1, 2) ~= "__"
+					and (annotated or fieldType.variant ~= "fn")
 				if add and fields and fields[field] == nil then fields[field] = fieldType end
 			end
 			return
@@ -4054,6 +4143,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		receiverTypeOf = receiverTypeOf, declaredHere = declaredHere, functionNodes = functionNodes, bodyOwner = bodyOwner, annotatedBodies = annotatedBodies,
 		inferredValuesOf = inferredValuesOf, inferredReturnOf = inferredReturnOf,
 		scopeAt = scopeAt, lookupIn = lookupIn, declaredField = declaredField,
+		inheritedField = inheritedField,
 		typeAt = analyzer.typeAt,
 		arithmetic = ARITHMETIC,
 		reusedSpan = cleanSpan,
