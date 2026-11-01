@@ -75,6 +75,8 @@ The shipped `ffi` plugin parses every `ffi.cdef` block in a file:
 - fixed arrays as `ffi.array<T, N>`, scalar pointers as `ffi.ptr<T>`, 64-bit scalars as
   `ffi.size_t`/`ffi.int64_t`/…, callbacks as `ffi.cb`
 - `ffi.new`, `ffi.cast`, `ffi.typeof`, `ffi.load` and `ffi.C` typed from the file's declarations
+- `ffi.typeof` gives a typed constructor: calling it makes the C type, so a constructor already
+  cached for a hot path stays a constructor
 - inline callbacks get the header's parameter types, and their returns are checked
 - semantic tokens colour the C inside the cdef block
 

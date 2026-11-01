@@ -340,23 +340,11 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 		if argument.kind == "prefix" and argument.callee then return ctypeOfName[argument.callee] end
 	end
 
-	---@param node lye.parser.Node
-	local function cTypeOf(node)
-		local called = callName(node)
-		if called == "ffi.load" then return loadedSymbols() end
-		-- `ffi.typeof` gives the ctype itself, which the definitions already name. A ctype is a
-		-- constructor only when it is called, and that call is not this one.
-		if called == "ffi.typeof" then return nil end
-		local argument = node.args and node.args[1] and parsed_.nodes[node.args[1]]
-		if not argument then return nil end
-		---@type string?
-		local written
-		if called == "ffi.new" or called == "ffi.cast" then
-			written = ctypeTextOf(argument)
-		else
-			written = ctypeOfName[called or ""]
-		end
-		if not written then return nil end
+	--- What a C type is worth when it is made: a struct is its class, an array its `ffi.array`,
+	--- and a scalar the class the definitions give it.
+	---@param written string
+	---@return lye.doc.Type?
+	local function valueOf(written)
 		local found, declared = cTypeNamed(written)
 		if not found or not declared then found, declared = builtinType(written) end
 		if not found or not declared then return nil end
@@ -364,13 +352,65 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 		-- name up lets the document's own class win over the generated one. Everything else is mapped.
 		local className = cdef.className(found)
 		---@cast className string?
+		---@type lye.doc.Type?
 		local named
 		if className then named = resolve(className) end
 		if named and (found.kind == "struct" or found.kind == "union" or found.kind == "enum"
 			or (found.kind == "typedef" and cdef.resolve(declared, found.name or "") ~= nil)) then
 			return named
 		end
-		return types.parse(cdef.notation(declared, found), resolve)
+		---@type lye.doc.Type?
+		local held = types.parse(cdef.notation(declared, found), resolve)
+		return held
+	end
+
+	--- The type `ffi.typeof` hands back: a constructor that already knows what it makes. The
+	--- engine interns it, so calling the cached constructor is faster than `ffi.new("T", ...)`,
+	--- which parses the type string on every call. It is a value in its own right — the ctype —
+	--- and calling it is what makes a value of the C type, which is what the metatable says.
+	---@param held lye.doc.Type
+	---@return lye.doc.Type
+	local function constructorOf(held)
+		local ctype = resolve("ffi.ctype")
+		local metatable = types.object({ __call = types.fn({}, held, true) })
+		if ctype and ctype.variant == "class" then return types.withMetatable(ctype, metatable) end
+		-- Without the definitions the ctype still has to be callable, so it gets a metatable of
+		-- its own rather than being the metatable itself.
+		return types.withMetatable(types.object({}), metatable)
+	end
+
+	--- The plain name of a call: `Vec()` has no field for `callName` to read, but a cached
+	--- constructor is called by exactly that name.
+	---@param node lye.parser.Node
+	---@return string?
+	local function plainNameOf(node)
+		local target = node.target and parsed_.nodes[node.target]
+		return target and target.callee or node.callee
+	end
+
+	---@param node lye.parser.Node
+	local function cTypeOf(node)
+		local called = callName and callName(node) or plainNameOf(node)
+		if not called then return nil end
+		if called == "ffi.load" then return loadedSymbols() end
+		-- `ffi.typeof("T")` gives the constructor itself, not an instance: a callable whose
+		-- `__call` is what `ffi.new("T", ...)` would do, but without a type string to parse again.
+		if called == "ffi.typeof" then
+			local argument = node.args and node.args[1] and parsed_.nodes[node.args[1]]
+			local written = argument and ctypeTextOf(argument)
+			local held = written and valueOf(written)
+			return held and constructorOf(held) or nil
+		end
+		---@type string?
+		local written
+		if called == "ffi.new" or called == "ffi.cast" then
+			local argument = node.args and node.args[1] and parsed_.nodes[node.args[1]]
+			written = argument and ctypeTextOf(argument)
+		else
+			written = ctypeOfName[called]
+		end
+		if not written then return nil end
+		return valueOf(written)
 	end
 
 	local answer = {}

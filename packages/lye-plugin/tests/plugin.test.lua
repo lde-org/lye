@@ -445,6 +445,62 @@ test.it("reads a cdef passed to pcall as a value", function()
 	test.includes(table.concat(marks, " "), "Wrapped:class", "and the name it declared")
 end)
 
+test.it("types an ffi.typeof constructor and what calling it makes", function()
+	-- The engine interns the ctype, so a cached constructor is the fast way to make a value:
+	-- `local Vec = ffi.typeof("Vec")` then `Vec()`, rather than parsing "Vec" again in `ffi.new`.
+	-- The constructor has to be callable on its own, without an annotation saying what it gives.
+	local Parser = require("lye-parser")
+	local cdefPlugin = require("lye-plugin.plugins.ffi")
+
+	local written = table.concat({
+		"local ffi = require(\"ffi\")\n",
+		"ffi.cdef[[\n",
+		"typedef struct { int x; } Vec;\n",
+		"]]\n",
+		"local Vec = ffi.typeof(\"Vec\")\n",
+		"local v = Vec()\n",
+		"local direct = ffi.typeof(\"Vec\")()\n",
+	}, "")
+	local parsed = Parser.new(written):parse()
+	---@param node lye.parser.Node
+	local function callName(node)
+		local target = node.target and parsed.nodes[node.target]
+		local field = node.field or (target and target.field)
+		if not field then return nil end
+		local ownerNode = target and (target.target or node.target)
+		local owner = ownerNode and parsed.nodes[ownerNode] and parsed.nodes[ownerNode].callee
+		return owner and (owner .. "." .. field) or field
+	end
+	local context = {
+		uri = "file:///f.lua", source = written, text = written, parsed = parsed,
+		annotations = { annotations = {} }, callName = callName,
+	}
+	---@cast context lye.plugin.TypeContext
+	local result = assert(cdefPlugin.types(context))
+	local Vec = types.classType("Vec", {}, { x = types.NUMBER }, {})
+	local ctype = types.classType("ffi.ctype*", {}, {}, {})
+	---@param name string
+	local function resolve(name)
+		if name == "Vec" then return Vec end
+		if name == "ffi.ctype" or name == "ffi.ctype*" then return ctype end
+	end
+	local providers = assert(result.attach(resolve))
+	local constructor, called
+	---@type lye.parser.Node[]
+	local calls = parsed.byKind.call or {}
+	for _, node in ipairs(calls) do
+		local text = written:sub(node.start, node.stop)
+		local held = providers.call(node)
+		if text == "ffi.typeof(\"Vec\")" then constructor = held
+		elseif text == "Vec()" then called = held end
+	end
+	test.truthy(constructor, "the ctype itself is typed")
+	local callable = types.metamethod(constructor, "__call")
+	test.truthy(callable, "and it is callable")
+	test.equal(callable and callable.returns, Vec, "calling it makes a Vec")
+	test.equal(called, Vec, "a constructor cached in a local keeps that call type")
+end)
+
 test.it("keeps a type an earlier pcall cdef declared", function()
 	-- LuaJIT keeps one cdef namespace, so a later block may name a type an earlier call added.
 	-- Parsed block by block the reference reads as unknown; that is not a problem for the file.

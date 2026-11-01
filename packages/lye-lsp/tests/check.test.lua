@@ -265,6 +265,26 @@ test.it("finds the package of a file named relatively", function()
 	test.equal(isOk, true, "the package's own link answers for a relatively named file")
 end)
 
+test.it("reads a fixed array against a method that takes one of unknown length", function()
+	-- `ffi.array<T>` is a length this file does not know, not a different class: a fixed
+	-- `ffi.array<T, 16>` fits it. The method signature comes from the package's linked module.
+	local dep = assert(io.open(PACKAGE_DIR .. "/target/ffi-dep.lua", "wb"))
+	dep:write(table.concat({
+		"---@class FfiDep\n",
+		"local FfiDep = {}\n",
+		"---@type fun(self: FfiDep, pixels: ffi.array<ffi.uint8_t>): number\n",
+		"function FfiDep:take(pixels) return pixels[0] end\n",
+		"return FfiDep\n",
+	}))
+	dep:close()
+	writeInput(table.concat({
+		'local ffi = require("ffi")\n',
+		'local dep = require("ffi-dep")\n',
+		'dep:take(ffi.new("uint8_t[16]"))\n',
+	}))
+	test.equal(check.file(INPUT), true)
+end)
+
 test.it("writes a configuration where there is none, and never over one", function()
 	-- A workspace says what it wants in a file beside it: `lye init` writes the shape of that file
 	-- and nothing else, since what goes in it is the workspace's own answer.

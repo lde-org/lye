@@ -62,15 +62,15 @@ local cb = {}
 ---@class ffi.wchar_t: ffi.cnum*
 ---@class ffi.bool: ffi.cdata
 
----An array of C values: what `ffi.new("int[4]")` gives and what a `T name[N]` member is. It is
----indexed with a number, which is the one thing an array does that no other cdata does, and the
----length the header wrote is carried as the second argument.
+---An array of C values: what a cached `ffi.typeof("int[4]")` constructor makes and what a
+---`T name[N]` member is. It is indexed with a number, which is the one thing an array does that no
+---other cdata does, and the length the header wrote is carried as the second argument.
 ---@class ffi.array<T, const N: integer>: ffi.cdata
 ---@field [integer] T
 
----A pointer to a C value: what `ffi.new("int *")` gives, what a callback receives where the header
----wrote a pointer, and what going through a pointer reads. Like an array it is indexed with a
----number, and it is not the value it points at.
+---A pointer to a C value: what a cached `ffi.typeof("int *")` constructor makes, what a callback
+---receives where the header wrote a pointer, and what going through a pointer reads. Like an array
+---it is indexed with a number, and it is not the value it points at.
 ---@class ffi.ptr<T: ffi.cdata*>: ffi.cdata
 ---@field [integer] T
 
@@ -85,13 +85,18 @@ function ffi.cdef(def: string, params?: any, ...) end
 ---@nodiscard
 function ffi.load(name: string, global?: boolean): ffi.namespace* end
 
+---`ffi.new` parses the type string on every call. A constructor cached from `ffi.typeof` has
+---already done that, so repeating construction should call the constructor instead.
 ---@overload fun(ct: ffi.ct*, init: any, ...)
 ---@nodiscard
 function ffi.new(ct: ffi.ct*, nelem?: integer, init?: any, ...): ffi.cdata* end
 
+---The engine's constructor for the type named: a callable ctype that makes that type. Cache it
+---and call it; the plugin types its `__call`, so no `---@type fun(...)` is needed.
 ---@nodiscard
 function ffi.typeof(ct: ffi.ct*, params?: any, ...): ffi.ctype* end
 
+---A cast takes a ctype, so a repeated cast can cache the ctype from `ffi.typeof` as well.
 ---@nodiscard
 function ffi.cast(ct: ffi.ct*, init: any): ffi.cdata* end
 

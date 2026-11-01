@@ -107,6 +107,36 @@ test.it("reads the types an ffi.cdef declares", function()
 		"a member the header never declared: " .. table.concat(messages, "; "))
 end)
 
+test.it("types an ffi.typeof constructor by what it makes", function()
+	-- `ffi.typeof("Vec")` is the engine's constructor, already typed: a cached one, a direct call
+	-- and a member read through either are all the Vec the cdef declared. No `---@type fun(...)`
+	-- is needed, because the constructor's own `__call` says what it returns.
+	local source = table.concat({
+		'local ffi = require("ffi")\n',
+		'ffi.cdef[[\n',
+		'\ttypedef struct { double x, y; } Vec;\n',
+		']]\n',
+		'local Vec = ffi.typeof("Vec")\n',
+		'local cached = Vec()\n',
+		'local direct = ffi.typeof("Vec")()\n',
+		'cached.x = 1\n',
+		'direct.y = 2\n',
+		'cached.nope = 3\n',
+		'direct.nope = 4\n',
+	}, "")
+	test.equal(typeOf(source, "cached"), "Vec", "the cached constructor makes a Vec")
+	test.equal(typeOf(source, "direct"), "Vec", "and calling ffi.typeof directly does too")
+
+	local messages = {}
+	for _, entry in ipairs(analyzer.analyze(source).diagnostics) do
+		messages[#messages + 1] = entry.message
+	end
+	local all = table.concat(messages, "; ")
+	test.truthy(all:match("`nope` is not a field of Vec"), "a field the cdef does not declare: " .. all)
+	test.equal(select(2, all:gsub("`nope` is not a field of Vec", "")), 2,
+		"reported through the cached and the direct constructor")
+end)
+
 test.it("leaves the ffi dialect to the plugin that owns it", function()
 	-- The analyzer no longer parses `ffi.cdef` itself: the shipped ffi plugin contributes the
 	-- classes the block declares and the type of `ffi.new`. A workspace that turns it off gets the
