@@ -70,8 +70,11 @@ root=$(git rev-parse --show-toplevel 2>/dev/null) || {
 
 if [ -z "$outfile" ]; then
 	outfile=$root/packages/lye-lsp/lye-lsp
-elif [ "${outfile#/}" = "$outfile" ]; then
-	outfile=$PWD/$outfile
+else
+	case "$outfile" in
+		/* | [A-Za-z]:*) ;;
+		*) outfile=$PWD/$outfile ;;
+	esac
 fi
 mkdir -p "$(dirname "$outfile")"
 
@@ -80,18 +83,33 @@ trap 'rm -rf "$tmp"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# GNU tar can ignore index entries deleted from the working tree; bsdtar (macOS)
+# has no such option, but still archives the files that exist.
+tar_ignore=
+if tar --ignore-failed-read -cf /dev/null -T /dev/null 2>/dev/null; then
+	tar_ignore=--ignore-failed-read
+fi
+
 (
 	cd "$root"
 	git ls-files -z --cached --others --exclude-standard |
-		tar --null --ignore-failed-read -cf - -T - |
+		tar --null $tar_ignore -cf - -T - |
 		tar -xf - -C "$tmp"
 ) || {
 	echo "compile.sh: could not snapshot the working tree" >&2
 	exit 1
 }
 
-set -- compile -C "$tmp/packages/lye-lsp" --outfile "$outfile"
-[ -n "$target" ] && set -- "$@" --target "$target"
-[ "$ensure_mingw" = 1 ] && set -- --ensure-mingw "$@"
+(
+	# lde does not treat a Windows drive path as absolute: it prepends its
+	# working directory to both -C and --outfile. Work from the snapshot with
+	# relative paths, then move the result to the caller's path.
+	cd "$tmp"
+	set -- compile -C packages/lye-lsp --outfile ../../lye-lsp
+	[ -n "$target" ] && set -- "$@" --target "$target"
+	[ "$ensure_mingw" = 1 ] && set -- --ensure-mingw "$@"
 
-lde "$@"
+	lde "$@"
+)
+
+mv "$tmp/lye-lsp" "$outfile"
