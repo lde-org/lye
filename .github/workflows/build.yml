@@ -1,0 +1,103 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Tag to stamp into the VS Code extension; empty leaves package.json alone.
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x86-64
+            asset: lye-linux-x86-64
+            mingw: false
+          - os: ubuntu-22.04-arm
+            target: linux-aarch64
+            asset: lye-linux-aarch64
+            mingw: false
+          - os: macos-15-intel
+            target: macos-x86-64
+            asset: lye-macos-x86-64
+            mingw: false
+          - os: macos-15
+            target: macos-aarch64
+            asset: lye-macos-aarch64
+            mingw: false
+          - os: windows-latest
+            target: windows-x86-64
+            asset: lye-windows-x86-64.exe
+            mingw: true
+          - os: windows-11-arm
+            target: windows-aarch64
+            asset: lye-windows-aarch64.exe
+            mingw: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: lde-org/setup-lde@v2
+
+      - name: Build ${{ matrix.asset }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+          MINGW: ${{ matrix.mingw }}
+        run: |
+          if [ "$MINGW" = "true" ]; then
+            tools/compile.sh --ensure-mingw --target "$TARGET" --outfile "$RUNNER_TEMP/$ASSET"
+          else
+            tools/compile.sh --target "$TARGET" --outfile "$RUNNER_TEMP/$ASSET"
+          fi
+          chmod +x "$RUNNER_TEMP/$ASSET"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ runner.temp }}/${{ matrix.asset }}
+
+  vsix:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install the extension toolchain
+        run: npm i
+
+      - name: Stamp the release version
+        if: inputs.version != ''
+        env:
+          VERSION: ${{ inputs.version }}
+        run: npm version "${VERSION#v}" --no-git-tag-version --allow-same-version
+
+      - name: Compile the extension
+        run: npm run compile
+
+      - name: Package the extension
+        run: npx vsce package --out "$RUNNER_TEMP/lye-$(node -p 'require("./package.json").version').vsix"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: ${{ runner.temp }}/lye-*.vsix
