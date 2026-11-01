@@ -23,10 +23,12 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.ref_name }}
           files: dist/*
           generate_release_notes: true
+          fail_on_unmatched_files: true
 
   marketplace:
     needs: build
@@ -41,7 +43,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: editors/vscode/package-lock.json
+          cache-dependency-path: editors/vscode/package.json
 
       - name: Install the extension toolchain
         run: npm i

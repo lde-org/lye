@@ -82,7 +82,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: editors/vscode/package-lock.json
+          cache-dependency-path: editors/vscode/package.json
 
       - name: Install the extension toolchain
         run: npm i
