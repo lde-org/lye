@@ -1,0 +1,68 @@
+{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"$id": "https://raw.githubusercontent.com/lde-org/lye/master/schemas/lye.schema.json",
+	"title": "lye configuration",
+	"description": "The lye.json a workspace or package reads: plugins, module search paths, and diagnostic policy.",
+	"type": "object",
+	"properties": {
+		"$schema": {
+			"type": "string",
+			"description": "The schema this file follows."
+		},
+		"plugins": {
+			"type": "array",
+			"description": "Plugins read with this document, in order: a path of the workspace's own, an installed module name, or `!name` to turn off a plugin lye ships.",
+			"items": {
+				"type": "string",
+				"minLength": 1
+			},
+			"uniqueItems": true
+		},
+		"requirePaths": {
+			"type": "array",
+			"description": "Search paths for `require`, written the way `package.path` does: `lib/?.lua`, `vendor/?/init.lua`.",
+			"items": {
+				"type": "string",
+				"minLength": 1
+			},
+			"uniqueItems": true
+		},
+		"diagnostics": {
+			"type": "object",
+			"description": "The policy a diagnostic code is held to in this workspace.",
+			"properties": {
+				"severity": {
+					"type": "object",
+					"description": "A diagnostic code's severity, or `off`/`none` to turn it off. `error`, `warning`, `hint`, and `information` name the LSP severities; 1, 2, and 3 are the same severities as numbers.",
+					"propertyNames": {
+						"pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+					},
+					"additionalProperties": {
+						"oneOf": [
+							{
+								"type": "string",
+								"enum": ["error", "warning", "hint", "information", "off", "none"]
+							},
+							{
+								"type": "integer",
+								"minimum": 1,
+								"maximum": 3
+							}
+						]
+					}
+				},
+				"disable": {
+					"type": "array",
+					"description": "Diagnostic codes this workspace turns off.",
+					"items": {
+						"type": "string",
+						"minLength": 1
+					},
+					"uniqueItems": true
+				}
+			},
+			"additionalProperties": false
+		}
+	},
+	"additionalProperties": false
+}

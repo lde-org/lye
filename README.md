@@ -116,10 +116,15 @@ Measured on one machine with one harness; medians:
 ## Plugins
 
 A workspace lists plugins in `lye.json` — a path, an installed module name, or `!name` to disable
-a shipped plugin (`patterns`, `formats`, `ffi`):
+a shipped plugin (`patterns`, `formats`, `ffi`). The file has a schema at
+[`schemas/lye.schema.json`](schemas/lye.schema.json); point `$schema` at it for editor completion
+and validation:
 
 ```json
-{ "plugins": ["./tools/moonscript.lua", "lye-plugin-moonscript", "!patterns"] }
+{
+	"$schema": "https://raw.githubusercontent.com/lde-org/lye/master/schemas/lye.schema.json",
+	"plugins": ["./tools/moonscript.lua", "lye-plugin-moonscript", "!patterns"]
+}
 ```
 
 A plugin answers one or more hooks:

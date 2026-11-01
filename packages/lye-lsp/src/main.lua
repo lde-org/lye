@@ -34,6 +34,7 @@ usage: lye [options] [files...]
 --- the shape of it.
 local STARTER = [[
 {
+	"$schema": "https://raw.githubusercontent.com/lde-org/lye/master/schemas/lye.schema.json",
 	"plugins": [],
 	"requirePaths": []
 }

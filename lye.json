@@ -1,4 +1,5 @@
 {
+  "$schema": "https://raw.githubusercontent.com/lde-org/lye/master/schemas/lye.schema.json",
   "requirePaths": [
     "packages/lye-lsp/target/?.lua",
     "packages/lye-lsp/target/?/init.lua",
