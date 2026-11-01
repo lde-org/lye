@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: lde-org/setup-lde@v1
+      - uses: lde-org/setup-lde@v2
 
       - name: Run the test suite
         run: lde test --jobs 1
