@@ -73,9 +73,8 @@ build:write("defs.lua", gathered)
 -- The definitions are gathered now, and this output directory is what lde copies into every package
 -- that depends on this one. The bundler bytecode-compiles every `.lua` it finds there, and these
 -- files are written for the analyzer rather than for Lua (`x: integer` is not a parameter list), so
--- the copy cannot stay. `build:delete` takes a file, so the files go first and the folder after
--- them. The source keeps the definitions; this copy is done with.
+-- the copy cannot stay. `build:delete` takes a file, not a directory—on Windows deleting one fails
+-- outright—so the files go and the empty `meta/` stays, where it holds no `.lua` to compile.
 for _, file in ipairs(build:scan("meta")) do
 	build:delete(file)
 end
-build:delete("meta")
