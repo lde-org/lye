@@ -12,7 +12,7 @@
 local fs = require("fs")
 local lexer = require("lye-lexer")
 local doc = require("lye-doc")
-local types = require("lye-doc.type")
+local methodIndex = require("lye-lsp.method_index")
 
 local KIND = lexer.KIND
 
@@ -35,6 +35,9 @@ local KIND = lexer.KIND
 ---@field stop integer
 ---@field isMethod boolean? declared with `:`, so `self` is implicit
 ---@field class string? the class the owner table declares, when an annotation says so
+---@field typeText string? the `---@type fun(...)` written above it
+---@field params { name: string, type: string? }[]? its `---@param` lines, when it has no `@type`
+---@field returns string[]? its `---@return` types, when it has no `@type`
 
 ---@class lye.WorkspaceRequire
 ---@field value string
@@ -274,6 +277,8 @@ local function read(source, tokens)
 	end
 
 	local file = doc.parse(source, tokens)
+	-- The names are the lexical scan's; the signatures come from the annotations above each one.
+	info.methods = methodIndex.scan(source, file.annotations, tokens)
 	-- The class a table declares is written above it: `---@class pkg.Thing` over `local Thing = {}`
 	-- makes `function Thing:grow` a method of `pkg.Thing`, and that is the name a class type is
 	-- looked up by in another file.
@@ -441,9 +446,7 @@ function Workspace:methods()
 				-- about what it returns. The analysis that declares the method replaces this with
 				-- the written signature; this entry exists so a reader in another file knows the
 				-- name is a field of the class rather than reporting it missing.
-				local fn = types.fn({}, types.UNKNOWN_TYPE, true)
-				fn.implicitSelf = method.isMethod
-				fields[method.name] = fn
+				fields[method.name] = methodIndex.signatureOf(method, {})
 			end
 		end
 	end

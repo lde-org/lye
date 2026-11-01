@@ -488,13 +488,17 @@ local function declaredTypeFor(parsed, file, declaration, resolve)
 	---@param annotation lye.doc.Annotation
 	local function typedBy(annotation)
 		if annotation.tag ~= "type" and annotation.tag ~= "as" then return nil end
+		-- A function type is one type however many values it returns: the commas in
+		-- `fun(): A, B` are not the commas that give each name of `local a, b` its own type.
+		local whole = parseType(annotation.type, resolve)
+		if whole and whole.variant == "fn" then return whole end
 		-- `---@type A, B` names one type per name of the statement, in order.
 		local written = types.splitValues(annotation.type or "")
 		if #written > 1 then
 			local at = declaration.position or 1
 			if written[at] then return parseType(written[at], resolve) end
 		end
-		return parseType(annotation.type, resolve)
+		return whole
 	end
 
 	-- The trailing annotation is written at the declaration it describes, so it is the answer
@@ -507,18 +511,25 @@ local function declaredTypeFor(parsed, file, declaration, resolve)
 	local spanStart = annotationSpan(parsed, declaration)
 	if not spanStart then return nil end
 
-	-- Searching back skips the trailing annotations of earlier lines, which describe those lines.
+	-- Searching back skips the trailing annotations of earlier lines, which describe those lines,
+	-- and a directive: `---@diagnostic disable-next-line` may sit between the type it silences
+	-- and the declaration the type is for, and it is not the type.
 	---@type lye.doc.Annotation?
 	local previous
 	for index = high, 1, -1 do
 		local annotation = annotations[index]
 		if annotation.start < spanStart then break end
 		if not trailsCode(parsed, annotation) then
-			previous = annotation
-			break
+			if annotation.tag ~= "diagnostic" then
+				previous = annotation
+				break
+			end
 		end
 	end
 	if not previous then return nil end
+	-- A `---@type` or `---@as` written in the same block as a class is the declaration's type:
+	-- the class describes the table or the function's result, not the function itself.
+	if previous.tag == "type" or previous.tag == "as" then return typedBy(previous) end
 	-- A class declared above a declaration is that declaration's type, looked for rather than taken
 	-- from the last line because its `---@field` lines follow it. Only where it holds the table.
 	local holdsTable = declaration.initializer == "table"
@@ -678,7 +689,11 @@ local function fieldTypeAt(self, base, baseName, field, offset)
 			local readScope = scopeAt(self, offset)
 			for _, entry in ipairs(writes) do
 				---@cast entry lye.analyzer.FieldWrite
-				if entry.at <= offset and scopeCovers(entry.scope, readScope) then
+				-- A read in the write's own value is evaluated before the write: `a.x = a.x + 1`
+				-- asks for what `a.x` was, not what it is being assigned.
+				local valueNode = entry.valueIdx and self.parser.nodes[entry.valueIdx]
+				local midWrite = valueNode and offset >= valueNode.start and offset <= valueNode.stop
+				if entry.at <= offset and scopeCovers(entry.scope, readScope) and not midWrite then
 					if self.inferCtx then
 						self.fieldWriteBuilding = self.fieldWriteBuilding or {}
 						self.fieldWriteBuilding[key] = true
@@ -1476,6 +1491,26 @@ local function declaredField(held, field)
 	end
 	local fields = held.fields
 	return fields and fields[field]
+end
+
+--- A field only the class's parents declare, when a method written here shadows it.
+---@param held lye.doc.Type?
+---@param field string
+---@return lye.doc.Type?
+local function inheritedField(held, field)
+	if not held then return nil end
+	if held.variant == "union" then
+		for _, member in ipairs(held.types) do
+			local found = inheritedField(member, field)
+			if found then return found end
+		end
+		return nil
+	end
+	if held.variant ~= "class" then return nil end
+	for _, parent in ipairs(held.parents or {}) do
+		local found = declaredField(parent, field) or inheritedField(parent, field)
+		if found then return found end
+	end
 end
 
 --- A metatable is a table of metamethods, and Lua has a fixed list of them. Everything Lua will
@@ -3065,7 +3100,12 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		-- a signature, which is how most Lua is written.
 		---@type lye.doc.Type?
 		local methodType
-		if annotated then
+		-- `---@type fun(...)` is the whole callable, returns included. A signature built from
+		-- `@param`/`@return` is the same promise written the long way; the body is the fallback.
+		local written = declaredTypeFor(parsed, annotations, declaration, resolve)
+		if written and written.variant == "fn" then
+			methodType = written
+		elseif annotated then
 			methodType = signatureTypeOf(declaration, annotated)
 		else
 			methodType = inferCtx.fnTypes[valueIdx] or infer.at(inferCtx, valueIdx)
@@ -3116,7 +3156,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 					---@type lye.parser.Declaration
 					local synthetic = {
 						name = written, start = node.start, stop = node.stop,
-						depth = node.depth or 0, qualifier = "field",
+						depth = node.depth or 0, qualifier = "field", valueIdx = node.valueIdx,
 					}
 					evolveMethod(owner, methodName, node.valueIdx, synthetic)
 				end
@@ -3396,10 +3436,21 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 			local annotation = written[index]
 			if annotation.stop < offset then
 				if annotation.tag ~= "type" then return false end
-				return source:sub(annotation.stop + 1, offset - 1):match("^%s*$") ~= nil
+				-- A directive may sit between the type and the statement it describes.
+				local between = source:sub(annotation.stop + 1, offset - 1)
+					:gsub("%-%-%-@diagnostic[^\n]*", "")
+				return between:match("^%s*$") ~= nil
 			end
 		end
 		return false
+	end
+
+	--- The first byte of the statement a declaration opens: a function's name start leaves the
+	--- `function` keyword between an annotation and the declaration it describes.
+	---@param declaration lye.parser.Declaration
+	local function statementStart(declaration)
+		local anchor = declaration.anchorIdx and parsed.tokens.arena[declaration.anchorIdx]
+		return anchor and anchor.start or declaration.start
 	end
 
 	---@param written string the name as written, `M.field`, `M:field` or `A.B.field`
@@ -3424,7 +3475,11 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		-- A `---@type` over a field assignment is different: it says the class table itself gains that
 		-- field (`gl.clearColor = ...` is how an OpenGL entry point is installed).
 		if variable and variable.declared then
-			if variable.declared.variant == "class" and base == first and rest == "" then
+			-- A class *table* gains the fields written on it; a value of the class does not. An
+			-- instance `---@type T local t = {}` writes its own fields, and letting those writes
+			-- evolve T made `t.a, t.n = f()` give the class the values in target order.
+			local isClassTable = namespace.classes[first or ""] ~= nil or classOfTable[first or ""] ~= nil
+			if isClassTable and variable.declared.variant == "class" and base == first and rest == "" then
 				local fields = variable.declared.fields
 				-- A function assigned without an annotation is the body of a method; it is
 				-- already added by the method pass, and its untyped parameters here would make
@@ -3478,8 +3533,15 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 			if className and methodName and not namespace.classes[className] then
 				local owner = ownerItemAt(declaration.start, declaration.stop or declaration.start)
 				if not (owner and plan.clean[owner.id]) or writesModuleTable(declaration.name, declaration.start) then
-					local methodType = inferCtx.fnTypes[declaration.valueIdx]
-						or infer.at(inferCtx, declaration.valueIdx)
+					local methodType = hasTypeAnnotation(statementStart(declaration))
+						and declaredTypeFor(parsed, annotations, declaration, resolve) or nil
+					if not methodType and signatureOfDecl[declaration] then
+						methodType = signatureTypeOf(declaration, signatureOfDecl[declaration])
+					end
+					if not methodType then
+						methodType = inferCtx.fnTypes[declaration.valueIdx]
+							or infer.at(inferCtx, declaration.valueIdx)
+					end
 					addTableField(declaration.name, declaration.start, methodType)
 				end
 			end
@@ -3550,8 +3612,18 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 			if written and written:find("[%.:]") then
 				local owner = ownerItemAt(node.start, node.stop)
 				if not (owner and plan.clean[owner.id]) or writesModuleTable(written, node.start) then
-					addTableField(written, node.start, infer.at(inferCtx, node.valueIdx),
-						hasTypeAnnotation(node.start))
+					local annotated = hasTypeAnnotation(node.start)
+					local fieldType
+					if annotated then
+						---@type lye.parser.Declaration
+						local synthetic = {
+							name = written, start = node.start, stop = node.stop,
+							depth = node.depth or 0, qualifier = "field", valueIdx = node.valueIdx,
+						}
+						fieldType = declaredTypeFor(parsed, annotations, synthetic, resolve)
+					end
+					addTableField(written, node.start,
+						fieldType or infer.at(inferCtx, node.valueIdx), annotated)
 				end
 			end
 		end
@@ -3566,8 +3638,15 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 			if declaration.valueIdx then
 				local className, methodName = declaration.name:match("^([%w_%.]+)%s*[%.:]([%w_]+)$")
 				if className and methodName and not namespace.classes[className] then
-					local methodType = inferCtx.fnTypes[declaration.valueIdx]
-						or infer.at(inferCtx, declaration.valueIdx)
+					local methodType = hasTypeAnnotation(statementStart(declaration))
+						and declaredTypeFor(parsed, annotations, declaration, resolve) or nil
+					if not methodType and signatureOfDecl[declaration] then
+						methodType = signatureTypeOf(declaration, signatureOfDecl[declaration])
+					end
+					if not methodType then
+						methodType = inferCtx.fnTypes[declaration.valueIdx]
+							or infer.at(inferCtx, declaration.valueIdx)
+					end
 					addTableField(declaration.name, declaration.start, methodType)
 				end
 			end
@@ -3614,8 +3693,15 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		---@cast field string
 
 		local held = receiverTypeOf(base, parsed.nodes[valueIdx].start)
-		if declaredHere(held, field) then return end
-		local wanted = declaredField(held, field)
+		local wanted
+		if declaredHere(held, field) then
+			-- The method declaration evolved the field from its own body. When a parent declares
+			-- it as well, the parent's signature is what the body and its callers are written for.
+			wanted = inheritedField(held, field)
+			if not wanted then return end
+		else
+			wanted = declaredField(held, field)
+		end
 		if not wanted then
 			-- `function Cache:put()` is a method of the class `Cache`, which is often a local whose own type
 			-- is the table it was built from. The name is the class, so the field is looked for there first.
@@ -3645,7 +3731,12 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		local params = {}
 		for index, param in ipairs(list) do
 			local paramType = wanted.params[index + shift]
-			if not paramType and param.name == "self" then paramType = held end
+			-- A parent writes the receiver as the parent, because that is where the method field
+			-- is declared. The body is written for the class that extends it, so `self` is that
+			-- class: `---@class App: lupa.App` must read `self.time` on its own fields.
+			if param.name == "self" and held and held.variant == "class" then
+				paramType = held
+			end
 			local variable = byDeclaration[param]
 			if variable and paramType then variable.declared = paramType end
 			if param.name ~= "self" then params[#params + 1] = paramType or types.ANY_TYPE end
@@ -3670,46 +3761,66 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 			adoptFieldFunction(declaration.name, declaration.valueIdx, value.params)
 		end
 	end
+	--- Give the parameters of a function body the types a written signature says they have.
+	---@param held lye.doc.Type?
+	---@param list lye.parser.Declaration[]?
+	local function applyFunctionType(held, list)
+		if not held or held.variant ~= "fn" or not list then return end
+		-- A `:` method's body carries `self` as its first parameter while a signature may write that
+		-- receiver itself. A dot function or an assignment leaves the receiver out of the body, so
+		-- the signature may hold one parameter more than the function does.
+		local shift = #held.params == #list + 1 and 1 or 0
+		if #list + shift ~= #held.params then return end
+		-- A name the signature declares for itself stands for what it is limited to inside the body:
+		-- `---@type fn<T: string>(t: T)` takes a string, so `t` is a string rather than a bare `T`.
+		---@type table<string, lye.doc.Type>
+		local limits = {}
+		local generics = held.generics
+		local constraints = held.constraints
+		if generics then
+			---@cast generics table<string, boolean>
+			for name in pairs(generics) do
+				---@cast name string
+				---@type string?
+				local constraint
+				if constraints then constraint = constraints[name] end
+				---@type lye.doc.Type
+				local limit = types.UNKNOWN_TYPE
+				if constraint then limit = parseType(constraint, resolve) or types.UNKNOWN_TYPE end
+				limits[name] = limit
+			end
+		end
+		for index, param in ipairs(list) do
+			local variable = byDeclaration[param]
+			local paramType = held.params[index + shift]
+			if paramType and next(limits) then
+				---@cast paramType lye.doc.Type
+				paramType = types.substitute(paramType, limits)
+			end
+			if variable and paramType and (variable.declared == nil or variable.declared == types.ANY_TYPE) then
+				variable.declared = paramType
+			end
+		end
+	end
+
 	-- A function assigned to a value whose type was written down takes that type's parameters, so the
 	-- body's own `x` is a number rather than the `any` an unannotated parameter starts as.
 	for _, declaration in ipairs(parsed.declarations) do
 		local value = declaration.valueIdx and parsed.nodes[declaration.valueIdx]
 		local owner = byDeclaration[declaration]
-		local held = owner and owner.declared
-		local list = value and value.kind == "function" and value.params or nil
-		-- A method's own receiver is not one of the signature's parameters, so the lists have to
-		-- line up exactly for this to mean anything.
-		if held and held.variant == "fn" and list and #list == #held.params then
-			-- A name the signature declares for itself stands for what it is limited to inside the body:
-			-- `---@type fn<T: string>(t: T)` takes a string, so `t` is a string rather than a bare `T`.
-			---@type table<string, lye.doc.Type>
-			local limits = {}
-			local generics = held.generics
-			local constraints = held.constraints
-			if generics then
-				---@cast generics table<string, boolean>
-				for name in pairs(generics) do
-					---@cast name string
-					---@type string?
-					local constraint
-					if constraints then constraint = constraints[name] end
-					---@type lye.doc.Type
-					local limit = types.UNKNOWN_TYPE
-					if constraint then limit = parseType(constraint, resolve) or types.UNKNOWN_TYPE end
-					limits[name] = limit
-				end
-			end
-			for index, param in ipairs(list) do
-				local variable = byDeclaration[param]
-				local paramType = held.params[index]
-				if paramType and next(limits) then
-					---@cast paramType lye.doc.Type
-					paramType = types.substitute(paramType, limits)
-				end
-				if variable and paramType and (variable.declared == nil or variable.declared == types.ANY_TYPE) then
-					variable.declared = paramType
-				end
-			end
+		applyFunctionType(owner and owner.declared, value and value.kind == "function" and value.params)
+	end
+	for _, node in ipairs(nodesOf(parsed, "assignment")) do
+		local value = node.valueIdx and parsed.nodes[node.valueIdx]
+		if value and value.kind == "function" then
+			local target = node.target and parsed.nodes[node.target]
+			local name = target and writtenNameOf(parsed, node.target) or ""
+			local synthetic = {
+				name = name, start = node.start, stop = node.stop, valueIdx = node.valueIdx,
+				isFunction = true, anchorIdx = node.anchorIdx, depth = node.depth or 0,
+				qualifier = name:find("[%.:]") and "field" or "local",
+			}
+			applyFunctionType(declaredTypeFor(parsed, annotations, synthetic, resolve), value.params)
 		end
 	end
 

@@ -331,80 +331,94 @@ local function fieldWrites(ctx)
 	-- to be the function that field says it is: what was written does not fit what the type said.
 	for _, node in ipairs(ctx.nodesOf("assignment")) do
 		if not reused(ctx, node.start, node.stop) then
-		---@type lye.parser.Node?
-		local target
-		if node.kind == "assignment" then target = parsed.nodes[node.target] end
-		---@type string?
-		local field
-		if target ~= nil and target.kind == "index" then field = target.field end
-		---@type string?
-		local base
-		if field ~= nil then
-			base = writtenNameOf(parsed, target.target)
-			---@cast base string?
-		end
-		---@type lye.doc.Type?
-		local held
-		if base ~= nil then held = receiverTypeOf(base, node.start) end
-		---@cast field string
-		-- Only a class says what its fields are; a table built field by field is typed by what was put
-		-- into it. `Foo.__index = Foo` is how a class is built, so the metatable keys are left alone.
-		local metatable = type(field) == "string" and field:sub(1, 2) == "__"
-		-- A write can be redirected by the metatable, which is what makes a read-only or computed table
-		-- possible. The write lands in the `__newindex` value and has to fit it.
-		local newindex = held and types.metamethod(held, "__newindex")
-		-- Where the write lands: the value itself, the `__newindex` table when the value does not
-		-- carry the field, and nowhere at all when a `__newindex` function computes the write.
-		---@type lye.doc.Type?
-		local destination
-		if held and held.variant == "class" then
-			destination = held
-			if newindex and not held.fields[field] then
-				-- `and nil or` would keep the function here: a `__newindex` function computes the
-				-- write, so there is no field to check it against.
-				if types.isFn(newindex) then
-					destination = nil
-				else
-					destination = newindex
+		-- A statement may write several fields at once, and each target takes its own value: the
+		-- second name of `t.a, t.b = f()` is the second value of the call, not the first.
+		local targetIndices = node.targets or { node.target }
+		for targetIndex, targetIdx in ipairs(targetIndices) do
+			---@type lye.parser.Node?
+			local target = parsed.nodes[targetIdx]
+			---@type string?
+			local field
+			if target ~= nil and target.kind == "index" then field = target.field end
+			---@type string?
+			local base
+			if field ~= nil then
+				base = writtenNameOf(parsed, target.target)
+				---@cast base string?
+			end
+			---@type lye.doc.Type?
+			local held
+			if base ~= nil then held = receiverTypeOf(base, node.start) end
+			---@cast field string
+			-- Only a class says what its fields are; a table built field by field is typed by what was put
+			-- into it. `Foo.__index = Foo` is how a class is built, so the metatable keys are left alone.
+			local metatable = type(field) == "string" and field:sub(1, 2) == "__"
+			-- A write can be redirected by the metatable, which is what makes a read-only or computed table
+			-- possible. The write lands in the `__newindex` value and has to fit it.
+			local newindex = held and types.metamethod(held, "__newindex")
+			-- Where the write lands: the value itself, the `__newindex` table when the value does not
+			-- carry the field, and nowhere at all when a `__newindex` function computes the write.
+			---@type lye.doc.Type?
+			local destination
+			if held and held.variant == "class" then
+				destination = held
+				if newindex and not held.fields[field] then
+					-- `and nil or` would keep the function here: a `__newindex` function computes the
+					-- write, so there is no field to check it against.
+					if types.isFn(newindex) then
+						destination = nil
+					else
+						destination = newindex
+					end
 				end
 			end
-		end
-		if held and held.variant == "class" and not metatable and not declaredHere(held, field)
-			and not buildsItsOwnClass(held, base) and destination ~= nil then
-			---@cast destination lye.doc.Type
-			local wanted = declaredField(destination, field)
-			local value = parsed.nodes[node.valueIdx]
-			if not wanted then
-				diagnostic.add(self, string.format("`%s` is not a field of %s", field,
-						destination.name or types.display(destination)), target.start, target.stop, nil, "missing-field")
-			elseif value then
-				local actual = infer.at(inferCtx, node.valueIdx)
-				if value.kind == "function" then
-					-- A bare `function` value says nothing about its parameters, so the signature is read off the
-					-- body: the parameters it declares and what it hands back.
-					local params = {}
-					for _, param in ipairs(value.params or {}) do
-						if param.name ~= "self" then
-							local variable = byDeclaration[param]
-							params[#params + 1] = (variable and variable.declared) or types.ANY_TYPE
-						end
+			local valueIdx = node.targetValues and node.targetValues[targetIndex] or node.valueIdx
+			local position = node.targetPositions and node.targetPositions[targetIndex] or 1
+			local value = valueIdx and parsed.nodes[valueIdx]
+			if held and held.variant == "class" and not metatable and not declaredHere(held, field)
+				and not buildsItsOwnClass(held, base) and destination ~= nil then
+				---@cast destination lye.doc.Type
+				local wanted = declaredField(destination, field)
+				if not wanted then
+					diagnostic.add(self, string.format("`%s` is not a field of %s", field,
+							destination.name or types.display(destination)), target.start, target.stop, nil, "missing-field")
+				elseif value then
+					-- A name is read through its variable at this offset, because inference may have
+					-- cached the placeholder it held before an assignment settled.
+					local actual
+					if value.kind == "prefix" and value.callee then
+						local variable = ctx.lookupIn(ctx.scopeAt(self, value.start), value.callee, value.start)
+						if variable then actual = ctx.typeAt(self, variable, value.start) end
 					end
-					actual = types.fn(params, infer.at(inferCtx, value.body) or types.VOID,
-						value.isVariadic == true)
-				end
-				local expected = wanted
-				-- The field's signature names the receiver and the value written for it does not,
-				-- which is every method: line them up before they are compared.
-				if actual and types.isFn(actual) and types.isFn(wanted)
-					and #wanted.params == #actual.params + 1
-					and not types.mismatch(wanted.params[1], held, "self") then
-					local rest = {}
-					for index = 2, #wanted.params do rest[index - 1] = wanted.params[index] end
-					expected = types.fn(rest, wanted.returns, wanted.isVariadic)
-				end
-				local message = actual and types.strictMismatch(expected, actual, field)
-				if message then
-					diagnostic.add(self, message, value.start, value.stop, nil, "type")
+					actual = actual or (position > 1 and valueIdx
+						and infer.valuesAt(inferCtx, valueIdx, position)) or infer.at(inferCtx, valueIdx)
+					if value.kind == "function" then
+						-- A bare `function` value says nothing about its parameters, so the signature is read off the
+						-- body: the parameters it declares and what it hands back.
+						local params = {}
+						for _, param in ipairs(value.params or {}) do
+							if param.name ~= "self" then
+								local variable = byDeclaration[param]
+								params[#params + 1] = (variable and variable.declared) or types.ANY_TYPE
+							end
+						end
+						actual = types.fn(params, infer.at(inferCtx, value.body) or types.VOID,
+							value.isVariadic == true)
+					end
+					local expected = wanted
+					-- The field's signature names the receiver and the value written for it does not,
+					-- which is every method: line them up before they are compared.
+					if actual and types.isFn(actual) and types.isFn(wanted)
+						and #wanted.params == #actual.params + 1
+						and not types.mismatch(wanted.params[1], held, "self") then
+						local rest = {}
+						for index = 2, #wanted.params do rest[index - 1] = wanted.params[index] end
+						expected = types.fn(rest, wanted.returns, wanted.isVariadic)
+					end
+					local message = actual and types.strictMismatch(expected, actual, field)
+					if message then
+						diagnostic.add(self, message, value.start, value.stop, nil, "type")
+					end
 				end
 			end
 		end
@@ -435,10 +449,20 @@ local function metatableChecks(ctx)
 					end
 					local declaration = enclosing and bodyOwner[enclosing.index]
 					local inside = declaration and declaration.name:match("^([%w_%.]+)%s*[%.:]")
-					local allowed = inside == targetType.name
+					-- A class is often named with its package while its methods are written on the
+					-- local table: `---@class lupa.Assets` over `local Assets = {}` is read by
+					-- `function Assets:image()`, and that is the same class.
+					local short = targetType.name and targetType.name:match("([^%.]+)$")
+					local allowed = inside == targetType.name or (inside ~= nil and inside == short)
 					if not allowed and visibility == "protected" and inside ~= nil then
 						---@cast inside string
 						local ownType = resolve(inside)
+						if not ownType and short and targetType.name then
+							-- The same package prefix names the subclass: `lupa.Savings` for
+							-- `function Savings:check()`.
+							local prefix = targetType.name:match("^(.*%.)")
+							if prefix then ownType = resolve(prefix .. inside) end
+						end
 						allowed = ownType ~= nil and types.satisfies(ownType, targetType)
 					end
 					if not allowed then
@@ -1046,6 +1070,10 @@ local function fieldKnown(member, field)
 	end
 	if member.variant == "class" then
 		if member.fields[field] then return true end
+		-- A parent declared in another file is a type beside this class, not a field of it.
+		for _, parent in ipairs(member.parents or {}) do
+			if fieldKnown(parent, field) == true then return true end
+		end
 		-- An index signature or a metatable can answer a name the class did not declare.
 		if (member.indexed and member.indexed.key == "string") or member.metatable then return nil end
 		-- A class with no fields at all is a marker or a build target; leave it open. One with a

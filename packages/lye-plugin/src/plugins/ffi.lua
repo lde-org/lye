@@ -47,6 +47,7 @@ local function blockOf(text)
 	if next(parsed) and #parsed > 8 then
 		for key in pairs(parsed) do parsed[key] = nil end
 	end
+	---@type lye.cdef.Namespace
 	local declared = cdef.parse(text)
 	held = {
 		declared = declared,
@@ -55,6 +56,42 @@ local function blockOf(text)
 	}
 	parsed[text] = held
 	return held
+end
+
+--- A C type written as a string without a cdef: `ffi.new("uint8_t[?]", n)` and
+--- `ffi.cast("float*", value)` name types the engine has always had. The declaration is built as
+--- a typedef the C parser can read, with a variable-length array written as the incomplete one the
+--- notation already knows. A name the parser cannot resolve, such as a struct another file
+--- declared, is left to the definitions rather than guessed.
+---@type table<string, { type: lye.cdef.Type, declared: lye.cdef.Namespace }|false>
+local builtins = {}
+
+---@param written string
+---@return lye.cdef.Type?
+---@return lye.cdef.Namespace?
+local function builtinType(written)
+	local held = builtins[written]
+	if held ~= nil then
+		if held then return held.type, held.declared end
+		return nil
+	end
+	local base, dimensions = written:match("^(.-)%s*(%[.*%])$")
+	local declaration
+	if base and base ~= "" then
+		declaration = "typedef " .. base .. " __lyeType" .. dimensions:gsub("%[%?%]", "[]") .. ";"
+	else
+		declaration = "typedef " .. written .. " __lyeType;"
+	end
+	---@type lye.cdef.Namespace
+	local declared = cdef.parse(declaration)
+	---@type lye.cdef.Type?
+	local found = declared.types.__lyeType
+	if not found or #declared.problems > 0 then
+		builtins[written] = false
+		return nil
+	end
+	builtins[written] = { type = found, declared = declared }
+	return found, declared
 end
 
 --- Where the text inside a cdef string begins: past the quote, or past the brackets and whatever
@@ -279,14 +316,49 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 		return loaded or nil
 	end
 
+	-- A ctype cached at module scope is called and cast with all the time: `local byteArray =
+	-- ffi.typeof("uint8_t[?]")` then `byteArray(n)` and `ffi.cast(bytePointer, value)`. The name
+	-- stands for the C type its initializer named, so a call through it is read as that type.
+	---@type table<string, string>
+	local ctypeOfName = {}
+	for _, declaration in ipairs(parsed_.declarations or {}) do
+		local value = declaration.valueIdx and parsed_.nodes[declaration.valueIdx]
+		if value and value.kind == "call" then
+			local argument = value.args and value.args[1] and parsed_.nodes[value.args[1]]
+			if argument and argument.kind == "string" and type(argument.value) == "string"
+				and callName(value) == "ffi.typeof" then
+				ctypeOfName[declaration.name] = argument.value
+			end
+		end
+	end
+
+	--- The C type a call argument names, when it is a string or a name a ctype was cached under.
+	---@param argument lye.parser.Node
+	---@return string?
+	local function ctypeTextOf(argument)
+		if argument.kind == "string" and type(argument.value) == "string" then return argument.value end
+		if argument.kind == "prefix" and argument.callee then return ctypeOfName[argument.callee] end
+	end
+
 	---@param node lye.parser.Node
 	local function cTypeOf(node)
 		local called = callName(node)
 		if called == "ffi.load" then return loadedSymbols() end
-		if called ~= "ffi.new" and called ~= "ffi.cast" and called ~= "ffi.typeof" then return nil end
+		-- `ffi.typeof` gives the ctype itself, which the definitions already name. A ctype is a
+		-- constructor only when it is called, and that call is not this one.
+		if called == "ffi.typeof" then return nil end
 		local argument = node.args and node.args[1] and parsed_.nodes[node.args[1]]
-		if not argument or argument.kind ~= "string" or type(argument.value) ~= "string" then return nil end
-		local found, declared = cTypeNamed(argument.value)
+		if not argument then return nil end
+		---@type string?
+		local written
+		if called == "ffi.new" or called == "ffi.cast" then
+			written = ctypeTextOf(argument)
+		else
+			written = ctypeOfName[called or ""]
+		end
+		if not written then return nil end
+		local found, declared = cTypeNamed(written)
+		if not found or not declared then found, declared = builtinType(written) end
 		if not found or not declared then return nil end
 		-- A struct, a union, an enum or a typedef of one is a class this file declares, and looking the
 		-- name up lets the document's own class win over the generated one. Everything else is mapped.
@@ -323,9 +395,9 @@ end
 ---@return lye.plugin.Types?
 function ffiPlugin.types(context)
 	local source, parsed_, callName = context.source, context.parsed, context.callName
-	-- Only a file that writes the word can be declaring C, and the scan is per node: reading the
-	-- text first is what keeps a file that declares nothing from paying for the search.
-	if not source:find("cdef", 1, true) then return nil end
+	-- A file that writes a cdef declares C; one that only calls `ffi.new("uint8_t[?]")` names a
+	-- builtin type. Both are the plugin's, and a file that mentions neither pays for no scan.
+	if not source:find("ffi", 1, true) then return nil end
 	local cdefs, files, diagnostics = {}, {}, {}
 	for _, node in ipairs(parsed_.byKind.call or {}) do
 		local argument = cdefArgument(parsed_, node, callName)
@@ -348,7 +420,6 @@ function ffiPlugin.types(context)
 			end
 		end
 	end
-	if #cdefs == 0 then return nil end
 	-- A cdef call adds to the engine's one type namespace: a later block may name a type an
 	-- earlier one declared. Each block is parsed on its own for its colours and annotations, so
 	-- that reference reads as unknown inside the block; it is not a problem if some block here

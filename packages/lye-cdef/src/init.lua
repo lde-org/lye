@@ -639,6 +639,7 @@ end
 --- Parse the text of a `ffi.cdef` call. Nothing is raised: a declaration that cannot be read is
 --- reported in `problems` and the rest of the header is still read.
 ---@param text string
+---@return lye.cdef.Namespace
 function cdef.parse(text)
 	assert(type(text) == "string", "cdef.parse expects a string")
 	-- Comments are tokens so a reader can colour them, and not part of what is parsed: a
@@ -701,6 +702,7 @@ end
 --- declared is no type at all, which is what makes the string form of these calls checkable.
 ---@param namespace lye.cdef.Namespace
 ---@param text string
+---@return lye.cdef.Type?
 function cdef.typeOf(namespace, text)
 	local ok, type = pcall(function()
 		local self = setmetatable({ tokens = tokenize(text), at = 1, namespace = namespace }, Parser)
@@ -716,6 +718,7 @@ end
 --- The name a type is an instance of, looking through the pointers and arrays in front of it:
 --- `Vec *` is a `Vec` written with a star, and that is the class a reader can name.
 ---@param type lye.cdef.Type
+---@return string?
 function cdef.className(type)
 	local current = type
 	while current and (current.kind == "pointer" or current.kind == "array") do

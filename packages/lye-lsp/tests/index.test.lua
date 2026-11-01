@@ -11,6 +11,7 @@ local fs = require("fs")
 local cache = require("lye-lsp.cache")
 local Index = require("lye-lsp.index")
 local parallel = require("lye-lsp.parallel")
+local types = require("lye-doc.type")
 
 local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
@@ -333,7 +334,7 @@ test.it("a package index follows its links and not the workspace", function()
 	local first = ROOT .. "/.deps/first.lua"
 	local second = ROOT .. "/.deps/second.lua"
 	write(ROOT .. "/src/main.lua", "return require(\"dep\")\n")
-	write(first, "---@class First\nreturn {}\n")
+	write(first, "---@class First\nlocal First = {}\n---@type fun(self: First, n: number): string\nfunction First:run(n) return tostring(n) end\nreturn First\n")
 	write(second, "---@class Second\nreturn {}\n")
 	test.truthy(fs.mklink(first, link), "the link is made")
 
@@ -346,6 +347,11 @@ test.it("a package index follows its links and not the workspace", function()
 	local pkg = Index.new({ kind = "package" })
 	test.truthy(pkg:save(pkg:build(ROOT)))
 	test.truthy(pkg:known().First, "the package reads what it links")
+	local firstClass = pkg:known().First
+	test.truthy(firstClass and firstClass.fields.run, "and the methods its classes declare")
+	local run = firstClass and firstClass.fields.run
+	test.equal(run and types.display(run), "fn(First, number) -> string",
+		"with the signature written above the method")
 	test.falsy(pkg:known().Second)
 	test.truthy(pkg:linkDigest(), "the links have a digest")
 

@@ -1917,6 +1917,14 @@ function types.fieldOf(type, name)
 				local carried = fields[name]
 				if carried then return carried end
 			end
+			-- A class declared in another file is not folded into this one's fields: the parent
+			-- type is kept beside them, and a field it declares is as real as one of its own.
+			if type.variant == "class" then
+				for _, parent in ipairs(type.parents or {}) do
+					local found = types.fieldOf(parent, name)
+					if found then return found end
+				end
+			end
 
 			local metatable = type.metatable
 			if not metatable then return nil end
@@ -2037,8 +2045,11 @@ function types.indexResult(target, field)
 		return target.indexed.type
 	end
 	-- A class may declare what indexing it gives: `ffi.array<T>` and `ffi.ptr<T>` both do, which is
-	-- what makes `a[1]` the element rather than nothing at all.
-	if target.variant == "class" and not field and target.indexed then
+	-- what makes `a[1]` the element rather than nothing at all. A numeric key may be written as a
+	-- name the parser records, so the key type says which reads the signature answers.
+	if target.variant == "class" and target.indexed
+		and (not field or ((target.indexed.key == "integer" or target.indexed.key == "number")
+			and field:match("^%-?%d+$"))) then
 		return target.indexed.type
 	end
 	if target.variant == "class" and field then

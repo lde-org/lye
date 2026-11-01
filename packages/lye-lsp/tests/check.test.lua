@@ -138,6 +138,20 @@ test.it("accepts a file that parses", function()
 	test.equal(check.file(INPUT), true)
 end)
 
+test.it("types a builtin C array and pointer without a cdef", function()
+	-- `ffi.new("uint8_t[?]")` and `ffi.cast("float*", ...)` name types the engine has always had,
+	-- so indexing them is a number rather than a use of an unknown.
+	writeInput(table.concat({
+		'local ffi = require("ffi")\n',
+		'local bytes = ffi.new("uint8_t[?]", 4)\n',
+		'bytes[0] = 1\n',
+		'local floats = ffi.cast("float*", 0)\n',
+		'local value = floats[0]\n',
+		'return bytes[0], value\n',
+	}))
+	test.equal(check.file(INPUT), true)
+end)
+
 test.it("resolves a module the definitions ship", function()
 	-- `lde-test` is injected by the runner and has no file in `target/`; the definitions carry
 	-- its type, so a test file is checked like any other module.

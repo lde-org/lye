@@ -20,6 +20,7 @@ local fs = require("fs")
 local ffi = require("ffi")
 local rapidhash = require("rapidhash")
 local doc = require("lye-doc")
+local methodIndex = require("lye-lsp.method_index")
 local classes = require("lye-doc.class")
 local serial = require("lye-doc.serial")
 local cache = require("lye-lsp.cache")
@@ -27,7 +28,7 @@ local parallel = require("lye-lsp.parallel")
 local timing = require("lye-lsp.timing")
 
 -- The shape of an entry. A reader of another one rebuilds rather than guesses.
-local SCHEMA = 2
+local SCHEMA = 3
 
 -- A cold build of fewer files than this is cheaper in one process: the fork and the record file
 -- cost more than a handful of comment lexes.
@@ -78,6 +79,7 @@ local sep = string.sub(package.config, 1, 1)
 ---@field isDefinition boolean
 ---@field annotations lye.lsp.IndexAnnotation[]
 ---@field types table<string, lye.lsp.IndexType>
+---@field methods lye.WorkspaceMethod[]
 
 ---@class lye.lsp.IndexEntry
 ---@field schema integer
@@ -223,6 +225,9 @@ local function digestOf(entry)
 			parts[#parts + 1] = annotation.tag .. "\0" .. (annotation.name or "") .. "\0"
 				.. (annotation.text or "") .. "\0" .. (annotation.type or "")
 		end
+		for _, method in ipairs(entry.files[path].methods or {}) do
+			parts[#parts + 1] = "method\0" .. (method.class or method.owner) .. "\0" .. method.name
+		end
 	end
 	return rapidhash.hex(table.concat(parts, "\1"))
 end
@@ -246,7 +251,11 @@ local function knownOf(entry)
 			annotations = entry.files[path].annotations --[[@as lye.doc.Annotation[] ]],
 		}
 	end
-	return classes.declare(files)
+	local found = classes.declare(files)
+	for _, path in ipairs(pathsOf(entry)) do
+		methodIndex.add(found, entry.files[path].methods or {})
+	end
+	return found
 end
 
 ---@param entry lye.lsp.IndexEntry
@@ -281,6 +290,7 @@ local function isValidEntry(entry, root)
 		if type(held.hash) ~= "string" then return false end
 		if type(held.size) ~= "number" or type(held.mtime) ~= "number" then return false end
 		if type(held.annotations) ~= "table" or type(held.types) ~= "table" then return false end
+		if type(held.methods) ~= "table" then return false end
 		if held.isDefinition ~= nil and type(held.isDefinition) ~= "boolean" then return false end
 	end
 	return true
@@ -495,7 +505,7 @@ function Index:record(path)
 	if type(source) ~= "string" then return nil end
 	self.stats_.reads += 1
 	local isOk, parsed = pcall(doc.parse, source)
-	local record = { hash = rapidhash.hex(source), annotations = {}, types = {} }
+	local record = { hash = rapidhash.hex(source), annotations = {}, types = {}, methods = {} }
 	if isOk then
 		---@cast parsed lye.doc.File
 		record.isDefinition = parsed.isDefinition
@@ -515,6 +525,7 @@ function Index:record(path)
 			}
 		end
 		collectTypes(record.types, path, source, parsed.annotations)
+		record.methods = methodIndex.scan(source, parsed.annotations)
 	end
 	local held = self.stat(path)
 	-- A stat's fields are integers, which on this runtime are cdata: the cache writes numbers.

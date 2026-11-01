@@ -12,6 +12,7 @@ local env = require("env")
 local parallel = require("lye-lsp.parallel")
 local cache = require("lye-lsp.cache")
 local Index = require("lye-lsp.index")
+local methodIndex = require("lye-lsp.method_index")
 local timing = require("lye-lsp.timing")
 local plugin = require("lye-plugin")
 local json = require("lye-json")
@@ -283,6 +284,7 @@ local function linkedDeclarations(root, cache, paths)
 		-- reading the closure of every closure; a run whose cache has already listed the farm —
 		-- its digest is taken over the same files — hands the list over instead of walking again.
 		local parsedFiles = {} ---@type lye.doc.File[]
+		local methodLists = {} ---@type lye.WorkspaceMethod[][]
 		---@param file string
 		local function read(file)
 			if #parsedFiles >= 2000 then return end
@@ -296,7 +298,10 @@ local function linkedDeclarations(root, cache, paths)
 				if isOk then docsByText[key] = one end
 				parsed = isOk and one or nil
 			end
-			if parsed then parsedFiles[#parsedFiles + 1] = parsed --[[@as lye.doc.File ]] end
+			if parsed then
+				parsedFiles[#parsedFiles + 1] = parsed --[[@as lye.doc.File ]]
+				methodLists[#methodLists + 1] = methodIndex.scan(source, parsed.annotations)
+			end
 		end
 		if paths then
 			for _, file in ipairs(paths) do read(file) end
@@ -309,6 +314,7 @@ local function linkedDeclarations(root, cache, paths)
 		-- What each name means, resolved once for the whole package: a dependency's alias is as
 		-- real to a reader as its own, and a bare name refuses every argument made of it.
 		found = classes.declare(parsedFiles)
+		for _, list in ipairs(methodLists) do methodIndex.add(found, list) end
 	end
 	cache[root] = found
 	return found
@@ -449,10 +455,13 @@ local function scopeFor(owner, scopes, elsewhere, store)
 	local held = scopes[owner]
 	if held then return held end
 	local scope = {}
-	for name, value in pairs(elsewhere or {}) do scope[name] = value end
+	-- What is linked into `target/` is what a file can require. The batch is read on top: a
+	-- package that links its own source there may have an older copy, and the files being checked
+	-- are the ones this run is about.
 	for name, value in pairs(linkedDeclarations(owner, scopes, store and store.farmFiles[owner])) do
 		scope[name] = value
 	end
+	for name, value in pairs(elsewhere or {}) do scope[name] = value end
 	scopes[owner] = scope
 	return scope
 end

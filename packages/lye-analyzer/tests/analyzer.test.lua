@@ -1417,6 +1417,143 @@ test.it("allows a subclass to read a protected field", function()
 	test.equal(#analyzer.analyze(source).diagnostics, 0)
 end)
 
+test.it("allows a namespaced class to read its own fields", function()
+	local source = table.concat({
+		"---@class lupa.Assets\n",
+		"---@field private draw number\n",
+		"local Assets = {}\n",
+		"function Assets:image()\n",
+		"\treturn self.draw\n",
+		"end\n",
+	}, "")
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
+test.it("allows a namespaced subclass to read a protected field", function()
+	local source = table.concat({
+		"---@class lupa.Account\n",
+		"---@field protected limit number\n",
+		"local Account = {}\n",
+		"---@class lupa.Savings: lupa.Account\n",
+		"local Savings = {}\n",
+		"function Savings:check()\n",
+		"\treturn self.limit\n",
+		"end\n",
+	}, "")
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
+test.it("types a dot function from the signature above it", function()
+	local source = table.concat({
+		"---@class M\n",
+		"local M = {}\n",
+		"---@type fun(self: M, x: number)\n",
+		"function M.b(x)\n",
+		"\tlocal held = x\n",
+		"\treturn held\n",
+		"end\n",
+	}, "")
+	test.equal(typeOf(source, "held"), "number")
+end)
+
+test.it("types an assigned function from the signature above it", function()
+	local source = table.concat({
+		"---@class M\n",
+		"local M = {}\n",
+		"---@type fun(self: M, x: number)\n",
+		"M.b = function(x)\n",
+		"\tlocal held = x\n",
+		"\treturn held\n",
+		"end\n",
+	}, "")
+	test.equal(typeOf(source, "held"), "number")
+end)
+
+test.it("types a local function from a signature below its class block", function()
+	-- The class and the signature share one comment block: the class describes the table, and
+	-- the signature describes the function that follows it.
+	local source = table.concat({
+		"---@class Draw\n",
+		"---@field arena Arena\n",
+		"---@type fun(draw: Draw)\n",
+		"local function f(draw)\n",
+		"\tlocal held = draw.arena\n",
+		"\treturn held\n",
+		"end\n",
+	}, "")
+	test.equal(typeOf(source, "held"), "Arena")
+end)
+
+test.it("keeps every return of a function type written inline", function()
+	local source = table.concat({
+		"---@type fun(x: number): number, string\n",
+		"local function pair(x) return x, tostring(x) end\n",
+		"local a, b = pair(1)\n",
+		"local held = b\n",
+	}, "")
+	test.equal(typeOf(source, "held"), "string")
+end)
+
+test.it("reads a LuaLS diagnostic code as the finding it names", function()
+	local source = table.concat({
+		"---@type number\n",
+		"---@diagnostic disable-next-line: assign-type-mismatch\n",
+		"local value = \"text\"\n",
+		"local held = value\n",
+		"return held, value\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	local directives = require("lye-analyzer.directives")
+	test.equal(#directives.apply(result.diagnostics, source, result.doc, nil), 0)
+	test.equal(typeOf(source, "held"), "number")
+end)
+
+test.it("reads a field in its own write as the value it had", function()
+	-- Each target of a multi-value assignment takes its own value, and the arguments the call is
+	-- written with are read before any of those writes lands.
+	local source = table.concat({
+		"---@class T\n",
+		"---@field a string\n",
+		"---@field n number\n",
+		"---@type T\n",
+		"local t = { a = \"a\", n = 0 }\n",
+		"---@param a string\n",
+		"---@param n number\n",
+		"---@return string a\n",
+		"---@return number n\n",
+		"local function pair(a, n) return a, n end\n",
+		"t.a, t.n = pair(t.a, t.n)\n",
+		"return t\n",
+	}, "")
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
+test.it("inherits a method signature and self from a class in another file", function()
+	local doc = require("lye-doc")
+	local parent = doc.classes.declare({
+		doc.parse("---@class lupa.App\n---@field start fun(self: lupa.App, assets: string)\n"),
+	})
+	local source = table.concat({
+		"---@class My: lupa.App\n",
+		"---@field own number\n",
+		"local App = {}\n",
+		"function App:start(assets)\n",
+		"\tself.own = 1\n",
+		"\tlocal held = assets\n",
+		"\treturn held\n",
+		"end\n",
+	}, "")
+	local result = analyzer.analyze(source, nil, parent)
+	test.equal(#result.diagnostics, 0)
+	for _, variable in ipairs(result.variables) do
+		if variable.name == "assets" then
+			test.equal(types.display(analyzer.typeAt(result, variable, #source)), "string")
+		elseif variable.name == "self" then
+			test.equal(types.display(analyzer.typeAt(result, variable, #source)), "My")
+		end
+	end
+end)
+
 test.it("binds a generic from the argument it is given", function()
 	local source = table.concat({
 		"---@generic T\n",

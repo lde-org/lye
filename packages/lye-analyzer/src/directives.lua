@@ -48,6 +48,15 @@ local function lineOf(starts, offset)
 	return high
 end
 
+-- The names LuaLS uses for the same findings, so a directive written for it still says what it
+-- means here: a file that silenced `assign-type-mismatch` silenced lye's `type`.
+local CODE_ALIASES = {
+	["assign-type-mismatch"] = "type",
+	["undefined-field"] = "missing-field",
+	["missing-fields"] = "missing-field",
+	["inject-field"] = "missing-field",
+}
+
 --- The codes a directive names, or nil when it names none and applies to every code.
 ---@param text string?
 ---@return table<string, boolean>?
@@ -58,7 +67,7 @@ local function codesOf(text)
 		local code = trim(part)
 		if code ~= "" then
 			codes = codes or {}
-			codes[code] = true
+			codes[CODE_ALIASES[code] or code] = true
 		end
 	end
 	return codes
