@@ -48,6 +48,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: lde-org/setup-lde@v2
+        with:
+          version: nightly
 
       - name: Build ${{ matrix.asset }}
         shell: bash
