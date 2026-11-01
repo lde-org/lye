@@ -459,6 +459,8 @@ end
 --- The words that are grammar inside a type rather than the name of one.
 local TYPE_KEYWORD = {
 	const = true, fun = true, fn = true, async = true,
+	-- Conditional types read these as grammar: `T extends Option<infer V> ? V : never`.
+	infer = true, extends = true,
 	-- The values a type can name are constants rather than names of one.
 	["true"] = true, ["false"] = true, ["nil"] = true,
 }

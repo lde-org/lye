@@ -997,6 +997,24 @@ test.it("encodes semantic tokens relative to the previous token", function()
 	test.equal(seen["1:15"], "parameter", "name is a parameter")
 end)
 
+test.it("marks infer and extends as keywords inside a type", function()
+	-- Both words are grammar in `T extends Option<infer V> ? V : never`; painting them as type
+	-- names made a conditional read as two names and an ordinary identifier.
+	local source = "---@alias X<T> T extends Option<infer V> ? V : never\n"
+	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
+	local data = results["2"].data
+	local lines = { source:gsub("\n$", "") }
+	local line, character, painted = 0, 0, {}
+	for index = 1, #data, 5 do
+		line += data[index]
+		character = data[index] == 0 and (character + data[index + 1]) or data[index + 1]
+		local text = lines[line + 1]:sub(character + 1, character + data[index + 2])
+		painted[text] = data[index + 3]
+	end
+	test.equal(painted["extends"], 0, "extends is a keyword")
+	test.equal(painted["infer"], 0, "infer is a keyword")
+end)
+
 test.it("marks a doc annotation as documentation and its tag as a keyword", function()
 	-- Annotations are the one comment an editor should not paint as an ordinary one.
 	local source = "---@param x number\nlocal function f(x) end\n"
