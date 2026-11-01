@@ -197,6 +197,31 @@ and `workspace/diagnostic` for every Lua file in the workspace; either is a full
 it names. Clients without workspace pull still publish the open document's diagnostics, and
 `lye check` is the whole-tree pass for CI.
 
+## Library
+
+The `lye-lsp` package is also a library. `main.lua` is the executable; `src/init.lua` is what an
+lde package gets from `require("lye-lsp")`, and it starts no server and reads no arguments. Add the
+package as a dependency and drive the same check `lye check` runs:
+
+```json
+{ "dependencies": { "lye-lsp": { "path": "../lye/packages/lye-lsp" } } }
+```
+
+```lua
+local lye = require("lye-lsp")
+local reporter = lye.report.collect()
+local isOk, err = lye.check.file("src/main.lua", nil, nil, reporter)
+
+for _, finding in ipairs(reporter.collect) do
+	print(string.format("%s:%d:%d: %s", finding.path, finding.line, finding.column, finding.message))
+end
+```
+
+`check.files` checks a batch the way the command line does, and `check.discover`, `check.expand` and
+`check.extensions` name the files and dialect extensions a run would use. A reporter from
+`report.collect()` keeps findings as `{ path, line, column, severity, message }` tables; the default
+reporter prints them.
+
 ## Building
 
 The editor packages use a standalone executable. Build it from a snapshot of the working tree:
