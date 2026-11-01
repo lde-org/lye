@@ -198,7 +198,7 @@ local function readField(annotation, fallback)
 	if inline == "private" or inline == "protected" or inline == "public" then
 		visibility = inline
 		local rest = typeText
-		local realName, remaining = rest:match("^([%w_%.]+)(.*)$")
+		local realName, remaining = rest:match("^([%w_%.%-]+)(.*)$")
 		if type(realName) ~= "string" or type(remaining) ~= "string" then return nil end
 		name, typeText = realName, (remaining:gsub("^%s+", ""))
 		---@cast name string
@@ -206,7 +206,7 @@ local function readField(annotation, fallback)
 		-- `---@field private data table<K, V>` carries the rest in the tag's text, which is where
 		-- the doc reader keeps a field's type when it stopped at the first word.
 		if typeText == "" then
-			local after = (annotation.text or ""):match("^private%s+[%w_%.]+%s+(.*)$")
+			local after = (annotation.text or ""):match("^private%s+[%w_%.%-]+%s+(.*)$")
 			typeText = after and (after:gsub("%s+$", "")) or "any"
 		end
 	end
@@ -677,7 +677,7 @@ function classes.read(file)
 			-- has a `Format` table, and the enum itself is a number for annotations. The concrete
 			-- members are read from the table at runtime, so a string index signature is the honest
 			-- shape for `Format.R8G8...` rather than an invented list of names.
-			local written = annotation.name or (annotation.text or ""):match("^%s*([%w_%.]+)")
+			local written = annotation.name or (annotation.text or ""):match("^%s*([%w_%.%-]+)")
 			if written then
 				local name = bareName(written)
 				local field = name:match("([^%.]+)$")
@@ -744,7 +744,7 @@ function classes.declare(files, base)
 	for _, file in ipairs(files) do
 		for _, annotation in ipairs(file.annotations) do
 			local declared = annotation.name
-				or (annotation.tag == "enum" and (annotation.text or ""):match("^%s*([%w_%.]+)"))
+				or (annotation.tag == "enum" and (annotation.text or ""):match("^%s*([%w_%.%-]+)"))
 			if (annotation.tag == "class" or annotation.tag == "alias" or annotation.tag == "enum")
 				and declared and found[declared] == nil then
 				found[declared] = resolve(declared) or true

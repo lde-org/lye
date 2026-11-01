@@ -244,6 +244,27 @@ test.it("reports a cdef it could not read where it is written", function()
 	test.equal(typeOf(source, "made"), "Good", "and the declaration after it is still read")
 end)
 
+test.it("reads a hyphen in a type name", function()
+	-- A Lua package may be called `winit-x11`; its classes keep the hyphen, and a hyphen written
+	-- without spaces beside a letter is part of the name rather than subtraction.
+	local source = table.concat({
+		"---@class winit-x11.Window\n",
+		"---@field width number\n",
+		"---@type winit-x11.Window\n",
+		"local window = { width = 800 }\n",
+		"local list = {} ---@type winit-x11.Window[]\n",
+		"list[1] = window\n",
+		"return window, list\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 0)
+	for _, variable in ipairs(result.variables) do
+		if variable.name == "window" then
+			test.equal(types.display(analyzer.typeAt(result, variable, #source)), "winit-x11.Window")
+		end
+	end
+end)
+
 test.it("reads a cdef type named as a string, and leaves the rest alone", function()
 	local source = table.concat({
 		'local ffi = require("ffi")\n',

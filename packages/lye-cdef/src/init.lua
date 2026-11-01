@@ -744,7 +744,9 @@ function cdef.notation(namespace, type, where)
 		-- the tag behind it may not even have one. A callback typedef keeps its name too: it is
 		-- the type a `ffi.cast` is written with.
 		local resolved = type.name and cdef.resolve(namespace, type.name)
-		if resolved and isCdata(namespace, resolved) then return type.name end
+		if resolved and (isCdata(namespace, resolved) or resolved.kind == "pointer") then
+			return type.name
+		end
 		-- A typedef of a 64-bit scalar keeps its own name too: the header wrote `size_t` and a
 		-- reader annotating with it gets the cdata type the engine hands over.
 		if resolved and resolved.kind == "int" and CDATA_SCALAR[resolved.name or ""] then

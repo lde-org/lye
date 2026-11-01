@@ -23,6 +23,10 @@ local directives = require("lye-analyzer.directives")
 
 local check = {}
 
+-- Defined once the plugin machinery below is in place; the linked-module declarations need it
+-- while they build the namespace they hand to a check.
+local pluginDeclarations
+
 --- What lye reads of a document no plugin lowered: the text itself, and a map that moves nothing.
 --- A shared one, since it holds no state: a check reads every file of a package through this.
 local IDENTITY = require("lye-plugin.source").lower("", {})
@@ -301,6 +305,9 @@ local function linkedDeclarations(root, cache, paths)
 			end
 			if parsed then
 				parsedFiles[#parsedFiles + 1] = parsed --[[@as lye.doc.File ]]
+				for _, declaration in ipairs(pluginDeclarations(file, source, parsed)) do
+					parsedFiles[#parsedFiles + 1] = declaration
+				end
 				methodLists[#methodLists + 1] = methodIndex.scan(source, parsed.annotations)
 			end
 		end
@@ -604,7 +611,7 @@ end
 ---@param written string
 ---@param annotations lye.doc.File
 ---@return lye.doc.File[]
-local function pluginDeclarations(path, written, annotations)
+function pluginDeclarations(path, written, annotations)
 	local specs = pluginsFor(path)
 	local hasTypes = false
 	for _, spec in ipairs(specs) do

@@ -225,7 +225,7 @@ local function parse(comment, start, stop)
 	if tag == "param" then
 		-- `---@param x string` and `---@param x? string`, where `?` marks it optional. `%?`
 		-- is not a character class on this LuaJIT, so the marker is matched literally.
-		local name, marker, remaining = rest:match("^([%w_%.]+)(%??)(.*)$")
+		local name, marker, remaining = rest:match("^([%w_%.%-]+)(%??)(.*)$")
 		annotation.name = name
 		annotation.type = cutType(remaining or "")
 		annotation.typeText = annotation.type
@@ -254,7 +254,7 @@ local function parse(comment, start, stop)
 		-- `---@field [integer] T` is an index signature rather than a field: what a value indexed
 		-- with that kind of key gives. The bracket is the name slot — a key type, not an
 		-- identifier — and the type after it is the value's.
-		local name, remaining = rest:match("^([%w_%.]+)(.*)$")
+		local name, remaining = rest:match("^([%w_%.%-]+)(.*)$")
 		if not name then
 			local bracket, body = rest:match("^(%[[^%]]*%])(.*)$")
 			name, remaining = bracket, body
@@ -264,7 +264,7 @@ local function parse(comment, start, stop)
 		annotation.type = cutType(written)
 		annotation.typeText = annotation.type
 	elseif tag == "alias" or tag == "generic" or tag == "class" then
-		local name, remaining = rest:match("^([%w_%.]+)(.*)$")
+		local name, remaining = rest:match("^([%w_%.%-]+)(.*)$")
 		annotation.name = name
 		local written = trim((remaining or ""):gsub("^=", ""))
 		if tag == "class" or tag == "alias" then

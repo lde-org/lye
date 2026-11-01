@@ -1046,6 +1046,9 @@ local function checkCalls(self, parsed, signatureOfCall, returns, resolve, infer
 		if declaration and declaration.name:find(":", 1, true) then
 			return false
 		end
+		-- The workspace index builds a method's parameters without `self`: the receiver is
+		-- already accounted for, so the first written argument is the first parameter.
+		if calleeType and calleeType.implicitSelf then return false end
 		if calleeType and calleeType.isMethod then return true end
 		local first = params[1]
 		if first == nil then return true end

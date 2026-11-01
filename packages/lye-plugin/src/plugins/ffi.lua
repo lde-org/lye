@@ -16,6 +16,9 @@ local cdef = require("lye-cdef")
 local doc = require("lye-doc")
 local types = require("lye-doc.type")
 
+-- Declared here because the colour pass reads a cdef before the type pass is written below.
+local decodeString, cdefText
+
 local ffiPlugin = {}
 
 --- What a name of a declaration is, in the vocabulary the server advertises.
@@ -90,6 +93,9 @@ local function builtinType(written)
 		builtins[written] = false
 		return nil
 	end
+	-- The synthetic typedef is only a way to let the C parser read the text; the type it names
+	-- is what a reader gets, not the name `__lyeType`.
+	found = cdef.resolve(declared, "__lyeType") or found
 	builtins[written] = { type = found, declared = declared }
 	return found, declared
 end
@@ -176,7 +182,7 @@ function ffiPlugin.tokens(context)
 	for _, node in ipairs(parsed_.byKind.call or {}) do
 		local argument = cdefArgument(parsed_, node, nameOf)
 		if argument then
-			local written = argument.value --[[@as string]]
+			local written = cdefText(text, argument)
 			local from = cdef.textStart(text, argument.start, argument.stop)
 			---@cast from integer
 			for _, span in ipairs(blockOf(written).spans) do
@@ -448,6 +454,61 @@ local function providersOf(cdefs, resolve, parsed_, callName)
 	return answer
 end
 
+--- A quoted Lua string as the engine reads it. The parser keeps the text as written, so a cdef
+--- written as `"typedef int A;\ntypedef int B;"` would hand the C parser a backslash instead of
+--- the newline between the declarations. Long-bracket strings are already exactly what they say.
+---@param text string
+---@return string
+function decodeString(text)
+	if not text:find("\\", 1, true) then return text end
+	local out, at = {}, 1
+	while at <= #text do
+		local char = text:sub(at, at)
+		if char ~= "\\" then
+			out[#out + 1] = char
+			at += 1
+		else
+			local following = text:sub(at + 1, at + 1)
+			local simple = ({
+				n = "\n", t = "\t", r = "\r", a = "\a", b = "\b", f = "\f", v = "\v",
+				["\\"] = "\\", ['"'] = '"', ["'"] = "'", ["\n"] = "\n",
+			})[following]
+			if simple then
+				out[#out + 1] = simple
+				at += 2
+			elseif following:match("%d") then
+				local digits = text:sub(at + 1, at + 3):match("^%d%d?%d?")
+				out[#out + 1] = string.char(tonumber(digits))
+				at += 1 + #digits
+			elseif following == "x" then
+				local hex = text:sub(at + 2, at + 3)
+				local byte = tonumber(hex, 16)
+				if byte then out[#out + 1] = string.char(byte) end
+				at += 4
+			elseif following == "z" then
+				at += 2
+				while text:sub(at, at):match("%s") do at += 1 end
+			else
+				out[#out + 1] = following
+				at += 2
+			end
+		end
+	end
+	return table.concat(out)
+end
+
+--- The text a `ffi.cdef` call hands the C parser: a long string as it stands, a quoted Lua string
+--- with its escapes read.
+---@param source string
+---@param argument lye.parser.Node
+---@return string
+function cdefText(source, argument)
+	local written = argument.value --[[@as string]]
+	local first = source:sub(argument.start, argument.start)
+	if first == '"' or first == "'" then return decodeString(written) end
+	return written
+end
+
 --- The C every `ffi.cdef` block in a file declares: the parsed namespaces, the annotations they
 --- write for the analyzer, and the problems that could not be read. A file that mentions neither
 --- `ffi` nor `cdef` pays for no walk.
@@ -462,7 +523,7 @@ local function collect(source, parsed_, callName)
 	for _, node in ipairs(parsed_.byKind.call or {}) do
 		local argument = cdefArgument(parsed_, node, callName)
 		if argument then
-			local written = argument.value --[[@as string]]
+			local written = cdefText(source, argument)
 			local held = blockOf(written)
 			cdefs[#cdefs + 1] = held.declared
 			files[#files + 1] = held.annotations

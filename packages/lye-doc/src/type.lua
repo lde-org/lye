@@ -933,6 +933,22 @@ function types.satisfies(type, constraint)
 	return result
 end
 
+--- A struct a cdef declared, as opposed to a pointer, an array, or a scalar: a constructor may
+--- leave its fields out and the engine zeroes them.
+---@param candidate lye.doc.Type?
+local function isCObject(candidate)
+	if not candidate or candidate.variant ~= "class" then return false end
+	local name = candidate.name
+	if name == "ffi.cdata*" or name == "ffi.ptr" or name == "ffi.array"
+		or name == "ffi.cb*" or name == "ffi.cnum" or name == "ffi.cnum*" then
+		return false
+	end
+	for _, parent in ipairs(candidate.parents or {}) do
+		if parent.variant == "class" and parent.name == "ffi.cdata*" then return true end
+	end
+	return false
+end
+
 --- The required data fields a class shape asks for and an object literal does not carry. A
 --- method is not counted: it comes from the metatable the literal is given, as `setmetatable`
 --- does. An empty literal is exactly the case a call has to refuse, where a declaration may be
@@ -943,6 +959,8 @@ end
 function types.missingRequiredFields(constraint, actual)
 	local missing = {}
 	if constraint.variant ~= "class" or actual.variant ~= "object" then return missing end
+	-- A C struct is built by a constructor that zeroes what the table leaves out.
+	if isCObject(constraint) then return missing end
 	for name, wanted in pairs(constraint.fields or {}) do
 		if not types.isFn(wanted) and actual.fields[name] == nil
 			and not types.satisfies(types.NIL_TYPE, wanted) then
@@ -1008,21 +1026,6 @@ local function isChar(candidate)
 	return name == "ffi.char" or name == "ffi.uint8_t"
 end
 
---- A struct a cdef declared, as opposed to a pointer, an array, or a scalar: a constructor may
---- leave its fields out and the engine zeroes them.
----@param candidate lye.doc.Type?
-local function isCObject(candidate)
-	if not candidate or candidate.variant ~= "class" then return false end
-	local name = candidate.name
-	if name == "ffi.cdata*" or name == "ffi.ptr" or name == "ffi.array"
-		or name == "ffi.cb*" or name == "ffi.cnum" or name == "ffi.cnum*" then
-		return false
-	end
-	for _, parent in ipairs(candidate.parents or {}) do
-		if parent.variant == "class" and parent.name == "ffi.cdata*" then return true end
-	end
-	return false
-end
 
 --- The comparison, at a depth: past the cap the same pair is being asked again, and the answer it
 --- is being worked out for is what the outer ask returns, so it fits.
@@ -1096,7 +1099,7 @@ function fits(type, constraint, depth, seen)
 		-- `char *` for a parameter written that way.
 		if type.variant == "nil" then return true end
 		if type.variant == "number" and type.value == 0 then return true end
-		if type.variant == "string" and isChar(target) then return true end
+		if (type.variant == "string" or stringValueOf(type)) and isChar(target) then return true end
 		if type.variant == "array" and fits(type.type, target, depth + 1, seen) then return true end
 		if type.variant == "class" and type.name == "ffi.ptr" then
 			local held = type.args[1]
@@ -1112,7 +1115,8 @@ function fits(type, constraint, depth, seen)
 		end
 		if type.variant == "class" and fits(type, target, depth + 1, seen) then return true end
 	end
-	if constraint.variant == "class" and constraint.name == "ffi.cdata*" and isCData(type) then
+	if constraint.variant == "class" and constraint.name == "ffi.cdata*"
+		and (isCData(type) or type.variant == "string" or stringValueOf(type)) then
 		return true
 	end
 	-- A pointer to a struct is read as the struct by the definitions, and an array of that struct
@@ -3030,11 +3034,23 @@ local function expressionParts(text)
 				op = char
 			end
 			if op then
+				-- Lua package and class names may carry a hyphen (`winit-x11.Window`). A hyphen
+				-- written without spaces and beside a letter is part of that name, not subtraction;
+				-- `5-2` and `A - B` remain arithmetic.
+				local partOfName = false
+				if op == "-" then
+					local previous = text:sub(at - 1, at - 1)
+					local following = text:sub(at + 1, at + 1)
+					if previous ~= "" and following ~= "" and previous ~= " " and following ~= " "
+						and (previous:match("[%a_]") or following:match("[%a_]")) then
+						partOfName = true
+					end
+				end
 				local before = text:sub(1, at - 1)
 				local left = before:gsub("%s+$", "")
 				local right = text:sub(at + #op):gsub("^%s+", "")
 				local unary = op == "-" and (left == "" or left:sub(-1):match("[%(,%+%-%*/%%%^%.,<>=]") ~= nil)
-				if not unary and left ~= "" and right ~= "" and not (op == "-" and text:sub(at + 1, at + 1) == ">") then
+				if not partOfName and not unary and left ~= "" and right ~= "" and not (op == "-" and text:sub(at + 1, at + 1) == ">") then
 					local precedence = EXPRESSION_PRECEDENCE[op]
 					local take = bestAt == nil or precedence < bestPrecedence
 					if not take and precedence == bestPrecedence then
@@ -3096,7 +3112,7 @@ function types.parse(text, resolve)
 
 	-- The common annotation is one name. It cannot be a conditional, an operator or an indexed
 	-- access, so resolving it here skips every scan below.
-	if not trimmed:match("^%d") and trimmed:match("^[%w_%.%*]+$") then
+	if not trimmed:match("^%d") and trimmed:match("^[%w_%.%-%*]+$") then
 		if trimmed == "true" then return types.booleanValue(true) end
 		if trimmed == "false" then return types.booleanValue(false) end
 		if trimmed == "integer" then return types.base("number") end
@@ -3694,6 +3710,7 @@ end
 ---@param actual lye.doc.Type
 ---@param name string
 function types.strictMismatch(declared, actual, name)
+
 	local opaque, at = opaqueWhere(declared, actual, {}, 0)
 	if opaque then
 		return string.format("%s is declared as %s but is assigned %s%s", name,
