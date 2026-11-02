@@ -535,8 +535,10 @@ local function declaredTypeFor(parsed, file, declaration, resolve)
 	-- the class describes the table or the function's result, not the function itself.
 	if previous.tag == "type" or previous.tag == "as" then return typedBy(previous) end
 	-- A class declared above a declaration is that declaration's type, looked for rather than taken
-	-- from the last line because its `---@field` lines follow it. Only where it holds the table.
-	local holdsTable = declaration.initializer == "table"
+	-- from the last line because its `---@field` lines follow it. What it describes is a value the
+	-- declaration builds: a table written in place, or a constructor's result. A function is the
+	-- other answer, below, and says what it returns.
+	local buildsClass = declaration.initializer == "table" or declaration.initializer == "call"
 		or (declaration.valueIdx and parsed.nodes[declaration.valueIdx]
 			and parsed.nodes[declaration.valueIdx].kind == "table")
 	-- Above a function the class is what it returns, which is how `---@class osdate` over
@@ -551,7 +553,7 @@ local function declaredTypeFor(parsed, file, declaration, resolve)
 			end
 		end
 	end
-	if holdsTable then
+	if buildsClass then
 		for index = high, 1, -1 do
 			local annotation = annotations[index]
 			if annotation.start < spanStart then break end
@@ -2212,6 +2214,50 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 			end
 		end
 	end
+	-- A function written as a table field -- `open = function(n)` -- is how a handler table is built,
+	-- and its `@param` block sits above the field name rather than above a declaration. The parser
+	-- keeps the key token each field was written with, so the same block reader a declaration uses
+	-- attaches there too.
+	for tableIdx, fields in pairs(parsed.tableFieldValues or {}) do
+		---@cast tableIdx integer
+		local anchors = parsed.tableFieldAnchors and parsed.tableFieldAnchors[tableIdx]
+		if anchors then
+			for fieldName, valueIdx in pairs(fields) do
+				---@cast fieldName string
+				---@cast valueIdx integer
+				local node = parsed.nodes[valueIdx]
+				local anchorIdx = anchors[fieldName]
+				if node and node.kind == "function" and anchorIdx and not bodyOwner[valueIdx] then
+					local synthetic = {
+						name = fieldName, start = parsed.tokens.arena[anchorIdx].start,
+						stop = node.stop, valueIdx = valueIdx, isFunction = true,
+						anchorIdx = anchorIdx, depth = node.depth or 0, qualifier = "field",
+					}
+					local params, returned, generics, constraints, predicates, overloads, flags =
+						signatureOf(parsed, annotations, synthetic)
+					---@cast overloads string[]
+					---@cast flags table<string, boolean>
+					if #params > 0 or returned or next(generics) or #predicates > 0 or #overloads > 0
+						or flags.deprecated or flags.nodiscard or flags.async then
+						bodyOwner[valueIdx] = synthetic
+						signatureOfDecl[synthetic] = {
+							params = params, returns = returned, generics = generics,
+							constraints = constraints, predicates = predicates, overloads = overloads,
+							values = annotationValues(returned),
+							deprecated = flags.deprecated, nodiscard = flags.nodiscard, async = flags.async,
+						}
+						local list = {}
+						for _, param in ipairs(node.params or {}) do
+							list[#list + 1] = param
+							paramOwner[param] = synthetic
+						end
+						declaredParams[synthetic] = list
+						annotatedBodies[valueIdx] = true
+					end
+				end
+			end
+		end
+	end
 	-- An annotated function returned from another function -- `return function(p, opts) ... end`
 	-- -- has no declaration of its own, so its `@param` block would otherwise be read by nobody.
 	-- The `return` that opens the statement is its anchor, exactly as a declaration's name is.
@@ -2602,7 +2648,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 	end
 	if counters then mark("fieldWrites") end
 	-- The list itself, not the file it was parsed into: a `---@cast` is read from there.
-	narrow.collect(parsed, byRecord, signatures, resolve, annotations.annotations)
+	narrow.collect(parsed, byRecord, signatures, resolve, annotations.annotations, root)
 	if counters then mark("scopes") end
 	inferCtx = infer.context(parsed, typeOfName, returns, function(base, baseName, field, offset)
 		return fieldTypeAt(self, base, baseName, field, offset)
@@ -3144,15 +3190,18 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 	end
 
 	if counters then mark("itemIndexes") end
-	-- The class a table declaration gives its name to. A class is often spelled longer than the
-	-- table that holds it — `---@class lde.Package` over `local Package = {}` — and the method
-	-- written on `Package` belongs to `lde.Package`. Only a class annotation counts: a `---@type`
-	-- says what the table holds rather than that the table declares the class.
+	-- The class a table or constructor declaration gives its name to. A class is often spelled
+	-- longer than the table that holds it — `---@class lde.Package` over `local Package = {}` —
+	-- and the method written on `Package` belongs to `lde.Package`. A constructor's result is the
+	-- same link: `---@class App` over `local App = wonderland.app()` makes `function App:view` a
+	-- method of `App`, and `self` is the app. Only a class annotation counts: a `---@type` says
+	-- what the table holds rather than that the table declares the class.
 	local classOfTable = {}
 	local written = annotations.annotations or {}
 	for _, declaration in ipairs(parsed.declarations) do
 		local spanStart = declaration.name and not declaration.name:find("[%.:]")
-			and declaration.initializer == "table" and annotationSpan(parsed, declaration)
+			and (declaration.initializer == "table" or declaration.initializer == "call")
+			and annotationSpan(parsed, declaration)
 		if spanStart then
 			local low, high = 1, #written
 			while low <= high do
@@ -3820,16 +3869,26 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		local className = held and held.name
 		local byHand = className and doc.classes.fieldsOf(namespace, className)[field]
 		if byHand then wanted = parseType(byHand.type, resolve) or wanted end
+		-- An optional method — `view fun(...)?` — says the app may leave it out, not that a body
+		-- that fills it in has no signature: the parameters are the non-nil half.
+		if wanted and wanted.variant == "union" then wanted = types.excludeType(wanted, types.NIL_TYPE) end
 		if not wanted or wanted.variant ~= "fn" then return end
 
-		-- Either side may spell the receiver out and the other leave it implicit, so a parameter list one
-		-- longer than the other side's belongs to the receiver, and the receiver's type says so.
+		-- Either side may spell the receiver out and the other leave it implicit, so the parameter
+		-- lists are lined up by the receiver. A method's body carries `self`, so its parameters line
+		-- up from the start, and a body may leave trailing ones out: `function App:update(message)`
+		-- writes no window and is called with one anyway. A dot function writes no receiver, so the
+		-- signature's `self` shifts it by one.
 		local shift = 0
-		if #wanted.params == #list + 1 and held
+		if list[1].name == "self" then
+			if #wanted.params == #list - 1 then
+				shift = -1
+			elseif #wanted.params < #list then
+				return
+			end
+		elseif #wanted.params == #list + 1 and held
 			and not types.mismatch(wanted.params[1], held, "self") then
 			shift = 1
-		elseif #wanted.params == #list - 1 and list[1].name == "self" then
-			shift = -1
 		elseif #wanted.params ~= #list then
 			return
 		end
@@ -3845,7 +3904,9 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 				paramType = held
 			end
 			local variable = byDeclaration[param]
-			if variable and paramType then variable.declared = paramType end
+			if variable and paramType and not variable.declaredExplicit then
+				variable.declared = paramType
+			end
 			if param.name ~= "self" then params[#params + 1] = paramType or types.ANY_TYPE end
 		end
 
@@ -4150,6 +4211,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		byDeclaration = byDeclaration,
 		receiverTypeOf = receiverTypeOf, declaredHere = declaredHere, functionNodes = functionNodes, bodyOwner = bodyOwner, annotatedBodies = annotatedBodies,
 		inferredValuesOf = inferredValuesOf, inferredReturnOf = inferredReturnOf,
+		signatureTypeOf = signatureTypeOf,
 		scopeAt = scopeAt, lookupIn = lookupIn, declaredField = declaredField,
 		inheritedField = inheritedField,
 		typeAt = analyzer.typeAt,

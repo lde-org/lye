@@ -103,6 +103,7 @@ local newTable = require("table.new")
 ---@field resumeStats lye.parser.ResumeStats how much of the parse came from a previous one
 ---@field source string the text the tree was read from
 ---@field tableFieldValues table<integer, table<string, integer>> field values per table literal
+---@field tableFieldAnchors table<integer, table<string, integer>> key token index per field, for an annotation block written on it
 ---@field tableIndexes table<integer, integer[]> positional element indices per table literal
 
 ---@class lye.parser.ResumeStats
@@ -136,6 +137,7 @@ local newTable = require("table.new")
 ---@field scopes string[][]
 ---@field count_ integer how many nodes have been emitted, which the next one's index is
 ---@field tableFieldValues table<integer, table<string, integer>>
+---@field tableFieldAnchors table<integer, table<string, integer>>
 ---@field lastKind string?
 ---@field lastFields table<string, string>? the field kinds of the table just read
 ---@field lastDeclaration integer?
@@ -297,6 +299,7 @@ function Parser.new(source, resume, definition)
 		lastScope = nil,
 		tableFields = {},
 		tableFieldValues = {},
+		tableFieldAnchors = {},
 		tableIndexes = {},
 		byKind = newTable(0, 16),
 		count_ = 0,
@@ -327,6 +330,7 @@ function Parser.new(source, resume, definition)
 	self.scopes_ = resume.scopes
 	self.tableFields = resume.tableFields
 	self.tableFieldValues = resume.tableFieldValues
+	self.tableFieldAnchors = resume.tableFieldAnchors
 	self.tableIndexes = resume.tableIndexes
 	self.resumeStats = { nodes = keep, tokens = resume.tokenIndex - 1 }
 	-- The scanner's problems (kept by `lexer.resume` when they lie before the resume point, and
@@ -488,6 +492,7 @@ function Parser.resumeAt(parsed, offset)
 		tokens = parsed.tokens, nodes = nodes, declarations = declarations,
 		scopes = scopes, diagnostics = carried,
 		tableFields = indexed(parsed.tableFields),
+		tableFieldAnchors = indexed(parsed.tableFieldAnchors),
 		tableFieldValues = indexed(parsed.tableFieldValues), tableIndexes = indexed(parsed.tableIndexes),
 	}
 end
@@ -874,6 +879,7 @@ function Parser:parse()
 		scopes = self.scopes_,
 		tableFields = self.tableFields,
 		tableFieldValues = self.tableFieldValues,
+		tableFieldAnchors = self.tableFieldAnchors,
 		tableIndexes = self.tableIndexes,
 		byKind = self.byKind,
 		topLevel = topLevel,

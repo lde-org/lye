@@ -1605,6 +1605,53 @@ test.it("inherits a method signature and self from a class in another file", fun
 	end
 end)
 
+test.it("binds a class annotation to a value a constructor makes", function()
+	-- `local App = wonderland.app()` is how an app is made, and `---@class MyApp` above it is
+	-- how the app's own fields are typed: the annotation is the value's class, and the methods
+	-- written on `App` are methods of it, the same as when the local holds a table literal.
+	-- The four hooks are optional fields, and a body that fills one in still takes its signature:
+	-- `update(message)` leaves the trailing window out, and a promise that nil fits is kept by a
+	-- body with no `return` at all.
+	local source = table.concat({
+		"---@class Base\n",
+		"---@field title string\n",
+		"---@field update (fun(self: Base, message: any, window: string): number?)?\n",
+		"---@field draw (fun(self: Base, window: string))?\n",
+		"local Base = {}\n",
+		"---@return Base\n",
+		"local function make() return { title = \"made\" } end\n",
+		"---@class MyApp: Base\n",
+		"---@field clicks number\n",
+		"local App = make()\n",
+		"function App:init()\n",
+		"\tself.clicks = 0\n",
+		"\tlocal heldTitle = self.title\n",
+		"\treturn heldTitle\n",
+		"end\n",
+		"function App:update(message)\n",
+		"\tlocal heldMessage = message\n",
+		"end\n",
+		"---@param window any\n",
+		"function App:draw(window)\n",
+		"\tlocal heldWindow = window\n",
+		"end\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 0)
+	for _, variable in ipairs(result.variables) do
+		local held = types.display(analyzer.typeAt(result, variable, #source))
+		if variable.name == "self" then
+			test.equal(held, "MyApp", "the method receiver is the class the call is annotated with")
+		elseif variable.name == "heldTitle" then
+			test.equal(held, "string")
+		elseif variable.name == "heldMessage" then
+			test.equal(held, "any", "a method may leave the signature's trailing parameters out")
+		elseif variable.name == "heldWindow" then
+			test.equal(held, "any", "an explicit parameter annotation is not overwritten")
+		end
+	end
+end)
+
 test.it("binds a generic from the argument it is given", function()
 	local source = table.concat({
 		"---@generic T\n",

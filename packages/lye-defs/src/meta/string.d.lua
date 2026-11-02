@@ -38,7 +38,7 @@ function string.format(s: string|number, ...: any): string end
 ---    end
 ---```
 ---
----@return fun():string|number, ...
+---@return fun(): string, string
 ---@nodiscard
 function string.gmatch(s: string|number, pattern: string|number) end
 

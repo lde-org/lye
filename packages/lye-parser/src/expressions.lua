@@ -174,6 +174,8 @@ local function parseTable(self)
 	local elementIdxs
 	---@type integer[]?
 	local keyIdxs
+	---@type table<string, integer>?
+	local fieldAnchors
 	self:expect("{")
 	while not self:check("}") and not self:isEof(self:peek()) do
 		self:skipComments()
@@ -196,8 +198,11 @@ local function parseTable(self)
 				fieldKinds[keyNode.value] = self.lastKind or "unknown"
 			end
 		elseif self:isName(self:peek()) and self:text(self:peekAt(2)) == "=" then
+			local keyIdx = self.index
 			local key = self:text(self:advance())
 			self:advance()
+			fieldAnchors = fieldAnchors or {}
+			fieldAnchors[key] = keyIdx
 			local from = self.index
 			fieldValues, fieldKinds = fieldValues or {}, fieldKinds or {}
 			fieldValues[key] = self:parseExpression()
@@ -235,6 +240,7 @@ local function parseTable(self)
 	-- Keyed by the node, which turns `local x = { foo = 1 }` into an object type without a
 	-- reader having to find the literal again by position.
 	if elementIdxs then self.tableIndexes[index] = elementIdxs end
+	if fieldAnchors then self.tableFieldAnchors[index] = fieldAnchors end
 	if fieldKinds then
 		self.tableFields[index] = fieldKinds
 		-- The node each value was read from, so a field of a literal is typed by what is written

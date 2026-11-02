@@ -980,9 +980,10 @@ end
 			-- contradict the annotation, and only a body that exists can be held to it.
 			local promised = fieldReturns[index]
 			-- A field that says nothing about a return promises nothing: only a written one can be
-			-- contradicted by a body that returns nothing.
+			-- contradicted by a body that returns nothing. A promise that nil fits is kept by a
+			-- body with no `return` at all, because that is exactly what it hands back.
 			local written = promised and promised ~= types.VOID and promised.variant ~= "unknown"
-				and promised.variant ~= "any"
+				and promised.variant ~= "any" and not types.satisfies(types.NIL_TYPE, promised)
 			if written and not inferred and not self.isDefinition and hasBody(parsed, index) then
 				self.diagnostics[#self.diagnostics + 1] = {
 					message = string.format("the type says this returns %s, but nothing is returned",
@@ -1239,6 +1240,25 @@ end
 			end
 		end
 
+		--- A function passed by name is still the body the call expects: `local handler = function(req) …`
+		--- or `local function handler(req) …` then `serve({ handler = handler })`. Looking through
+		--- the name lets the signature reach the parameter the same way it does for a literal.
+		---@param node lye.parser.Node?
+		---@return lye.parser.Node?
+		local function bodyOf(node)
+			if not node then return nil end
+			if node.kind == "function" then return node end
+			local name = node.kind == "name" and node.name
+				or (node.kind == "prefix" and not node.field and node.callee)
+			if not name then return nil end
+			local scope = ctx.scopeAt(self, node.start)
+			local variable = ctx.lookupIn(scope, name, node.start)
+			local valueIdx = variable and variable.declaration.valueIdx
+			local value = valueIdx and parsed.nodes[valueIdx]
+			if value and value.kind == "function" then return value end
+			return nil
+		end
+
 		---@param fnNode lye.parser.Node
 		---@param expected lye.doc.Type
 		local function apply(fnNode, expected)
@@ -1309,15 +1329,14 @@ end
 				local hasBody = false
 				for _, argIdx in ipairs(node.args or {}) do
 					local argument = parsed.nodes[argIdx]
-					if argument and argument.kind == "function" then
+					if bodyOf(argument) then
 						hasBody = true
 						break
 					end
 					if argument and argument.kind == "table" then
 						local fields = parsed.tableFieldValues and parsed.tableFieldValues[argIdx]
 						for _, fieldIdx in pairs(fields or {}) do
-							local field = parsed.nodes[fieldIdx]
-							if field and field.kind == "function" then
+							if bodyOf(parsed.nodes[fieldIdx]) then
 								hasBody = true
 								break
 							end
@@ -1356,7 +1375,7 @@ end
 					end
 					for index, argIdx in ipairs(node.args or {}) do
 						local argument = parsed.nodes[argIdx]
-						if argument and (argument.kind == "function" or argument.kind == "table") then
+						if argument and (bodyOf(argument) or argument.kind == "table") then
 							local wanted = params[index + shift]
 							if not wanted and calleeType.isVariadic and index + shift > #params then
 								wanted = calleeType.variadic
@@ -1364,9 +1383,10 @@ end
 							if wanted and next(bindings) then
 								wanted = types.substitute(wanted, bindings)
 							end
-							if argument.kind == "function" then
+							local argumentBody = bodyOf(argument)
+							if argumentBody then
 								local expected = callableOf(wanted)
-								if expected then apply(argument, expected) end
+								if expected then apply(argumentBody, expected) end
 							elseif wanted then
 								-- A table written for an options shape gives its function fields
 								-- the signatures the shape names: `new(view, { onMessage = function(m) … end })`
@@ -1375,10 +1395,10 @@ end
 								---@cast fields table<string, integer>?
 								for field, fieldIdx in pairs(fields or {}) do
 									---@cast field string
-									local functionNode = parsed.nodes[fieldIdx]
+									local functionNode = bodyOf(parsed.nodes[fieldIdx])
 									local fieldType = types.fieldOf(wanted, field)
 									local callable = fieldType and callableOf(fieldType)
-									if functionNode and functionNode.kind == "function" and callable then
+									if functionNode and callable then
 										---@cast callable lye.doc.Type
 										apply(functionNode, callable)
 									end

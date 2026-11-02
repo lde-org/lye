@@ -287,15 +287,19 @@ function statements.parseConst(self, start)
 
 	-- The initializer is read the way `local` reads one, so `const n = 5` is a number rather than
 	-- a name nothing knows.
+	local valueIdxs = {}
+	---@cast valueIdxs integer[]
 	if self:accept("=") then
 		for offset = 0, count - 1 do
 			self.lastKind = nil
 			local valueIdx = self:parseExpression()
+			valueIdxs[#valueIdxs + 1] = valueIdx
 			if first then self:setInitializer(first + offset, self.lastKind, valueIdx) end
 			if not self:accept(",") then break end
 		end
 	end
-	self:emit("const", start, self.arena[self.index - 1].stop)
+	local constIdx = self:emit("const", start, self.arena[self.index - 1].stop)
+	self:adopt(constIdx, valueIdxs)
 end
 
 ---@param self lye.parser.Parser

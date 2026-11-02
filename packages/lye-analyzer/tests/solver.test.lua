@@ -150,6 +150,22 @@ local r = s:gsub("%a", function(c) return c:upper() end)
 	test.equal(#replaced.diagnostics, 0, messages(replaced))
 end)
 
+test.it("types a named function handed to a callback signature", function()
+	local result = analyze([[
+---@class Req
+---@field path string
+---@alias Handler fun(req: Req)
+---@param h Handler
+local function serve(h) end
+local function handler(req)
+	local p = req.path
+end
+serve(handler)
+]])
+	test.equal(#result.diagnostics, 0, messages(result))
+	test.equal(typeOf(result, "p"), "string")
+end)
+
 test.it("checks a generic constraint and a function's declared return", function()
 	local result = analyze([[
 ---@generic T: number

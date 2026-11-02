@@ -31,6 +31,7 @@ local isNeverNumeric, callLabel = annotations.isNeverNumeric, annotations.callLa
 ---@field declaredHere fun(held: lye.doc.Type, field: string): boolean
 ---@field inferredValuesOf fun(index: integer): lye.doc.Type[]
 ---@field inferredReturnOf fun(index: integer): lye.doc.Type?
+---@field signatureTypeOf fun(declaration: lye.parser.Declaration, signature: lye.analyzer.Signature): lye.doc.Type
 ---@field scopeAt fun(self: lye.analyzer.Result, offset: integer): lye.analyzer.Scope
 ---@field lookupIn fun(scope: lye.analyzer.Scope, name: string, offset: integer): lye.analyzer.Variable?
 ---@field typeAt fun(self: lye.analyzer.Result, variable: lye.analyzer.Variable, offset: integer): lye.doc.Type
@@ -831,7 +832,10 @@ local function moduleExport(ctx)
 				local firstNode = ctx.parsed.nodes[firstIdx]
 				---@type string?
 				local name
-				if firstNode ~= nil and firstNode.kind == "prefix" then name = firstNode.callee end
+				if firstNode ~= nil then
+					if firstNode.kind == "prefix" then name = firstNode.callee
+					elseif firstNode.kind == "name" then name = firstNode.name end
+				end
 				-- Only a definition file's global backing table is the class: a document's own
 				-- `local bit = {}` shadows the library and must answer as the value it built.
 				local className = ctx.self.isDefinition and name
@@ -854,6 +858,12 @@ local function moduleExport(ctx)
 						local declaration = signature and signature.declaration
 						local variable = declaration and ctx.byDeclaration[declaration]
 						local declared = variable and variable.declared
+						if declared == nil and signature ~= nil and declaration ~= nil
+							and (#signature.params > 0 or signature.returns ~= nil) then
+							-- A field function's contract is the `@param`/`@return` block above it,
+							-- not only what its body happened to do: another file reads these values.
+							declared = ctx.signatureTypeOf(declaration, signature)
+						end
 						if declared ~= nil then
 							---@cast declared lye.doc.Type
 							if types.isFn(declared) then

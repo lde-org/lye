@@ -763,8 +763,10 @@ end
 ---@param store lye.check.Store? what the run keeps between runs, whose farm list is reused here
 local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch, store)
 	local owner = packageOf(path)
-	if not owner then return nil end
-	local found = modulePath(owner, name)
+	-- A file outside an lde package (a bootstrap script at a repository root, say) still
+	-- reaches the engine's builtin modules: `require("ffi")` and `require("jit")` are in the
+	-- definitions, not in a package's `target/`.
+	local found = owner and modulePath(owner, name) or nil
 	local builtin = not found and builtinModule(name) or nil
 	if not found and not builtin then
 		return nil
@@ -801,7 +803,7 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 	-- What an earlier run kept, when nothing the module was read against has changed: the same
 	-- answer two package slices, or two runs, would otherwise pay to work out twice.
 	local ownerOfModule = packageOf(found --[[@as string ]]) or owner
-	if store then
+	if store and ownerOfModule ~= nil then
 		local kept = loadInterface(key, path, store, ownerOfModule, written)
 		if kept then
 			stats.interfaces.loaded += 1
@@ -846,7 +848,7 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 	local held = { type = names.module }
 	modules[key] = held
 	interfacesByText[key] = held
-	if store then
+	if store and ownerOfModule ~= nil then
 		local keptStore = store --[[@as lye.check.Store ]]
 		if saveInterface(key, path, keptStore, ownerOfModule, written, names.module) then
 			stats.interfaces.stored += 1

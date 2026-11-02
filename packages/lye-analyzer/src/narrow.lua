@@ -251,14 +251,15 @@ end
 ---@param signatures table<string, lye.analyzer.Signature>
 ---@param resolve fun(text: string): lye.doc.Type?
 ---@param annotations lye.doc.Annotation[]?
-local function collectNarrowing(parsed, byRecord, signatures, resolve, annotations)
+---@param root lye.analyzer.Scope the whole file's scope, which a top-level fact belongs to
+local function collectNarrowing(parsed, byRecord, signatures, resolve, annotations, root)
 	local ordered = {}
 	for _, scope in ipairs(parsed.scopes) do ordered[#ordered + 1] = scope end
 	table.sort(ordered, function(a, b) return a.start < b.start end)
 
 	--- The innermost scope holding an offset: the block a statement is written in.
 	---@param offset integer
-	---@return lye.parser.Scope?
+	---@return lye.analyzer.Scope?
 	local function scopeAtOffset(offset)
 		local low, high = 1, #ordered
 		while low <= high do
@@ -268,6 +269,7 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 		for index = high, 1, -1 do
 			if ordered[index].stop >= offset then return ordered[index] end
 		end
+		return root
 	end
 
 	-- `local t = type(value)` gives `t` the answer a later `t == "number"` tests. The branch is
@@ -543,7 +545,7 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 	end
 
 	---@param condition lye.analyzer.Condition
-	---@param record lye.parser.Scope
+	---@param record lye.parser.Scope|lye.analyzer.Scope
 	---@param from integer?
 	---@param until_ integer?
 	local function add(condition, record, from, until_)
@@ -568,7 +570,8 @@ local function collectNarrowing(parsed, byRecord, signatures, resolve, annotatio
 				end
 			end
 		end
-		local guarded = byRecord[record].facts
+		local mapped = byRecord[record]
+		local guarded = (mapped and mapped.facts) or record.facts
 		local list = guarded[condition.name]
 		if not list then
 			list = {}
