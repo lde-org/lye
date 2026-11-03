@@ -64,6 +64,20 @@ local SPACED_OPERATORS = {
 }
 table.sort(SPACED_OPERATORS, function(left, right) return #left > #right end)
 
+--- Whether the text ends in the exponent marker of a number literal. A sign after it is part of
+--- that number, but the same spelling can end an identifier (`x1e - 2`), so the run must start at
+--- a token boundary.
+---@param text string
+---@return boolean
+local function endsInExponent(text)
+	local decimal = text:match("([%d%.]+[eE])$")
+	local hex = text:match("(0[xX]%x[%x%.]*[pP])$")
+	local candidate = hex or decimal
+	if candidate == nil then return false end
+	local prior = text:sub(#text - #candidate, #text - #candidate)
+	return prior == "" or prior:match("[%w_%.]") == nil
+end
+
 ---@param word string?
 ---@return boolean
 local function unaryWord(word)
@@ -146,10 +160,16 @@ function format.spaceLine(line)
 				local previousWord = before:match("([%a_][%w_]*)$")
 				local previousChar = before:sub(-1)
 				---@cast previousChar string
+				-- An exponent sign belongs to the number it follows: 1e-6 and 0x1p-2 are one
+				-- literal, not an expression. Spacing it as subtraction changes the program.
+				local exponentSign = (operator == "-" or operator == "+")
+					and endsInExponent(before)
 				local unary = (operator == "-" or operator == "+" or operator == "~")
 					and (previousChar == "" or previousChar:match("[%(%[%{%,%;%:%=%<%>%+%-%*%/%%%^%&%|~!%?]") ~= nil
 						or unaryWord(previousWord))
-				if unary then
+				if exponentSign then
+					append(operator)
+				elseif unary then
 					append(operator)
 				else
 					trimTrailing(count)

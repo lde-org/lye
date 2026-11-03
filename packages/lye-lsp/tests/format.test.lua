@@ -36,6 +36,18 @@ test.it("lays out indentation and token spacing", function()
 	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
 end)
 
+test.it("keeps exponent signs inside numbers", function()
+	local source = "local a=1e-6\nlocal b=1E+9\nlocal c=0x1.8p-2\nlocal d=-1e-6\n"
+	local expected = "local a = 1e-6\nlocal b = 1E+9\nlocal c = 0x1.8p-2\nlocal d = -1e-6\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("does not read an identifier ending in e as a number", function()
+	local source = "local x1e=3\nreturn x1e-2\n"
+	local expected = "local x1e = 3\nreturn x1e - 2\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
 test.it("keeps a literal and a long string exactly as written", function()
 	local source = "local s=  \"a  b\"\nlocal t=[[\n  keep  this\n]]\nreturn s,t\n"
 	local out = format(source, { indent_style = "space", indent_size = "2" })
