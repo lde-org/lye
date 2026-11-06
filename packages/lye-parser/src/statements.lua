@@ -76,7 +76,9 @@ end
 function statements.parseFor(self)
 	local start = self:peek().start
 	self:expect("for")
-	self:pushScope(self:peek().start)
+	-- The control names need a scope around the body, and the body opens one of its own. The
+	-- marker tells a reader that this outer scope is not another indentation level.
+	self:pushScope(self:peek().start, nil, true)
 
 	-- The control variables belong to the loop rather than to the body, so they carry their own
 	-- kind: a numeric `for` counts, and a generic one takes what its expressions yield.

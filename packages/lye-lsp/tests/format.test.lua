@@ -54,6 +54,24 @@ test.it("keeps a vararg as one token", function()
 	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
 end)
 
+test.it("indents a loop body once, not once per scope", function()
+	local source = "for i = 1, 2 do\nprint(i)\nend\nfor _, item in ipairs(items) do\nprint(item)\nend\n"
+	local expected = "for i = 1, 2 do\n  print(i)\nend\nfor _, item in ipairs(items) do\n  print(item)\nend\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("indents a table's fields inside its braces", function()
+	local source = "local t = {\na = 1,\nb = {\nc = 2,\n},\n}\n"
+	local expected = "local t = {\n  a = 1,\n  b = {\n    c = 2,\n  },\n}\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("keeps one space before a closing brace that shares its line", function()
+	local source = "local t = { a = 1 }\nlocal u = {a=1}\nlocal v = {}\nreturn t,u,v\n"
+	local expected = "local t = { a = 1 }\nlocal u = {a = 1}\nlocal v = {}\nreturn t, u, v\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
 test.it("keeps a literal and a long string exactly as written", function()
 	local source = "local s=  \"a  b\"\nlocal t=[[\n  keep  this\n]]\nreturn s,t\n"
 	local out = format(source, { indent_style = "space", indent_size = "2" })

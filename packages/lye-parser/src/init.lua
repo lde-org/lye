@@ -77,6 +77,7 @@ local newTable = require("table.new")
 ---@field start integer
 ---@field stop integer
 ---@field depth integer scope nesting, 1 at the top level
+---@field isLoop boolean? the scope `for` opens around its control names; its body opens another
 ---@field branch string? "then"|"elseif"|"else"|"do"|"body"
 ---@field conditionIdx integer? arena index of the expression guarding this block
 
@@ -791,7 +792,8 @@ end
 ---@param self lye.parser.Parser
 ---@param start integer
 ---@param conditionIdx integer?
-function Parser:pushScope(start, conditionIdx)
+---@param isLoop boolean?
+function Parser:pushScope(start, conditionIdx, isLoop)
 	assert(start, "pushScope needs the scope's start offset")
 	self.depth += 1
 	self.scopes[#self.scopes + 1] = {}
@@ -800,6 +802,7 @@ function Parser:pushScope(start, conditionIdx)
 	-- sorted two thousand scopes to put them back.
 	local record = {
 		kind = "scope", start = start, depth = self.depth, conditionIdx = conditionIdx,
+		isLoop = isLoop,
 	}
 	self.scopes_[#self.scopes_ + 1] = record
 	self.scopeStarts[#self.scopeStarts + 1] = {

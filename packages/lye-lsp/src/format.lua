@@ -16,21 +16,25 @@ local KIND = lexer.KIND
 
 local format = {}
 
---- How deep a line is written: the number of blocks the parser recorded around it. The tree knows
---- which blocks are bodies, so nothing is guessed from the text.
+--- How deep a line is written: the number of blocks the parser recorded around it, plus the table
+--- constructors it sits inside. The tree knows which blocks are bodies, so nothing is guessed
+--- from the text.
 ---@param parsed lye.parser.Result
 ---@param offset integer
 ---@return integer
 local function indentAt(parsed, offset)
-	local depth, seen = 0, {}
+	local depth = 0
 	for _, scope in ipairs(parsed.scopes) do
-		-- Keyed by the scope itself: an `if` clause and the block it opens begin at the same
-		-- offset when the clause is the block's first statement, and keying by the offset counted
-		-- one of them and threw the other away — which is a body at the depth of its own header.
-		if scope.start <= offset and offset <= scope.stop and not seen[scope] then
-			seen[scope] = true
+		-- A `for` opens one scope for its control names and another for its body. A body line is
+		-- inside both, but the loop is only one indentation level, so the outer one is skipped.
+		if not scope.isLoop and scope.start <= offset and offset <= scope.stop then
 			depth = depth + 1
 		end
+	end
+	-- A table constructor is not a scope, but its fields read one level in. The opening brace is
+	-- at the node's start and the closing one at its stop, so neither line counts its own table.
+	for _, node in ipairs(parsed.byKind.table or {}) do
+		if node.start < offset and offset < node.stop then depth = depth + 1 end
 	end
 	-- A line at the top of the file is inside no block at all: the chunk is not among the scopes the
 	-- parser records, so what is counted here is exactly the nesting a reader sees.
@@ -191,8 +195,16 @@ function format.spaceLine(line)
 				while line:sub(index, index):match("%s") do index += 1 end
 				local nextChar = line:sub(index, index)
 				if nextChar ~= "" and nextChar ~= ")" and nextChar ~= "]" and nextChar ~= "}" then append(" ") end
-			elseif char == ")" or char == "]" or char == "}" then
+			elseif char == ")" or char == "]" then
 				trimTrailing(count)
+				append(char)
+				index += 1
+			elseif char == "}" then
+				-- An inline table reads as `{ a = 1 }`: keep the one space the writer put before
+				-- the brace. A closing brace on its own line has nothing before it on the line.
+				local spaced = out[count] == " "
+				trimTrailing(count)
+				if spaced and count > 0 then append(" ") end
 				append(char)
 				index += 1
 			elseif char == " " then
