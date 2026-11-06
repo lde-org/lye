@@ -48,6 +48,12 @@ test.it("does not read an identifier ending in e as a number", function()
 	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
 end)
 
+test.it("keeps a vararg as one token", function()
+	local source = "local function f(...)\nreturn ...\nend\nlocal x=f(...)..\"a\"\nreturn f(...),x\n"
+	local expected = "local function f(...)\n  return ...\nend\nlocal x = f(...) .. \"a\"\nreturn f(...), x\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
 test.it("keeps a literal and a long string exactly as written", function()
 	local source = "local s=  \"a  b\"\nlocal t=[[\n  keep  this\n]]\nreturn s,t\n"
 	local out = format(source, { indent_style = "space", indent_size = "2" })

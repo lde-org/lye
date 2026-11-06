@@ -136,6 +136,11 @@ function format.spaceLine(line)
 			---@cast rest string
 			append(rest)
 			return text()
+		elseif char == "." and line:sub(index, index + 2) == "..." then
+			-- `...` is one token: reading it as the `..` operator and a stray dot rewrites the
+			-- vararg into the concatenation of two invalid expressions.
+			append("...")
+			index += 3
 		elseif char == "[" and (line:sub(index + 1, index + 1) == "["
 			or line:match("^%[=+%[", index)) then
 			local level = line:match("^%[(=*)%[", index) or ""
