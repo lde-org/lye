@@ -79,7 +79,11 @@ function Printer:writeOperand(index, indent, parentLevel, isRight, parentOp)
 			return
 		end
 	end
+	-- An arrow body reaches as far right as it can. A converted function must be grouped when
+	-- it is an operand, or the operator after it would be read as part of the body.
+	local arrowLike = kind == "function" and not node.isArrow and self:arrowReturn(node) ~= nil
 	local wrap = node.isGrouped
+		or (arrowLike and parentLevel ~= nil)
 		or (parentLevel ~= nil and needsParens(node, parentLevel, isRight == true, parentOp))
 	if wrap then self:emit("(") end
 	if self.hasComments and self:hasDirectComment(node) then
@@ -207,7 +211,16 @@ function Printer:writeCommentedExpression(node, indent)
 		local endsLine = self:writeGapComments(condition.stop, thenNode.start, indent)
 		if not endsLine then self:emit(" ") end
 		self:emit("? ")
-		self:writeExpression(node.right, indent)
+		local held = node.right and self.nodes[node.right]
+		local grouped = held and not held.isGrouped and held.kind == "function"
+			and not held.isArrow and self:arrowReturn(held) ~= nil
+		if grouped then
+			self:emit("(")
+			self:writeExpression(node.right, indent)
+			self:emit(")")
+		else
+			self:writeExpression(node.right, indent)
+		end
 		endsLine = self:writeGapComments(thenNode.stop, alternative.start, indent)
 		if not endsLine then self:emit(" ") end
 		self:emit(": ")
@@ -284,7 +297,10 @@ function Printer:writePlainExpression(node, indent)
 		self:writeOperand(node.left, indent, TERNARY_LEVEL, false, "?")
 		self:emit(" ? ")
 		local held = node.right and self.nodes[node.right]
-		if held and held.kind == "ternary" and not held.isGrouped then
+		local grouped = held and not held.isGrouped
+			and (held.kind == "ternary"
+				or (held.kind == "function" and not held.isArrow and self:arrowReturn(held) ~= nil))
+		if grouped then
 			self:emit("(")
 			self:writeExpression(node.right, indent)
 			self:emit(")")
@@ -564,6 +580,55 @@ function Printer:writeParameters(node)
 	end
 end
 
+--- The value an anonymous function gives back when it is only a single `return`.
+---@param self table
+---@param node table
+---@return integer?
+function Printer:arrowReturn(node)
+	if node.isArrow or node.isLocal or node.name ~= nil then return nil end
+	if node.isVariadic or node.inlineGenerics or node.inlineReturns or node.inlineVariadic then
+		return nil
+	end
+	for _, parameter in ipairs(node.params or {}) do
+		---@cast parameter table
+		if parameter.isImplicit or parameter.inlineType or parameter.inlineOptional then return nil end
+	end
+	if self.hasComments and self.lines:hasCommentIn(node.start, node.stop) then return nil end
+	local body = node.bodyStatements
+	if not body or #body ~= 1 then return nil end
+	local statement = self.nodes[body[1]]
+	if not statement or statement.kind ~= "return" then return nil end
+	local values = statement.children
+	if not values or #values ~= 1 then return nil end
+	local returned = values[1]
+	---@cast returned integer
+	return returned
+end
+
+---@param node table
+---@param returned integer
+---@param indent integer
+---@param self table
+function Printer:writeArrow(node, returned, indent)
+	local parameters = node.params or {}
+	local visible = 0
+	for _, parameter in ipairs(parameters) do
+		---@cast parameter table
+		if not parameter.isImplicit then visible += 1 end
+	end
+	if visible == 0 then
+		self:emit("|| -> ")
+	elseif visible == 1 then
+		self:writeParameters(node)
+		self:emit(" -> ")
+	else
+		self:emit("|")
+		self:writeParameters(node)
+		self:emit("| -> ")
+	end
+	self:writeExpression(returned, indent)
+end
+
 ---@param node table
 ---@param indent integer
 ---@param self table
@@ -582,6 +647,12 @@ function Printer:writeFunction(node, indent)
 			self:emit("| -> ")
 		end
 		self:writeExpression(node.body, indent)
+		return
+	end
+
+	local returned = self:arrowReturn(node)
+	if returned then
+		self:writeArrow(node, returned, indent)
 		return
 	end
 

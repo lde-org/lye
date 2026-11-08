@@ -215,6 +215,38 @@ test.it("breaks a call with many arguments when it does not fit", function()
 	}), expected)
 end)
 
+test.it("writes a single-return anonymous function as an arrow", function()
+	local source = "local f=function(x,y,z) return x+y+z end\n"
+		.. "local g=function(x) return x+1 end\n"
+		.. "local h=function() return 5 end\n"
+	local expected = "local f = |x, y, z| -> x + y + z\n"
+		.. "local g = x -> x + 1\n"
+		.. "local h = || -> 5\n"
+	test.equal(format(source, { indent_style = "tab", indent_size = 4 }), expected)
+end)
+
+test.it("keeps a function that is not one return expression", function()
+	local source = "local f=function(x) return x,x+1 end\n"
+		.. "local g=function(x) y() return x end\n"
+		.. "local h=function(...) return ... end\n"
+		.. "local function i(x) return x end\n"
+	local expected = "local f = function(x) return x, x + 1 end\n"
+		.. "local g = function(x)\n\ty()\n\treturn x\nend\n"
+		.. "local h = function(...) return ... end\n"
+		.. "local function i(x) return x end\n"
+	test.equal(format(source, { indent_style = "tab", indent_size = 4 }), expected)
+end)
+
+test.it("groups a converted arrow when it is an operand", function()
+	local source = "local a = 1 + function(x) return x end\n"
+		.. "local b = flag ? function() return 1 end : 2\n"
+		.. "local c = not function() return true end\n"
+	local expected = "local a = 1 + (x -> x)\n"
+		.. "local b = flag ? (|| -> 1) : 2\n"
+		.. "local c = not (|| -> true)\n"
+	test.equal(format(source, { indent_style = "tab", indent_size = 4 }), expected)
+end)
+
 test.it("keeps a call that fits within the line limit on one line", function()
 	-- A call that already fits must not be split just because it was written across lines.
 	local source = "local function f(job)\n\ttest.truthy(\n\t\tjob:isDone(), \"the worker has already said it is done\")\nend\n"
