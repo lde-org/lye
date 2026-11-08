@@ -215,6 +215,17 @@ test.it("breaks a call with many arguments when it does not fit", function()
 	}), expected)
 end)
 
+test.it("keeps a call that fits within the line limit on one line", function()
+	-- A call that already fits must not be split just because it was written across lines.
+	local source = "local function f(job)\n\ttest.truthy(\n\t\tjob:isDone(), \"the worker has already said it is done\")\nend\n"
+	local expected = "local function f(job)\n\ttest.truthy(job:isDone(), \"the worker has already said it is done\")\nend\n"
+	test.equal(format(source, {
+		indent_style = "tab",
+		indent_size = 4,
+		max_line_length = 180,
+	}), expected)
+end)
+
 test.it("keeps a table's comments between its members", function()
 	local source = "local t = { -- head\na = 1, -- one\n-- note\nb = 2\n}\n"
 	local expected = "local t = {\n  -- head\n  a = 1, -- one\n  -- note\n  b = 2\n}\n"
