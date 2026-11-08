@@ -1,8 +1,8 @@
 --[[
-	Tests for document symbols, hover and go-to-definition.
+Tests for document symbols, hover and go - to - definition.
 
-	Each drives the real server as a subprocess over framed bytes, so the assertions cover
-	the whole path from the wire to the parser and back.
+Each drives the real server as a subprocess over framed bytes, so the assertions cover
+the whole path from the wire to the parser and back.
 ]]
 
 local test = require("lde-test")
@@ -119,7 +119,7 @@ local function run(requests, source, root, uri, folders)
 	handle:close()
 
 	local pipe = assert(io.popen(string.format("LYE_CACHE_DIR=%q cat %q | lde run %q 2>/dev/null",
-		CACHE, INPUT, FIXTURE)))
+	CACHE, INPUT, FIXTURE)))
 	local output = pipe:read("*a")
 	pipe:close()
 
@@ -165,12 +165,12 @@ test.it("reads a module the engine ships from the definitions", function()
 	---@return table<string, lye.test.Item>
 	local function labels()
 		local results = run({ {
-			jsonrpc = "2.0", id = 2, method = "textDocument/completion",
-			params = {
-				textDocument = { uri = "file:///f.lua" },
-				position = { line = 2, character = 4 },
-			},
-		} }, source)
+				jsonrpc = "2.0", id = 2, method = "textDocument/completion",
+				params = {
+					textDocument = { uri = "file:///f.lua" },
+					position = { line = 2, character = 4 },
+				},
+			} }, source)
 		---@type table<string, lye.test.Item>
 		local found = {}
 		for _, item in ipairs(results["2"].items or {}) do found[item.label] = item end
@@ -198,12 +198,12 @@ test.it("completes a module required by the expression it is", function()
 	-- fields as `local ffi = require("ffi"); ffi.`.
 	local source = 'require("ffi").'
 	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/completion",
-		params = {
-			textDocument = { uri = "file:///f.lua" },
-			position = { line = 0, character = #source },
-		},
-	} }, source)
+			jsonrpc = "2.0", id = 2, method = "textDocument/completion",
+			params = {
+				textDocument = { uri = "file:///f.lua" },
+				position = { line = 0, character = #source },
+			},
+		} }, source)
 	local found = {}
 	for _, item in ipairs(results["2"] and results["2"].items or {}) do found[item.label] = item end
 	test.truthy(found.cdef, "a field of the required library")
@@ -211,15 +211,15 @@ test.it("completes a module required by the expression it is", function()
 
 	local typed = 'require("ffi").C'
 	local narrowed = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/completion",
-		params = {
-			textDocument = { uri = "file:///f.lua" },
-			position = { line = 0, character = #typed },
-		},
-	} }, typed)
+			jsonrpc = "2.0", id = 2, method = "textDocument/completion",
+			params = {
+				textDocument = { uri = "file:///f.lua" },
+				position = { line = 0, character = #typed },
+			},
+		} }, typed)
 	test.truthy(narrowed["2"] and narrowed["2"].items
-		and narrowed["2"].items[1] and narrowed["2"].items[1].label == "C",
-		"a field prefix filters the same list")
+	and narrowed["2"].items[1] and narrowed["2"].items[1].label == "C",
+	"a field prefix filters the same list")
 end)
 
 test.it("offers the definitions' globals beside the names in scope", function()
@@ -227,12 +227,12 @@ test.it("offers the definitions' globals beside the names in scope", function()
 	-- reached through a metatable that `pairs` cannot see through.
 	local source = "local mine = 1\nlocal read = "
 	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/completion",
-		params = {
-			textDocument = { uri = "file:///f.lua" },
-			position = { line = 1, character = 14 },
-		},
-	} }, source)
+			jsonrpc = "2.0", id = 2, method = "textDocument/completion",
+			params = {
+				textDocument = { uri = "file:///f.lua" },
+				position = { line = 1, character = 14 },
+			},
+		} }, source)
 
 	local labels = {}
 	for _, item in ipairs(results["2"].items or {}) do labels[item.label] = item end
@@ -279,7 +279,7 @@ test.it("keeps every semantic token inside one line", function()
 		character = data[index] == 0 and (character + data[index + 1]) or data[index + 1]
 		local length = data[index + 2]
 		test.truthy(character + length <= #lines[line + 1],
-			string.format("token on line %d ends inside it", line + 1))
+		string.format("token on line %d ends inside it", line + 1))
 		covered[line + 1] = true
 	end
 	for _, expected in ipairs({ 1, 2, 3, 4, 5 }) do
@@ -313,12 +313,12 @@ test.it("reads the signature a definition file writes inline", function()
 	-- The request names the document itself: the helper's default is `f.lua`, and this file is a
 	-- definition because of its name.
 	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/hover",
-		params = {
-			textDocument = { uri = "file:///f.d.lua" },
-			position = { line = 3, character = 8 },
-		},
-	} }, source, nil, "file:///f.d.lua")
+			jsonrpc = "2.0", id = 2, method = "textDocument/hover",
+			params = {
+				textDocument = { uri = "file:///f.d.lua" },
+				position = { line = 3, character = 8 },
+			},
+		} }, source, nil, "file:///f.d.lua")
 	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
 	test.truthy(shown:find("fn(number)", 1, true), "the signature is read from the source: " .. shown)
 	test.truthy(shown:find("string", 1, true), "and so is what it gives back: " .. shown)
@@ -334,9 +334,9 @@ test.it("colours the types a definition file writes inline", function()
 		"return takes\n",
 	}, "")
 	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/semanticTokens/full",
-		params = { textDocument = { uri = "file:///f.d.lua" } },
-	} }, source, nil, "file:///f.d.lua")
+			jsonrpc = "2.0", id = 2, method = "textDocument/semanticTokens/full",
+			params = { textDocument = { uri = "file:///f.d.lua" } },
+		} }, source, nil, "file:///f.d.lua")
 	local counts = {}
 	for index = 1, #(results["2"].data), 5 do
 		local kind = results["2"].data[index + 3]
@@ -360,17 +360,17 @@ test.it("answers for a dotted type name as one name", function()
 	}, source)
 	local definition = results["2"]
 	test.truthy(definition and definition.uri and definition.uri:match("jit%.util%.lua"),
-		"the jump lands on the class: " .. json.encode(definition or {}))
+	"the jump lands on the class: " .. json.encode(definition or {}))
 	test.equal(definition.range["end"].character - definition.range.start.character, 14,
-		"on the whole name it declares")
+	"on the whole name it declares")
 	local typed = results["3"]
 	test.truthy(typed and typed.uri and typed.uri:match("jit%.util%.lua"),
-		"and so does the type jump: " .. json.encode(typed or {}))
+	"and so does the type jump: " .. json.encode(typed or {}))
 	local highlights = results["4"] or {}
 	---@cast highlights lye.test.Highlight[]
 	test.truthy(#highlights > 0, "the highlight covers the name")
 	test.equal(highlights[1].range["end"].character - highlights[1].range.start.character, 14,
-		"the whole of `jit.funcinfo.c`, not one of its parts")
+	"the whole of `jit.funcinfo.c`, not one of its parts")
 end)
 
 test.it("says nothing where an inlay hint would repeat the name", function()
@@ -569,9 +569,9 @@ test.it("refuses to index a type that holds nothing at a key", function()
 	}, "")
 	local uri = "file:///tmp/indexed.lua"
 	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/hover",
-		params = { textDocument = { uri = uri }, position = { line = 6, character = 8 } },
-	} }, source, nil, uri)
+			jsonrpc = "2.0", id = 2, method = "textDocument/hover",
+			params = { textDocument = { uri = uri }, position = { line = 6, character = 8 } },
+		} }, source, nil, uri)
 	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
 	test.truthy(shown:match("ffi%.int"), "an array is indexed: " .. shown)
 end)
@@ -609,9 +609,9 @@ test.it("gives ffi.load the symbols the file's cdef declared", function()
 	}, "")
 	local uri = "file:///tmp/loaded.lua"
 	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/hover",
-		params = { textDocument = { uri = uri }, position = { line = 8, character = 21 } },
-	} }, source, nil, uri)
+			jsonrpc = "2.0", id = 2, method = "textDocument/hover",
+			params = { textDocument = { uri = uri }, position = { line = 8, character = 21 } },
+		} }, source, nil, uri)
 	-- The field is the function the cdef declared, with the signature it declared it with: two
 	-- pointers and a `size_t`, which is a shape only the header could have told us.
 	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
@@ -626,9 +626,9 @@ test.it("resolves a require the way lde does", function()
 	local uri = "file://" .. project .. "/src/consumer.lua"
 	local source = 'local helper = require("helper")\nlocal counted = helper.count()\n'
 	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/hover",
-		params = { textDocument = { uri = uri }, position = { line = 1, character = 20 } },
-	} }, source, project, uri)
+			jsonrpc = "2.0", id = 2, method = "textDocument/hover",
+			params = { textDocument = { uri = uri }, position = { line = 1, character = 20 } },
+		} }, source, project, uri)
 	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
 	test.truthy(shown:match("count"), "the dependency resolves and its function is typed: " .. shown)
 end)
@@ -640,9 +640,9 @@ test.it("resolves a require a lye.json points at", function()
 	local uri = "file://" .. project .. "/src/consumer.lua"
 	local source = 'local thing = require("thing")\nlocal ready = thing.ready\n'
 	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/hover",
-		params = { textDocument = { uri = uri }, position = { line = 1, character = 15 } },
-	} }, source, project, uri)
+			jsonrpc = "2.0", id = 2, method = "textDocument/hover",
+			params = { textDocument = { uri = uri }, position = { line = 1, character = 15 } },
+		} }, source, project, uri)
 	local shown = results["2"] and results["2"].contents and results["2"].contents.value or ""
 	test.truthy(shown:match("true"), "the module lye.json names resolves: " .. shown)
 end)
@@ -674,11 +674,11 @@ test.it("reads a collection from the writes to it and a string's methods off the
 		return answer and answer.contents and answer.contents.value or ""
 	end
 	test.truthy(shown("2"):find("string[]", 1, true),
-		"a name written one past the end makes the table a list: " .. shown("2"))
+	"a name written one past the end makes the table a list: " .. shown("2"))
 	test.truthy(shown("3"):find("table<string, true>", 1, true),
-		"a true written at a string key makes the table a set: " .. shown("3"))
+	"a true written at a string key makes the table a set: " .. shown("3"))
 	test.truthy(shown("4"):match("string") ~= nil and shown("4"):match("table") == nil,
-		"and a method call on a string is a string, not a table: " .. shown("4"))
+	"and a method call on a string is a string, not a table: " .. shown("4"))
 end)
 
 test.it("continues an alias when a new line is started in one", function()
@@ -723,7 +723,7 @@ test.it("resolves a method call to the function it calls", function()
 	test.truthy(shown:match("gsub%("), "the hover is the signature being called: " .. shown)
 	local target = results["3"]
 	test.truthy(target and target.uri and target.uri:match("string%.lua"),
-		"and the jump goes where it is declared: " .. tostring(target and target.uri))
+	"and the jump goes where it is declared: " .. tostring(target and target.uri))
 end)
 
 test.it("resolves a method called on the result of another call", function()
@@ -816,7 +816,7 @@ test.it("colours the conversions and the pattern inside a literal a function int
 	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
 	local data = results["2"].data
 	test.equal(marked(data, source, 13), "%d,%s,%s,+",
-		"the two conversions and every part of the pattern are marked")
+	"the two conversions and every part of the pattern are marked")
 	local strings = 0
 	for index = 1, #data, 5 do
 		if data[index + 3] == 1 then strings = strings + 1 end
@@ -835,7 +835,7 @@ test.it("colours a pattern a method is called on a value rather than a name", fu
 	local results = run({ request(2, "textDocument/semanticTokens/full") }, source)
 	local data = results["2"].data
 	test.equal(marked(data, source, 13), "%s,+,^,%s,+,%s,+",
-		"the pattern of each call, the anchor's included")
+	"the pattern of each call, the anchor's included")
 end)
 
 test.it("colours an ffi.cdef from its own parse", function()
@@ -1177,9 +1177,9 @@ test.it("jumps to a class from an annotation and to a builtin from code", functi
 	-- The `App` in `---@type App`, which is a type rather than a name the parser declares.
 	local typeResults = run({
 		{ jsonrpc = "2.0", id = 2, method = "textDocument/definition", params = {
-			textDocument = { uri = "file:///f.lua" },
-			position = { line = 3, character = 0 },
-		} },
+				textDocument = { uri = "file:///f.lua" },
+				position = { line = 3, character = 0 },
+			} },
 	}, source .. "---@type App\nlocal app = {}\n")
 	test.truthy(typeResults["2"], "a name in an annotation should answer")
 
@@ -1222,11 +1222,10 @@ test.it("reads a method written on a grouped value", function()
 
 	-- And the same on a plain receiver, which always worked: the two must not disagree.
 	local same = run({ request(2, "textDocument/completion", { line = 1, character = #"\treturn s:" }) },
-		"---@param s string\nlocal function f(s)\n\treturn s:lower()\nend\nprint(f)\n")
+	"---@param s string\nlocal function f(s)\n\treturn s:lower()\nend\nprint(f)\n")
 	test.truthy(same["2"] and #(same["2"].items or {}) > 5,
-		"a method on a plain receiver is offered too")
+	"a method on a plain receiver is offered too")
 end)
-
 
 test.it("reads an access a guard is written before", function()
 	-- `?.` guards whatever suffix follows it, and it is two bytes where a plain access writes one:
@@ -1330,7 +1329,7 @@ test.it("reads a field on a value that may be absent", function()
 	test.truthy(hover and hover.contents.value:match("lower"), "the method is described")
 	local target = results["3"]
 	test.truthy(target and target.uri:match("lye/defs/string%.lua"),
-		"and found in the string library: " .. tostring(target and target.uri))
+	"and found in the string library: " .. tostring(target and target.uri))
 	local labels = {}
 	for _, item in ipairs(results["4"] and results["4"].items or {}) do labels[item.label] = true end
 	test.truthy(labels["lower"] and labels["upper"], "and the library is offered after the guard")
@@ -1377,7 +1376,7 @@ test.it("jumps from a method call to the definition it declares", function()
 	test.truthy(localTarget, "a method this document declares is a target")
 	test.equal(localTarget and localTarget.uri, "file:///f.lua")
 	test.equal(localTarget and localTarget.range and localTarget.range.start.line, 1,
-		"and the jump lands on the declaration")
+	"and the jump lands on the declaration")
 end)
 
 test.it("reads bit as the bit library, like ffi", function()
@@ -1400,12 +1399,12 @@ test.it("offers require paths and the engine's modules", function()
 	local source = 'local x = require("")\n'
 	local uri = "file://" .. root .. "/main.lua"
 	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/completion",
-		params = {
-			textDocument = { uri = uri },
-			position = { line = 0, character = 18 },
-		},
-	} }, source, root, uri)
+			jsonrpc = "2.0", id = 2, method = "textDocument/completion",
+			params = {
+				textDocument = { uri = uri },
+				position = { line = 0, character = 18 },
+			},
+		} }, source, root, uri)
 	local labels = {}
 	for _, item in ipairs(results["2"] and results["2"].items or {}) do labels[item.label] = item end
 	test.truthy(labels["bit"], "the engine's own module")
@@ -1422,18 +1421,18 @@ test.it("narrows the parameter type as the arguments select an overload", functi
 	}, "")
 	local open = "h:read("
 	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/signatureHelp",
-		params = {
-			textDocument = { uri = "file:///f.lua" },
-			position = { line = 1, character = #open },
-		},
-	}, {
-		jsonrpc = "2.0", id = 3, method = "textDocument/signatureHelp",
-		params = {
-			textDocument = { uri = "file:///f.lua" },
-			position = { line = 2, character = 11 },
-		},
-	} }, source)
+			jsonrpc = "2.0", id = 2, method = "textDocument/signatureHelp",
+			params = {
+				textDocument = { uri = "file:///f.lua" },
+				position = { line = 1, character = #open },
+			},
+		}, {
+			jsonrpc = "2.0", id = 3, method = "textDocument/signatureHelp",
+			params = {
+				textDocument = { uri = "file:///f.lua" },
+				position = { line = 2, character = 11 },
+			},
+		} }, source)
 	local all = results["2"] and results["2"].signatures and results["2"].signatures[1]
 	local one = results["3"] and results["3"].signatures and results["3"].signatures[1]
 	test.truthy(all and all.label:match("%*a"), "every mode still possible")
@@ -1447,7 +1446,7 @@ test.it("finds references and renames a method another file declares", function(
 	-- workspace index is what lets find-references and rename cross that boundary.
 	local root = PACKAGE_DIR .. "/target/workspace-refs"
 	os.execute("rm -rf " .. string.format("%q", root)
-		.. " && mkdir -p " .. string.format("%q", root))
+	.. " && mkdir -p " .. string.format("%q", root))
 	local function write(name, text)
 		local handle = assert(io.open(root .. "/" .. name, "wb"))
 		handle:write(text)
@@ -1477,15 +1476,15 @@ test.it("finds references and renames a method another file declares", function(
 	local uri = "file://" .. root .. "/b.lua"
 	local results = run({
 		{ jsonrpc = "2.0", id = 2, method = "textDocument/references", params = {
-			textDocument = { uri = uri }, position = { line = 3, character = 3 },
-			context = { includeDeclaration = true },
-		} },
+				textDocument = { uri = uri }, position = { line = 3, character = 3 },
+				context = { includeDeclaration = true },
+			} },
 		{ jsonrpc = "2.0", id = 3, method = "textDocument/rename", params = {
-			textDocument = { uri = uri }, position = { line = 3, character = 3 }, newName = "shift",
-		} },
+				textDocument = { uri = uri }, position = { line = 3, character = 3 }, newName = "shift",
+			} },
 		{ jsonrpc = "2.0", id = 4, method = "textDocument/diagnostic", params = {
-			textDocument = { uri = uri },
-		} },
+				textDocument = { uri = uri },
+			} },
 	}, used, root, uri)
 	local references = results["2"] or {}
 	---@cast references { uri: string, range: table }[]
@@ -1512,7 +1511,7 @@ end)
 test.it("links a require, edits a module rename, and answers the small protocol extras", function()
 	local root = PACKAGE_DIR .. "/target/workspace-extras"
 	os.execute("rm -rf " .. string.format("%q", root)
-		.. " && mkdir -p " .. string.format("%q", root))
+	.. " && mkdir -p " .. string.format("%q", root))
 	local function write(name, text)
 		local handle = assert(io.open(root .. "/" .. name, "wb"))
 		handle:write(text)
@@ -1524,8 +1523,8 @@ test.it("links a require, edits a module rename, and answers the small protocol 
 	local uri = "file://" .. root .. "/main.lua"
 	local function at(id, method, position)
 		local request = { jsonrpc = "2.0", id = id, method = method, params = {
-			textDocument = { uri = uri },
-		} }
+				textDocument = { uri = uri },
+			} }
 		if position then request.params.position = position end
 		return request
 	end
@@ -1535,19 +1534,19 @@ test.it("links a require, edits a module rename, and answers the small protocol 
 		at(4, "textDocument/moniker", { line = 0, character = 6 }),
 		at(5, "textDocument/declaration", { line = 0, character = 6 }),
 		{ jsonrpc = "2.0", id = 6, method = "workspace/willRenameFiles", params = {
-			files = { { oldUri = "file://" .. root .. "/dep.lua", newUri = "file://" .. root .. "/other.lua" } },
-		} },
+				files = { { oldUri = "file://" .. root .. "/dep.lua", newUri = "file://" .. root .. "/other.lua" } },
+			} },
 		{ jsonrpc = "2.0", id = 7, method = "textDocument/inlineValue", params = {
-			textDocument = { uri = uri },
-			range = { start = { line = 0, character = 0 }, ["end"] = { line = 1, character = 0 } },
-			context = {
-				frameId = 1,
-				stoppedLocation = {
-					uri = uri,
-					range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 0 } },
+				textDocument = { uri = uri },
+				range = { start = { line = 0, character = 0 }, ["end"] = { line = 1, character = 0 } },
+				context = {
+					frameId = 1,
+					stoppedLocation = {
+						uri = uri,
+						range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 0 } },
+					},
 				},
-			},
-		} },
+			} },
 		{ jsonrpc = "2.0", id = 8, method = "completionItem/resolve", params = { label = "dep" } },
 		at(9, "textDocument/references", { line = 0, character = 6 }),
 	}, source, root, uri)
@@ -1585,15 +1584,15 @@ test.it("offers fixes for a diagnostic and a reference lens", function()
 	}
 	local results = run({
 		{ jsonrpc = "2.0", id = 2, method = "textDocument/codeAction", params = {
-			textDocument = { uri = "file:///f.lua" }, range = range,
-			context = { diagnostics = { {
-				range = range, severity = 2, code = "unused-local", source = "lye",
-				message = "unused local `x`",
-			} } },
-		} },
+				textDocument = { uri = "file:///f.lua" }, range = range,
+				context = { diagnostics = { {
+							range = range, severity = 2, code = "unused-local", source = "lye",
+							message = "unused local `x`",
+						} } },
+			} },
 		{ jsonrpc = "2.0", id = 3, method = "textDocument/codeLens", params = {
-			textDocument = { uri = "file:///f.lua" },
-		} },
+				textDocument = { uri = "file:///f.lua" },
+			} },
 	}, source)
 	local actions = results["2"] or {}
 	---@cast actions { title: string, kind: string?, edit: table? }[]
@@ -1612,7 +1611,7 @@ end)
 test.it("walks the class hierarchy across workspace files", function()
 	local root = PACKAGE_DIR .. "/target/workspace-types"
 	os.execute("rm -rf " .. string.format("%q", root)
-		.. " && mkdir -p " .. string.format("%q", root))
+	.. " && mkdir -p " .. string.format("%q", root))
 	local function write(name, text)
 		local handle = assert(io.open(root .. "/" .. name, "wb"))
 		handle:write(text)
@@ -1624,8 +1623,8 @@ test.it("walks the class hierarchy across workspace files", function()
 	local uri = "file://" .. root .. "/child.lua"
 	local function at(id, method, position)
 		return { jsonrpc = "2.0", id = id, method = method, params = {
-			textDocument = { uri = uri }, position = position,
-		} }
+				textDocument = { uri = uri }, position = position,
+			} }
 	end
 	local results = run({
 		at(2, "textDocument/prepareTypeHierarchy", { line = 0, character = 10 }),
@@ -1636,8 +1635,8 @@ test.it("walks the class hierarchy across workspace files", function()
 	local prepared = run({
 		{ jsonrpc = "2.0", id = 3, method = "typeHierarchy/supertypes", params = { item = items[1] } },
 		{ jsonrpc = "2.0", id = 4, method = "typeHierarchy/subtypes", params = {
-			item = { name = "Base", uri = uri, data = { name = "Base" } },
-		} },
+				item = { name = "Base", uri = uri, data = { name = "Base" } },
+			} },
 	}, child, root, uri)
 	local parents = prepared["3"] or {}
 	---@cast parents { name: string }[]
@@ -1651,8 +1650,8 @@ test.it("lists symbols from every workspace folder", function()
 	local base = "/tmp/lye-workspace-roots"
 	local first, second = base .. "/one", base .. "/two"
 	os.execute("rm -rf " .. string.format("%q", base)
-		.. " && mkdir -p " .. string.format("%q", first)
-		.. " " .. string.format("%q", second))
+	.. " && mkdir -p " .. string.format("%q", first)
+	.. " " .. string.format("%q", second))
 	local function write(root, name, text)
 		local handle = assert(io.open(root .. "/" .. name, "wb"))
 		handle:write(text)
@@ -1678,9 +1677,9 @@ end)
 test.it("answers a semantic-token delta against the answer it held", function()
 	local source = "local x = 1\nreturn x\n"
 	local first = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/semanticTokens/full",
-		params = { textDocument = { uri = "file:///f.lua" } },
-	} }, source)
+			jsonrpc = "2.0", id = 2, method = "textDocument/semanticTokens/full",
+			params = { textDocument = { uri = "file:///f.lua" } },
+		} }, source)
 	local id = first["2"] and first["2"].resultId
 	test.truthy(id, "the full answer has an identity")
 	local second = run({
@@ -1699,12 +1698,12 @@ end)
 test.it("spaces a formatted line without touching a string", function()
 	local source = "local x=1+2\nlocal  y =  \"a  b\"\nreturn x,  y\n"
 	local results = run({ {
-		jsonrpc = "2.0", id = 2, method = "textDocument/formatting",
-		params = {
-			textDocument = { uri = "file:///f.lua" },
-			options = { tabSize = 2, insertSpaces = true },
-		},
-	} }, source)
+			jsonrpc = "2.0", id = 2, method = "textDocument/formatting",
+			params = {
+				textDocument = { uri = "file:///f.lua" },
+				options = { tabSize = 2, insertSpaces = true },
+			},
+		} }, source)
 	local edits = results["2"] or {}
 	---@cast edits { newText: string, range: { start: { line: integer } } }[]
 	local text = {}
@@ -1712,6 +1711,47 @@ test.it("spaces a formatted line without touching a string", function()
 	test.equal(text[0], "local x = 1 + 2")
 	test.equal(text[1], "local y = \"a  b\"", "the literal keeps the spaces it holds")
 	test.equal(text[2], "return x, y")
+end)
+
+test.it("answers a hover on a table key with the field the expected type declares", function()
+	-- `name` in a table written for `probe.Thing` is a field of that class, not a word: the answer
+	-- says its type and links to the annotation that promises it. A table written for a union is
+	-- read as the member its discriminant picks, so `type = "b"` is `probe.B`'s field and links
+	-- to that class, not to the union's first member.
+	local source = table.concat({
+		"---@class probe.Thing\n",
+		"---@field name string\n",
+		"---@param thing probe.Thing\n",
+		"local function use(thing) return thing end\n",
+		"use({ name = \"x\" })\n",
+		"---@class probe.A\n",
+		"---@field type \"a\"\n",
+		"---@field id number\n",
+		"---@class probe.B\n",
+		"---@field type \"b\"\n",
+		"---@field id number\n",
+		"---@alias probe.M probe.A|probe.B\n",
+		"---@param m probe.M\n",
+		"local function take(m) return m end\n",
+		"take({ type = \"b\", id = 2 })\n",
+	}, "")
+	local results = run({
+		request(2, "textDocument/hover", { line = 4, character = 6 }),
+		request(3, "textDocument/hover", { line = 14, character = 7 }),
+		request(4, "textDocument/hover", { line = 14, character = 19 }),
+	}, source)
+	local field = results["2"] and results["2"].contents and results["2"].contents.value or ""
+	test.truthy(field:find("probe.Thing.name: string", 1, true), field)
+	test.truthy(field:find("[declared here](file://", 1, true), "the field's declaration is linked: " .. field)
+	test.truthy(field:find("#L2", 1, true), "on the line it is written: " .. field)
+
+	local discriminant = results["3"] and results["3"].contents and results["3"].contents.value or ""
+	test.truthy(discriminant:find("probe.B.type: \"b\"", 1, true), discriminant)
+	test.truthy(discriminant:find("#L10", 1, true), "the member the discriminant picks: " .. discriminant)
+
+	local id = results["4"] and results["4"].contents and results["4"].contents.value or ""
+	test.truthy(id:find("probe.B.id: number", 1, true), id)
+	test.truthy(id:find("#L11", 1, true), "the same member's other field: " .. id)
 end)
 
 return true

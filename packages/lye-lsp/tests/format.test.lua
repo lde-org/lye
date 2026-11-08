@@ -79,6 +79,14 @@ test.it("keeps a literal and a long string exactly as written", function()
 	test.includes(out, "  keep  this", "the long string keeps its own indentation and spaces")
 end)
 
+test.it("keeps a short function's parameter bars tight", function()
+	-- `|a, b| -> value` is one function expression. A binary `|` has a space on either side, but
+	-- the bars around the parameters belong to the parameters: `| a |` reads as a bit operation.
+	local source = "local f=|x| ->x+1\nlocal g=|a,b| -> a+b\nlocal h=|| -> 5\nlocal i = |x| -> x | 1\n"
+	local expected = "local f = |x| -> x + 1\nlocal g = |a, b| -> a + b\nlocal h = || -> 5\nlocal i = |x| -> x | 1\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
 test.it("formats a file in place, and --check reports without writing", function()
 	fs.write(FILE, "local x=1+2\nreturn x\n")
 	local check = run(string.format(

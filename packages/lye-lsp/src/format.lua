@@ -90,12 +90,92 @@ local function unaryWord(word)
 		or word == "until" or word == "in" or word == "local"
 end
 
+--- The positions of `|` that delimit a short function's parameters. A binary `|` is spaced like
+--- every other operator; the pair around `a, b` in `|a, b| -> value` is written without the space
+--- that would separate the names from their own brackets.
+---@param line string
+---@return table<integer, "open"|"close">?
+local function shortFunctionPipes(line)
+	-- Strings and comments may hold an arrow or a pipe that is text, not syntax.
+	local masked = {}
+	local at = 1
+	while at <= #line do
+		local char = line:sub(at, at)
+		if char == '"' or char == "'" then
+			local quote = char
+			masked[at] = true
+			at += 1
+			while at <= #line do
+				masked[at] = true
+				if line:sub(at, at) == "\\" then
+					masked[at + 1] = true
+					at += 2
+				elseif line:sub(at, at) == quote then
+					at += 1
+					break
+				else
+					at += 1
+				end
+			end
+		elseif char == "-" and line:sub(at + 1, at + 1) == "-" then
+			for index = at, #line do masked[index] = true end
+			break
+		elseif char == "[" then
+			local level = line:match("^%[(=*)%[", at)
+			if level then
+				local close = "]" .. level .. "]"
+				local found = line:find(close, at + 2 + #level, true)
+				local stop = found and (found + #close - 1) or #line
+				for index = at, stop do masked[index] = true end
+				at = stop + 1
+			else
+				at += 1
+			end
+		else
+			at += 1
+		end
+	end
+
+	local marks = {}
+	local from = 1
+	while true do
+		local arrow = line:find("->", from, true)
+		if not arrow then break end
+		if not masked[arrow] and not masked[arrow + 1] then
+			local close = arrow - 1
+			while close >= 1 and line:sub(close, close):match("%s") do close -= 1 end
+			if close >= 1 and line:sub(close, close) == "|" and not masked[close] then
+				local before = close - 1
+				while before >= 1 and line:sub(before, before):match("%s") do before -= 1 end
+				if before >= 1 and line:sub(before, before) == "|" and not masked[before] then
+					marks[before], marks[close] = "open", "close"
+				else
+					local opening = before
+					while opening >= 1 do
+						local char = line:sub(opening, opening)
+						if char == "|" and not masked[opening] then
+							marks[opening], marks[close] = "open", "close"
+							break
+						end
+						if not char:match("[%w_%s,%.]") then break end
+						opening -= 1
+					end
+				end
+			end
+		end
+		from = arrow + 2
+	end
+	if next(marks) == nil then return nil end
+	return marks
+end
+
 --- Space a line of code the way the rest of the formatter writes it, leaving literals and a
 --- trailing comment alone. The line is the content after indentation; the caller puts the
 --- indentation back.
 ---@param line string
 ---@return string
 function format.spaceLine(line)
+	local pipes = shortFunctionPipes(line)
 	local out = {}
 	local count = 0
 	---@param text string
@@ -156,6 +236,24 @@ function format.spaceLine(line)
 			append(held)
 			index = stop + 1
 		else
+			local pipe = pipes and pipes[index]
+			if pipe == "open" then
+				local before = text():gsub("%s+$", "")
+				local previousChar = before:sub(-1)
+				---@cast previousChar string
+				trimTrailing(count)
+				if before ~= "" and previousChar:match("[%(%[%{%,%;%:]") == nil then append(" ") end
+				append("|")
+				index += 1
+				while line:sub(index, index):match("%s") do index += 1 end
+				goto continue
+			elseif pipe == "close" then
+				trimTrailing(count)
+				append("|")
+				index += 1
+				while line:sub(index, index):match("%s") do index += 1 end
+				goto continue
+			end
 			local operator
 			for _, candidate in ipairs(SPACED_OPERATORS) do
 				if line:sub(index, index + #candidate - 1) == candidate then
@@ -215,6 +313,7 @@ function format.spaceLine(line)
 				append(char)
 				index += 1
 			end
+			::continue::
 		end
 	end
 	return (text():gsub("%s+$", ""))

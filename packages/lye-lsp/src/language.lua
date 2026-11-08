@@ -1,5 +1,5 @@
 --[[
-	The lye language server: wires the protocol layer to the Lua tooling.
+The lye language server: wires the protocol layer to the Lua tooling.
 ]]
 
 -- First, so the mark it writes for `initialize` covers everything this server loaded.
@@ -14,6 +14,7 @@ local json = require("lye-json")
 local definitionsIndex = require("lye-lsp.definitions")
 local Parser = require("lye-parser")
 local analyzer = require("lye-analyzer")
+local infer = require("lye-analyzer.infer")
 local analyzerNames = require("lye-analyzer.names")
 local editorconfig = require("lye-lsp.editorconfig")
 local lexer = require("lye-lexer")
@@ -359,7 +360,7 @@ local function overlaySpans(spans, asked, limit)
 				end
 				if winner then
 					addOverlay(from --[[@as integer]], to --[[@as integer]],
-						winner.kind --[[@as string]], winner.modifiers --[[@as number]])
+					winner.kind --[[@as string]], winner.modifiers --[[@as number]])
 				end
 			end
 			previousPoint = point
@@ -583,7 +584,6 @@ local function typeWords(text, from, stop, visit)
 	end
 end
 
-
 --- A `---@tag` inside a comment, with the tag's own span. Whitespace is matched without
 --- newlines, so a tag never counts as spanning two lines.
 local DOC_TAG = "%-%-%-[ \t]*@"
@@ -761,7 +761,7 @@ function Lye:checkpoint(force)
 	-- worth the recompilation, flushing the traces is what actually gives the analysis back.
 	local traceBytes = timing.heap() * 1024
 	if self.cache.traceGarbage
-		and (traceBytes >= TRACE_HEAP_BYTES or (force and traceBytes >= TRACE_CLOSE_BYTES)) then
+	and (traceBytes >= TRACE_HEAP_BYTES or (force and traceBytes >= TRACE_CLOSE_BYTES)) then
 		jit.flush()
 		collectgarbage("collect")
 		self.lastHeap = timing.heap()
@@ -882,7 +882,7 @@ function Lye:pluginConfig(uri)
 				-- A relative path is read from the file that wrote it, and a name is left as it is
 				-- for the package's own resolution.
 				local named = entry:sub(1, 1) ~= "!" and entry:sub(1, 1) ~= "/"
-					and (entry:sub(1, 1) == "." or entry:sub(-4) == ".lua")
+				and (entry:sub(1, 1) == "." or entry:sub(-4) == ".lua")
 				out[#out + 1] = named and (dir .. "/" .. entry:gsub("^%./", "")) or entry
 			end
 		end
@@ -1056,7 +1056,6 @@ function Lye:useWorkspaceCache()
 	if root and root ~= "" and not cache.named() then cache.setRoot(root .. "/.lye") end
 end
 
-
 --- What one document declares, which `declaredBy` keeps after its analysis is dropped.
 ---@param file lye.doc.File
 local function declarationsOf(file)
@@ -1191,19 +1190,19 @@ function Lye:analyze(uri, from)
 	local function reportPlugin(message) self.server:log(message, framework.LOG.warning) end
 	local analysisStarted = timing.now()
 	local names = analyzer.analyze(view.text, PRELUDE, declared, moduleAt,
-		resume, self.cache:annotationsFor(uri, view.text), nil, self:isDefinition(uri),
-		view.specs, reportPlugin, options)
+	resume, self.cache:annotationsFor(uri, view.text), nil, self:isDefinition(uri),
+	view.specs, reportPlugin, options)
 	timing.detail("analyzer-call", analysisStarted, "bytes=%d", #view.text)
 	if counters then
 		timing.detail("analyzer-phases", analysisStarted,
-			"parse=%.1f checks=%.1f checkCalls=%.1f typing=%.1f typing2=%.1f inferParams=%.1f contextual=%.1f scopes=%.1f setup=%.1f reuse=%.1f finalize=%.1f",
-			(counters.parse or 0) * 1000, (counters.checkReport or 0) * 1000,
-			(counters.checkCalls or 0) * 1000, (counters.typing or 0) * 1000,
-			(counters.typing2 or 0) * 1000, (counters.inferParams or 0) * 1000,
-			(counters.contextual or 0) * 1000, (counters.scopes or 0) * 1000,
-			(counters.itemsBuild or 0) * 1000 + (counters.itemIndexes or 0) * 1000
-				+ (counters.declare or 0) * 1000 + (counters.methods or 0) * 1000,
-			(counters.reuseTime or 0) * 1000, (counters.finalize or 0) * 1000)
+		"parse=%.1f checks=%.1f checkCalls=%.1f typing=%.1f typing2=%.1f inferParams=%.1f contextual=%.1f scopes=%.1f setup=%.1f reuse=%.1f finalize=%.1f",
+		(counters.parse or 0) * 1000, (counters.checkReport or 0) * 1000,
+		(counters.checkCalls or 0) * 1000, (counters.typing or 0) * 1000,
+		(counters.typing2 or 0) * 1000, (counters.inferParams or 0) * 1000,
+		(counters.contextual or 0) * 1000, (counters.scopes or 0) * 1000,
+		(counters.itemsBuild or 0) * 1000 + (counters.itemIndexes or 0) * 1000
+		+(counters.declare or 0) * 1000 + (counters.methods or 0) * 1000,
+		(counters.reuseTime or 0) * 1000, (counters.finalize or 0) * 1000)
 	end
 	local parsed = names.parser
 
@@ -1225,7 +1224,7 @@ function Lye:analyze(uri, from)
 		if node.kind == "call" and node.callee == "require" and node.args and node.args[1] then
 			local argument = parsed.nodes[node.args[1]]
 			if argument and argument.kind == "string" and type(argument.value) == "string"
-				and not self:moduleFile(argument.value, uri) then
+			and not self:moduleFile(argument.value, uri) then
 				diagnostics[#diagnostics + 1] = {
 					message = string.format("module `%s` is not found", argument.value),
 					severity = 1, code = "missing-module",
@@ -1257,7 +1256,7 @@ function Lye:analyze(uri, from)
 	local items, reused = 0, 0
 	if counters then items, reused = counters.items or 0, counters.reused or 0 end
 	timing.detail("analyze", started, "bytes=%d resumed=%s items=%s reused=%s",
-		#view.text, resume and "1" or "0", tostring(items), tostring(reused))
+	#view.text, resume and "1" or "0", tostring(items), tostring(reused))
 	return result
 end
 
@@ -1269,7 +1268,7 @@ function Lye:evictCache()
 	local started = timing.now()
 	local stats = self.cache:evict()
 	timing.detail("cache", started, "entries=%d bytes=%d analyses=%d analysisBytes=%d parsedBytes=%d",
-		stats.entries, stats.bytes, stats.analyses, stats.analysisBytes, stats.parsedBytes)
+	stats.entries, stats.bytes, stats.analyses, stats.analysisBytes, stats.parsedBytes)
 end
 
 ---@param self lye.Server
@@ -1322,7 +1321,7 @@ function Lye:offsetAt(uri, line, character)
 	local document = self.server.documents:get(uri)
 	if not document then return nil end
 	local offset = position.toOffset(
-		document.text, document.lineIndex, line, character, self.server.encoding
+	document.text, document.lineIndex, line, character, self.server.encoding
 	)
 	local view = self:view(uri)
 	if view and not view.map:isEmpty() then offset = view.map:toLowered(offset) end
@@ -1477,10 +1476,10 @@ function Lye:onWorkspaceDiagnostic(params)
 			local path = entry.path
 			---@cast path string
 			local absolute = path:sub(1, 1) == "/" or path:sub(1, 1) == "\\"
-				or path:match("^%a:[/\\]") ~= nil
+			or path:match("^%a:[/\\]") ~= nil
 			if not absolute then
 				local base = self.server:rootFor("file://" .. path)
-					or (self.server.rootPaths or {})[1] or self.server.rootPath
+				or (self.server.rootPaths or {})[1] or self.server.rootPath
 				if base then path = base .. "/" .. path:gsub("^%./", "") end
 			end
 			local uri = "file://" .. path
@@ -1559,7 +1558,7 @@ local function fieldUseAt(parsed, token, name)
 	if separator ~= "." and separator ~= ":" then return false end
 	for _, node in ipairs(parsed.nodes) do
 		if node.field == name and (node.kind == "index" or node.kind == "call")
-			and node.start <= token.start and node.stop >= token.stop then
+		and node.start <= token.start and node.stop >= token.stop then
 			return true
 		end
 	end
@@ -1668,8 +1667,8 @@ function Lye:resolvePosition(params)
 	if not result or not names or not view then return nil end
 
 	local offset = position.toOffset(
-		document.text, document.lineIndex, where.line, where.character,
-		self.server.encoding
+	document.text, document.lineIndex, where.line, where.character,
+	self.server.encoding
 	)
 	-- The editor holds one text and lye reads another: the position is carried across before
 	-- anything is asked about it. What is handed back is the text the offsets belong to, so every
@@ -1693,8 +1692,8 @@ local function typeOfExpression(result, idx, offset)
 	if node.kind == "string" then return types.base("string") end
 	if node.kind == "prefix" then
 		local variable = node.callee
-			and (result.byStart and result.byStart[node.start]
-				or analyzer.lookupAt(result, node.callee, offset))
+		and (result.byStart and result.byStart[node.start]
+		or analyzer.lookupAt(result, node.callee, offset))
 		return variable and analyzer.typeAt(result, variable, offset) or nil
 	end
 	if node.kind == "index" and node.target then
@@ -1780,6 +1779,162 @@ local function fieldTypeOf(result, node, offset)
 	return analyzer.fieldTypeAt(result, base, baseName, node.field, offset)
 end
 
+--- The key of a table field written at an offset: the table node, the field name, and the token
+--- span of the key. A hover over `type` in `{ type = "open" }` is asking about the field the
+--- table's expected type declares, not about the word.
+---@param result lye.analyzer.Result
+---@param offset integer
+---@return integer? tableIdx
+---@return string? fieldName
+---@return integer? from
+---@return integer? to
+local function tableKeyAt(result, offset)
+	local parser = result.parser
+	for tableIdx, anchors in pairs(parser.tableFieldAnchors or {}) do
+		for fieldName, tokenIdx in pairs(anchors) do
+			local token = parser.tokens and parser.tokens.arena[tokenIdx]
+			if token and offset >= token.start and offset <= token.stop then
+				return tableIdx, fieldName, token.start, token.stop
+			end
+		end
+	end
+end
+
+--- The declaration a value's own index belongs to, by the value it initializes.
+---@param result lye.analyzer.Result
+---@param idx integer
+---@return lye.analyzer.Variable?
+local function declarationVariableOf(result, idx)
+	for _, declaration in ipairs(result.parser.declarations) do
+		if declaration.valueIdx == idx then return result.byStart[declaration.start] end
+	end
+end
+
+--- The type a value is written to become. A table handed to a call takes the parameter's type, a
+--- table written as a result takes the return's, and one assigned to a typed name is that type:
+--- this is what the fields a writer leaves out are checked against, read here for the hover.
+---@param result lye.analyzer.Result
+---@param idx integer
+---@param offset integer
+---@param seen table<integer, boolean>? the values already walked, so a self-nesting table ends
+---@return lye.doc.Type?
+local function expectedTypeOf(result, idx, offset, seen)
+	local parser = result.parser
+	local node = parser.nodes[idx]
+	if not node or not node.parent then return nil end
+	seen = seen or {}
+	if seen[idx] then return nil end
+	seen[idx] = true
+	local parent = parser.nodes[node.parent]
+
+	if parent.kind == "table" then
+		local fields = parser.tableFieldValues and parser.tableFieldValues[parent.index]
+		---@type string?
+		local fieldName
+		for name, valueIdx in pairs(fields or {}) do
+			if valueIdx == idx and type(name) == "string" then fieldName = name break end
+		end
+		if not fieldName then return nil end
+		local expected = expectedTypeOf(result, parent.index, offset, seen)
+		return expected and types.fieldOf(expected, fieldName)
+	end
+
+	if parent.kind == "local" then
+		local variable = declarationVariableOf(result, idx)
+		if not variable then return nil end
+		local held = variable.declared
+		if held == nil or held.variant == "any" or types.isMutable(held) then
+			held = analyzer.typeAt(result, variable, offset)
+		end
+		return held
+	end
+
+	if parent.kind == "return" then
+		local fn = parent.parent and parser.nodes[parent.parent]
+		while fn and fn.kind ~= "function" do fn = fn.parent and parser.nodes[fn.parent] end
+		local variable = fn and declarationVariableOf(result, fn.index)
+		if not variable then return nil end
+		local held = analyzer.typeAt(result, variable, offset)
+		if held and types.isFn(held) then return held.returns end
+		return nil
+	end
+
+	if parent.kind == "call" then
+		local position
+		for at, argIdx in ipairs(parent.args or {}) do
+			if argIdx == idx then position = at break end
+		end
+		if not position or not result.inferCtx then return nil end
+		local callee = infer.calleeTypeOf(result.inferCtx, parent)
+		if not callee or not types.isFn(callee) then return nil end
+		local shift = 0
+		if parent.isMethod then
+			local receiver = parent.target and infer.at(result.inferCtx, parent.target)
+			local first = callee.params[1]
+			if first and receiver and types.satisfies(receiver, first) then shift = 1 end
+		end
+		local wanted = callee.params[position + shift]
+		if not wanted and callee.isVariadic and position + shift > #callee.params then
+			wanted = callee.variadic
+		end
+		return wanted
+	end
+
+	if parent.kind == "assignment" then
+		local target = parent.target and parser.nodes[parent.target]
+		if not target then return nil end
+		if target.kind == "index" and target.field then
+			local base = typeOfExpression(result, target.target, offset)
+			return base and types.fieldOf(base, target.field)
+		end
+		if target.kind == "name" and target.name then
+			local variable = analyzer.lookupAt(result, target.name, offset)
+			return variable and analyzer.typeAt(result, variable, offset)
+		end
+		if target.kind == "prefix" and target.callee then
+			local variable = analyzer.lookupAt(result, target.callee, offset)
+			return variable and analyzer.typeAt(result, variable, offset)
+		end
+	end
+end
+
+--- The one member of a union a table's discriminant names. A message is a union of kinds; the
+--- table written with `type = "open"` is the `OpenMessage`, and its hover points at that class's
+--- field rather than at all of them.
+---@param expected lye.doc.Type?
+---@param result lye.analyzer.Result
+---@param idx integer
+---@param offset integer
+---@return lye.doc.Type?
+local function narrowByDiscriminant(expected, result, idx, offset)
+	if not expected or expected.variant ~= "union" then return expected end
+	local written = (result.inferCtx and infer.at(result.inferCtx, idx)) or typeOfExpression(result, idx, offset)
+	local discriminant = written and types.fieldOf(written, "type")
+	if not discriminant then return expected end
+	for _, member in ipairs(expected.types) do
+		local wanted = types.fieldOf(member, "type")
+		if wanted and types.display(wanted) == types.display(discriminant) then return member end
+	end
+	return expected
+end
+
+--- The line an offset is on, in a document read from disk, numbered as a reader counts them.
+---@param location lye.DefinitionLocation
+---@param uri string
+---@param text string
+---@return integer?
+local function lineOfLocation(location, uri, text)
+	local source = text
+	if location.uri ~= uri then
+		local path = location.uri:gsub("^file://", "")
+		source = fs.read(path)
+	end
+	if type(source) ~= "string" then return nil end
+	local line = 1
+	for _ in source:sub(1, math.max(0, location.start - 1)):gmatch("\n") do line = line + 1 end
+	return line
+end
+
 --- A signature as its annotations wrote it: `print(...: any)`, `math.floor(x: number) -> number`.
 --- The name is optional, since a completion item is already labelled with it, and so is the
 --- signature: a caller that has none shows the type instead.
@@ -1803,7 +1958,7 @@ local function signatureText(signature, name, result)
 		returned = types.display(result)
 	else
 		returned = signature.values and table.concat(signature.values, ", ")
-			or (signature.returns and signature.returns.type)
+		or (signature.returns and signature.returns.type)
 		---@type lye.doc.Type[]?
 		local inferred = signature.inferredValues
 		if not returned and inferred and #inferred > 0 then
@@ -1813,7 +1968,7 @@ local function signatureText(signature, name, result)
 		end
 	end
 	return (name or "") .. "(" .. table.concat(parts, ", ") .. ")"
-		.. (returned and (" -> " .. returned) or "")
+	.. (returned and (" -> " .. returned) or "")
 end
 
 --- The signature behind whatever sits at an offset: a name the definitions declare, a field read off
@@ -1874,7 +2029,7 @@ end
 local function readAsName(names, name, offset, at)
 	---@type lye.analyzer.Variable?
 	local variable = (at and names.byStart and names.byStart[at])
-		or analyzer.lookupAt(names, name, offset)
+	or analyzer.lookupAt(names, name, offset)
 	if variable then
 		local held = analyzer.typeAt(names, variable, offset)
 		if types.isFn(held) then return "function" end
@@ -1983,15 +2138,15 @@ local function nodeAt(result, offset, withLiterals)
 	local found
 	for _, node in ipairs(result.parser.nodes) do
 		local isValue = node.kind == "prefix" or node.kind == "index" or node.kind == "call"
-			or node.kind == "name"
+		or node.kind == "name"
 		if withLiterals and (node.kind == "string" or node.kind == "literal"
-			or node.kind == "number" or node.kind == "table") then
+		or node.kind == "number" or node.kind == "table") then
 			isValue = true
 		end
 		if isValue and node.start <= offset and offset <= node.stop + 1 then
 			-- The innermost: the latest start, and among those the shortest span.
 			if not found or node.start > found.start
-				or (node.start == found.start and node.stop < found.stop) then
+			or (node.start == found.start and node.stop < found.stop) then
 				found = node
 			end
 		end
@@ -2110,7 +2265,7 @@ local function shownType(lines)
 					local name = field.name
 					if field.optional then name = name .. "?" end
 					local prefix = field.visibility and field.visibility ~= "public"
-						and (field.visibility .. " ") or ""
+					and (field.visibility .. " ") or ""
 					local comment = field.comment and (" -- " .. field.comment) or ""
 					out[#out + 1] = string.format("    %s%s: %s,%s", prefix, name, field.type, comment)
 				end
@@ -2129,7 +2284,7 @@ local function shownType(lines)
 				local body = alias.body:gsub("%s*|%s*", " | ")
 				local kind = body:find("|", 1, true) and "union" or "alias"
 				return kind .. " " .. name .. " = " .. body,
-					#documentation > 0 and table.concat(documentation, "\n") or nil
+				#documentation > 0 and table.concat(documentation, "\n") or nil
 			end
 		end
 	end
@@ -2147,7 +2302,7 @@ function Lye:onHover(params)
 	local document = self.server.documents:get(uri)
 	if view and document and params.position then
 		local original = position.toOffset(document.text, document.lineIndex,
-			params.position.line, params.position.character, self.server.encoding)
+		params.position.line, params.position.character, self.server.encoding)
 		local context = self:navigationContext(uri, original)
 		if context then
 			local answer = plugin.hover(view.specs, context)
@@ -2160,6 +2315,32 @@ function Lye:onHover(params)
 					range = self:toRange(view.source, view.sourceIndex, from, to),
 				}
 			end
+		end
+	end
+
+	-- A key of a table literal is asking about the field the table's expected type declares:
+	-- `type = "open"` under a `beat.Message` is the `type` of the kind the discriminant picks, and
+	-- the answer points at the annotation that promises it.
+	local tableIdx, fieldName, keyFrom, keyTo = tableKeyAt(result, offset)
+	if tableIdx and fieldName then
+		local expected = narrowByDiscriminant(expectedTypeOf(result, tableIdx, offset), result, tableIdx, offset)
+		local fieldType = expected and types.fieldOf(expected, fieldName)
+		if fieldType then
+			local owner = expected.variant == "class" and expected.name or nil
+			local label = owner and (owner .. "." .. fieldName) or fieldName
+			local blocks = { string.format("```lua\n%s: %s\n```", label, types.display(fieldType)) }
+			if owner then
+				local location = self.declarations:fieldLocation(owner, fieldName, uri)
+				if location then
+					local line = lineOfLocation(location, uri, text)
+					local target = location.uri .. (line and ("#L" .. line) or "")
+					blocks[#blocks + 1] = string.format("[declared here](%s)", target)
+				end
+			end
+			return {
+				contents = { kind = "markdown", value = table.concat(blocks, "\n\n") },
+				range = self:toRange(text, index, keyFrom, keyTo),
+			}
 		end
 	end
 
@@ -2231,7 +2412,7 @@ function Lye:onHover(params)
 	if signature then
 		---@cast signature lye.analyzer.Signature
 		label = signatureText(signature, writtenName(result, node, text),
-			node.kind == "call" and held or nil)
+		node.kind == "call" and held or nil)
 		-- The other shapes a call may take are part of the answer: `pcall`'s generic success
 		-- shape is where its result type comes from, and showing only the primary `any` hid it.
 		if signature.overloads and #signature.overloads > 0 then
@@ -2348,7 +2529,7 @@ function Lye:targetAt(uri, text, names, offset)
 	-- `require("a.b")` names a file: the string is a path, and the jump goes to the module.
 	local required = nodeAt(names, offset)
 	if required and required.kind == "call" and required.callee == "require"
-		and required.args and required.args[1] then
+	and required.args and required.args[1] then
 		local argument = names.parser.nodes[required.args[1]]
 		if argument and argument.kind == "string" and offset >= argument.start and offset <= argument.stop then
 			local path = type(argument.value) == "string" and self:moduleFile(argument.value)
@@ -2386,7 +2567,7 @@ function Lye:targetAt(uri, text, names, offset)
 				for _, candidate in ipairs(candidates) do
 					for _, declaration in ipairs(names.parser.declarations) do
 						if declaration.name == candidate
-							and (declaration.qualifier == "field" or declaration.qualifier == "global") then
+						and (declaration.qualifier == "field" or declaration.qualifier == "global") then
 							return { uri = uri, start = declaration.start, stop = declaration.stop }
 						end
 					end
@@ -2400,7 +2581,7 @@ function Lye:targetAt(uri, text, names, offset)
 		-- A name that is not declared here may still be a value of a type that is: `math` is the
 		-- table `mathlib` describes, and the class is where a reader wants to land.
 		local held = node.kind == "prefix" and node.callee
-			and typeOfExpression(names, node.index, offset)
+		and typeOfExpression(names, node.index, offset)
 		if held and held.variant == "class" then
 			local found = self:targetOfType(held.name, uri)
 			if found and found.uri ~= uri then return found end
@@ -2423,7 +2604,7 @@ function Lye:onDefinition(params)
 	local document = self.server.documents:get(uri)
 	if view and document and params.position then
 		local original = position.toOffset(document.text, document.lineIndex,
-			params.position.line, params.position.character, self.server.encoding)
+		params.position.line, params.position.character, self.server.encoding)
 		local context = self:navigationContext(uri, original)
 		local answer = context and plugin.definition(view.specs, context)
 		if answer and answer.from then
@@ -2487,15 +2668,15 @@ function Lye:fastSemanticTokens(uri, patchedOnly)
 	local before = self.pendingChangeTexts and self.pendingChangeTexts[uri]
 	local beforeIndex = self.lastIndexes[uri]
 	if cached and cached.spans and before and beforeIndex and cached.text == before
-		and changes and #changes == 1 and changes[1].range then
+	and changes and #changes == 1 and changes[1].range then
 		local change = changes[1]
 		local beforeText, beforeLine = assert(before), assert(beforeIndex)
 		local range = assert(change.range)
 		local start, stop = assert(range.start), assert(range["end"])
 		local from = position.toOffset(beforeText, beforeLine,
-			start.line, start.character, self.server.encoding)
+		start.line, start.character, self.server.encoding)
 		local to = position.toOffset(beforeText, beforeLine,
-			stop.line, stop.character, self.server.encoding)
+		stop.line, stop.character, self.server.encoding)
 		if to < from then from, to = to, from end
 		local inserted = change.text or ""
 		local delta = #inserted - (to - from)
@@ -2620,7 +2801,7 @@ function Lye:onSemanticTokens(params)
 	for _, declaration in ipairs(result.declarations) do
 		if declaration.qualifier ~= "label" then
 			local target = declaration.isFunction and "function"
-				or (declaration.qualifier == "param" and "parameter" or "variable")
+			or (declaration.qualifier == "param" and "parameter" or "variable")
 			for at = declaration.start, declaration.stop do
 				kinds[at] = target
 			end
@@ -2920,89 +3101,89 @@ function Lye:onSemanticTokens(params)
 		-- cut them, and that overlay is merged in one pass over both lists.
 		flat, total = overlaySpans(spans, asked, #view.source)
 	else
-	---@type table<integer, string>
-	local askedKind = {}
-	---@type table<integer, integer>
-	local askedMods = {}
-	for _, span in ipairs(asked) do
-		local from, to, kind = span.from, span.to, span.type
-		if type(from) == "number" and type(to) == "number" and TOKEN_TYPE[kind] and to >= from then
-			for at = math.max(from, 1), math.min(to, #view.source) do
-				askedKind[at] = kind
-				askedMods[at] = span.modifiers or 0
-			end
-		end
-	end
-	---@type (integer|string)[]
-	local pieces = {}
-	local pieceCount = 0
-	---@param from integer
-	---@param to integer
-	---@param kind string
-	---@param modifiers integer?
-	local function collect(from, to, kind, modifiers)
-		if from > to then return end
-		pieceCount += 4
-		pieces[pieceCount - 3], pieces[pieceCount - 2] = from, to
-		pieces[pieceCount - 1], pieces[pieceCount] = kind, modifiers or 0
-	end
-	for index = 1, #spans, 4 do
-		local spanFrom, spanTo = spans[index], spans[index + 1]
-		local spanKind, spanMods = spans[index + 2], spans[index + 3]
-		---@cast spanFrom integer
-		---@cast spanTo integer
-		---@cast spanKind string
-		---@cast spanMods integer
-		-- What lye read out of the text a plugin wrote has nowhere to be pointed at: `---@type
-		-- number` exists in the lowered text, not in the line the reader wrote.
-		if not view.map:rangeIsWritten(spanFrom, spanTo) then
-			local from, to = originalRange(view.map, spanFrom, spanTo)
-			---@cast from integer
-			---@cast to integer
-			local at = from
-			while at <= to do
-				local asked = askedKind[at]
-				local kind = asked or spanKind
-				local modifiers = asked and askedMods[at] or spanMods
-				local stop = at
-				while stop < to do
-					local nextAsked = askedKind[stop + 1]
-					if (nextAsked or spanKind) ~= kind
-						or ((nextAsked and askedMods[stop + 1] or spanMods) ~= modifiers) then
-						break
-					end
-					stop += 1
+		---@type table<integer, string>
+		local askedKind = {}
+		---@type table<integer, integer>
+		local askedMods = {}
+		for _, span in ipairs(asked) do
+			local from, to, kind = span.from, span.to, span.type
+			if type(from) == "number" and type(to) == "number" and TOKEN_TYPE[kind] and to >= from then
+				for at = math.max(from, 1), math.min(to, #view.source) do
+					askedKind[at] = kind
+					askedMods[at] = span.modifiers or 0
 				end
-				-- A span a plugin covers is the plugin's: the walk writes up to it and carries on
-				-- after it, and the plugin's own span is written from its own list below.
-				if not asked then collect(at, stop, kind, modifiers) end
-				at = stop + 1
 			end
 		end
-	end
-	for _, span in ipairs(asked) do
-		if TOKEN_TYPE[span.type] and type(span.from) == "number" and type(span.to) == "number" then
-			collect(math.max(span.from, 1), math.min(span.to, #view.source), span.type, span.modifiers)
+		---@type (integer|string)[]
+		local pieces = {}
+		local pieceCount = 0
+		---@param from integer
+		---@param to integer
+		---@param kind string
+		---@param modifiers integer?
+		local function collect(from, to, kind, modifiers)
+			if from > to then return end
+			pieceCount += 4
+			pieces[pieceCount - 3], pieces[pieceCount - 2] = from, to
+			pieces[pieceCount - 1], pieces[pieceCount] = kind, modifiers or 0
 		end
-	end
+		for index = 1, #spans, 4 do
+			local spanFrom, spanTo = spans[index], spans[index + 1]
+			local spanKind, spanMods = spans[index + 2], spans[index + 3]
+			---@cast spanFrom integer
+			---@cast spanTo integer
+			---@cast spanKind string
+			---@cast spanMods integer
+			-- What lye read out of the text a plugin wrote has nowhere to be pointed at: `---@type
+			-- number` exists in the lowered text, not in the line the reader wrote.
+			if not view.map:rangeIsWritten(spanFrom, spanTo) then
+				local from, to = originalRange(view.map, spanFrom, spanTo)
+				---@cast from integer
+				---@cast to integer
+				local at = from
+				while at <= to do
+					local asked = askedKind[at]
+					local kind = asked or spanKind
+					local modifiers = asked and askedMods[at] or spanMods
+					local stop = at
+					while stop < to do
+						local nextAsked = askedKind[stop + 1]
+						if (nextAsked or spanKind) ~= kind
+						or ((nextAsked and askedMods[stop + 1] or spanMods) ~= modifiers) then
+							break
+						end
+						stop += 1
+					end
+					-- A span a plugin covers is the plugin's: the walk writes up to it and carries on
+					-- after it, and the plugin's own span is written from its own list below.
+					if not asked then collect(at, stop, kind, modifiers) end
+					at = stop + 1
+				end
+			end
+		end
+		for _, span in ipairs(asked) do
+			if TOKEN_TYPE[span.type] and type(span.from) == "number" and type(span.to) == "number" then
+				collect(math.max(span.from, 1), math.min(span.to, #view.source), span.type, span.modifiers)
+			end
+		end
 
-	-- Sorting the flat list in place would need an order over four fields; sorting the positions
-	-- of its spans is one small array and keeps the spans themselves flat.
-	local order = {}
-	total = pieceCount / 4
-	for index = 1, total do order[index] = index end
-	table.sort(order, function(left, right)
-		local leftAt, rightAt = (left - 1) * 4, (right - 1) * 4
-		local leftFrom, rightFrom = pieces[leftAt + 1], pieces[rightAt + 1]
-		if leftFrom ~= rightFrom then return leftFrom < rightFrom end
-		return pieces[leftAt + 2] > pieces[rightAt + 2]
-	end)
-	flat = {}
-	for index = 1, total do
-		local fromAt, toAt = (order[index] - 1) * 4, (index - 1) * 4
-		flat[toAt + 1], flat[toAt + 2] = pieces[fromAt + 1], pieces[fromAt + 2]
-		flat[toAt + 3], flat[toAt + 4] = pieces[fromAt + 3], pieces[fromAt + 4]
-	end
+		-- Sorting the flat list in place would need an order over four fields; sorting the positions
+		-- of its spans is one small array and keeps the spans themselves flat.
+		local order = {}
+		total = pieceCount / 4
+		for index = 1, total do order[index] = index end
+		table.sort(order, function(left, right)
+			local leftAt, rightAt = (left - 1) * 4, (right - 1) * 4
+			local leftFrom, rightFrom = pieces[leftAt + 1], pieces[rightAt + 1]
+			if leftFrom ~= rightFrom then return leftFrom < rightFrom end
+			return pieces[leftAt + 2] > pieces[rightAt + 2]
+		end)
+		flat = {}
+		for index = 1, total do
+			local fromAt, toAt = (order[index] - 1) * 4, (index - 1) * 4
+			flat[toAt + 1], flat[toAt + 2] = pieces[fromAt + 1], pieces[fromAt + 2]
+			flat[toAt + 3], flat[toAt + 4] = pieces[fromAt + 3], pieces[fromAt + 4]
+		end
 	end
 	timing.detail("token-merge", stageStarted)
 	stageStarted = timing.now()
@@ -3091,7 +3272,7 @@ local function accessAt(result, source, offset)
 		-- `t["` names no field in the tree, and an `index` or a method call is what has one. The node spans
 		-- its arguments — an unterminated call spans the file — so the field decides, not the node.
 		local isAccess = node.kind == "index" and node.isDynamic ~= true
-			or (node.kind == "call" and node.isMethod == true)
+		or (node.kind == "call" and node.isMethod == true)
 		if node.target and isAccess then
 			---@type lye.parser.Node?
 			local target = result.parser.nodes[node.target]
@@ -3187,7 +3368,7 @@ function Lye:completeTypes(uri)
 	-- This document's own come first, since they win over the definitions where they disagree.
 	offerNamespace(namespace.classes, namespace.aliases)
 	offerNamespace(PRELUDE.classes,
-		PRELUDE.aliases --[[@as table<string, lye.doc.Alias>]])
+	PRELUDE.aliases --[[@as table<string, lye.doc.Alias>]])
 	return { isIncomplete = false, items = items }
 end
 
@@ -3297,7 +3478,7 @@ function Lye:onCompletion(params)
 						local signature = PRELUDE.fields[field]
 						if not signature and owner and base.variant == "class" then
 							signature = signatures[owner .. "." .. name]
-								or signatures[owner .. ":" .. name]
+							or signatures[owner .. ":" .. name]
 						end
 						if signature then
 							item.detail = signatureText(signature)
@@ -3419,13 +3600,13 @@ function Lye:onDocumentChanged(params, atOnce)
 	if view then
 		local previous = self.annotationFingerprints and self.annotationFingerprints[uri]
 		if previous and view.map:isEmpty()
-			and not changeTouchesAnnotation(params.contentChanges, self.lastTexts[uri], self.lastIndexes[uri]) then
+		and not changeTouchesAnnotation(params.contentChanges, self.lastTexts[uri], self.lastIndexes[uri]) then
 			fingerprint = previous
 		else
 			fingerprint = annotationFingerprint(view.text)
 		end
 		keepDeclarations = self.annotationFingerprints ~= nil
-			and self.annotationFingerprints[uri] == fingerprint
+		and self.annotationFingerprints[uri] == fingerprint
 	end
 	self:forget(uri, keepDeclarations)
 	timing.detail("change-forget", started)
@@ -3518,7 +3699,7 @@ function Lye:onIdle(force, collect)
 			if document and #document.text > bytes then bytes = #document.text end
 		end
 		local delay = bytes <= 8192 and IDLE_DELAY_SMALL
-			or (bytes <= 131072 and IDLE_DELAY_MEDIUM or IDLE_DELAY_LARGE)
+		or (bytes <= 131072 and IDLE_DELAY_MEDIUM or IDLE_DELAY_LARGE)
 		local remaining = delay - (timing.now() - dirty[1].at)
 		if remaining > 0 then return remaining end
 	end
@@ -3667,7 +3848,7 @@ function Lye:symbolAt(params)
 
 	local declaration = declarationFor(names, offset)
 	if declaration and declaration.name:match("[%.:]")
-		and declaration.name:match("([^%.:]+)$") == name then
+	and declaration.name:match("([^%.:]+)$") == name then
 		-- `function Owner:method` is the method's declaration, and the owner is written in the
 		-- same name. This is what lets rename find the other files that call it.
 		target.kind = "field"
@@ -3823,7 +4004,7 @@ function Lye:onReferences(params)
 	local document = uri and self.server.documents:get(uri)
 	if uri and view and document and params.position then
 		local original = position.toOffset(document.text, document.lineIndex,
-			params.position.line, params.position.character, self.server.encoding)
+		params.position.line, params.position.character, self.server.encoding)
 		local context = self:navigationContext(uri, original)
 		local answers = context and plugin.references(view.specs, context)
 		if answers and #answers > 0 then
@@ -3889,7 +4070,7 @@ function Lye:placesOfType(text, lineIndex, names, written)
 				local from, to = annotation.typeText:find(written, at, true)
 				if not from or not to then break end
 				if not annotation.typeText:sub(from - 1, from - 1):match("[%w_%.]")
-					and not annotation.typeText:sub(to + 1, to + 1):match("[%w_%.]") then
+				and not annotation.typeText:sub(to + 1, to + 1):match("[%w_%.]") then
 					addTypeRange(typeStart + from - 1, typeStart + to - 1)
 				end
 				at = to + 1
@@ -4294,9 +4475,9 @@ local function overloadMismatch(wanted, actual)
 		return true
 	end
 	local exact = (wanted.variant == "number" and wanted.value ~= nil)
-		or (wanted.variant == "boolean" and wanted.value ~= nil)
-		or (wanted.variant == "extern" and wanted.name
-			and wanted.name:match("^[\"']") and wanted.name:match("[\"']$"))
+	or (wanted.variant == "boolean" and wanted.value ~= nil)
+	or (wanted.variant == "extern" and wanted.name
+	and wanted.name:match("^[\"']") and wanted.name:match("[\"']$"))
 	if exact then return types.display(wanted) ~= types.display(actual) end
 	return types.mismatch(wanted, actual, "argument") ~= nil
 end
@@ -4355,7 +4536,7 @@ local function remainingOverloads(names, node, offset, signature, completed)
 						wanted = shape.variadic
 					end
 					if argIdx and wanted
-						and overloadMismatch(wanted, argumentTypeAt(names, names.parser.nodes[argIdx], offset)) then
+					and overloadMismatch(wanted, argumentTypeAt(names, names.parser.nodes[argIdx], offset)) then
 						fits = false
 						break
 					end
@@ -4412,7 +4593,7 @@ local function narrowedSignature(names, node, text, kept)
 	local returned = returns[1] and types.display(types.union(returns)) or nil
 	return {
 		label = writtenName(names, node, text) .. "(" .. table.concat(parts, ", ") .. ")"
-			.. (returned and (" -> " .. returned) or ""),
+		.. (returned and (" -> " .. returned) or ""),
 		parameters = parameters,
 		count = count,
 	}
@@ -4444,7 +4625,7 @@ function Lye:onSignatureHelp(params)
 	end
 	local returned = signature.returns and signature.returns.type
 	local label = writtenName(names, node, text) .. "(" .. table.concat(parts, ", ") .. ")"
-		.. (returned and (" -> " .. returned) or "")
+	.. (returned and (" -> " .. returned) or "")
 
 	-- How many arguments are wholly written before the cursor. The one being typed is left out:
 	-- its overload is not decided until the literal is complete.
@@ -4471,10 +4652,10 @@ function Lye:onSignatureHelp(params)
 
 	return {
 		signatures = json.array({ {
-			label = label,
-			parameters = params_,
-			documentation = signature.doc and { kind = "markdown", value = signature.doc } or nil,
-		} }),
+				label = label,
+				parameters = params_,
+				documentation = signature.doc and { kind = "markdown", value = signature.doc } or nil,
+			} }),
 		activeSignature = 0,
 		activeParameter = active,
 	}
@@ -4494,13 +4675,13 @@ function Lye:onCallHierarchyPrepare(params)
 	if not variable then return nil end
 	local declaration = variable.declaration
 	return json.array({ {
-		name = variable.name,
-		kind = variable.declaration.isFunction and 12 or 13,
-		uri = uri,
-		range = self:toRange(text, index, declaration.start, declaration.stop),
-		selectionRange = self:toRange(text, index, declaration.start, declaration.stop),
-		data = { uri = uri, name = variable.name, offset = declaration.start },
-	} })
+			name = variable.name,
+			kind = variable.declaration.isFunction and 12 or 13,
+			uri = uri,
+			range = self:toRange(text, index, declaration.start, declaration.stop),
+			selectionRange = self:toRange(text, index, declaration.start, declaration.stop),
+			data = { uri = uri, name = variable.name, offset = declaration.start },
+		} })
 end
 
 --- The function a position is inside, which is what a caller is: the innermost declaration whose
@@ -4776,7 +4957,7 @@ function Lye:onImplementation(params)
 			for _, declaration in ipairs(names.parser.declarations) do
 				local wanted = fieldName and (className .. ":" .. fieldName) or className
 				if declaration.name == className or declaration.name == wanted
-					or declaration.name == (className .. "." .. (fieldName or "")) then
+				or declaration.name == (className .. "." .. (fieldName or "")) then
 					out[#out + 1] = {
 						uri = uri,
 						range = self:toRange(text, index, declaration.start, declaration.stop),
@@ -4819,12 +5000,12 @@ function Lye:onCodeAction(params)
 					edit = {
 						changes = {
 							[uri] = json.array({ {
-								range = {
-									start = { line = line, character = 0 },
-									["end"] = { line = line + 1, character = 0 },
-								},
-								newText = "",
-							} }),
+									range = {
+										start = { line = line, character = 0 },
+										["end"] = { line = line + 1, character = 0 },
+									},
+									newText = "",
+								} }),
 						},
 					},
 				}
@@ -4840,12 +5021,12 @@ function Lye:onCodeAction(params)
 				edit = {
 					changes = {
 						[uri] = json.array({ {
-							range = {
-								start = { line = line, character = 0 },
-								["end"] = { line = line, character = 0 },
-							},
-							newText = string.format("---@diagnostic disable-next-line: %s\n", code),
-						} }),
+								range = {
+									start = { line = line, character = 0 },
+									["end"] = { line = line, character = 0 },
+								},
+								newText = string.format("---@diagnostic disable-next-line: %s\n", code),
+							} }),
 					},
 				},
 			}
@@ -4858,7 +5039,7 @@ function Lye:onCodeAction(params)
 	local range = params.range and params.range.start
 	if uri and view and document and range then
 		local original = position.toOffset(document.text, document.lineIndex,
-			range.line, range.character, self.server.encoding)
+		range.line, range.character, self.server.encoding)
 		local context = self:navigationContext(uri, original, params.context?.diagnostics)
 		if context then
 			for _, action in ipairs(plugin.codeActions(view.specs, context)) do
@@ -4885,8 +5066,8 @@ function Lye:onCodeLens(params)
 	for _, variable in ipairs(names.variables) do
 		local declaration = variable.declaration
 		local isFunction = declaration.isFunction or (declaration.valueIdx
-			and names.parser.nodes[declaration.valueIdx]
-			and names.parser.nodes[declaration.valueIdx].kind == "function")
+		and names.parser.nodes[declaration.valueIdx]
+		and names.parser.nodes[declaration.valueIdx].kind == "function")
 		local places = #variable.references
 		if isFunction and places > 0 then
 			local range = self:toRange(document.text, document.lineIndex, declaration.start, declaration.stop)
@@ -4968,7 +5149,7 @@ function Lye:onMoniker(params)
 	local target = self:symbolAt(params)
 	if not target then return nil end
 	local identifier = (target.kind == "field" and target.owner)
-		and (target.owner .. "." .. target.name) or target.name
+	and (target.owner .. "." .. target.name) or target.name
 	return {
 		{
 			scheme = "lye",
@@ -5212,7 +5393,7 @@ function Lye:workspaceSymbols()
 	local function scan(root)
 		if not root then return end
 		local pipe = io.popen(string.format(
-			"find %q -type f -name '*.lua' -not -path '*/target/*' -not -path '*/.*/*' | head -2000", root))
+		"find %q -type f -name '*.lua' -not -path '*/target/*' -not -path '*/.*/*' | head -2000", root))
 		if not pipe then return end
 		for file in pipe:lines() do
 			---@cast file string
@@ -5235,7 +5416,7 @@ function Lye:workspaceSymbols()
 					local declarations = result.declarations
 					for _, declaration in ipairs(declarations) do
 						if declaration.qualifier ~= "param" and declaration.qualifier ~= "label"
-							and not declaration.name:find("[%.:]") then
+						and not declaration.name:find("[%.:]") then
 							local range = self:toRange(source, index, declaration.start, declaration.stop)
 							out[#out + 1] = {
 								name = declaration.name,
@@ -5409,9 +5590,9 @@ function Lye:register()
 					id = "lye-watched-files",
 					method = method.workspaceDidChangeWatchedFiles,
 					registerOptions = { watchers = {
-						{ globPattern = "**/*.lua" },
-						{ globPattern = "**/lye.json" },
-					} },
+							{ globPattern = "**/*.lua" },
+							{ globPattern = "**/lye.json" },
+						} },
 				},
 			},
 		})
@@ -5429,10 +5610,10 @@ function Lye:register()
 		-- loaded: from here on the session is answering rather than starting.
 		if method == framework.METHOD.initialize then timing.fromStart("initialize") end
 		if method ~= framework.METHOD.didChange and method ~= framework.METHOD.didOpen
-			and method ~= framework.METHOD.semanticTokens
-			and method ~= framework.METHOD.semanticTokensRange then
+		and method ~= framework.METHOD.semanticTokens
+		and method ~= framework.METHOD.semanticTokensRange then
 			local ending = method == framework.METHOD.shutdown or method == framework.METHOD.exit
-				or method == framework.METHOD.didClose
+			or method == framework.METHOD.didClose
 			self:onIdle(true, ending)
 		end
 	end)

@@ -1,7 +1,7 @@
 --[[
-	Recursive typing over the arena: a node's type comes from its operands.
+Recursive typing over the arena: a node's type comes from its operands.
 
-	Memoised per arena index, and a node kind nothing understands yields a mutable unknown, not a guess.
+Memoised per arena index, and a node kind nothing understands yields a mutable unknown, not a guess.
 ]]
 
 local types = require("lye-doc.type")
@@ -364,7 +364,15 @@ local function of(ctx, idx)
 				local valueIdx = values and values[name]
 				if valueIdx ~= nil then
 					---@cast valueIdx integer
-					fields[name] = of(ctx, valueIdx)
+					local valueNode = ctx.parser.nodes[valueIdx]
+					-- A string written as a field's value is the string it spells: `{ type = "open" }`
+					-- is a discriminant a tagged union is matched by. A name or an expression is
+					-- still the type of the value it holds.
+					if valueNode and valueNode.kind == "string" and type(valueNode.value) == "string" then
+						fields[name] = types.stringValue(valueNode.value)
+					else
+						fields[name] = of(ctx, valueIdx)
+					end
 				else
 					fields[name] = literalType(fieldKind)
 				end
@@ -407,8 +415,8 @@ local function of(ctx, idx)
 		local field = node.field
 		---@cast field string
 		result = node.isDynamic ~= true and stringFieldOf(ctx, base, field, node.start)
-			or ctx.typeOfField and ctx.typeOfField(base, baseName, field, node.start)
-			or types.indexResult(base, field)
+		or ctx.typeOfField and ctx.typeOfField(base, baseName, field, node.start)
+		or types.indexResult(base, field)
 		-- A `?.` read of a value that may be nil is that value's field or nil: it does not fail,
 		-- so the result is optional the way the access is.
 		if node.isSafe then result = types.union({ result, types.NIL_TYPE }) end
@@ -503,7 +511,7 @@ local function of(ctx, idx)
 					---@cast source integer
 					local sourceNode = ctx.parser.nodes[source]
 					result = sourceNode and sourceNode.kind == "call"
-						and infer.valuesAt(ctx, source, 1) or of(ctx, source)
+					and infer.valuesAt(ctx, source, 1) or of(ctx, source)
 				else
 					result = types.NIL_TYPE
 				end
@@ -583,7 +591,7 @@ local function of(ctx, idx)
 					local actual = of(ctx, argIdx)
 					if wanted and actual then
 						infer.bindArgument(ctx, wanted, actual, argIdx, calleeType.generics,
-							calleeType.consts, bindings)
+						calleeType.consts, bindings)
 					end
 				end
 				result = types.substitute(calleeType.returns, bindings)
@@ -678,7 +686,7 @@ function infer.valuesAt(ctx, idx, position)
 	-- result is read here rather than only where the call was typed: the literal's body may have
 	-- been typed after that.
 	if (node.callee == "pcall" or node.callee == "xpcall") and position > 1 and node.args
-		and node.args[1] then
+	and node.args[1] then
 		-- `pcall(require, "module")` gives the module as its second result: the call the status
 		-- guards is the require itself, not a function value.
 		local targetNode = ctx.parser.nodes[node.args[1]]
@@ -727,14 +735,14 @@ function infer.valuesAt(ctx, idx, position)
 		local overload = overloadOf(ctx, node, calleeType, of)
 		if overload and overload.values then
 			local value = overload.values[position]
-				or (overload.isSpread and overload.values[#overload.values])
+			or (overload.isSpread and overload.values[#overload.values])
 			if value then
 				local bindings = overloadBindings(ctx, node, overload, of)
 				if next(bindings) then value = types.substitute(value, bindings) end
 				-- The success shape of `pcall` is the called function's result; one that returns
 				-- nothing leaves only the error object, so the slot is not `void`.
 				if value.variant == types.VOID.variant
-					and (node.callee == "pcall" or node.callee == "xpcall") then
+				and (node.callee == "pcall" or node.callee == "xpcall") then
 					return types.ANY_TYPE
 				end
 				return value
@@ -747,7 +755,7 @@ function infer.valuesAt(ctx, idx, position)
 			-- A spread gives every value after the last one it names, so a position past the list
 			-- still has the type of that last value rather than nil.
 			local value = calleeType.values[position]
-				or (calleeType.isSpread and calleeType.values[#calleeType.values])
+			or (calleeType.isSpread and calleeType.values[#calleeType.values])
 			if not value then return types.NIL_TYPE end
 			if calleeType.generics and next(calleeType.generics) then
 				local bindings = {}
@@ -756,7 +764,7 @@ function infer.valuesAt(ctx, idx, position)
 					local actual = of(ctx, argIdx)
 					if wanted and actual then
 						infer.bindArgument(ctx, wanted, actual, argIdx, calleeType.generics,
-							calleeType.consts, bindings)
+						calleeType.consts, bindings)
 					end
 				end
 				return types.substitute(value, bindings)
@@ -783,7 +791,7 @@ function infer.calleeTypeOf(ctx, node)
 		local targetType = of(ctx, node.target)
 		if node.field then
 			return stringFieldOf(ctx, targetType, node.field, node.start)
-				or types.indexResult(targetType, node.field)
+			or types.indexResult(targetType, node.field)
 		end
 		if types.isFn(targetType) then return targetType end
 		-- A table with a `__call` metamethod can be called: Lua runs the metamethod, with the
@@ -874,7 +882,7 @@ function infer.bind(pattern, actual, generics, bindings)
 		if actual.variant == "array" then
 			return infer.bind(pattern.type, actual.type, generics, bindings)
 		elseif actual.variant == "object" and actual.indexed
-			and (actual.indexed.key == "integer" or actual.indexed.key == "number") then
+		and (actual.indexed.key == "integer" or actual.indexed.key == "number") then
 			return infer.bind(pattern.type, actual.indexed.type, generics, bindings)
 		end
 		return

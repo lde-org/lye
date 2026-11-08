@@ -1,12 +1,12 @@
 --[[
-	What the workspace and the packages it can reach declare, and where the types they name are
-	written. Extracted from `language.lua` so the index behind it can change without the server
-	that asks.
+What the workspace and the packages it can reach declare, and where the types they name are
+written. Extracted from `language.lua` so the index behind it can change without the server
+that asks.
 
-	The declarations are read from the persisted index: a warm session reads the entry for a root
-	and touches no source file, and a file watcher updates only the root an event belongs to. What
-	this module keeps on the server — `known`, `annotationsDigest`, `packageNames`,
-	`packageDigests`, `typeLocations` — is the contract the analyzer and the module cache read.
+The declarations are read from the persisted index: a warm session reads the entry for a root
+and touches no source file, and a file watcher updates only the root an event belongs to. What
+this module keeps on the server — `known`, `annotationsDigest`, `packageNames`,
+`packageDigests`, `typeLocations` — is the contract the analyzer and the module cache read.
 ]]
 
 local timing = require("lye-lsp.timing")
@@ -333,7 +333,7 @@ function Declarations:ensureWorkspace(requested)
 	end
 	local stats = index:stats()
 	timing.mark("workspace-scan", started, string.format(
-		"files=%d built=%d loaded=%d reads=%d", stats.files, stats.built, stats.loaded, stats.reads))
+	"files=%d built=%d loaded=%d reads=%d", stats.files, stats.built, stats.loaded, stats.reads))
 	self.knownByRoot[root] = index:known()
 	self.digestByRoot[root] = index:digest()
 	self:mergeKnown()
@@ -410,7 +410,7 @@ function Declarations:package(root)
 	self:touchPackage(root)
 	local stats = index:stats()
 	timing.detail("package-scan", started, "files=%d built=%d loaded=%d reads=%d root=%s",
-		stats.files, stats.built, stats.loaded, stats.reads, root)
+	stats.files, stats.built, stats.loaded, stats.reads, root)
 	self.generation += 1
 	self:mergeLocations()
 	return lye.packageNames[root]
@@ -662,7 +662,7 @@ function Declarations:watchedFiles(params)
 		local root
 		for _, candidate in ipairs(roots) do
 			if candidate and candidate ~= ""
-				and (path == candidate or path:sub(1, #candidate + 1) == candidate .. "/") then
+			and (path == candidate or path:sub(1, #candidate + 1) == candidate .. "/") then
 				if not root or #candidate > #root then root = candidate end
 			end
 		end
@@ -788,6 +788,60 @@ function Declarations:typeLocation(name, uri)
 		lines[#lines + 1] = lineAt(source, lineStart(source, where.start))
 	end
 	return { location = found, lines = table.concat(lines, "\n") }
+end
+
+--- Where a class's field is written. A document's own annotations are read first, because a
+--- buffer that was never saved is as real as one on disk; then the workspace and the packages it
+--- links, whose index kept every annotation's span; then the definitions a builtin lives in. The
+--- hover over a table key uses this to point at the field the key is supposed to be.
+---@param className string
+---@param fieldName string
+---@param uri string? the document the question came from
+---@return lye.DefinitionLocation?
+---@param self lye.Declarations
+function Declarations:fieldLocation(className, fieldName, uri)
+	local function inAnnotations(annotations, documentUri)
+		local current
+		for _, annotation in ipairs(annotations) do
+			---@cast annotation lye.doc.Annotation
+			if annotation.tag == "class" or annotation.tag == "alias" then
+				current = annotation.name
+			elseif annotation.tag == "field" and current == className and annotation.name == fieldName then
+				return {
+					uri = documentUri,
+					start = annotation.nameStart or annotation.start,
+					stop = annotation.nameStop or annotation.stop,
+				}
+			end
+		end
+	end
+
+	local names = uri and self.lye.names[uri]
+	local found = names and inAnnotations(names.doc.annotations, uri)
+	if found then return found end
+
+	---@param index lye.lsp.Index
+	local function inIndex(index)
+		for path, file in pairs(index:files()) do
+			local held = inAnnotations(file.annotations --[[@as lye.doc.Annotation[] ]], "file://" .. path)
+			if held then return held end
+		end
+	end
+	for _, index in pairs(self.workspaceIndexes) do
+		local held = inIndex(index)
+		if held then return held end
+	end
+	local roots = {}
+	for root in pairs(self.packageIndexes) do roots[#roots + 1] = root end
+	table.sort(roots)
+	for _, root in ipairs(roots) do
+		local held = inIndex(self.packageIndexes[root])
+		if held then return held end
+	end
+
+	local lye = self.lye
+	local definitions = lye:definitionIndex() --[[@as lye.Definitions ]]
+	return definitions.fields[className .. "." .. fieldName]
 end
 
 --- The class or alias a name declares: in this document, in another the server has analysed, or in

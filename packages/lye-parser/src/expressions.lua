@@ -491,6 +491,10 @@ local function parsePrimary(self, allowTernaryColon)
 		self:popScope(self.arena[self.index - 1].stop)
 		local index = self:emit("function", start, self.arena[self.index - 1].stop,
 			{ isFunction = true, body = bodyIdx, params = params })
+		-- The expression is the function's result, not a statement of the block that holds the
+		-- function: a call there is not a discarded value, and a reader of the body's parent has
+		-- to find the function it belongs to.
+		self.nodes[bodyIdx].parent = index
 		self.lastKind = "function"
 		return index
 	end
