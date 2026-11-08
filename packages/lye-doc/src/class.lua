@@ -1,7 +1,7 @@
 --[[
-	Classes and aliases, as their annotations declare them.
+Classes and aliases, as their annotations declare them.
 
-	A field keeps the text it was written as; nothing here resolves a type.
+A field keeps the text it was written as; nothing here resolves a type.
 ]]
 
 local classes = {}
@@ -188,7 +188,6 @@ local function readAlias(text)
 	return params, body, consts, constraints, defaults
 end
 
-
 --- A `---@field` line: `---@field [visibility] name[?] type`.
 ---@param annotation lye.doc.Annotation
 ---@param fallback lye.doc.Visibility
@@ -293,6 +292,13 @@ end
 function classes.fieldsOf(namespace, text)
 	local found, args = classes.resolve(namespace, text)
 	if not found then return {} end
+	-- A name written without arguments takes the parameters' defaults: `Box` is `Box<T = string>`
+	-- when the class says so, and the fields hold the default rather than an unknown.
+	if found.defaults then
+		for index, param in ipairs(found.params) do
+			if args[index] == nil and found.defaults[param] then args[index] = found.defaults[param] end
+		end
+	end
 
 	local fields = {}
 	---@param class lye.doc.Class
@@ -331,6 +337,26 @@ function classes.resolver(namespace, elsewhere)
 	namespace.built = namespace.built or {}
 	local evolved, built = namespace.evolved, namespace.built
 
+	-- A class another file declares is held as the type it was built as, with the declaration it
+	-- came from kept beside it: a generic parent written in one file — `---@class Page: Base<S>`
+	-- — has to be read again with this file's arguments, and the type alone has no parameters
+	-- left to substitute. The namespace answers a foreign name with that declaration, so a
+	-- parent's fields are read here exactly as they would be in the file that declares them.
+	local foreignNamespace
+	local function foreignClasses(name)
+		if not elsewhere then return nil end
+		local held = elsewhere[name]
+		if type(held) == "table" and held.variant == "class" then return held.raw end
+	end
+	local function classesOfElsewhere()
+		if foreignNamespace then return foreignNamespace end
+		foreignNamespace = {
+			classes = setmetatable({}, { __index = function(_, name) return foreignClasses(name) end }),
+			aliases = {},
+		}
+		return foreignNamespace
+	end
+
 	---@param text string
 	---@return lye.doc.Type?
 	local function resolve(text)
@@ -340,6 +366,35 @@ function classes.resolver(namespace, elsewhere)
 		-- in a file that never declares it reads as that type rather than as a bare name, which
 		-- is what lets the two compare equal.
 		if not found then
+			-- A generic name written with arguments — `beat.Page<State>` — is not the bare name
+			-- the other file declared, so the declaration is read again with these arguments.
+			local base, argsText = splitGeneric(text)
+			local foreignBase = elsewhere and elsewhere[base]
+			if argsText and type(foreignBase) == "table" and foreignBase.variant == "class"
+			and foreignBase.raw ~= nil then
+				if built[text] then return built[text] end
+				local argTypes = {}
+				for index, arg in ipairs(classes.splitList(argsText)) do
+					argTypes[index] = types.parse(arg, resolve) or types.UNKNOWN_TYPE
+				end
+				local classType = types.classType(foreignBase.name, argTypes)
+				classType.raw = foreignBase.raw
+				classType.fromDocument = false
+				built[text] = classType
+				for name, field in pairs(classes.fieldsOf(classesOfElsewhere(), text)) do
+					---@cast name string
+					---@cast field lye.doc.Field
+					local held = types.parse(field.type, resolve) or types.UNKNOWN_TYPE
+					if field.optional then held = types.union({ held, types.NIL_TYPE }) end
+					local key = name:match("^%[([^%]]+)%]$")
+					if key then
+						classType.indexed = { key = key, type = held }
+					else
+						classType.fields[name] = held
+					end
+				end
+				return classType
+			end
 			local foreign = elsewhere and elsewhere[text]
 			if type(foreign) == "table" then return foreign end
 		end
@@ -350,7 +405,7 @@ function classes.resolver(namespace, elsewhere)
 			for index, param in ipairs(found.params or {}) do
 				local argText = args[index] or (found.defaults and found.defaults[param])
 				argTypes[index] = argText and (types.parse(argText, resolve) or types.UNKNOWN_TYPE)
-					or types.UNKNOWN_TYPE
+				or types.UNKNOWN_TYPE
 			end
 			-- Built once per spelling, so a class type is the same table every time it is read
 			-- and a method declared later can reach it. It goes into `built` before its fields
@@ -358,11 +413,12 @@ function classes.resolver(namespace, elsewhere)
 			-- extending itself through a parent — finds the type being built rather than an
 			-- unresolved name, and the cycle ends because there is nothing left to build.
 			local classType = types.classType(found.name, argTypes)
+			classType.raw = found
 			classType.visibility = classType.visibility or {}
 			-- A class declared by this document's own annotations is checked for a missing method;
 			-- one that comes from a package or a definition may have methods the index never saw.
 			classType.fromDocument = rawget(namespace.classes, found.name) ~= nil
-				or rawget(namespace.classes, bareName(found.name)) ~= nil
+			or rawget(namespace.classes, bareName(found.name)) ~= nil
 			built[text] = classType
 			for name, field in pairs(classes.fieldsOf(namespace, text)) do
 				---@cast name string
@@ -399,7 +455,7 @@ function classes.resolver(namespace, elsewhere)
 				end
 			end
 			local methods = found.name
-				and (evolved[found.name] or evolved[bareName(found.name)])
+			and (evolved[found.name] or evolved[bareName(found.name)])
 			-- A method declared on a generic class is written in the class's own parameters:
 			-- `function Box:get() return self.value end` hands back `T`, and which `T` is what the
 			-- arguments of the class say. Each method is one type shared by every instance, so the
@@ -442,7 +498,7 @@ function classes.resolver(namespace, elsewhere)
 					end
 				end
 				classType.fields[name] = bindings
-					and types.substitute(field, bindings) or field
+				and types.substitute(field, bindings) or field
 			end
 			for _, written in ipairs(found.parents or (found.parent and { found.parent }) or {}) do
 				local parentText = substitute(written, found.params, args)
@@ -532,10 +588,10 @@ function classes.resolver(namespace, elsewhere)
 			-- comparing types expect.
 			local wide = type(named) == "table" and named.variant == "union" and #named.types > 4
 			if wide and named.variant ~= "class"
-				and named ~= types.NUMBER and named ~= types.STRING and named ~= types.BOOLEAN
-				and named ~= types.NIL_TYPE and named ~= types.TABLE and named ~= types.VOID
-				and named ~= types.NEVER and named ~= types.UNKNOWN_TYPE and named ~= types.ANY_TYPE
-				and not named.aliasName then
+			and named ~= types.NUMBER and named ~= types.STRING and named ~= types.BOOLEAN
+			and named ~= types.NIL_TYPE and named ~= types.TABLE and named ~= types.VOID
+			and named ~= types.NEVER and named ~= types.UNKNOWN_TYPE and named ~= types.ANY_TYPE
+			and not named.aliasName then
 				named.aliasName = text
 			end
 			return built[text]
@@ -642,7 +698,7 @@ function classes.evolve(namespace, className, field, method)
 				end
 			end
 			classType.fields[field] = bindings
-				and canonicalize(types.substitute(method, bindings), {}) or method
+			and canonicalize(types.substitute(method, bindings), {}) or method
 		end
 	end
 end
@@ -765,8 +821,10 @@ end
 ---@param base lye.doc.Namespace|lye.analyzer.Prelude? the definitions the file is read through, so a class whose
 --- parent is `ffi.cdata*` or a field naming `ffi.size_t` resolves against the same prelude the
 --- analysis uses
+---@param elsewhere table<string, boolean|lye.doc.Type>? names another package links, so a field
+--- naming one of their aliases means what it means there
 ---@return table<string, lye.doc.Type|boolean> the type where one can be built, `true` where not
-function classes.declare(files, base)
+function classes.declare(files, base, elsewhere)
 	local merged = { classes = {}, aliases = {} }
 	if base then
 		for name, class in pairs(base.classes or {}) do merged.classes[name] = class end
@@ -777,14 +835,14 @@ function classes.declare(files, base)
 		for name, class in pairs(namespace.classes) do merged.classes[name] = merged.classes[name] or class end
 		for name, alias in pairs(namespace.aliases) do merged.aliases[name] = merged.aliases[name] or alias end
 	end
-	local resolve = classes.resolver(merged)
+	local resolve = classes.resolver(merged, elsewhere)
 	local found = {}
 	for _, file in ipairs(files) do
 		for _, annotation in ipairs(file.annotations) do
 			local declared = annotation.name
-				or (annotation.tag == "enum" and (annotation.text or ""):match("^%s*([%w_%.%-]+)"))
+			or (annotation.tag == "enum" and (annotation.text or ""):match("^%s*([%w_%.%-]+)"))
 			if (annotation.tag == "class" or annotation.tag == "alias" or annotation.tag == "enum")
-				and declared and found[declared] == nil then
+			and declared and found[declared] == nil then
 				found[declared] = resolve(declared) or true
 			end
 		end

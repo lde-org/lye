@@ -1,12 +1,12 @@
 --[[
-	Method names a file declares, without its body: `function Owner:method` and
-	`function Owner.method` are the fields a class gains, and a reader in another file needs their
-	names before it can read a package whose source is not open.
+Method names a file declares, without its body: `function Owner:method` and
+`function Owner.method` are the fields a class gains, and a reader in another file needs their
+names before it can read a package whose source is not open.
 
-	The scan is lexical, like the workspace's — the declaration index keeps annotations, and a
-	method is not an annotation. The class each owner table declares is found the same way the
-	workspace finds it: `---@class pkg.Thing` over `local Thing = {}` makes `Thing:method` a
-	method of `pkg.Thing`.
+The scan is lexical, like the workspace's — the declaration index keeps annotations, and a
+method is not an annotation. The class each owner table declares is found the same way the
+workspace finds it: ` ---@class pkg.Thing` over `local Thing = {}` makes `Thing:method` a
+method of `pkg.Thing`.
 ]]
 
 local lexer = require("lye-lexer")
@@ -31,8 +31,12 @@ local function classOfTable(source, annotations)
 				if not line:match("^%s*$") and not line:match("^%s*%-%-") then
 					local global = line:match("^%s*([%w_%.]+)%s*=%s*{%s*}%s*$")
 					local localName = line:match("^%s*local%s+([%w_%.]+)%s*=%s*{%s*}%s*$")
-					if className and (global or localName) then
-						found[global or localName] = className
+					-- A constructor's result is the same link: `---@class App` over
+					-- `local App = wonderland.app()` makes `function App:view` a method of the
+					-- class, the same rule the analyzer reads a table literal by.
+					local called = line:match("^%s*local%s+([%w_%.]+)%s*=%s*[%w_%.:]+%s*%b()%s*$")
+					if className and (global or localName or called) then
+						found[global or localName or called] = className
 					end
 					break
 				end
@@ -103,17 +107,25 @@ function methods.scan(source, annotations, tokens)
 					local params
 					---@type string[]?
 					local returns
+					---@type string[]
+					local generics = {}
 					for _, annotation in ipairs(blockOf(source, annotations, token.start)) do
 						if annotation.tag == "type" and annotation.type then
 							typeText = annotation.type
 						elseif annotation.tag == "param" and annotation.name then
 							params = params or {}
 							params[#params + 1] = { name = annotation.name, type = annotation.type }
-						elseif annotation.tag == "return" and annotation.type then
-							returns = returns or {}
-							for _, one in ipairs(types.splitValues(annotation.type)) do
-								returns[#returns + 1] = one
+						elseif annotation.tag == "return" then
+							-- `---@return A a, B b` names several values on one line; the parser keeps
+							-- the whole list beside the first, and every one is part of the signature.
+							local written = annotation.values
+							or (annotation.type and types.splitValues(annotation.type))
+							if written then
+								returns = returns or {}
+								for _, one in ipairs(written) do returns[#returns + 1] = one end
 							end
+						elseif annotation.tag == "generic" and type(annotation.text) == "string" then
+							generics[#generics + 1] = annotation.text
 						end
 					end
 					found[#found + 1] = {
@@ -126,6 +138,7 @@ function methods.scan(source, annotations, tokens)
 						typeText = typeText,
 						params = params,
 						returns = returns,
+						generics = generics,
 					}
 				end
 			end
@@ -156,11 +169,60 @@ end
 ---@param classes table<string, boolean|lye.doc.Type>
 ---@return lye.doc.Type
 local function signatureOf(method, classes)
+	-- A parameter written with a class's arguments — `beat.Instance<S>` — has to be read as that
+	-- class with this method's own variables: the plain map has only the bare name, and handing
+	-- the whole spelling to the definitions leaves a name nothing stands for.
+	local rawNamespace
+	---@type fun(text: string): lye.doc.Type?
+	local resolve
+	---@param text string
+	---@param base string
+	---@param argsText string
+	---@return lye.doc.Type?
+	local function instantiate(text, base, argsText)
+		local baseType = classes[base]
+		if type(baseType) ~= "table" or baseType.variant ~= "class" or baseType.raw == nil then return nil end
+		if not rawNamespace then
+			rawNamespace = {
+				classes = setmetatable({}, {
+					__index = function(_, name)
+						local held = classes[name]
+						if type(held) == "table" and held.raw then return held.raw end
+						return nil
+					end,
+				}),
+				aliases = {},
+			}
+		end
+		local argTypes = {}
+		for index, arg in ipairs(types.splitAt(argsText, 44)) do
+			arg = arg:gsub("^%s+", ""):gsub("%s+$", "")
+			argTypes[index] = types.parse(arg, resolve) or types.UNKNOWN_TYPE
+		end
+		local classType = types.classType(baseType.name, argTypes)
+		classType.raw = baseType.raw
+		for name, field in pairs(doc.classes.fieldsOf(rawNamespace, text)) do
+			local held = types.parse(field.type, resolve) or types.UNKNOWN_TYPE
+			if field.optional then held = types.union({ held, types.NIL_TYPE }) end
+			local key = name:match("^%[([^%]]+)%]$")
+			if key then
+				classType.indexed = { key = key, type = held }
+			else
+				classType.fields[name] = held
+			end
+		end
+		return classType
+	end
 	---@param text string
 	---@return lye.doc.Type?
-	local function resolve(text)
+	resolve = function(text)
 		local held = classes[text]
 		if type(held) == "table" then return held end
+		local base, argsText = text:match("^([%w_%.]+)%s*<(.+)>$")
+		if base then
+			local instance = instantiate(text, base, argsText)
+			if instance then return instance end
+		end
 		return definitions()(text)
 	end
 	if method.typeText then
@@ -187,6 +249,33 @@ local function signatureOf(method, classes)
 	local fn = types.fn(params, (values and values[1]) or types.mutable(), variadic ~= nil, false, variadic)
 	if values and #values > 1 then fn.values = values end
 	if method.isMethod then fn.implicitSelf = true end
+	-- A generic method's parameters are the class's own variables: `---@generic S` beside a
+	-- `---@param which beat.Instance<S>` is what lets a caller bind S from the argument.
+	for _, text in ipairs(method.generics or {}) do
+		for _, part in ipairs(types.splitAt(text, 44)) do
+			part = part:gsub("^%s+", ""):gsub("%s+$", "")
+			local marked = part:match("^const%s+") ~= nil
+			part = part:gsub("^const%s+", "")
+			local colon = part:find(":", 1, true)
+			local constraint
+			if colon then
+				constraint = (part:sub(colon + 1):gsub("^%s+", ""))
+				part = (part:sub(1, colon - 1):gsub("%s+$", ""))
+			end
+			if part ~= "" then
+				fn.generics = fn.generics or {}
+				fn.generics[part] = true
+				if constraint and constraint ~= "" then
+					fn.constraints = fn.constraints or {}
+					fn.constraints[part] = constraint
+				end
+				if marked then
+					fn.consts = fn.consts or {}
+					fn.consts[part] = true
+				end
+			end
+		end
+	end
 	return fn
 end
 methods.signatureOf = signatureOf

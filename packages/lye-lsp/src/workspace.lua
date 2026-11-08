@@ -1,12 +1,12 @@
 --[[
-	The workspace as a name index: every token and annotation of every file, kept per file and
-	rebuilt only when that file's text moves.
+The workspace as a name index: every token and annotation of every file, kept per file and
+rebuilt only when that file's text moves.
 
-	The declaration index answers what a file declares. This answers where a name is written — the
-	other half of find-references, rename and a module-file rename. It is deliberately lexical: the
-	analysis still decides what a position means, and the caller filters these occurrences against
-	the symbol it resolved. A per-file record is cached by the text, so a keystroke rebuilds one
-	file and not the workspace.
+The declaration index answers what a file declares. This answers where a name is written — the
+other half of find - references, rename and a module - file rename. It is deliberately lexical: the
+analysis still decides what a position means, and the caller filters these occurrences against
+the symbol it resolved. A per - file record is cached by the text, so a keystroke rebuilds one
+file and not the workspace.
 ]]
 
 local fs = require("fs")
@@ -38,6 +38,7 @@ local KIND = lexer.KIND
 ---@field typeText string? the `---@type fun(...)` written above it
 ---@field params { name: string, type: string? }[]? its `---@param` lines, when it has no `@type`
 ---@field returns string[]? its `---@return` types, when it has no `@type`
+---@field generics string[]? its `---@generic` lines
 
 ---@class lye.WorkspaceRequire
 ---@field value string
@@ -169,7 +170,7 @@ local function scanStructure(tokens)
 		-- declaration of it.
 		for _, held in ipairs(methods) do
 			if held.owner == occurrence.owner and held.name == occurrence.name
-				and held.start == occurrence.start then return end
+			and held.start == occurrence.start then return end
 		end
 		methods[#methods + 1] = occurrence
 	end
@@ -208,7 +209,7 @@ local function scanStructure(tokens)
 				local functionIndex = equal + 1
 				while functionIndex <= tokens.count and arena[functionIndex].kind == KIND.comment do functionIndex += 1 end
 				if functionIndex <= tokens.count and arena[functionIndex].kind == KIND.keyword
-					and texts[functionIndex] == "function" then
+				and texts[functionIndex] == "function" then
 					local owner, name, start, isMethod = chainAt(tokens, index)
 					if owner and name then
 						addMethod({ owner = owner, name = name, start = start, stop = arena[index].stop, isMethod = isMethod })
@@ -305,7 +306,7 @@ local function read(source, tokens)
 				name = annotation.name, start = annotation.nameStart, stop = annotation.nameStop or annotation.nameStart,
 				annotation = true, tag = annotation.tag,
 				declaration = annotation.tag == "class" or annotation.tag == "alias"
-					or annotation.tag == "enum" or annotation.tag == "field" or annotation.tag == "param",
+				or annotation.tag == "enum" or annotation.tag == "field" or annotation.tag == "param",
 			})
 		end
 		local written, from = annotation.typeText, annotation.typeStart

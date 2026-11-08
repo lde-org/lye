@@ -1,5 +1,5 @@
 --[[
-	Tests for reading classes and aliases out of annotations.
+Tests for reading classes and aliases out of annotations.
 ]]
 
 local test = require("lde-test")
@@ -169,11 +169,11 @@ test.it("reads an enum as a number and a table on the class that holds it", func
 		"Enums.PresentMode = { FIFO = 1 }\n",
 	}, ""))
 	test.equal(table.concat(fields(namespace, "Enums"), ", "),
-		"Format: table<string, number>, PresentMode: table<string, number>")
+	"Format: table<string, number>, PresentMode: table<string, number>")
 	local resolve = classes.resolver(namespace)
 	---@cast resolve fun(name: string): lye.doc.Type
 	test.equal(doctype.display(resolve("Enums.Format")), "number",
-		"the enum's own type is the value it holds")
+	"the enum's own type is the value it holds")
 end)
 
 test.it("reads the default marker on the first alias member", function()
@@ -203,7 +203,7 @@ test.it("substitutes the arguments of a generic alias", function()
 	test.equal(doctype.display(resolve("ArrayOfNumberLike<number>")), "number[]")
 	test.equal(doctype.display(resolve("ArrayOfNumberLike<string>")), "string[]")
 	test.equal(doctype.display(resolve("ArrayOfNumberLike")), "unknown[]",
-		"an alias with no argument holds unknown, as a class does")
+	"an alias with no argument holds unknown, as a class does")
 end)
 
 test.it("substitutes a class's parameters into a method added after it was built", function()
@@ -239,7 +239,7 @@ test.it("reads an alias that names a class declared below it", function()
 	local resolve = classes.resolver(namespace)
 	---@cast resolve fun(name: string): lye.doc.Type
 	test.equal(doctype.display(resolve("Ids")), "Point[]",
-		"the body is resolved where it is used, so a class below it is found")
+	"the body is resolved where it is used, so a class below it is found")
 end)
 
 test.it("answers nothing for a class it does not know", function()
@@ -272,7 +272,7 @@ test.it("keeps the name of a parameter that carries a limit", function()
 	local namespace = read("---@class Box<T: number>\n---@field item T\nlocal Box = {}\n")
 	test.equal(namespace.classes.Box.name, "Box")
 	test.equal(table.concat(namespace.classes.Box.params, ","), "T",
-		"the limit is not part of the parameter's name")
+	"the limit is not part of the parameter's name")
 	local resolve = classes.resolver(namespace)
 	local boxType = resolve("Box<string>")
 	---@cast boxType { fields: table<string, lye.doc.Type> }
@@ -304,9 +304,9 @@ test.it("substitutes an argument into arithmetic in a type", function()
 	---@cast resolve fun(name: string): lye.doc.Type
 	local types = doctype
 	test.equal(types.display(resolve("F<string, 5>")), "{ x: string[], y: 7 }",
-		"the arithmetic is worked out where the type is used")
+	"the arithmetic is worked out where the type is used")
 	test.equal(types.display(resolve("F<string, 40 + 2>")), "{ x: string[], y: 44 }",
-		"and an argument may be an expression itself")
+	"and an argument may be an expression itself")
 end)
 
 test.it("reads the operators a class declares", function()
@@ -325,7 +325,7 @@ test.it("reads the operators a class declares", function()
 	local vec = resolve("Vec")
 	---@cast vec { operators: table<string, lye.doc.Type> }
 	test.equal(doctype.display(assert(vec.operators.add)), "fn(number) -> number",
-		"the signature is read as the callable the operator is")
+	"the signature is read as the callable the operator is")
 	test.equal(doctype.display(assert(vec.operators.unm)), "fn() -> Vec")
 end)
 
@@ -341,4 +341,34 @@ test.it("marks a field the annotation above it deprecates", function()
 	---@cast found table<string, lye.doc.Field>
 	test.equal(found.legacy and found.legacy.deprecated, true, "the marker belongs to the field below it")
 	test.equal(found.name and found.name.deprecated, nil, "and not to the one above")
+end)
+
+test.it("reads a field with the parameter's default when the name leaves it out", function()
+	local namespace = read(table.concat({
+		"---@class Fallback\n",
+		"---@field name string\n",
+		"---@class Box<T = Fallback>\n",
+		"---@field item T\n",
+		"local Box = {}\n",
+	}, ""))
+	test.equal(table.concat(fields(namespace, "Box"), ","), "item: Fallback",
+	"`Box` is `Box<Fallback>`, not a box of nothing")
+end)
+
+test.it("reads another file's generic class with the arguments this file writes", function()
+	local base = doc.parse(table.concat({
+		"---@class Slot<S>\n",
+		"---@field state S\n",
+		"local Slot = {}\n",
+	}))
+	---@cast base lye.doc.File
+	local state = doc.parse("---@class MenuState\n---@field anchor number\nlocal MenuState = {}\n")
+	---@cast state lye.doc.File
+	local declared = classes.declare({ base, state })
+	local use = read("---@class Menu\n---@field slot Slot<MenuState>\nlocal Menu = {}\n")
+	local resolve = classes.resolver(use, declared)
+	local slot = resolve("Slot<MenuState>")
+	---@cast slot { fields: table<string, lye.doc.Type> }
+	test.equal(doctype.display(slot.fields.state), "MenuState",
+	"the argument is the class this file names")
 end)

@@ -1,9 +1,9 @@
 --[[
-	Tests for headless checking.
+Tests for headless checking.
 
-	The CLI has to work without an editor, so this drives the module and the real entry
-	point. Output goes to the C `io.stdout`, which cannot be intercepted from Lua, so the
-	observable contract is tested instead: the returned status and the process exit code.
+The CLI has to work without an editor, so this drives the module and the real entry
+point. Output goes to the C `io.stdout`, which cannot be intercepted from Lua, so the
+observable contract is tested instead: the returned status and the process exit code.
 ]]
 
 local test = require("lde-test")
@@ -72,7 +72,7 @@ local function probe(paths, cacheDir)
 	local named = {}
 	for _, path in ipairs(paths) do named[#named + 1] = string.format("%q", path) end
 	local command = string.format("LYE_WORKERS=1 lde run %q -- %s 2>&1",
-		PROBE, table.concat(named, " "))
+	PROBE, table.concat(named, " "))
 	local output
 	if cacheDir == false then
 		output = runWith(nil, "LYE_CACHE=off " .. command)
@@ -190,7 +190,7 @@ end)
 local function exitCode(source, flag)
 	writeInput(source)
 	local out = run(string.format(
-		"lde run %q -- %s %q >/dev/null 2>&1; echo $?", MAIN, flag, INPUT
+	"lde run %q -- %s %q >/dev/null 2>&1; echo $?", MAIN, flag, INPUT
 	))
 	return tonumber(out) or -1
 end
@@ -214,7 +214,7 @@ test.it("checks a file of a language a plugin reads, and reports it where it is 
 	local discovered = {}
 	for _, path in ipairs(check.discover(workspace)) do discovered[path] = true end
 	test.truthy(discovered[toy], "the walk finds the file its plugin claims: "
-		.. table.concat(check.discover(workspace), " "))
+	.. table.concat(check.discover(workspace), " "))
 
 	-- A walk of the workspace checks what is committed, so the fixture it keeps reads cleanly.
 	-- The fault is written under `target/`, which no walk of the workspace visits, and the
@@ -228,22 +228,22 @@ test.it("checks a file of a language a plugin reads, and reports it where it is 
 	handle:close()
 
 	local output = run("lde run " .. string.format("%q", MAIN) .. " --check " .. string.format("%q", faulty)
-		.. " 2>&1")
+	.. " 2>&1")
 	test.includes(output, "holding is declared as number but is assigned string",
-		"the fault the plugin's own line has: " .. output)
+	"the fault the plugin's own line has: " .. output)
 	test.includes(output, "faulty.toy:1:", "reported on the first line of the file, where it was written")
 
 	-- The same file a second time, and the same file named the way a run in a directory names it:
 	-- what is held between the two is the analysis of the lowered text, and a finding of it has to
 	-- travel back once per report rather than once per analysis.
 	local again = run("lde run " .. string.format("%q", MAIN) .. " --check " .. string.format("%q", faulty)
-		.. " " .. string.format("%q", faulty) .. " 2>&1")
+	.. " " .. string.format("%q", faulty) .. " 2>&1")
 	test.equal(again, output, "a file named twice is checked once, and reported the same way")
 
 	local relative = run("lde run " .. string.format("%q", MAIN)
-		.. " --check tests/fixtures/syntax/target/faulty.toy 2>&1")
+	.. " --check tests/fixtures/syntax/target/faulty.toy 2>&1")
 	test.includes(relative, "holding is declared as number but is assigned string",
-		"and a path relative to the run finds the plugin beside it: " .. relative)
+	"and a path relative to the run finds the plugin beside it: " .. relative)
 end)
 
 test.it("finds the package of a file named relatively", function()
@@ -256,7 +256,7 @@ test.it("finds the package of a file named relatively", function()
 	dep:write("---@class RelativeDep\n---@field amount integer\nreturn {}\n")
 	dep:close()
 	writeInput("---@param d RelativeDep\nlocal function f(d)\n\treturn d.amount\nend\n"
-		.. "f({ amount = 1 })\n")
+	.. "f({ amount = 1 })\n")
 
 	local previous = env.cwd()
 	env.chdir(PACKAGE_DIR)
@@ -296,7 +296,7 @@ test.it("writes a configuration where there is none, and never over one", functi
 	test.includes(first, "init-fixture/lye.json", "the file is written: " .. first)
 	---@type string?
 	local written
-	do
+		do
 		local handle = io.open(dir .. "/lye.json", "rb")
 		if handle then
 			written = handle:read("*a") --[[@as string? ]]
@@ -372,8 +372,8 @@ test.it("serves the protocol when an editor passes its own flags", function()
 	-- `vscode-languageclient` appends exactly these, so this is the command line an editor runs.
 	local frame = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
 	local out = run(string.format(
-		"printf 'Content-Length: %d\\r\\n\\r\\n%s' | lde run %q -- --stdio --clientProcessId=1234 2>/dev/null",
-		#frame, frame, MAIN
+	"printf 'Content-Length: %d\\r\\n\\r\\n%s' | lde run %q -- --stdio --clientProcessId=1234 2>/dev/null",
+	#frame, frame, MAIN
 	))
 	test.truthy(out:match("Content%-Length:%s*%d+"), "the server should answer, got: " .. out)
 	test.truthy(out:match('"capabilities"'), "and the answer should carry capabilities")
@@ -468,7 +468,7 @@ test.it("checks a batch across processes the way one process does", function()
 
 	local function checkIn(workers)
 		return run(string.format("LYE_WORKERS=%d lde run %q -- --check %q 2>/dev/null",
-			workers, MAIN, root))
+		workers, MAIN, root))
 	end
 	local one = checkIn(1)
 	test.truthy(one:match(": warning: "), "the fixture has something to compare, got: " .. one)
@@ -511,7 +511,7 @@ test.it("reads an unchanged tree back without analysing it", function()
 	test.equal(warm.analyses, "0", "a warm run analyses nothing: " .. warm.output)
 	test.equal(warm.ok, "true", "and finds what the cold run found: " .. warm.output)
 	test.truthy(tonumber(warm.seconds) < tonumber(cold.seconds),
-		"and takes less CPU than the cold run: " .. warm.seconds .. " vs " .. cold.seconds)
+	"and takes less CPU than the cold run: " .. warm.seconds .. " vs " .. cold.seconds)
 end)
 
 test.it("re-checks only the files whose text changed", function()
@@ -608,7 +608,7 @@ test.it("reads the batch's annotations from the declaration index instead of par
 	test.equal(warm.loadeddocs, tostring(#named), "every file comes from the index: " .. warm.output)
 	test.equal(warm.ok, cold.ok, "and the batch passes as it did: " .. warm.output)
 	test.equal(findingsOf(warm.output), findingsOf(cold.output),
-		"the findings are byte-for-byte what an uncached run found")
+	"the findings are byte-for-byte what an uncached run found")
 end)
 
 test.it("parses only the file whose text the index does not hold", function()
@@ -632,7 +632,7 @@ test.it("parses only the file whose text the index does not hold", function()
 	test.equal(warm.loadeddocs, tostring(#named - 1), "the rest come from the index: " .. warm.output)
 	test.equal(warm.analyses, "1", "and only the changed file is analysed: " .. warm.output)
 	test.equal(findingsOf(warm.output), findingsOf(cold.output),
-		"the findings are what an uncached run finds for the new text")
+	"the findings are what an uncached run finds for the new text")
 end)
 
 test.it("an index that cannot be read is parsed as it always was", function()
@@ -681,6 +681,33 @@ test.it("reads a plugin's types across files", function()
 	local output = run(command .. " 2>&1")
 	test.includes(output, "nothing to report", "the cdef type is the workspace's: " .. output)
 	test.falsy(output:find("unknown type", 1, true), "and is not unknown in the other file: " .. output)
+end)
+
+test.it("reads a method another checked file declares", function()
+	-- `function Thing:double` is part of the class for a reader in another file: an annotation at
+	-- the top of a batch carries the fields written as `---@field`, not the methods, and a check
+	-- that read only those refused a call the file makes.
+	local root = PACKAGE_DIR .. "/target/batch-methods-fixture"
+	writeTree(root, {
+		["lde.json"] = '{ "name": "batch-methods-fixture", "version": "0.1.0" }\n',
+		["src/declares.lua"] = table.concat({
+			"---@class Thing\n",
+			"---@field n number\n",
+			"local Thing = {}\n",
+			"---@return number\n",
+			"function Thing:double() return self.n * 2 end\n",
+			"return Thing\n",
+		}),
+		["src/uses.lua"] = table.concat({
+			"---@param t Thing\n",
+			"local function uses(t) return t:double() end\n",
+			"return uses\n",
+		}),
+	})
+	local command = string.format("LYE_CACHE=off lde run %q -- check %q", MAIN, root .. "/src")
+	local output = run(command .. " 2>&1")
+	test.includes(output, "nothing to report", "the method is the class's: " .. output)
+	test.falsy(output:find("is not a field", 1, true), "and is not missing: " .. output)
 end)
 
 return true

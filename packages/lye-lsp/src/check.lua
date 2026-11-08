@@ -1,5 +1,4 @@
 
-
 local report = require("lye-lsp.report")
 local doc = require("lye-doc")
 local classes = require("lye-doc.class")
@@ -370,8 +369,8 @@ function Store.new(paths, keysByPath, docsByText)
 				-- Everything `classes.declare` reads from an annotation, and nothing that moves
 				-- with it: a run whose annotations hash the same declares the same names.
 				parts[#parts + 1] = (annotation.tag or "") .. "\0" .. (annotation.name or "") .. "\0"
-					.. (annotation.text or "") .. "\0" .. (annotation.type or "") .. "\0"
-					.. (annotation.typeText or "")
+				.. (annotation.text or "") .. "\0" .. (annotation.type or "") .. "\0"
+				.. (annotation.typeText or "")
 			end
 		end
 	end
@@ -591,7 +590,7 @@ local function pluginsFor(path)
 		for _, entry in ipairs(config.plugins) do
 			if type(entry) == "string" and entry ~= "" then
 				local named = entry:sub(1, 1) ~= "!" and entry:sub(1, 1) ~= "/"
-					and (entry:sub(1, 1) == "." or entry:sub(-4) == ".lua")
+				and (entry:sub(1, 1) == "." or entry:sub(-4) == ".lua")
 				entries[#entries + 1] = named and (absolute(dir .. "/" .. entry:gsub("^%./", ""))) or entry
 			end
 		end
@@ -605,7 +604,7 @@ local function pluginsFor(path)
 	---@param message string
 	local function reportPlugin(message) io.stderr:write("check: " .. message .. "\n") end
 	local specs = plugin.load(entries, owner and absolute(owner) or absolute(env.cwd()),
-		moduleAt, reportPlugin) --[[@as lye.plugin.Spec[] ]]
+	moduleAt, reportPlugin) --[[@as lye.plugin.Spec[] ]]
 	pluginsByPackage[key] = specs
 	return specs
 end
@@ -689,7 +688,7 @@ end
 ---@param owner string the module's package root
 local function interfaceKey(key, path, store, owner)
 	return cache.key("interface", key, cache.codeVersion(),
-		tostring(isDefinitionPath(path)), store.annotations, store:farm(owner))
+	tostring(isDefinitionPath(path)), store.annotations, store:farm(owner))
 end
 
 --- The interface a previous run kept for a module, when its text, its plugins and everything it
@@ -825,16 +824,16 @@ local function moduleOf(path, name, modules, analysing, elsewhere, scopes, batch
 	-- run's to report, so the passes that only build them are left out.
 	local batchPath = batch and batch[key]
 	local own = batchPath
-		and scopeFor(packageOf(batchPath) or path, scopes or {}, elsewhere, store)
-		or elsewhere
+	and scopeFor(packageOf(batchPath) or path, scopes or {}, elsewhere, store)
+	or elsewhere
 	local names = analysesByText[key]
 	if names == nil then
 		stats.analyses += 1
 		names = analyzer.analyze(written, PRELUDE, own, function(inner)
 			return moduleOf(found --[[@as string ]], inner, modules, analysing, own, scopes, batch, store)
 		end, nil, docsByText[key] --[[@as lye.doc.File? ]], batchPath == nil, builtin ~= nil or isDefinitionPath(path),
-			builtin and {} or pluginsFor(found --[[@as string ]]),
-			function(message) io.stderr:write("check: " .. message .. "\n") end)
+		builtin and {} or pluginsFor(found --[[@as string ]]),
+		function(message) io.stderr:write("check: " .. message .. "\n") end)
 		analysesByText[key] = names
 		moduleOnlyByText[key] = batchPath == nil
 	end
@@ -936,8 +935,8 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 		---@param message string
 		local function reportPlugin(message) io.stderr:write("check: " .. message .. "\n") end
 		names = analyzer.analyze(written, PRELUDE, elsewhere, moduleFor, nil, docsByText[key] --[[@as lye.doc.File? ]],
-			nil, isDefinitionPath(path), pluginsFor(path), reportPlugin,
-			{ uri = path, root = owner })
+		nil, isDefinitionPath(path), pluginsFor(path), reportPlugin,
+		{ uri = path, root = owner })
 		analysesByText[key] = names
 		moduleOnlyByText[key] = nil
 		-- The full analysis says what `require` of this file gives back as well, and it is the
@@ -958,9 +957,9 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 		if node.kind == "call" and node.callee == "require" and node.args and node.args[1] then
 			local argument = names.parser.nodes[node.args[1]]
 			if argument and argument.kind == "string" and type(argument.value) == "string"
-				and not modulePath(owner or env.cwd(), argument.value)
-				and not binaryModulePath(owner or env.cwd(), argument.value)
-				and not builtinModule(argument.value) then
+			and not modulePath(owner or env.cwd(), argument.value)
+			and not binaryModulePath(owner or env.cwd(), argument.value)
+			and not builtinModule(argument.value) then
 				local writtenName = argument.value
 				local suggestion
 				if owner then
@@ -972,8 +971,8 @@ local function checkSource(path, elsewhere, modules, reporter, scopes, source, k
 				end
 				names.diagnostics[#names.diagnostics + 1] = {
 					message = suggestion
-						and string.format("module `%s` is not found; did you mean `%s`?", writtenName, suggestion)
-						or string.format("module `%s` is not found", writtenName),
+					and string.format("module `%s` is not found; did you mean `%s`?", writtenName, suggestion)
+					or string.format("module `%s` is not found", writtenName),
 					severity = 1, code = "missing-module",
 					start = argument.start, stop = argument.stop,
 				}
@@ -1157,6 +1156,7 @@ function check.files(paths, reporter)
 	-- tables, so a forked worker inherits them copy-on-write rather than through IPC.
 	local parsedFiles = {}
 	---@cast parsedFiles lye.doc.File[]
+	local methodLists = {} ---@type lye.WorkspaceMethod[][]
 	local sourcesByPath, keysByPath = {}, {}
 	local records = cache.enabled() and indexedFiles(paths) or nil
 	local loaded, parsed = 0, 0
@@ -1187,6 +1187,11 @@ function check.files(paths, reporter)
 			end
 			if type(held) == "table" then
 				parsedFiles[#parsedFiles + 1] = held
+				-- A method is a field of its class to the files that read it, and annotations
+				-- carry only the fields written as `---@field`: `function Thing:run` is read from
+				-- the source, the way a dependency's is. Without it a file in the batch calling
+				-- another's method is refused for a field the class does have.
+				methodLists[#methodLists + 1] = methodIndex.scan(written, held.annotations)
 				for _, declaration in ipairs(pluginDeclarations(path, written, held)) do
 					parsedFiles[#parsedFiles + 1] = declaration
 				end
@@ -1210,7 +1215,7 @@ function check.files(paths, reporter)
 			-- A file that could not be read, or could not be parsed, is not one a run kept an
 			-- answer for: it is checked, and the check reports what is wrong with it.
 			local entry = type(source) == "string" and key and docsByText[key]
-				and store:hit(path, key, packageOf(path))
+			and store:hit(path, key, packageOf(path))
 			if not entry then
 				missing = true
 				break
@@ -1233,8 +1238,23 @@ function check.files(paths, reporter)
 
 	-- What each name stands for, not only that it exists: a parameter declared with an alias
 	-- another file writes is checked against what the alias means, and a name on its own refuses
-	-- every argument handed to it.
-	local declared = classes.declare(parsedFiles, PRELUDE)
+	-- every argument handed to it. What a package links into `target/` is read first, because a
+	-- class's field may name a dependency's alias (`wonderland.RenderWindow`) and the batch's own
+	-- annotations alone leave that name unresolved everywhere the class is used.
+	local prelinked = {} ---@type table<string, table<string, boolean|lye.doc.Type>>
+	local elsewhere = {} ---@type table<string, boolean|lye.doc.Type>
+	local linkedSeen = {}
+	for _, path in ipairs(paths) do
+		local root = packageOf(path)
+		if root and not linkedSeen[root] then
+			linkedSeen[root] = true
+			for name, held in pairs(linkedDeclarations(root, prelinked)) do
+				if elsewhere[name] == nil then elsewhere[name] = held end
+			end
+		end
+	end
+	local declared = classes.declare(parsedFiles, PRELUDE, elsewhere)
+	for _, list in ipairs(methodLists) do methodIndex.add(declared, list) end
 
 	-- The work, in the units one process has to hold together: a package's files, which read the
 	-- same linked names and resolve one another in the order they are written.
@@ -1270,7 +1290,7 @@ function check.files(paths, reporter)
 		end
 		for _, path in ipairs(files) do
 			local passed, err = checkSource(path, declared, modules, collector, scopes,
-				sourcesByPath[path], keysByPath[path], true, keeper, batch)
+			sourcesByPath[path], keysByPath[path], true, keeper, batch)
 			if passed ~= true and err then
 				-- A file that cannot be read reports to whoever asked, and the name of the file is
 				-- what that report is about, so it travels with the rest and is said where it is

@@ -1,8 +1,8 @@
 --[[
-	LuaLS annotation parsing.
+LuaLS annotation parsing.
 
-	Annotations are comments, so they are read from the token stream rather than the parser, which
-	discards them. Types are kept as written and interpreted only where a check is made.
+Annotations are comments, so they are read from the token stream rather than the parser, which
+discards them. Types are kept as written and interpreted only where a check is made.
 ]]
 
 local lexer = require("lye-lexer")
@@ -151,9 +151,9 @@ local function cutType(text)
 			local left = text:sub(1, at - 1)
 			local right = text:sub(stop)
 			local expression = left:match("%s%.%.$") ~= nil or left:match("%s[%+%-%*/%%%^]$") ~= nil
-				or right:match("^%.%.%s") ~= nil or right:match("^[%+%-%*/%%%^]%s") ~= nil
+			or right:match("^%.%.%s") ~= nil or right:match("^[%+%-%*/%%%^]%s") ~= nil
 			if conditional or afterKeyof or arrowHere or arrowNext or expression
-				or BINDS[text:sub(at - 1, at - 1)] or CONTINUES[text:sub(stop, stop)] then
+			or BINDS[text:sub(at - 1, at - 1)] or CONTINUES[text:sub(stop, stop)] then
 				at = stop
 			else
 				break
@@ -184,6 +184,34 @@ local function spanOf(comment, text, from)
 	local at = comment:find(text, from, true)
 	if not at then return nil end
 	return at, at + #text - 1
+end
+
+--- How many brackets a written type leaves open at its end, ignoring quoted strings. A record
+--- written over several `---` lines — the spelling LuaLS reads — is one type, and the lines below
+--- the tag are its continuation until the brackets balance.
+---@param text string
+---@return integer
+local function openDepth(text)
+	local depth, quote, template, at, length = 0, nil, false, 1, #text
+	while at <= length do
+		local char = text:sub(at, at)
+		if template then
+			if char == "`" then template = false end
+		elseif char == "`" then
+			template = true
+		elseif quote then
+			if char == "\\" then at += 1
+			elseif char == quote then quote = nil end
+		elseif char == '"' or char == "'" then
+			quote = char
+		elseif char == "(" or char == "{" or char == "[" or char == "<" then
+			depth += 1
+		elseif char == ")" or char == "}" or char == "]" or char == ">" then
+			if depth > 0 then depth -= 1 end
+		end
+		at += 1
+	end
+	return depth
 end
 
 ---@param comment string
@@ -375,6 +403,10 @@ function doc.parse(source, tokens)
 	-- bars they were written with, so the body that comes out is the one a single line would give.
 	---@type lye.doc.Annotation?
 	local continued = nil
+	-- A type whose brackets are still open runs over the comment lines below its tag: a record
+	-- written one field per line, as `---@param opts {` and then `--- name: string` is read here.
+	---@type lye.doc.Annotation?
+	local typeContinuation = nil
 	-- The parser lexes the same text on its way to a tree, and a caller that has done so already
 	-- hands the tokens over rather than paying for a second pass over every byte.
 	-- Only the comments are wanted, and asking the full lexer for them means scanning every name,
@@ -436,13 +468,28 @@ function doc.parse(source, tokens)
 						if not close then break end
 						---@type lye.doc.Annotation?
 						local found = parse(line:sub(bracketed, close + 1),
-							index + bracketed - 1, index + close)
+						index + bracketed - 1, index + close)
 						if found then annotations[#annotations + 1] = found end
 						bracketed = line:find("%-%-%[%[%s*@", close)
 					end
 				end
+				if typeContinuation then
+					if last ~= nil then
+						typeContinuation = nil
+					else
+						local member = line:gsub("^%s*%-%-%-?", ""):gsub("%s+$", "")
+						if member == "" then
+							typeContinuation = nil
+						else
+							local joined = (typeContinuation.type or "") .. " " .. member
+							typeContinuation.type, typeContinuation.typeText = joined, joined
+							if openDepth(joined) == 0 then typeContinuation = nil end
+						end
+					end
+				end
 				if last then
 					continued = last.tag == "alias" and last or nil
+					if last.type and openDepth(last.type) > 0 then typeContinuation = last end
 				elseif continued then
 					local member = line:gsub("^%s*%-%-%-?", ""):match("^%s*|%s*(.-)%s*$")
 					if member then

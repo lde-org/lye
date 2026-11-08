@@ -1225,6 +1225,9 @@ end
 	function typing.contextualize(ctx, only, reused)
 		local parsed, self, inferCtx = ctx.parsed, ctx.self, ctx.inferCtx
 		local changed = false
+		if os.getenv("LYE_DEBUG_CTX") then
+			io.stderr:write("CTX begin calls=" .. tostring(#(ctx.callNodes or {})) .. " only=" .. tostring(next(only) ~= nil) .. "\n")
+		end
 
 		--- The callable member of an expected type: many callbacks are written optional, and a
 		--- union says the same signature as the member that is there.
@@ -1262,6 +1265,17 @@ end
 		---@param fnNode lye.parser.Node
 		---@param expected lye.doc.Type
 		local function apply(fnNode, expected)
+			if os.getenv("LYE_DEBUG_CTX") and types.display(expected):find("MenuContext", 1, true) then
+				io.stderr:write("CTX apply at " .. tostring(fnNode.start) .. " expected=" .. types.display(expected) .. "\n")
+				local first = expected.params and expected.params[1]
+				local n = 0
+				for _ in pairs(first and first.fields or {}) do n = n + 1 end
+				io.stderr:write("   param1=" .. tostring(first and first.variant) .. " name=" .. tostring(first and first.name) .. " fields=" .. n .. "\n")
+				for _, param in ipairs(fnNode.params or {}) do
+					local v = self.byStart[param.start]
+					io.stderr:write("   param " .. tostring(param.name) .. " var=" .. tostring(v and v.name) .. " declared=" .. tostring(v and v.declared and types.display(v.declared)) .. "\n")
+				end
+			end
 			local fnType = inferCtx.fnTypes[fnNode.index]
 				or infer.at(inferCtx, fnNode.index)
 			if not fnType or fnType.variant ~= "fn" then return end
@@ -1286,6 +1300,9 @@ end
 					if variable.declared ~= declared then
 						changed = true
 						variable.declared = declared
+						if os.getenv("LYE_DEBUG_CTX") and variable.name == "ctx" then
+							io.stderr:write("CTX ctx set to " .. types.display(declared or types.UNKNOWN_TYPE) .. "\n")
+						end
 						variable.pending = true
 						-- A read of the parameter was typed before this signature arrived; the
 						-- cache holds the `any` it had then, and the body has to see the new type.
@@ -1327,6 +1344,18 @@ end
 				-- Only a call that has a function body written into it has anything to type here.
 				-- Walking every call for a callback that is not there was most of a full check.
 				local hasBody = false
+				if os.getenv("LYE_DEBUG_CTX") then
+					local label = (node.callee or "") .. "." .. (node.field or "")
+					for _, argIdx in ipairs(node.args or {}) do
+						local a = parsed.nodes[argIdx]
+						local fields = parsed.tableFieldValues and parsed.tableFieldValues[argIdx]
+						for key in pairs(fields or {}) do
+							if key == "setup" or key == "message" then
+								io.stderr:write("CTX " .. label .. " table field " .. key .. " kind=" .. tostring(parsed.nodes[fields[key]].kind) .. "\n")
+							end
+						end
+					end
+				end
 				for _, argIdx in ipairs(node.args or {}) do
 					local argument = parsed.nodes[argIdx]
 					if bodyOf(argument) then
@@ -1347,6 +1376,9 @@ end
 				if not hasBody then goto continue_call end
 				---@type lye.doc.Type?
 				local calleeType = infer.calleeTypeOf(inferCtx, node)
+				if os.getenv("LYE_DEBUG_CTX") and node.field == "action" then
+					io.stderr:write("CTX call action callee=" .. tostring(calleeType and calleeType.variant) .. " desc=" .. tostring(calleeType and types.display(calleeType)) .. "\n")
+				end
 				if calleeType and types.isFn(calleeType) then
 					local params = calleeType.params or {}
 					-- A receiver written with `:` occupies the first parameter when the callable

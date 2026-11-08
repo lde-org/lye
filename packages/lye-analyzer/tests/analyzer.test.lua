@@ -1,5 +1,5 @@
 --[[
-	Tests for name resolution and type inference.
+Tests for name resolution and type inference.
 ]]
 
 local test = require("lde-test")
@@ -25,7 +25,7 @@ local types = require("lye-doc.type")
 local function analyzeSource(source, prepared, elsewhere, modules, resume, cachedAnnotations,
 	isModuleOnly, isDefinition, plugins, report, options)
 	local result = lye.analyze(source, prepared, elsewhere, modules, resume, cachedAnnotations,
-		isModuleOnly, isDefinition, plugins, report, options)
+	isModuleOnly, isDefinition, plugins, report, options)
 	local kept = {}
 	for _, entry in ipairs(result.diagnostics) do
 		if not entry.message:match("^unused local") then kept[#kept + 1] = entry end
@@ -60,21 +60,21 @@ test.it("gives a table the fields its own writes add", function()
 	-- `local M = {}` given its functions below is how a Lua module is written, and the table a
 	-- `require` hands back is only useful if those writes are part of its shape.
 	test.equal(typeOf("local t = {}\nfunction t.f(x) return x end\nlocal held = t.f\n", "held"),
-		"fn(any) -> any", "a function declared on the table")
+	"fn(any) -> any", "a function declared on the table")
 	test.equal(typeOf("local t = {}\nt.f = function(x) return x end\nlocal held = t.f\n", "held"),
-		"fn(any) -> any", "and one assigned to it")
+	"fn(any) -> any", "and one assigned to it")
 	test.equal(typeOf("local t = {}\nt.count = 2\nlocal held = t.count\n", "held"), "2",
-		"a value written to it")
+	"a value written to it")
 	test.equal(typeOf("local t = {}\nt.f = 2\nt.f = \"s\"\nlocal held = t.f\n", "held"),
-		"2|string", "two writes are two possible values, as they are for a name")
+	"2|string", "two writes are two possible values, as they are for a name")
 	test.equal(typeOf("local A = { B = {} }\nfunction A.B.f() end\nlocal held = A.B.f\n", "held"),
-		"fn()", "and the name it is written on may be dotted")
+	"fn()", "and the name it is written on may be dotted")
 
 	-- An annotation governs the value: the literal behind `---@type App` is not where the fields
 	-- of an App live, and evolving it would give the same table two different shapes.
 	test.equal(typeOf("---@class App\n---@field call fun(self: App): number\n"
-		.. "---@type App\nlocal x = {}\nfunction x:call() return 1 end\nlocal held = x.call\n", "held"),
-		"fn(App) -> number", "a declared type is the shape, not the literal")
+	.. "---@type App\nlocal x = {}\nfunction x:call() return 1 end\nlocal held = x.call\n", "held"),
+	"fn(App) -> number", "a declared type is the shape, not the literal")
 end)
 
 test.it("reads the types an ffi.cdef declares", function()
@@ -104,7 +104,7 @@ test.it("reads the types an ffi.cdef declares", function()
 		messages[#messages + 1] = entry.message
 	end
 	test.truthy(table.concat(messages, "; "):match("`nope` is not a field of Vec"),
-		"a member the header never declared: " .. table.concat(messages, "; "))
+	"a member the header never declared: " .. table.concat(messages, "; "))
 end)
 
 test.it("types an ffi.typeof constructor by what it makes", function()
@@ -134,7 +134,7 @@ test.it("types an ffi.typeof constructor by what it makes", function()
 	local all = table.concat(messages, "; ")
 	test.truthy(all:match("`nope` is not a field of Vec"), "a field the cdef does not declare: " .. all)
 	test.equal(select(2, all:gsub("`nope` is not a field of Vec", "")), 2,
-		"reported through the cached and the direct constructor")
+	"reported through the cached and the direct constructor")
 end)
 
 test.it("leaves the ffi dialect to the plugin that owns it", function()
@@ -163,7 +163,7 @@ test.it("leaves the ffi dialect to the plugin that owns it", function()
 	test.truthy(found and found ~= "Vec", "without the plugin the block declares nothing: " .. tostring(found))
 	for _, entry in ipairs(result.diagnostics) do
 		test.falsy(entry.message:match("`nope` is not a field of Vec"),
-			"and the generated class does not report its members: " .. entry.message)
+		"and the generated class does not report its members: " .. entry.message)
 	end
 end)
 
@@ -191,7 +191,7 @@ test.it("types a callback from the C signature it was cast to", function()
 		"end)\n",
 	}, "")
 	test.equal(typeOf(source, "ptr"), "ffi.ptr<ffi.char>",
-		"a char pointer arrives as a pointer to a char")
+	"a char pointer arrives as a pointer to a char")
 	test.equal(typeOf(source, "size"), "ffi.size_t", "a size_t is the cdata type the engine hands over")
 	test.equal(typeOf(source, "nmemb"), "ffi.size_t")
 	test.equal(typeOf(source, "_"), "ffi.ptr<ffi.cdata*>", "and a void pointer points at anything")
@@ -213,7 +213,7 @@ test.it("types a callback from the C signature it was cast to", function()
 		if entry.message:match("the result") then messages[#messages + 1] = entry.message end
 	end
 	test.equal(messages[1], "the result is declared as ffi.size_t but is assigned string",
-		table.concat(messages, "; "))
+	table.concat(messages, "; "))
 end)
 
 test.it("reports a cdef it could not read where it is written", function()
@@ -307,7 +307,7 @@ test.it("evolves a name that is assigned after its declaration", function()
 	for _, variable in ipairs(result.variables) do byName[variable.name] = variable end
 	test.equal(types.display(analyzer.typeAt(result, byName.x, #source)), "number|string")
 	test.equal(types.display(analyzer.typeAt(result, byName.y, #source)), "number|string",
-		"an initializer sees what the name became, not what it started as")
+	"an initializer sees what the name became, not what it started as")
 end)
 
 test.it("gives a parameter the type its @param names", function()
@@ -341,7 +341,7 @@ test.it("does not hand one function's annotations to the next", function()
 	local at = assert(source:find("print", 1, true))
 	local a = assert(analyzer.lookupAt(result, "a", at))
 	test.equal(types.display(analyzer.typeAt(result, a, at)), "any",
-		"f's @param is not g's: an unannotated parameter is any")
+	"f's @param is not g's: an unannotated parameter is any")
 end)
 
 test.it("keeps a parameter clear of a local of the same name", function()
@@ -401,7 +401,7 @@ test.it("infers a type from what a name was assigned", function()
 	-- The bare `x -> e` shorthand names its one parameter the way the barred form does.
 	test.equal(typeOf("local a = x -> x", "a"), "fn(any) -> any")
 	test.equal(typeOf("local a = |x| -> x", "a"), "fn(any) -> any",
-		"the named parameter is declared, and the body is what it returns")
+	"the named parameter is declared, and the body is what it returns")
 	test.equal(typeOf("local g = true", "g"), "true")
 end)
 
@@ -580,7 +580,7 @@ test.it("reads every `@return` line as another value", function()
 	test.equal(typeOf(source, "total"), "number", "the first name takes the first line")
 	test.equal(typeOf(source, "failed"), "boolean", "the second takes the second")
 	test.equal(typeOf(source, "foo"), "fn(number, number) -> number, boolean",
-		"and the signature names both")
+	"and the signature names both")
 	test.equal(#(result.signatures.foo.values or {}), 2, "the hover has both values")
 
 	-- A definition file is read by the same code, and its functions are reached by name rather
@@ -606,22 +606,22 @@ end)
 test.it("infers what a function returns from its body", function()
 	test.equal(typeOf("local function f() return 1 end", "f"), "fn() -> 1")
 	test.equal(typeOf("local function f(a) if a then return 1 end return \"s\" end", "f"),
-		"fn(any) -> 1|string", "every return is unioned")
+	"fn(any) -> 1|string", "every return is unioned")
 	-- Every value a statement hands back is named, and the *first* is what a caller reading one
 	-- gets: a signature that unioned them would claim `f()` may be a string, and
 	-- `local n: number = f()` would be reported against a body that is right.
 	test.equal(typeOf("local function f() return 1, \"s\" end", "f"), "fn() -> 1, string",
-		"both values are named")
+	"both values are named")
 	test.equal(typeOf("local function f() return 1, \"s\" end\nlocal n = f()\n", "n"), "1",
-		"and a name reading one value gets the first")
+	"and a name reading one value gets the first")
 	test.equal(typeOf("local function f(a) if a then return 1, \"s\" end return \"t\", 2 end", "f"),
-		"fn(any) -> 1|string, 2|string", "and each position is unioned on its own")
-		test.equal(typeOf("local function f() return end", "f"), "fn()",
-		"a bare return hands back nothing at all")
-		test.equal(typeOf("local function f() end", "f"), "fn()",
-		"and a body with no return statement is the same")
+	"fn(any) -> 1|string, 2|string", "and each position is unioned on its own")
+	test.equal(typeOf("local function f() return end", "f"), "fn()",
+	"a bare return hands back nothing at all")
+	test.equal(typeOf("local function f() end", "f"), "fn()",
+	"and a body with no return statement is the same")
 	test.equal(typeOf("local function f() return g() end", "f"), "fn() -> unknown",
-		"a call it cannot type is unknown rather than invented")
+	"a call it cannot type is unknown rather than invented")
 end)
 
 test.it("types a call from what the callee returns", function()
@@ -651,7 +651,7 @@ test.it("infers the return of a function that only names its parameters", functi
 	-- Nothing is claimed yet, and the answer is recomputable: a body that returns something
 	-- promotes the unknown it started as, so a call typed before the body is read still sees it.
 	test.equal(typeOf(stub, "test"), "fn(string) -> unknown",
-		"a stub has not said what it returns, so nothing is claimed")
+	"a stub has not said what it returns, so nothing is claimed")
 end)
 
 test.it("keeps an annotated return over the inferred one", function()
@@ -754,7 +754,6 @@ test.it("sees parameters inside a function", function()
 	test.truthy(#names >= 2, "both parameters should be visible: " .. table.concat(names, ","))
 end)
 
-
 --- The type a name has at a given offset, as text.
 ---@param source string
 ---@param name string
@@ -811,7 +810,7 @@ test.it("narrows a discriminated union by the field it tests", function()
 	}, "")
 	local inside = assert(source:find("print(x)", 1, true))
 	test.equal(typeAtOffset(source, "x", inside), "{ foo: number }",
-		"only the member carrying foo remains")
+	"only the member carrying foo remains")
 end)
 
 test.it("keeps a list a list when the other branch is an empty table", function()
@@ -859,9 +858,9 @@ test.it("reads a multi-value `---@type` one type per name", function()
 	test.equal(#analyzer.analyze(source).diagnostics, 0)
 	-- Read where each is written, before the assignment below replaces it.
 	test.equal(typeAtOffset(source, "depType", source:find("depType =", 1, true) - 1), '"git"|"path"',
-		"the first name takes the first type")
+	"the first name takes the first type")
 	test.equal(typeAtOffset(source, "depValue", source:find("depValue =", 1, true) - 1), "string?",
-		"and the second the second")
+	"and the second the second")
 end)
 
 test.it("lets a class table be built by assignment", function()
@@ -965,13 +964,13 @@ end)
 
 test.it("narrows unknown and any to the type a type() test proves", function()
 	local unknown = "---@type unknown\nlocal x = 5\n"
-		.. "if type(x) == \"table\" then\n\tprint(x)\nend\n"
+	.. "if type(x) == \"table\" then\n\tprint(x)\nend\n"
 	test.equal(typeAtOffset(unknown, "x", offsetOf(unknown, "print")), "table",
-		"unknown becomes the tested type")
+	"unknown becomes the tested type")
 	local any = "---@type any\nlocal x = 5\n"
-		.. "if type(x) == \"table\" then\n\tprint(x)\nend\n"
+	.. "if type(x) == \"table\" then\n\tprint(x)\nend\n"
 	test.equal(typeAtOffset(any, "x", offsetOf(any, "print")), "table",
-		"any is narrowed by an explicit runtime test")
+	"any is narrowed by an explicit runtime test")
 end)
 
 test.it("rejects a type() comparison with a name type cannot return", function()
@@ -994,7 +993,7 @@ test.it("rejects a type() comparison with a name type cannot return", function()
 	for _, variable in ipairs(result.variables) do
 		if variable.name == "y" then
 			test.equal(types.display(analyzer.typeAt(result, variable, #bad)), "unknown",
-				"and nothing is narrowed from an impossible test")
+			"and nothing is narrowed from an impossible test")
 		end
 	end
 
@@ -1051,13 +1050,13 @@ test.it("keeps a discriminated union's comparisons apart across an elseif chain"
 	local result = analyzer.analyze(source)
 	test.equal(#result.diagnostics, 0, "the later comparisons are not judged against the first branch")
 	test.equal(typeAtOffset(source, "node", assert(source:find("local ident", 1, true))),
-		'{ type: "ident", value: string }', "the first body keeps the member its condition proved")
+	'{ type: "ident", value: string }', "the first body keeps the member its condition proved")
 	test.equal(typeAtOffset(source, "node", assert(source:find("local other", 1, true))),
-		'{ type: "bool", value: boolean }|{ type: "number", value: number }',
-		"the later branch keeps only the members its condition allows")
+	'{ type: "bool", value: boolean }|{ type: "number", value: number }',
+	"the later branch keeps only the members its condition allows")
 	test.equal(typeAtOffset(source, "node", #source),
-		'{ type: "bool", value: boolean }|{ type: "ident", value: string }|{ type: "number", value: number }',
-		"and nothing narrows once the chain is over")
+	'{ type: "bool", value: boolean }|{ type: "ident", value: string }|{ type: "number", value: number }',
+	"and nothing narrows once the chain is over")
 end)
 
 test.it("narrows every else branch of a chain by the conditions before it", function()
@@ -1156,7 +1155,7 @@ test.it("narrows both sides of a conjunction", function()
 		"end\n",
 	}, "")
 	test.equal(typeAtOffset(source, "x", offsetOf(source, "print(x)")), "{ foo: number }",
-		"the second test only means something once the first holds")
+	"the second test only means something once the first holds")
 end)
 
 test.it("narrows both sides of a disjunction in its else branch", function()
@@ -1180,7 +1179,7 @@ end)
 test.it("asserts nothing where a disjunction holds", function()
 	local source = "---@type string?\nlocal x = \"s\"\nif x == nil or x == nil then\n\tprint(x)\nend\n"
 	test.equal(typeAtOffset(source, "x", offsetOf(source, "print")), "string?",
-		"either side could have held, so neither is certain")
+	"either side could have held, so neither is certain")
 end)
 
 test.it("narrows an outer name before an inner one shadows it", function()
@@ -1195,7 +1194,7 @@ test.it("narrows an outer name before an inner one shadows it", function()
 		"end\n",
 	}, "")
 	test.equal(typeAtOffset(source, "x", offsetOf(source, "print(x)")), "string",
-		"the inner declaration is not in scope yet")
+	"the inner declaration is not in scope yet")
 end)
 
 test.it("never lets an inner declaration inherit an outer narrowing", function()
@@ -1213,7 +1212,7 @@ test.it("never lets an inner declaration inherit an outer narrowing", function()
 	local at = offsetOf(source, "print(x)")
 	local inner = assert(analyzer.lookupAt(result, "x", at), "the inner one resolves here")
 	test.equal(types.display(analyzer.typeAt(result, inner, at)), "string?",
-		"a different variable, so the outer branch says nothing about it")
+	"a different variable, so the outer branch says nothing about it")
 	test.equal(typeAtOffset(source, "x", at), "string", "and the outer one is still narrowed")
 end)
 
@@ -1232,7 +1231,7 @@ test.it("hard types a function from its own annotations", function()
 	local declared = f.declared --[[@as lye.doc.Type]]
 	test.equal(types.display(declared), "fn(number) -> string")
 	test.equal(types.display(analyzer.typeAt(result, byName.g, #source)), "fn(number) -> string",
-		"the signature travels with the function")
+	"the signature travels with the function")
 	test.equal(#result.diagnostics, 1, "assigning a number to a function is an error")
 	test.truthy(result.diagnostics[1].message:match("fn%(number%) %-> string"), result.diagnostics[1].message)
 end)
@@ -1256,7 +1255,7 @@ test.it("keeps a function's name visible after its own declaration", function()
 	local result = analyzer.analyze(source)
 	local g = result.variables[2]
 	test.equal(types.display(analyzer.typeAt(result, g, #source)), "fn()",
-		"and it carries what f returns, which is nothing")
+	"and it carries what f returns, which is nothing")
 end)
 
 test.it("reports arithmetic on a type that cannot be a number", function()
@@ -1732,7 +1731,7 @@ test.it("reads the standard library through a prepared prelude", function()
 	local first = with.variables[1]
 	local second = with.variables[2]
 	test.equal(types.display(analyzer.typeAt(bare, bare.variables[1], #source)), "unknown",
-		"without the definitions there is nothing to read")
+	"without the definitions there is nothing to read")
 	test.equal(types.display(analyzer.typeAt(with, first, #source)), "string")
 	test.equal(types.display(analyzer.typeAt(with, second, #source)), "string")
 	test.equal(#with.diagnostics, 0)
@@ -1757,7 +1756,7 @@ test.it("absorbs a literal into the number a call returns", function()
 	end
 	test.truthy(seed)
 	test.equal(types.display(analyzer.typeAt(result, seed, #source)), "number",
-		"a number literal beside number is just number")
+	"a number literal beside number is just number")
 	test.equal(#result.diagnostics, 0)
 end)
 
@@ -1798,7 +1797,7 @@ test.it("errors when an any value is used the same way", function()
 	test.equal(#reported(prefix .. "return v + 1\n"), 1, "an operator on any is an error")
 	test.equal(#reported(prefix .. "return v()\n"), 1, "calling any is an error")
 	local passed = analyzer.analyze("---@return any\nlocal function anything() end\n"
-		.. "---@param a string\nlocal function f(a) end\nf(anything())\n")
+	.. "---@param a string\nlocal function f(a) end\nf(anything())\n")
 	local said = {}
 	for _, entry in ipairs(passed.diagnostics) do said[#said + 1] = entry.message end
 	test.truthy(table.concat(said, " / "):match("f expects string, got any"), table.concat(said, " / "))
@@ -1824,10 +1823,10 @@ test.it("gives an empty table the shape a parameter expects", function()
 	local held = {}
 	for _, variable in ipairs(result.variables) do held[variable.name] = variable end
 	test.equal(types.display(analyzer.typeAt(result, held.out, #source)), "Entry[]",
-		"the empty table took the parameter's shape")
+	"the empty table took the parameter's shape")
 	test.equal(types.display(analyzer.typeAt(result, held.seen, #source)), "table<string, boolean>")
 	test.equal(types.display(analyzer.typeAt(result, held.entry, #source)), "Entry",
-		"so ipairs yields the element type")
+	"so ipairs yields the element type")
 	test.equal(types.display(analyzer.typeAt(result, held.name, #source)), "string")
 	for _, entry in ipairs(result.diagnostics) do
 		test.falsy(entry.message:match("unknown"), entry.message)
@@ -1867,13 +1866,13 @@ test.it("gives pairs the key and value of the table it walks", function()
 	local held = {}
 	for _, variable in ipairs(result.variables) do held[variable.name] = variable end
 	test.equal(types.display(analyzer.typeAt(result, held.key, #source)), "string",
-		"pairs yields the key type of the map it walks")
+	"pairs yields the key type of the map it walks")
 	test.equal(types.display(analyzer.typeAt(result, held.entry, #source)), "Entry",
-		"and the value type")
+	"and the value type")
 	test.equal(types.display(analyzer.typeAt(result, held.named, #source)), "string",
-		"so a field of the value is read")
+	"so a field of the value is read")
 	test.equal(types.display(analyzer.typeAt(result, held.index, #source)), "number",
-		"an array's keys are numbers")
+	"an array's keys are numbers")
 	test.equal(types.display(analyzer.typeAt(result, held.item, #source)), "Entry")
 end)
 
@@ -1886,14 +1885,14 @@ test.it("checks an argument against its parameter type", function()
 	test.equal(#analyzer.analyze("---@param a string\nlocal function f(a) end\nf(\"s\")\n").diagnostics, 0)
 	-- A settled unknown handed to a parameter that says what it takes is a use of the unknown.
 	local unknown = analyzer.analyze(
-		"---@return unknown\nlocal function g() end\n---@param a string\nlocal function f(a) end\nf(g())\n"
+	"---@return unknown\nlocal function g() end\n---@param a string\nlocal function f(a) end\nf(g())\n"
 	)
 	test.equal(#unknown.diagnostics, 1)
 	test.truthy(unknown.diagnostics[1].message:match("f expects string, got unknown"),
-		unknown.diagnostics[1].message)
+	unknown.diagnostics[1].message)
 	-- Returning it, storing it or branching on it is not a use.
 	test.equal(#analyzer.analyze(
-		"---@return unknown\nlocal function g() end\nlocal x = g()\nif x then end\nreturn x\n"
+	"---@return unknown\nlocal function g() end\nlocal x = g()\nif x then end\nreturn x\n"
 	).diagnostics, 0)
 end)
 
@@ -1910,7 +1909,7 @@ test.it("spans the whole name an argument is written with", function()
 	local entry = result.diagnostics[1]
 	test.truthy(entry.message:match("f expects string"))
 	test.equal(source:sub(entry.start, entry.stop), "maybe",
-		"the diagnostic covers the whole name, not its first character")
+	"the diagnostic covers the whole name, not its first character")
 end)
 
 test.it("checks what an argument past the named ones has to be", function()
@@ -1926,7 +1925,7 @@ test.it("checks what an argument past the named ones has to be", function()
 	local result = analyzer.analyze(source)
 	test.equal(#result.diagnostics, 2, "the table and the nil are refused, the number and string are not")
 	test.truthy(result.diagnostics[1].message:match("takes expects number|string, got table"),
-		result.diagnostics[1].message)
+	result.diagnostics[1].message)
 	test.truthy(result.diagnostics[2].message:match("got nil"), result.diagnostics[2].message)
 end)
 
@@ -1935,11 +1934,11 @@ test.it("holds a definition file to its annotations, not to bodies it does not h
 	-- the whole of that function, and there is no body to contradict the annotation.
 	local source = "---@meta\n---@type string\nlocal x = 1\nreturn x\n"
 	test.equal(#analyzer.analyze(source).diagnostics, 0,
-		"a definition file's annotations describe the library rather than a body")
+	"a definition file's annotations describe the library rather than a body")
 
 	local same = source:gsub("^%-%-%-@meta\n", "")
 	test.equal(#analyzer.analyze(same).diagnostics, 1,
-		"and without the marker what is written is checked against what it says")
+	"and without the marker what is written is checked against what it says")
 end)
 
 test.it("checks against the types a definition file writes inline", function()
@@ -1957,9 +1956,9 @@ test.it("checks against the types a definition file writes inline", function()
 
 	test.equal(#result.diagnostics, 2, "the string and the table are refused, the number is not")
 	test.truthy(result.diagnostics[1].message:find("test expects number, got", 1, true),
-		result.diagnostics[1].message)
+	result.diagnostics[1].message)
 	test.truthy(result.diagnostics[2].message:match("generic expects number, got table"),
-		result.diagnostics[2].message)
+	result.diagnostics[2].message)
 end)
 
 test.it("applies the type a definition file writes on a local", function()
@@ -1976,11 +1975,11 @@ end)
 test.it("checks what a definition file writes for its varargs", function()
 	-- `function takes(...: string|number)` says what every extra argument has to be.
 	local result = analyzer.analyze(
-		"function takes(...: string|number): nil end\ntakes(1, {})\nreturn takes\n",
-		nil, nil, nil, nil, nil, nil, true)
+	"function takes(...: string|number): nil end\ntakes(1, {})\nreturn takes\n",
+	nil, nil, nil, nil, nil, nil, true)
 	test.equal(#result.diagnostics, 1)
 	test.truthy(result.diagnostics[1].message:find("takes expects", 1, true),
-		result.diagnostics[1].message)
+	result.diagnostics[1].message)
 end)
 
 test.it("reads the types a definition file writes inline through a prepared prelude", function()
@@ -1993,11 +1992,11 @@ test.it("reads the types a definition file writes inline through a prepared prel
 	local result = analyzer.analyze(source, prelude)
 	test.equal(#result.diagnostics, 1, "the string is refused where an integer is wanted")
 	test.truthy(result.diagnostics[1].message:find("sized expects", 1, true),
-		result.diagnostics[1].message)
+	result.diagnostics[1].message)
 	test.truthy(result.diagnostics[1].message:find("got \"nope\"", 1, true),
-		result.diagnostics[1].message)
+	result.diagnostics[1].message)
 	test.equal(types.display(analyzer.typeAt(result, result.variables[1], #source)), "string",
-		"and what it gives back is read too")
+	"and what it gives back is read too")
 end)
 
 test.it("hints that `fun(...):...` is what `function` already says", function()
@@ -2074,7 +2073,7 @@ end)
 
 test.it("checks each argument against its own parameter", function()
 	local result = analyzer.analyze(
-		"---@param a string\n---@param b number\nlocal function f(a, b) end\nf(\"s\", \"t\")\n"
+	"---@param a string\n---@param b number\nlocal function f(a, b) end\nf(\"s\", \"t\")\n"
 	)
 	test.equal(#result.diagnostics, 1)
 	test.truthy(result.diagnostics[1].message:match("expects number"))
@@ -2144,7 +2143,7 @@ test.it("types a standard library table from the class that describes it", funct
 	local bad = analyzer.analyze("local n = math.floor(\"s\")\n", prelude)
 	test.equal(#bad.diagnostics, 1)
 	test.truthy(bad.diagnostics[1].message:match("math.floor expects number, got \"s\""),
-		"the literal is named as the string it is")
+	"the literal is named as the string it is")
 end)
 
 test.it("types the result of setmetatable as the metatable's class", function()
@@ -2169,9 +2168,9 @@ test.it("types the result of setmetatable as the metatable's class", function()
 	local byName = {}
 	for _, variable in ipairs(result.variables) do byName[variable.name] = variable end
 	test.equal(types.display(analyzer.typeAt(result, byName.p, #source)), "Point",
-		"the metatable argument is what T was bound to")
+	"the metatable argument is what T was bound to")
 	test.equal(types.display(analyzer.typeAt(result, byName.x, #source)), "number",
-		"a field read before the binding settled is worked out again")
+	"a field read before the binding settled is worked out again")
 end)
 
 test.it("checks an argument passed to a method", function()
@@ -2217,7 +2216,7 @@ test.it("gives the first name of a generic loop what the iterator yields", funct
 	for _, variable in ipairs(result.variables) do byName[variable.name] = variable end
 	test.equal(types.display(analyzer.typeAt(result, byName.index, #source)), "number")
 	test.equal(types.display(analyzer.typeAt(result, byName.value, #source)), "string",
-		"and the second takes what the table it walks holds, which is what makes `for _, x in ipairs(list)` a string")
+	"and the second takes what the table it walks holds, which is what makes `for _, x in ipairs(list)` a string")
 	test.equal(types.display(analyzer.typeAt(result, byName.plus, #source)), "number")
 end)
 
@@ -2245,13 +2244,13 @@ test.it("reads what a table holds at a computed key from the writes to it", func
 		"end\n",
 	}, "")
 	test.equal(typeOf(source, "consts"), "table<string, true>",
-		"a `true` written at a string key is what makes a table a set")
+	"a `true` written at a string key is what makes a table a set")
 	test.equal(typeOf(source, "names"), "string[]",
-		"a name written one past the end of a list is what makes it a list")
+	"a name written one past the end of a list is what makes it a list")
 	test.equal(typeOf(source, "held"), "table<string, string>",
-		"and a value written at a string key is what the key holds")
+	"and a value written at a string key is what the key holds")
 	test.equal(typeOf(source, "first"), "string",
-		"which is what reading that key back gives")
+	"which is what reading that key back gives")
 end)
 
 test.it("lets a class reach itself through a field", function()
@@ -2286,7 +2285,7 @@ test.it("reads a conjunction by what its left side can be", function()
 	local byName = {}
 	for _, variable in ipairs(result.variables) do byName[variable.name] = variable end
 	test.equal(types.display(analyzer.typeAt(result, byName.digit, #source)), "boolean",
-		"a number is never falsy, so the conjunction is the comparison")
+	"a number is never falsy, so the conjunction is the comparison")
 end)
 
 test.it("takes any function where a variadic wildcard is wanted", function()
@@ -2368,9 +2367,9 @@ test.it("narrows both branches of a predicate condition", function()
 	for _, variable in ipairs(result.variables) do byName[variable.name] = variable end
 	test.equal(types.display(analyzer.typeAt(result, byName.held, #source)), "string")
 	test.equal(types.display(analyzer.typeAt(result, byName.other, #source)), "number",
-		"the else of a predicate is what the type leaves")
+	"the else of a predicate is what the type leaves")
 	test.equal(types.display(analyzer.typeAt(result, byName.inverted, #source)), "number",
-		"`not` swaps which branch the predicate holds in")
+	"`not` swaps which branch the predicate holds in")
 end)
 
 test.it("reports code after a call that never returns", function()
@@ -2435,7 +2434,7 @@ test.it("narrows past a branch that cannot fall through", function()
 	local byName = {}
 	for _, variable in ipairs(result.variables) do byName[variable.name] = variable end
 	test.equal(types.display(analyzer.typeAt(result, byName.body, #source)), "string",
-		"the branch that raises leaves the name narrowed for the rest of the block")
+	"the branch that raises leaves the name narrowed for the rest of the block")
 end)
 
 test.it("says nothing about a value that never exists", function()
@@ -2541,7 +2540,7 @@ test.it("carries the metatable a value was given, and reads its fields through i
 	local byName = {}
 	for _, variable in ipairs(result.variables) do byName[variable.name] = variable end
 	test.equal(types.display(analyzer.typeAt(result, byName.x, #source)), "number",
-		"the field the class declares")
+	"the field the class declares")
 	local held = analyzer.typeAt(result, byName.v, #source)
 	test.truthy(types.metatableOf(held), "the metatable is kept on the type, not thrown away")
 end)
@@ -2552,14 +2551,14 @@ test.it("computes an operator through the metamethod the type defines", function
 	local byName = {}
 	for _, variable in ipairs(result.variables) do byName[variable.name] = variable end
 	test.equal(types.display(analyzer.typeAt(result, byName.sum, #source)), "Vec",
-		"`__add` returns a Vec, so `v + v` is one")
+	"`__add` returns a Vec, so `v + v` is one")
 end)
 
 test.it("refuses a metatable whose metamethods are not functions", function()
 	test.truthy(mentions("local t = setmetatable({}, { __add = 5 })\n",
-		"expects lye.Metatable"), "a number is not a metamethod")
+	"expects lye.Metatable"), "a number is not a metamethod")
 	test.truthy(mentions("local t = setmetatable({}, { __pluss = function() end })\n",
-		"`__pluss` is not a metamethod"), "Lua has no such metamethod")
+	"`__pluss` is not a metamethod"), "Lua has no such metamethod")
 	test.truthy(mentions(table.concat({
 		"---@param a string\n",
 		"---@param b string\n",
@@ -2606,11 +2605,11 @@ test.it("reports a type name nothing declares", function()
 	end
 
 	test.equal(#unknowns("---@class Box<T>\nlocal Box = {}\n---@param b Box<string>\nlocal function f(b) end\n"), 0,
-		"a generic spelling is the class it names")
+	"a generic spelling is the class it names")
 	test.equal(#unknowns("---@generic T: table\n---@param v T\n---@return T\nlocal function id(v) end\n"), 0,
-		"a generic name is declared by the annotation that limits it")
+	"a generic name is declared by the annotation that limits it")
 	test.equal(#unknowns("---@param t thread\n---@param u userdata\n---@param c cdata\nlocal function g(t, u, c) end\n"), 0,
-		"the engine's own names are types")
+	"the engine's own names are types")
 	test.equal(#unknowns(table.concat({
 		"---@class file*\n",
 		"local file = {}\n",
@@ -2620,7 +2619,7 @@ test.it("reports a type name nothing declares", function()
 	-- The set of names other files declare is the third argument to `analyze`; the server and the
 	-- batch checker pass it, and the sweep of this repository is what exercises it.
 	test.equal(#unknowns("---@param p Elsewhere\nlocal function f(p) end\n"), 1,
-		"a name nothing declares here is reported")
+	"a name nothing declares here is reported")
 end)
 
 --- A library with `error` declared, so a branch that calls it cannot fall through and the
@@ -2798,13 +2797,13 @@ test.it("reports a parameter annotation naming nothing the function takes", func
 	end
 
 	test.equal(said("---@param a number\n---@param c string\nlocal function f(a, b)\n\treturn a, b\nend\n"),
-		"`c` is not a parameter of this function")
+	"`c` is not a parameter of this function")
 	test.equal(said("---@param a number\n---@param b string\nlocal function f(a, b)\n\treturn a, b\nend\n"),
-		"", "a name that is one of them is left alone")
+	"", "a name that is one of them is left alone")
 	test.equal(said("---@class T\nlocal T = {}\n---@param self T\n---@param x number\nfunction T:m(x)\n\treturn x\nend\n"),
-		"", "the receiver a method takes is a parameter like any other")
+	"", "the receiver a method takes is a parameter like any other")
 	test.equal(said("---@param ... number\nlocal function f(...)\n\treturn ...\nend\n"),
-		"", "the variadic parameter is annotated `...`")
+	"", "the variadic parameter is annotated `...`")
 end)
 
 test.it("reads the direction a `---@cast` asserts", function()
@@ -2813,7 +2812,7 @@ test.it("reads the direction a `---@cast` asserts", function()
 	-- of taking the nil out of it — and the writer sees a wrong type rather than an error.
 	local function after(held, cast)
 		local source = "---@param q " .. held .. "\nlocal function f(q)\n\t" .. cast
-			.. "\n\tlocal here = 1\nend\n"
+		.. "\n\tlocal here = 1\nend\n"
 		local result = analyzer.analyze(source)
 		local variable
 		for _, one in ipairs(result.variables) do
@@ -2844,23 +2843,23 @@ test.it("gives a name the value at its own position in a multi-value assignment"
 	-- `a, b = f()` hands `b` the second value; checked against the first, every second name of a
 	-- call was reported as a value of the type that came before it.
 	local head = "---@return number, string\nlocal function pair() end\n"
-		.. "---@type number\nlocal a\n---@type string\nlocal b\n"
+	.. "---@type number\nlocal a\n---@type string\nlocal b\n"
 	test.equal(#analyzer.analyze(head .. "a, b = pair()\n").diagnostics, 0,
-		"the second name takes the second value")
+	"the second name takes the second value")
 	test.equal(#analyzer.analyze(head .. "a, b = 1, \"s\"\n").diagnostics, 0,
-		"a name with an expression of its own takes that one")
+	"a name with an expression of its own takes that one")
 	test.equal(#analyzer.analyze(head .. "a = 1, \"s\"\n").diagnostics, 0,
-		"and a lone name before several values takes the first")
+	"and a lone name before several values takes the first")
 end)
 
 test.it("keeps the class a name was assigned, not the placeholder it settled from", function()
 	-- `cache = defaults` reads as the value written even while that value's type is still being
 	-- worked out, so `cache` is a C and not the `C?` it was declared as.
 	local source = "---@class C\nlocal C = {}\n"
-		.. "---@return C\nfunction C.new() end\n"
-		.. "---@type C?\nlocal cache = nil\nconst defaults = C.new()\n"
-		.. "---@return C\nlocal function getConfig()\n\tcache = defaults\n\treturn cache\nend\n"
-		.. "local held = cache\n"
+	.. "---@return C\nfunction C.new() end\n"
+	.. "---@type C?\nlocal cache = nil\nconst defaults = C.new()\n"
+	.. "---@return C\nlocal function getConfig()\n\tcache = defaults\n\treturn cache\nend\n"
+	.. "local held = cache\n"
 	local result = analyzer.analyze(source)
 	for _, entry in ipairs(result.diagnostics) do
 		-- A hint that the `@return C` is redundant is the point: the body is read as giving one.
@@ -2874,8 +2873,8 @@ test.it("evolves a method onto the class its table declares", function()
 	-- and `function Thing:grow()` is a method of it: without the link a call through the class had
 	-- no method to read, and its arguments went unchecked.
 	local source = "---@class pkg.Thing\n---@field size number\nlocal Thing = {}\n"
-		.. "---@param by number\nfunction Thing:grow(by) end\n"
-		.. "---@param thing pkg.Thing\nlocal function use(thing)\n\tthing:grow(\"s\")\nend\n"
+	.. "---@param by number\nfunction Thing:grow(by) end\n"
+	.. "---@param thing pkg.Thing\nlocal function use(thing)\n\tthing:grow(\"s\")\nend\n"
 	local bad = analyzer.analyze(source)
 	test.equal(#bad.diagnostics, 1)
 	test.truthy(bad.diagnostics[1].message:match("expects number"))
@@ -2886,9 +2885,9 @@ test.it("narrows after a guard that returns a table literal", function()
 	-- The members of a literal belong to it, not to the chunk: taken for statements they made the
 	-- clause look like it fell through, and nothing after the guard was narrowed.
 	local source = "---@return string?\nlocal function find() end\n"
-		.. "local function f()\n\tlocal tag = find()\n"
-		.. "\tif not tag then return { error = \"none\" } end\n"
-		.. "\tlocal held = tag\n\treturn held\nend\n"
+	.. "local function f()\n\tlocal tag = find()\n"
+	.. "\tif not tag then return { error = \"none\" } end\n"
+	.. "\tlocal held = tag\n\treturn held\nend\n"
 	test.equal(typeOf(source, "held"), "string")
 end)
 
@@ -2896,8 +2895,8 @@ test.it("keeps a class when a fallback is written for it", function()
 	-- `opts or {}` is the class when there is one and an empty table otherwise; the fact that the
 	-- right operand only runs when `opts` was falsy must not reach back over the left one.
 	local source = "---@class Opts\n---@field name string?\n"
-		.. "---@param opts Opts?\nlocal function f(opts)\n\topts = opts or {}\n"
-		.. "\tlocal held = opts\n\treturn held\nend\n"
+	.. "---@param opts Opts?\nlocal function f(opts)\n\topts = opts or {}\n"
+	.. "\tlocal held = opts\n\treturn held\nend\n"
 	test.equal(typeOf(source, "held"), "Opts")
 end)
 
@@ -2905,9 +2904,9 @@ test.it("types a field of a literal from the name as it is narrowed there", func
 	-- The field is read where the condition holds, so it is the narrowed type and not the optional
 	-- one the name was declared with.
 	local source = "---@return string?\nlocal function find() end\n"
-		.. "local function f()\n\tlocal dir = find()\n\tif dir then\n"
-		.. "\t\t---@type { archive: string }\n\t\tlocal entry = { archive = dir }\n"
-		.. "\t\treturn entry\n\tend\nend\n"
+	.. "local function f()\n\tlocal dir = find()\n\tif dir then\n"
+	.. "\t\t---@type { archive: string }\n\t\tlocal entry = { archive = dir }\n"
+	.. "\t\treturn entry\n\tend\nend\n"
 	test.equal(#analyzer.analyze(source).diagnostics, 0)
 end)
 
@@ -2916,15 +2915,15 @@ test.it("narrows a ternary's branch from its condition", function()
 	-- does. Reading `inferred.variant` where the condition proved `inferred` is there must not
 	-- report the optional field as absent.
 	local source = "---@class Shape\n---@field variant string\n"
-		.. "---@class Box\n---@field inferred Shape?\n"
-		.. "---@param box Box\nlocal function f(box)\n"
-		.. "\treturn box.inferred ? box.inferred.variant : \"-\"\nend\n"
+	.. "---@class Box\n---@field inferred Shape?\n"
+	.. "---@param box Box\nlocal function f(box)\n"
+	.. "\treturn box.inferred ? box.inferred.variant : \"-\"\nend\n"
 	test.equal(#analyzer.analyze(source).diagnostics, 0)
 
 	-- The other branch is where the condition is false, and a local's optional is nil there.
 	local bad = "---@class Shape\n---@field variant string\n"
-		.. "---@param x Shape?\nlocal function f(x)\n"
-		.. "\treturn x ? \"-\" : x.variant\nend\n"
+	.. "---@param x Shape?\nlocal function f(x)\n"
+	.. "\treturn x ? \"-\" : x.variant\nend\n"
 	local diagnostics = analyzer.analyze(bad).diagnostics
 	test.equal(#diagnostics, 1)
 	test.truthy(diagnostics[1].message:match("nil"), diagnostics[1].message)
@@ -2934,8 +2933,8 @@ test.it("reads a string key in brackets as a field", function()
 	-- `["end"] = v` holds what `{ end = v }` holds; leaving it out made the literal miss a member
 	-- the annotation that describes it asked for.
 	local source = "---@return { duration: number, [\"end\"]: number }\n"
-		.. "local function f()\n\tlocal out = { name = \"x\", [\"end\"] = 2, duration = 1 }\n"
-		.. "\treturn out\nend\n"
+	.. "local function f()\n\tlocal out = { name = \"x\", [\"end\"] = 2, duration = 1 }\n"
+	.. "\treturn out\nend\n"
 	test.equal(#analyzer.analyze(source).diagnostics, 0)
 end)
 
@@ -2943,11 +2942,11 @@ test.it("binds const generic arguments into an operation result", function()
 	-- The body is generic, so it is checked against its constraint rather than against one
 	-- instantiation; the call binds the literals and the result is the concatenated string.
 	local source = "---@type fn<const A: string, const B: string>(a: A, b: B) -> A .. B\n"
-		.. "local function concat(a, b)\n\treturn a .. b\nend\n"
-		.. "local text = concat(\"bar\", \"baz\")\n"
-		.. "---@type number\n"
-		.. "local bad = text\n"
-		.. "return text, bad\n"
+	.. "local function concat(a, b)\n\treturn a .. b\nend\n"
+	.. "local text = concat(\"bar\", \"baz\")\n"
+	.. "---@type number\n"
+	.. "local bad = text\n"
+	.. "return text, bad\n"
 	local result = analyzer.analyze(source)
 	test.equal(#result.diagnostics, 1)
 	test.includes(result.diagnostics[1].message, 'declared as number')
@@ -2978,9 +2977,9 @@ test.it("checks a mapped parameter's shape at the call site", function()
 	-- A mapped parameter is a shape, not an operation left for the reader: every key of the
 	-- source has to hold the mapped value, and a string in a number field is a mistake.
 	local source = "---@param spec { [K in keyof { a: number, b: string }]: number }\n"
-		.. "local function takesMapped(spec) end\n"
-		.. "takesMapped({ a = 1, b = 2 })\n"
-		.. "takesMapped({ a = 1, b = \"x\" })\n"
+	.. "local function takesMapped(spec) end\n"
+	.. "takesMapped({ a = 1, b = 2 })\n"
+	.. "takesMapped({ a = 1, b = \"x\" })\n"
 	local result = analyzer.analyze(source)
 	test.equal(#result.diagnostics, 1)
 	test.includes(result.diagnostics[1].message, "b")
@@ -2991,8 +2990,8 @@ test.it("does not cast an expression of another branch from a trailing `@cast`",
 	-- annotation belongs to the branch that came before, and casting it turned that branch's
 	-- literal into a string.
 	local source = "---@param flag boolean\n---@return { a: number }\n"
-		.. "local function f(flag)\n\tif flag then\n\t\treturn { a = 1 }\n"
-		.. "\telse ---@cast flag string\n\t\treturn { a = 2 }\n\tend\nend\n"
+	.. "local function f(flag)\n\tif flag then\n\t\treturn { a = 1 }\n"
+	.. "\telse ---@cast flag string\n\t\treturn { a = 2 }\n\tend\nend\n"
 	test.equal(#analyzer.analyze(source).diagnostics, 0)
 end)
 
@@ -3003,10 +3002,10 @@ test.it("reads an `and`/`or` chain as the table it picks", function()
 		lib = "---@param v any\n---@return string\nfunction type(v) end\n",
 	})
 	local source = "---@class Port\n---@field versions table<string, string>?\n"
-		.. "---@param existing Port?\n---@param fallback table<string, string>\n"
-		.. "local function f(existing, fallback)\n"
-		.. "\tlocal held = (existing and type(existing.versions) == \"table\") and existing.versions or fallback\n"
-		.. "\treturn held\nend\n"
+	.. "---@param existing Port?\n---@param fallback table<string, string>\n"
+	.. "local function f(existing, fallback)\n"
+	.. "\tlocal held = (existing and type(existing.versions) == \"table\") and existing.versions or fallback\n"
+	.. "\treturn held\nend\n"
 	local result = analyzer.analyze(source, prelude)
 	test.equal(#result.diagnostics, 0)
 	for _, variable in ipairs(result.variables) do
@@ -3014,6 +3013,30 @@ test.it("reads an `and`/`or` chain as the table it picks", function()
 			test.equal(types.display(analyzer.typeAt(result, variable, #source)), "table<string, string>")
 		end
 	end
+end)
+
+test.it("reads a union argument as an argument, not as a method receiver", function()
+	-- `function App:go(route)` takes a route, and a route is a union of table shapes. The
+	-- receiver is the App the method was read from, so the route is the first argument; reading
+	-- it as the receiver left the second parameter to check the first argument against.
+	local source = table.concat({
+		"---@alias Route { kind: \"home\" }|{ kind: \"album\", id: number }\n",
+		"---@class App\n",
+		"local App = {}\n",
+		"---@param route Route\n",
+		"function App:go(route) end\n",
+		"App:go({ kind = \"home\" })\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 0)
+end)
+
+test.it("keeps a primitive union as the receiver of a library method", function()
+	-- `string.find` is declared `string.find(s: string|number, …)`: the union is the subject the
+	-- method is called on, so `s:find(pattern, 1, true)` checks its three arguments in order.
+	local source = "---@param body string\nlocal function f(body) return body:find(\"x\", 1, true) end\nreturn f\n"
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 0)
 end)
 
 return true
