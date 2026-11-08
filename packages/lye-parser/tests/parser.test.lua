@@ -396,4 +396,69 @@ test.it("does not read that spelling in a file that runs", function()
 	test.equal(#Parser.new("local function test(n: number) end"):parse().diagnostics > 0, true)
 end)
 
+test.it("records the bodies of the statements that open a block", function()
+	local source = table.concat({
+		"if x then a() elseif y then b() else c() end\n",
+		"while x do d() end\n",
+		"repeat e() until f\n",
+		"for i = 1, 2 do g() end\n",
+		"for k, v in pairs(t) do h() end\n",
+		"do i() end\n",
+		"local function j() k() end\n",
+	}, "")
+	local parsed = Parser.new(source):parse()
+	---@type table<string, lye.parser.Node[]>
+	local byKind = parsed.byKind
+	test.equal(#byKind["if"][1].thenBody, 1)
+	test.equal(#byKind["if"][1].elseIfs, 1)
+	test.equal(#byKind["if"][1].elseBody, 1)
+	test.equal(#byKind["while"][1].bodyStatements, 1)
+	test.equal(#byKind["repeat"][1].bodyStatements, 1)
+	test.equal(#byKind["for"][1].controlNames, 1)
+	test.equal(byKind["for"][1].fromValue ~= nil, true)
+	test.equal(byKind["for"][2].controlNames[2], "v")
+	test.equal(#byKind["for"][2].iteratorValues, 1)
+	test.equal(byKind["do"][1].bodyStatements[1] ~= nil, true)
+	test.equal(byKind["function"][1].name, "j")
+	test.equal(#byKind["function"][1].bodyStatements, 1)
+end)
+
+test.it("keeps a table's members in the order they were written", function()
+	local parsed = Parser.new("local t = { z = 1, [k] = 2, 3; }"):parse()
+	local fields = parsed.byKind.table[1].fields
+	test.equal(#fields, 3)
+	test.equal(fields[1].kind, "name")
+	test.equal(fields[1].name, "z")
+	test.equal(fields[2].kind, "key")
+	test.equal(fields[3].kind, "element")
+	test.equal(fields[3].separator, ";")
+end)
+
+test.it("keeps an assignment's values and operator as written", function()
+	local parsed = Parser.new("a, b, c = 1, f()\nx += 2\n"):parse()
+	local first, second = parsed.byKind.assignment[1], parsed.byKind.assignment[2]
+	test.equal(#first.assignedValues, 2, "the last value is not repeated for the third name")
+	test.equal(first.op, "=")
+	test.equal(second.op, "+=")
+end)
+
+test.it("keeps a group and a call's own parentheses as trivia", function()
+	local parsed = Parser.new("local a = (f())\nlocal b = g(1)\nlocal c = g{1}\n"):parse()
+	local declarations = {}
+	for _, declaration in ipairs(parsed.declarations) do declarations[declaration.name] = declaration end
+	local group = parsed.nodes[declarations.a.valueIdx]
+	local withParens = parsed.nodes[declarations.b.valueIdx]
+	local withoutParens = parsed.nodes[declarations.c.valueIdx]
+	test.equal(group.isGrouped, true)
+	test.equal(withParens.hasParens, true)
+	test.equal(withoutParens.hasParens, false)
+end)
+
+test.it("does not let a comment after a statement into its span", function()
+	local source = "local x = 1\n-- next\nlocal y = 2\n"
+	local parsed = Parser.new(source):parse()
+	local first = parsed.byKind["local"][1]
+	test.equal(source:sub(first.start, first.stop), "local x = 1")
+end)
+
 return true

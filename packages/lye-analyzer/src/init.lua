@@ -3915,6 +3915,21 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 			adoptFieldFunction(declaration.name, declaration.valueIdx, value.params)
 		end
 	end
+	-- A `---@return` on a function written for a table field (`function messages.reset`) is a
+	-- promise too. It has no class field to adopt it from, so keep it here for the body check.
+	---@type table<integer, lye.doc.Type>
+	local annotationReturns = {}
+	for _, declaration in ipairs(parsed.declarations) do
+		local valueIdx = declaration.valueIdx
+		local value = valueIdx and parsed.nodes[valueIdx]
+		local signature = signatureOfDecl[declaration]
+		if valueIdx and value and value.kind == "function" and signature and signature.returns
+			and declaration.name and declaration.name:find("[%.:]")
+			and not fieldReturns[valueIdx] then
+			local fnType = signatureTypeOf(declaration, signature)
+			if fnType and fnType.returns then annotationReturns[valueIdx] = fnType.returns end
+		end
+	end
 	--- Give the parameters of a function body the types a written signature says they have.
 	---@param held lye.doc.Type?
 	---@param list lye.parser.Declaration[]?
@@ -4031,6 +4046,7 @@ local function analyze(source, prepared, elsewhere, modules, resume, cachedAnnot
 		parsed = parsed, self = self, inferCtx = inferCtx, signatures = signatures,
 		lookupIn = lookupIn, scopeAt = scopeAt,
 		returns = returns, resolve = resolve, typeOfText = typeOfText, fieldReturns = fieldReturns,
+		annotationReturns = annotationReturns,
 		loopOf = loopOf, signatureOfCall = signatureOfCall, returnsOf = returnsOf,
 		bodyOwner = bodyOwner, annotatedBodies = annotatedBodies, checkMetatable = checkMetatable, signatureOfDecl = signatureOfDecl,
 	}

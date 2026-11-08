@@ -25,6 +25,7 @@ local nodesOf = require("lye-parser").nodesOf
 ---@field resolve fun(text: string): lye.doc.Type?
 ---@field typeOfText fun(text: string): lye.doc.Type? a written type, parsed once per document
 ---@field fieldReturns table<lye.doc.Type, lye.doc.Type>
+---@field annotationReturns table<integer, lye.doc.Type> return promises written on field functions
 ---@field loopOf fun(variable: lye.analyzer.Variable): lye.parser.Node?
 ---@field signatureOfCall fun(node: lye.parser.Node): lye.analyzer.Signature?, lye.doc.Type?, boolean
 ---@field returnsOf table<integer, lye.parser.Node[]> the `return`s of each body, by node index
@@ -581,6 +582,7 @@ function typing.typeAll(ctx, only, reused)
 	end
 	local returns, resolve = ctx.returns, ctx.resolve
 	local fieldReturns, loopOf = ctx.fieldReturns, ctx.loopOf
+	local annotationReturns = ctx.annotationReturns
 	local signatureOfCall = ctx.signatureOfCall
 	local bodyOwner, annotatedBodies = ctx.bodyOwner, ctx.annotatedBodies
 	local signatureOfDecl = ctx.signatureOfDecl
@@ -955,7 +957,7 @@ function typing.typeAll(ctx, only, reused)
 			end
 			-- A field promised its callers a result, and the body written for it has to give that: compared
 			-- against what the function turned out to be, once the body is typed.
-			local promise = fieldReturns[index]
+			local promise = fieldReturns[index] or annotationReturns[index]
 			if promise and inferred then
 				local message = types.strictMismatch(promise, inferred, "the result")
 				if message then
@@ -1250,7 +1252,8 @@ function typing.contextualize(ctx, only, reused)
 		if not name then return nil end
 		local scope = ctx.scopeAt(self, node.start)
 		local variable = ctx.lookupIn(scope, name, node.start)
-		local valueIdx = variable and variable.declaration.valueIdx
+		local declaration = variable and variable.declaration
+		local valueIdx = declaration and declaration.valueIdx
 		local value = valueIdx and parsed.nodes[valueIdx]
 		if value and value.kind == "function" then return value end
 		return nil

@@ -3039,4 +3039,32 @@ test.it("keeps a primitive union as the receiver of a library method", function(
 	test.equal(#result.diagnostics, 0)
 end)
 
+test.it("checks a return annotation written on a function field", function()
+	-- `function messages.reset()` is a field declaration, not a local. Its `---@return` is the
+	-- only signature the body has, so the body still has to give what it promises.
+	local source = table.concat({
+		"---@class ResetMessage\n",
+		"---@field type \"reset\"\n",
+		"local messages = {}\n",
+		"---@return ResetMessage\n",
+		"function messages.reset() return { type = \"refset\" } end\n",
+		"return messages\n",
+	}, "")
+	local result = analyzer.analyze(source)
+	test.equal(#result.diagnostics, 1)
+	test.includes(result.diagnostics[1].message, "the result is declared as ResetMessage")
+end)
+
+test.it("accepts a function field that gives its annotated result", function()
+	local source = table.concat({
+		"---@class ResetMessage\n",
+		"---@field type \"reset\"\n",
+		"local messages = {}\n",
+		"---@return ResetMessage\n",
+		"function messages.reset() return { type = \"reset\" } end\n",
+		"return messages\n",
+	}, "")
+	test.equal(#analyzer.analyze(source).diagnostics, 0)
+end)
+
 return true

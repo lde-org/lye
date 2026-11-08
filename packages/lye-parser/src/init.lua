@@ -52,6 +52,42 @@ local newTable = require("table.new")
 ---@field inlineReturns string? the inline return type text
 ---@field inlineReturnsStart integer? byte inline returns start at
 ---@field inlineReturnsStop integer? byte inline returns stop at
+---@field isStatement boolean? whether the node is a statement of its block
+---@field condition integer? the condition of an `if`, `while` or `repeat`
+---@field thenBody integer[]? the statements of an `if`'s first clause
+---@field thenStart integer? byte the first clause's body starts at
+---@field thenStop integer? byte the first clause's body stops at
+---@field elseIfs { condition: integer, body: integer[], bodyStart: integer, bodyStop: integer, start: integer }[]? the `elseif` clauses of an `if`
+---@field elseBody integer[]? the statements of an `if`'s `else`
+---@field elseStart integer? byte the `else` body starts at
+---@field elseStop integer? byte the `else` body stops at
+---@field bodyStatements integer[]? the statements of a block body
+---@field bodyStart integer? byte the body's first token starts at, comments included
+---@field bodyStop integer? byte the body's last token stops at, comments included
+---@field controlNames string[]? the names a `for` declares
+---@field controlDeclarations lye.parser.Declaration[]? the declarations a `for` makes
+---@field fromValue integer? a numeric `for`'s first value
+---@field toValue integer? a numeric `for`'s last value
+---@field stepValue integer? a numeric `for`'s step
+---@field iteratorValues integer[]? the expressions a generic `for` iterates
+---@field declarations lye.parser.Declaration[]? the names a `local` or `const` declares
+---@field fields lye.parser.TableField[]? a table literal's members, in source order
+---@field isGrouped boolean? the expression was written inside parentheses
+---@field hasParens boolean? a call wrote its arguments inside parentheses
+---@field isLocal boolean? a function statement was written `local function`
+---@field isArrow boolean? a function expression was written with `->`
+---@field isBareArrow boolean? a single-parameter arrow was written `x ->`
+---@field keyword string? the word a `break` node stands for: `break` or `continue`
+---@field assignedValues integer[]? the values an assignment writes, as written
+
+---@class lye.parser.TableField
+---@field kind "name"|"key"|"element"
+---@field name string? the field's name, for a name field
+---@field nameStart integer? byte the name starts at
+---@field nameStop integer? byte the name stops at
+---@field key integer? the key expression, for a computed field
+---@field value integer the field's value, or the element itself
+---@field separator string? the `,` or `;` written after it
 
 ---@class lye.parser.Declaration
 ---@field name string
@@ -70,6 +106,7 @@ local newTable = require("table.new")
 ---@field inlineType string? the type written where the name is
 ---@field inlineTypeStart integer? byte the inline type starts at
 ---@field inlineTypeStop integer? byte the inline type stops at
+---@field isImplicit boolean? a method's `self`, which no source writes
 
 --- A scope is guarded by a condition when the block only runs under one, as `if`/`while`
 --- bodies do.
@@ -96,7 +133,8 @@ local newTable = require("table.new")
 ---@field scopes lye.parser.Scope[]
 ---@field tableFields table<integer, table<string, string>> field kinds, keyed by table node
 ---@field byKind table<string, lye.parser.Node[]> every node, listed under its kind, in emission order
----@field topLevel integer[] the statements of the chunk, by node index
+---@field statements integer[] every statement, by node index, in source order
+---@field topLevel integer[] the nodes of the chunk that belong to no other node, by node index
 ---@field tokens lye.lexer.Tokens
 ---@field nodes lye.parser.Node[]
 ---@field declarations lye.parser.Declaration[]
@@ -156,7 +194,7 @@ local newTable = require("table.new")
 ---@field rootIdx integer? the chunk node the parse produced
 ---@field skipInlineType fun(self: lye.parser.Parser): string?, integer?, integer?
 ---@field parseIf fun(self: lye.parser.Parser): void
----@field parseDoBlock fun(self: lye.parser.Parser): void
+---@field parseDoBlock fun(self: lye.parser.Parser): integer[], integer, integer
 ---@field parseWhile fun(self: lye.parser.Parser): void
 ---@field parseRepeat fun(self: lye.parser.Parser): void
 ---@field parseFor fun(self: lye.parser.Parser): void
@@ -166,8 +204,8 @@ local newTable = require("table.new")
 ---@field parseConst fun(self: lye.parser.Parser, start: integer)
 ---@field parseReturn fun(self: lye.parser.Parser): void
 ---@field parseExpressionStatement fun(self: lye.parser.Parser): void
----@field parseStatement fun(self: lye.parser.Parser): boolean?
----@field parseBlock fun(self: lye.parser.Parser): void
+---@field parseStatement fun(self: lye.parser.Parser): boolean?, integer?
+---@field parseBlock fun(self: lye.parser.Parser): integer[]
 ---@field parseExpression fun(self: lye.parser.Parser, allowTernaryColon?: boolean): integer
 ---@field declare fun(self: lye.parser.Parser, name: string, qualifier: lye.parser.Qualifier, token: lye.lexer.ffi.token, isFunction: boolean?, position: integer?): lye.parser.Declaration
 local Parser = {}
@@ -504,6 +542,18 @@ function Parser:peek()
 	return self.arena[self.index]
 end
 
+--- The byte the last token of a construct stops at. A comment is not part of the construct:
+--- stepping over one leaves `index` past it, and a span that reached it would swallow the
+--- comment written before the next statement.
+---@param self lye.parser.Parser
+---@return integer
+function Parser:lastStop()
+	local index = self.index - 1
+	while index > 0 and self.arena[index].kind == lexer.KIND.comment do index -= 1 end
+	if index <= 0 then return 0 end
+	return self.arena[index].stop
+end
+
 --- A token's text lives beside the arena, keyed by the token's own index, so a reader holding
 --- a token needs nothing else.
 ---@param token lye.lexer.ffi.token
@@ -808,6 +858,7 @@ function Parser:pushScope(start, conditionIdx, isLoop)
 	self.scopeStarts[#self.scopeStarts + 1] = {
 		start = start, conditionIdx = conditionIdx, record = record,
 	}
+	return record
 end
 
 ---@param self lye.parser.Parser
@@ -874,6 +925,17 @@ function Parser:parse()
 	self:adopt(chunkIdx, topLevel)
 	self.rootIdx = chunkIdx
 
+	-- Every statement, in source order. The chunk's children are not enough: they also hold the
+	-- expressions of a statement that were never adopted, and a resumed parse keeps nodes this
+	-- one never saw parsed. The marker `parseBlock` leaves on each statement is what survives both.
+	local statements = {}
+	for _, node in ipairs(self.nodes) do
+		if node.isStatement then statements[#statements + 1] = node.index end
+	end
+	table.sort(statements, function(left, right)
+		return self.nodes[left].start < self.nodes[right].start
+	end)
+
 	-- The text the tree was read from, so a reader that wants what a node *spells* — the exact
 	-- literal a condition compared against, say — does not have to be handed it separately.
 	return {
@@ -885,6 +947,7 @@ function Parser:parse()
 		tableFieldAnchors = self.tableFieldAnchors,
 		tableIndexes = self.tableIndexes,
 		byKind = self.byKind,
+		statements = statements,
 		topLevel = topLevel,
 		tokens = self.tokens,
 		nodes = self.nodes,

@@ -99,12 +99,14 @@ local function parsePrefix(self, allowTernaryColon)
 			link = { field = method, isMethod = true, args = args, isCall = true }
 		elseif text == "(" or text == "{" or nextToken.kind == KIND.string then
 			local before = self.index
-			local _, parsedArgs = self:parseArguments()
+			local _, parsedArgs, hasParens = self:parseArguments()
 			-- A call names the name it is written on only when nothing has been wrapped yet:
 			-- `load("x").lazy(f)` calls `lazy`, and carrying `load` onto that node had every
 			-- argument of the second call checked against the first call's parameters.
 			local called = expressionIdx == wrapper and callee or nil
-			if self.index > before then link = { callee = called, args = parsedArgs, isCall = true } end
+			if self.index > before then
+				link = { callee = called, args = parsedArgs, isCall = true, hasParens = hasParens }
+			end
 		end
 
 		if not link then break end
@@ -113,19 +115,26 @@ local function parsePrefix(self, allowTernaryColon)
 		-- The guard is what says a nil target is allowed here: `a?.b` and `a?.:m()` are reads a
 		-- missing value passes through, and the type they give is therefore optional as well.
 		link.isSafe = isSafe
-		expressionIdx = self:emit(link.kind, startOffset, self.arena[self.index - 1].stop, link,
+		expressionIdx = self:emit(link.kind, startOffset, self:lastStop(), link,
 			expressionIdx)
 		-- Arguments are a list of any length, so they are adopted by loop rather than passed.
 		if link.args then self:adopt(expressionIdx, link.args) end
 		self.lastKind = link.kind
 	end
 
-	if expressionIdx == wrapper and groupIdx then return groupIdx end
+	if expressionIdx == wrapper and groupIdx then
+		-- The parentheses are gone from the tree, but not from the program: `local a, b = (f())`
+		-- gives `a` one value, while `local a, b = f()` gives it all of them. The marker is what
+		-- lets a formatter put the pair back.
+		self.nodes[groupIdx].isGrouped = true
+		return groupIdx
+	end
 	return expressionIdx
 end
 
 ---@return integer
 ---@return integer[] arguments arena indices, like every other child in the tree
+---@return boolean hasParens the call wrote its arguments inside `(` `)`
 ---@param self lye.parser.Parser
 local function parseArguments(self)
 	local token = self:peek()
@@ -143,20 +152,20 @@ local function parseArguments(self)
 			until not self:accept(",")
 		end
 		self:expect(")")
-		return start, args
+		return start, args, true
 	end
 	-- The argument is the index of the node, like every other one: a reader takes an argument out
 	-- of the arena by that index, and a node table put here instead reads as no argument at all.
 	if self:text(token) == "{" then
 		local argStart = self:parseTable()
-		return argStart, { self.nodes[#self.nodes].index }
+		return argStart, { self.nodes[#self.nodes].index }, false
 	end
 
 	-- A string literal used directly as an argument: `print[[hello]]`.
 	local start = token.start
 	self:advance()
 	self:emit("string", start, token.stop, { value = stringValue(self:text(token)) })
-	return start, { self.nodes[#self.nodes].index }
+	return start, { self.nodes[#self.nodes].index }, false
 end
 
 ---@return integer
@@ -176,10 +185,14 @@ local function parseTable(self)
 	local keyIdxs
 	---@type table<string, integer>?
 	local fieldAnchors
+	---@type lye.parser.TableField[]
+	local fields = {}
 	self:expect("{")
 	while not self:check("}") and not self:isEof(self:peek()) do
 		self:skipComments()
 		if self:check("}") then break end
+		---@type lye.parser.TableField
+		local field
 		if self:check("[") then
 			self:advance()
 			local keyIdx = self:parseExpression()
@@ -188,6 +201,7 @@ local function parseTable(self)
 			self:expect("]")
 			self:expect("=")
 			local valueIdx = self:parseExpression()
+			field = { kind = "key", key = keyIdx, value = valueIdx }
 			-- A key written as a string literal is a field like any other: `["end"] = v` holds what
 			-- `{ end = v }` holds, and leaving it out made a shape miss a member an annotation asked
 			-- for — `{ end = 2 }` read as an object with no `end` at all.
@@ -199,25 +213,41 @@ local function parseTable(self)
 			end
 		elseif self:isName(self:peek()) and self:text(self:peekAt(2)) == "=" then
 			local keyIdx = self.index
+			local keyToken = self:peek()
 			local key = self:text(self:advance())
 			self:advance()
 			fieldAnchors = fieldAnchors or {}
 			fieldAnchors[key] = keyIdx
 			local from = self.index
 			fieldValues, fieldKinds = fieldValues or {}, fieldKinds or {}
-			fieldValues[key] = self:parseExpression()
+			local valueIdx = self:parseExpression()
+			fieldValues[key] = valueIdx
 			fieldKinds[key] = self.lastKind or "unknown"
 			if self.index == from then self:advance() end
+			field = {
+				kind = "name", name = key, nameStart = keyToken.start,
+				nameStop = keyToken.stop, value = valueIdx,
+			}
 		else
 			-- A positional element. Its node is kept, so the literal's element type comes from
 			-- what the elements actually are rather than from a kind name.
 			elementIdxs = elementIdxs or {}
-			elementIdxs[#elementIdxs + 1] = self:parseExpression()
+			local valueIdx = self:parseExpression()
+			elementIdxs[#elementIdxs + 1] = valueIdx
+			field = { kind = "element", value = valueIdx }
 		end
-		if not self:accept(",") and not self:accept(";") then break end
+		fields[#fields + 1] = field
+		---@type string?
+		local separator
+		if self:accept(",") then separator = ","
+		elseif self:accept(";") then separator = ";" end
+		if not separator then break end
+		field.separator = separator
+		self:skipComments()
 	end
 	self:expect("}")
-	local index = self:emit("table", start, self.arena[self.index - 1].stop)
+	local stop = self:lastStop()
+	local index = self:emit("table", start, stop, { fields = fields })
 	-- The members belong to the literal, the way an operator's operands belong to it: without this
 	-- they stayed unparented and were taken for statements of the chunk, which is what a guard's
 	-- `fallsThrough` reads when it asks whether the clause ends in a `return` — `if not x then
@@ -355,7 +385,11 @@ local function parseFunctionBody(self, start, isMethod)
 	self:expect("(")
 	self:pushScope(paramsStart)
 	local params = {}
-	if isMethod then params[#params + 1] = self:declare("self", "param", self.arena[self.index]) end
+	if isMethod then
+		local implicit = self:declare("self", "param", self.arena[self.index])
+		implicit.isImplicit = true
+		params[#params + 1] = implicit
+	end
 
 	-- A comment may sit between any two of these: `f(a --[[string]], b)` is written that way. The
 	-- lexer emits comments as tokens, so each step past one is a step past a token.
@@ -415,12 +449,15 @@ local function parseFunctionBody(self, start, isMethod)
 		end
 	end
 
-	self:parseBlock()
+	local bodyStart = self:peek().start
+	local bodyStatements = self:parseBlock()
 	self:popScope(self:peek().start - 1)
+	local bodyStop = self:peek().start - 1
 	self:expect("end")
-	local index = self:emit("function", start, self.arena[self.index - 1].stop,
+	local index = self:emit("function", start, self:lastStop(),
 		{
 			isFunction = true, isVariadic = isVariadic, params = params,
+			bodyStatements = bodyStatements, bodyStart = bodyStart, bodyStop = bodyStop,
 			inlineReturns = inlineReturns, inlineReturnsStart = inlineReturnsStart,
 			inlineReturnsStop = inlineReturnsStop,
 			inlineVariadic = inlineVariadic, inlineVariadicStart = inlineVariadicStart,
@@ -488,9 +525,9 @@ local function parsePrimary(self, allowTernaryColon)
 		self:expect("->")
 		-- The expression is the body, and what an arrow returns.
 		local bodyIdx = self:parseExpression()
-		self:popScope(self.arena[self.index - 1].stop)
-		local index = self:emit("function", start, self.arena[self.index - 1].stop,
-			{ isFunction = true, body = bodyIdx, params = params })
+		self:popScope(self:lastStop())
+		local index = self:emit("function", start, self:lastStop(),
+			{ isFunction = true, isArrow = true, isBareArrow = false, body = bodyIdx, params = params })
 		-- The expression is the function's result, not a statement of the block that holds the
 		-- function: a call there is not a discarded value, and a reader of the body's parent has
 		-- to find the function it belongs to.
@@ -541,6 +578,7 @@ local function parseUnary(self, allowTernaryColon)
 	if symbol then
 		local startOffset = token.start
 		self:advance()
+		self:skipComments()
 		local operandIdx = parseUnary(self, allowTernaryColon)
 		return self:emit("unary", startOffset, self.nodes[operandIdx].stop,
 			{ op = symbol, operand = operandIdx }, operandIdx)
@@ -568,7 +606,8 @@ local function parseUnary(self, allowTernaryColon)
 		local bodyIdx = self:parseBinary(1, allowTernaryColon)
 		if written then self:popScope(self.nodes[bodyIdx].stop) end
 		idx = self:emit("function", startOffset, self.nodes[bodyIdx].stop,
-			{ isFunction = true, body = bodyIdx, params = params }, { bodyIdx })
+			{ isFunction = true, isArrow = true, isBareArrow = true, body = bodyIdx, params = params },
+			{ bodyIdx })
 		-- Set last, since parsing the body overwrites it.
 		self.lastKind = "function"
 	end
@@ -602,7 +641,7 @@ local function parseBinary(self, minPrecedence, allowTernaryColon)
 			local thenIdx = self:parseBinary(1, false)
 			self:expect(":")
 			local elseIdx = self:parseBinary(1, allowTernaryColon)
-			leftIdx = self:emit("ternary", startOffset, self.arena[self.index - 1].stop,
+			leftIdx = self:emit("ternary", startOffset, self:lastStop(),
 				{ left = leftIdx, right = thenIdx, alternative = elseIdx },
 				leftIdx, thenIdx, elseIdx)
 			self.lastKind = "ternary"

@@ -60,16 +60,26 @@ test.it("indents a loop body once, not once per scope", function()
 	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
 end)
 
-test.it("indents a table's fields inside its braces", function()
+test.it("keeps a table on one line while it fits", function()
 	local source = "local t = {\na = 1,\nb = {\nc = 2,\n},\n}\n"
-	local expected = "local t = {\n  a = 1,\n  b = {\n    c = 2,\n  },\n}\n"
+	local expected = "local t = { a = 1, b = { c = 2 } }\n"
 	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
 end)
 
-test.it("keeps one space before a closing brace that shares its line", function()
+test.it("writes an inline table with one space inside its braces", function()
 	local source = "local t = { a = 1 }\nlocal u = {a=1}\nlocal v = {}\nreturn t,u,v\n"
-	local expected = "local t = { a = 1 }\nlocal u = {a = 1}\nlocal v = {}\nreturn t, u, v\n"
+	local expected = "local t = { a = 1 }\nlocal u = { a = 1 }\nlocal v = {}\nreturn t, u, v\n"
 	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("breaks a table that no longer fits", function()
+	local source = "local t = { a = 1, b = 2, c = 3 }\n"
+	local expected = "local t = {\n  a = 1,\n  b = 2,\n  c = 3\n}\n"
+	test.equal(format(source, {
+		indent_style = "space",
+		indent_size = "2",
+		max_line_length = 20,
+	}), expected)
 end)
 
 test.it("keeps a literal and a long string exactly as written", function()
@@ -108,6 +118,112 @@ test.it("reads and writes stdin with -", function()
 	local output = run(string.format(
 		"printf 'local x=1+2\\n' | lde run %q -- format - 2>&1", MAIN))
 	test.equal(output, "local x = 1 + 2\n")
+end)
+
+test.it("keeps comments and collapses a run of blank lines", function()
+	local source = "local x=1 -- trailing\n-- leading\n\n\nlocal y=2\n"
+	local expected = "local x = 1 -- trailing\n-- leading\n\nlocal y = 2\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("keeps a group and a unary operator where they change the value", function()
+	-- The parser erases a group that nothing wraps, but `(f())` gives one value and `f()` gives
+	-- all of them. `-2^2` and `(-2)^2` are the two answers of the same expression.
+	local source = "local a,b=(f())\nlocal y=-2^2\nlocal z=(-2)^2\nreturn a,b,y,z\n"
+	local expected = "local a, b = (f())\nlocal y = -2 ^ 2\nlocal z = (-2) ^ 2\nreturn a, b, y, z\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("writes the values of a multiple assignment as they were given", function()
+	-- Filling the third name from the second value is a type rule; writing it out would run the
+	-- call twice.
+	local source = "a,b,c=1,f()\nok,err=pcall(f)\n"
+	local expected = "a, b, c = 1, f()\nok, err = pcall(f)\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("keeps a compound assignment's operator", function()
+	local source = "x+=1\nt..=\"a\"\n"
+	local expected = "x += 1\nt ..= \"a\"\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("writes a table's fields in the order they were read", function()
+	local source = "local t = { z=1, [k]=2, 3 }\n"
+	local expected = "local t = { z = 1, [k] = 2, 3 }\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("honours the table separator a project asks for", function()
+	local source = "local t = {\na = 1,\nb = 2\n}\n"
+	local expected = "local t = {\n\ta = 1;\n\tb = 2;\n}\n"
+	test.equal(format(source, {
+		indent_style = "tab",
+		table_separator_style = "semicolon",
+		trailing_table_separator = "always",
+		max_line_length = 20,
+	}), expected)
+end)
+
+test.it("lays out a block's statements from the tree", function()
+	local source = "do local x=1 end\n::top::\ngoto top\nfor i=1,3 do continue end\n"
+	local expected = "do local x = 1 end\n::top::\ngoto top\nfor i = 1, 3 do continue end\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("keeps a method's implicit self out of its parameter list", function()
+	local source = "local function f(a,b,...) return a end\nfunction M:m(x) return x end\n"
+	local expected = "local function f(a, b, ...) return a end\nfunction M:m(x) return x end\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("copies a comment inside an expression and formats around it", function()
+	local source = "local x=1\nlocal a=f(1) --[[why]]+2\nlocal y=2\n"
+	local expected = "local x = 1\nlocal a = f(1) --[[why]] + 2\nlocal y = 2\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("continues after a line comment inside an expression", function()
+	local source = "local a=b -- why\n+ c\n"
+	local expected = "local a = b -- why\n  + c\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("keeps a call chain on one line while it fits", function()
+	local source = "div():foo():bar():baz():qux():bar()\n"
+	local expected = "div():foo():bar():baz():qux():bar()\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("packs a long call chain onto continuation lines", function()
+	local source = "div():foo():bar():baz():qux():bar()\n"
+	local expected = "div()\n  :foo():bar():baz()\n  :qux():bar()\n"
+	test.equal(format(source, {
+		indent_style = "space",
+		indent_size = "2",
+		max_line_length = 25,
+	}), expected)
+end)
+
+test.it("breaks a call with many arguments when it does not fit", function()
+	local source = "local x = foo(a, b, c)\n"
+	local expected = "local x = foo(\n  a,\n  b,\n  c\n)\n"
+	test.equal(format(source, {
+		indent_style = "space",
+		indent_size = "2",
+		max_line_length = 10,
+	}), expected)
+end)
+
+test.it("keeps a table's comments between its members", function()
+	local source = "local t = { -- head\na = 1, -- one\n-- note\nb = 2\n}\n"
+	local expected = "local t = {\n  -- head\n  a = 1, -- one\n  -- note\n  b = 2\n}\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), expected)
+end)
+
+test.it("leaves a file the parser could not read unchanged", function()
+	local source = "local = 2\n"
+	test.equal(format(source, { indent_style = "space", indent_size = "2" }), source)
 end)
 
 return true

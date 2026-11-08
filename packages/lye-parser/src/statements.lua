@@ -9,70 +9,101 @@ local KIND = Parser.KIND --[[@as table<string, integer>]]
 local statements = {}
 
 ---@param self lye.parser.Parser
+---@return integer
 function statements.parseIf(self)
 	local start = self:peek().start
 	self:expect("if")
 	local conditionIdx = self:parseExpression()
 	self:expect("then")
-	self:pushScope(self:peek().start, conditionIdx)
-	self:parseBlock()
+	local thenScope = self:pushScope(self:peek().start, conditionIdx)
+	local thenBody = self:parseBlock()
 	self:popScope(self:peek().start - 1, "then")
 
+	local elseIfs = {}
 	while self:check("elseif") do
+		local clauseStart = self:peek().start
 		self:advance()
 		local clauseIdx = self:parseExpression()
 		self:expect("then")
-		self:pushScope(self:peek().start, clauseIdx)
-		self:parseBlock()
+		local clauseScope = self:pushScope(self:peek().start, clauseIdx)
+		local body = self:parseBlock()
 		self:popScope(self:peek().start - 1, "elseif")
+		elseIfs[#elseIfs + 1] = {
+			condition = clauseIdx, body = body, start = clauseStart,
+			bodyStart = clauseScope.start, bodyStop = clauseScope.stop,
+		}
 	end
 
+	local elseBody, elseStart, elseStop
 	if self:check("else") then
 		self:advance()
-		self:pushScope(self:peek().start)
-		self:parseBlock()
+		local elseScope = self:pushScope(self:peek().start)
+		elseBody = self:parseBlock()
 		self:popScope(self:peek().start - 1, "else")
+		elseStart, elseStop = elseScope.start, elseScope.stop
 	end
 	self:expect("end")
-	self:emit("if", start, self.arena[self.index - 1].stop)
+	local index = self:emit("if", start, self:lastStop(), {
+		condition = conditionIdx, thenBody = thenBody,
+		thenStart = thenScope.start, thenStop = thenScope.stop,
+		elseIfs = elseIfs, elseBody = elseBody, elseStart = elseStart, elseStop = elseStop,
+	})
+	return index
 end
 
 ---@param self lye.parser.Parser
 ---@param start integer?
 ---@param conditionIdx integer?
+---@return integer[] body
+---@return integer bodyStart
+---@return integer bodyStop
 function statements.parseDoBlock(self, start, conditionIdx)
 	start = start or self:peek().start
 	self:expect("do")
+	local bodyStart = self:peek().start
 	self:pushScope(start, conditionIdx)
-	self:parseBlock()
+	local body = self:parseBlock()
 	self:popScope(self:peek().start - 1)
+	local bodyStop = self:peek().start - 1
 	self:expect("end")
+	return body, bodyStart, bodyStop
 end
 
 ---@param self lye.parser.Parser
+---@return integer
 function statements.parseWhile(self)
 	local start = self:peek().start
 	self:expect("while")
 	local conditionIdx = self:parseExpression()
-	self:parseDoBlock(nil, conditionIdx)
-	self:emit("while", start, self.arena[self.index - 1].stop)
+	local body, bodyStart, bodyStop = self:parseDoBlock(nil, conditionIdx)
+	local index = self:emit("while", start, self:lastStop(), {
+		condition = conditionIdx, bodyStatements = body, bodyStart = bodyStart, bodyStop = bodyStop,
+	})
+	return index
 end
 
 ---@param self lye.parser.Parser
+---@return integer
 function statements.parseRepeat(self)
 	local start = self:peek().start
 	self:expect("repeat")
-	self:pushScope(self:peek().start)
-	self:parseBlock()
+	local bodyStart = self:peek().start
+	local scope = self:pushScope(self:peek().start)
+	local body = self:parseBlock()
 	self:popScope(self:peek().start - 1)
+	local bodyStop = self:peek().start - 1
 	-- The condition is parsed after the body, so the scope it guards takes it afterwards.
-	local scope = self.lastScope
 	self:expect("until")
-	scope.conditionIdx = self:parseExpression()
-	self:emit("repeat", start, self.arena[self.index - 1].stop)
+	local conditionIdx = self:parseExpression()
+	scope.conditionIdx = conditionIdx
+	local index = self:emit("repeat", start, self:lastStop(), {
+		condition = conditionIdx, bodyStatements = body, bodyStart = bodyStart, bodyStop = bodyStop,
+	})
+	return index
 end
 
 ---@param self lye.parser.Parser
+---@return integer
 function statements.parseFor(self)
 	local start = self:peek().start
 	self:expect("for")
@@ -82,27 +113,35 @@ function statements.parseFor(self)
 
 	-- The control variables belong to the loop rather than to the body, so they carry their own
 	-- kind: a numeric `for` counts, and a generic one takes what its expressions yield.
+	local names, declarations = {}, {}
+	---@param declared string
+	---@param written lye.lexer.ffi.token
+	local function declareControl(declared, written)
+		names[#names + 1] = declared
+		declarations[#declarations + 1] = self:declare(declared, "loop", written)
+	end
 	local name, token = self:parseName()
 	if name then
 		---@cast name string
 		---@cast token lye.lexer.ffi.token
-		self:declare(name, "loop", token)
+		declareControl(name, token)
 	end
 
 	local values, isNumeric = {}, false
+	local fromValue, toValue, stepValue
 	if self:accept("=") then
 		isNumeric = true
-		self:parseExpression()
+		fromValue = self:parseExpression()
 		self:expect(",")
-		self:parseExpression()
-		if self:accept(",") then self:parseExpression() end
+		toValue = self:parseExpression()
+		if self:accept(",") then stepValue = self:parseExpression() end
 	else
 		while self:accept(",") do
 			local extra, extraToken = self:parseName()
 			if extra then
 				---@cast extra string
 				---@cast extraToken lye.lexer.ffi.token
-				self:declare(extra, "loop", extraToken)
+				declareControl(extra, extraToken)
 			end
 		end
 		self:expect("in")
@@ -114,13 +153,19 @@ function statements.parseFor(self)
 	-- Pass the scope's own start: `parseDoBlock` would otherwise default to the current
 	-- token, which by then is `do` at best and `end` if the body was empty.
 	local doStart = self:peek().start
-	self:parseDoBlock(doStart)
-	self:popScope(self.arena[self.index - 1].stop)
-	local forIdx = self:emit("for", start, self.arena[self.index - 1].stop,
-		{ isNumeric = isNumeric })
+	local body, bodyStart, bodyStop = self:parseDoBlock(doStart)
+	self:popScope(self:lastStop())
+	local forIdx = self:emit("for", start, self:lastStop(), {
+		isNumeric = isNumeric,
+		controlNames = names, controlDeclarations = declarations,
+		fromValue = fromValue, toValue = toValue, stepValue = stepValue,
+		iteratorValues = #values > 0 and values or nil,
+		bodyStatements = body, bodyStart = bodyStart, bodyStop = bodyStop,
+	})
 	-- The expressions a generic `for` iterates over, so the loop's names can be typed from what
 	-- the iterator yields.
 	if #values > 0 then self:adopt(forIdx, values) end
+	return forIdx
 end
 
 ---@return string? name
@@ -155,6 +200,7 @@ function statements.parseFunctionName(self)
 end
 
 ---@param self lye.parser.Parser
+---@return integer?
 function statements.parseFunctionStatement(self)
 	local start, startIdx = self:peek().start, self.index
 	self:expect("function")
@@ -172,10 +218,16 @@ function statements.parseFunctionStatement(self)
 	local bodyIdx = self:parseFunctionBody(start, isMethod)
 	if generics and bodyIdx then self.nodes[bodyIdx].inlineGenerics = generics end
 	if declarationIdx then self:setInitializer(declarationIdx, "function", bodyIdx) end
+	if bodyIdx then
+		local body = self.nodes[bodyIdx]
+		body.name, body.isMethod, body.isLocal = name, isMethod, false
+	end
+	return bodyIdx
 end
 
 ---@param self lye.parser.Parser
 ---@param start integer
+---@return integer?
 function statements.parseLocal(self, start)
 	local startIdx = self.index
 	self:expect("local")
@@ -194,11 +246,16 @@ function statements.parseLocal(self, start)
 		local bodyIdx = self:parseFunctionBody(start, false)
 		if generics and bodyIdx then self.nodes[bodyIdx].inlineGenerics = generics end
 		if declarationIdx then self:setInitializer(declarationIdx, "function", bodyIdx) end
-		return
+		if bodyIdx then
+			local body = self.nodes[bodyIdx]
+			body.name, body.isMethod, body.isLocal = name, false, true
+		end
+		return bodyIdx
 	end
 
 	local first, count = nil, 0
 	local lastToken
+	local declared = {}
 	repeat
 		local name, token = self:parseName()
 		lastToken = token
@@ -206,6 +263,7 @@ function statements.parseLocal(self, start)
 			---@cast name string
 			---@cast token lye.lexer.ffi.token
 			local declaration = self:declare(name, "local", token, nil, count + 1)
+			declared[#declared + 1] = declaration
 			-- `local held: number = 1` writes the type where the name is.
 			if self.definition then
 				self:skipComments()
@@ -260,25 +318,30 @@ function statements.parseLocal(self, start)
 			if self.declarations[index] then self.declarations[index].anchorIdx = startIdx end
 		end
 	end
-	local localIdx = self:emit("local", start, self.arena[self.index - 1].stop, nil)
+	local localIdx = self:emit("local", start, self:lastStop(),
+		{ declarations = declared })
 	self:adopt(localIdx, valueIdxs)
+	return localIdx
 end
 
 ---@param self lye.parser.Parser
 ---@param start integer
+---@return integer
 function statements.parseConst(self, start)
 	local startIdx = self.index
 	self:expect("const")
 	local first, count = nil, 0
+	local declared = {}
 	repeat
 		local name, token = self:parseName()
 		if name then
 			---@cast name string
 			---@cast token lye.lexer.ffi.token
-			self:declare(name, "local", token, nil, count + 1)
+			local declaration = self:declare(name, "local", token, nil, count + 1)
+			declared[#declared + 1] = declaration
 			-- The name is held, so nothing may write it again and its type is what it was given.
-			self.declarations[self.lastDeclaration].isConst = true
-			self.declarations[self.lastDeclaration].anchorIdx = startIdx
+			declaration.isConst = true
+			declaration.anchorIdx = startIdx
 			first = first or self.lastDeclaration
 			count += 1
 		else
@@ -300,11 +363,14 @@ function statements.parseConst(self, start)
 			if not self:accept(",") then break end
 		end
 	end
-	local constIdx = self:emit("const", start, self.arena[self.index - 1].stop)
+	local constIdx = self:emit("const", start, self:lastStop(),
+		{ declarations = declared })
 	self:adopt(constIdx, valueIdxs)
+	return constIdx
 end
 
 ---@param self lye.parser.Parser
+---@return integer
 function statements.parseReturn(self)
 	local start = self:peek().start
 	self:expect("return")
@@ -318,13 +384,15 @@ function statements.parseReturn(self)
 		until not self:accept(",")
 	end
 	self:accept(";")
-	local returnIdx = self:emit("return", start, self.arena[self.index - 1].stop)
+	local returnIdx = self:emit("return", start, self:lastStop())
 	self:adopt(returnIdx, valueIdxs)
+	return returnIdx
 end
 
 --- An assignment or a call statement. The engine parses the prefix once and then decides
 --- from the next token, which is why this reads the same way.
 ---@param self lye.parser.Parser
+---@return integer
 function statements.parseExpressionStatement(self)
 	local anchorIdx = self.index
 	-- `parsePrefix` reports a node index, so the statement's span comes from that node.
@@ -351,16 +419,12 @@ function statements.parseExpressionStatement(self)
 		-- The last value is the one the tree links. One name and one value is what almost every
 		-- assignment is, and it carries nothing more than that: the lists below are for the rest.
 		local lastTarget, lastValue = target, valueIdxs and valueIdxs[#valueIdxs] or firstValue
-		if targets == nil and valueIdxs == nil then
-			self:emit("assignment", start, self.arena[self.index - 1].stop,
-				{ target = lastTarget, valueIdx = lastValue, anchorIdx = anchorIdx }, lastTarget, lastValue)
-			return
-		end
-		-- A name past the last expression takes its value at that position in it, the way a name
-		-- in a declaration does: `ok, err = pcall(f)` gives `err` the second value of the call.
-		-- Every other name takes the expression written for it.
 		local allTargets = targets or { firstTarget }
 		local allValues = valueIdxs or { firstValue }
+		-- A name past the last expression takes its value at that position in it, the way a name
+		-- in a declaration does: `ok, err = pcall(f)` gives `err` the second value of the call.
+		-- Every other name takes the expression written for it. The list written in the source is
+		-- kept separately, so a formatter never repeats the last expression to fill the names.
 		local values, positions = {}, {}
 		for index = 1, #allTargets do
 			if index <= #allValues then
@@ -370,24 +434,28 @@ function statements.parseExpressionStatement(self)
 				positions[index] = index - #allValues + 1
 			end
 		end
-		self:emit("assignment", start, self.arena[self.index - 1].stop,
+		local index = self:emit("assignment", start, self:lastStop(),
 			{
-				target = lastTarget, targets = allTargets, targetValues = values,
+				op = "=", target = lastTarget, targets = allTargets,
+				assignedValues = allValues, targetValues = values,
 				targetPositions = positions, valueIdx = lastValue, anchorIdx = anchorIdx,
 			},
 			lastTarget, lastValue)
-		return
+		return index
 	end
 
 	if Parser.COMPOUND and Parser.COMPOUND[text] then
 		self:advance()
 		local valueIdx = self:parseExpression()
-		self:emit("assignment", start, self.arena[self.index - 1].stop,
-			{ target = target, valueIdx = valueIdx, anchorIdx = anchorIdx }, target, valueIdx)
+		local index = self:emit("assignment", start, self:lastStop(),
+			{ op = text, target = target, valueIdx = valueIdx, anchorIdx = anchorIdx }, target, valueIdx)
+		return index
 	end
+	return target
 end
 
 ---@return boolean whether the token started a statement
+---@return integer? index the statement's node, when it emitted one
 ---@param self lye.parser.Parser
 function statements.parseStatement(self)
 	-- The kind the last expression gave is read while a table is shaped, and a statement does not
@@ -410,19 +478,26 @@ function statements.parseStatement(self)
 	-- of comparisons rather than every keyword the grammar knows.
 	if kind == KIND.keyword then
 		local text = self.texts[token.index]
-		if text == "if" then self:parseIf() return true end
-		if text == "while" then self:parseWhile() return true end
-		if text == "repeat" then self:parseRepeat() return true end
-		if text == "for" then self:parseFor() return true end
-		if text == "do" then self:parseDoBlock() return true end
-		if text == "function" then self:parseFunctionStatement() return true end
-		if text == "local" then self:parseLocal(token.start) return true end
-		if text == "return" then self:parseReturn() return true end
-		if text == "const" then self:parseConst(token.start) return true end
+		if text == "if" then return true, self:parseIf() end
+		if text == "while" then return true, self:parseWhile() end
+		if text == "repeat" then return true, self:parseRepeat() end
+		if text == "for" then return true, self:parseFor() end
+		if text == "do" then
+			local start = token.start
+			local body, bodyStart, bodyStop = self:parseDoBlock()
+			local index = self:emit("do", start, self:lastStop(), {
+				bodyStatements = body, bodyStart = bodyStart, bodyStop = bodyStop,
+			})
+			return true, index
+		end
+		if text == "function" then return true, self:parseFunctionStatement() end
+		if text == "local" then return true, self:parseLocal(token.start) end
+		if text == "return" then return true, self:parseReturn() end
+		if text == "const" then return true, self:parseConst(token.start) end
 		if text == "break" or text == "continue" then
 			self:advance()
-			self:emit("break", token.start, token.stop)
-			return true
+			local index = self:emit("break", token.start, token.stop, { keyword = text })
+			return true, index
 		end
 		return false
 	end
@@ -431,13 +506,14 @@ function statements.parseStatement(self)
 		local text = self.texts[token.index]
 		-- A soft keyword starts a goto statement only when a name follows it.
 		if text == "goto" and self:isName(self:peekAt(2)) then
+			local name = self:text(self:peekAt(2))
 			self:advance()
 			self:advance()
-			self:emit("goto", token.start, self.arena[self.index - 1].stop)
-			return true
+			local index = self:emit("goto", token.start, self:lastStop(),
+				{ name = name })
+			return true, index
 		end
-		self:parseExpressionStatement()
-		return true
+		return true, self:parseExpressionStatement()
 	end
 
 	if kind == KIND.symbol then
@@ -448,8 +524,7 @@ function statements.parseStatement(self)
 			return true
 		end
 		if text == "(" then
-			self:parseExpressionStatement()
-			return true
+			return true, self:parseExpressionStatement()
 		end
 		return false
 	end
@@ -467,27 +542,34 @@ function statements.parseStatement(self)
 			---@cast labelToken lye.lexer.ffi.token
 			self:declare(name, "label", labelToken)
 		end
-		self:emit("label", token.start, token.stop)
-		return true
+		local index = self:emit("label", token.start, token.stop, { name = name })
+		return true, index
 	end
 	return false
 end
 
 ---@param self lye.parser.Parser
+---@return integer[] the statement nodes of the block, in source order
 function statements.parseBlock(self)
+	local body = {}
 	while true do
 		-- Comments carry no syntax, but they do carry annotations, so they stay in the
 		-- stream for other readers. Skipping them first is also what makes a comment before
 		-- `end` not look like trailing code.
 		while self:peek().kind == KIND.comment do self:advance() end
-		if self:isBlockEnd() then return end
+		if self:isBlockEnd() then return body end
 
 		local before = self.index
-		if not self:parseStatement() then
+		local started, statementIdx = self:parseStatement()
+		if not started then
 			local token = self:peek()
-			if token.kind == KIND.eof then return end
+			if token.kind == KIND.eof then return body end
 			self:report(token, string.format("unexpected '%s'", self:text(token)))
 			self:advance()
+		elseif statementIdx then
+			local statement = self.nodes[statementIdx]
+			statement.isStatement = true
+			body[#body + 1] = statementIdx
 		end
 		-- No progress means the recovery would loop forever.
 		if self.index == before then self:advance() end
