@@ -9,6 +9,7 @@ local stdio = require("lye-rpc.stdio")
 local doc = require("lye-doc")
 local classes = require("lye-doc.class")
 local framework = require("lye-framework")
+local Uri = require("lye-framework.uri")
 local position = require("lye-framework.position")
 local json = require("lye-json")
 local definitionsIndex = require("lye-lsp.definitions")
@@ -798,7 +799,7 @@ end
 function Lye:packageRoot(uri)
 	local root = self.server.rootPath
 	if not uri or not root then return nil end
-	local path = uri:gsub("^file://", "")
+	local path = Uri.toPath(uri)
 	local at = path:match("^(.*)/[^/]+$")
 	while at and #at >= #root do
 		if self.packageRoots then
@@ -842,7 +843,7 @@ function Lye:requirePaths(uri)
 			if type(pattern) == "string" and pattern ~= "" then
 				-- A pattern is written the way `package.path` writes one; an absolute one is left
 				-- alone and a relative one is read from the file that declared it.
-				out[#out + 1] = pattern:sub(1, 1) == "/" and pattern or (dir .. "/" .. pattern)
+				out[#out + 1] = Uri.isAbsolute(pattern) and pattern or (dir .. "/" .. pattern)
 			end
 		end
 	end
@@ -881,7 +882,7 @@ function Lye:pluginConfig(uri)
 			if type(entry) == "string" and entry ~= "" then
 				-- A relative path is read from the file that wrote it, and a name is left as it is
 				-- for the package's own resolution.
-				local named = entry:sub(1, 1) ~= "!" and entry:sub(1, 1) ~= "/"
+				local named = entry:sub(1, 1) ~= "!" and not Uri.isAbsolute(entry)
 				and (entry:sub(1, 1) == "." or entry:sub(-4) == ".lua")
 				out[#out + 1] = named and (dir .. "/" .. entry:gsub("^%./", "")) or entry
 			end
@@ -1097,7 +1098,7 @@ end
 ---@return table<string, table<string, lye.doc.Type>>? methods
 function Lye:declaredWithMethods(uri)
 	local declared = self:declaredTypes(uri)
-	local methods = self.workspaceIndex:methods()
+	local methods = self.declarations:methods(uri)
 	if not next(methods) then return declared, methods end
 	local copies = {}
 	return setmetatable({}, {
@@ -1380,7 +1381,7 @@ function Lye:workspaceFoldersChanged(params)
 	local removedFolders = event.removed or {}
 	for _, folder in ipairs(removedFolders) do
 		local uri = folder.uri
-		if type(uri) == "string" then removed[uri:gsub("^file://", ""):gsub("[/\\]+$", "")] = true end
+		if type(uri) == "string" then removed[Uri.rootPath(uri)] = true end
 	end
 	local roots = {}
 	for _, root in ipairs(self.server.rootPaths or {}) do
@@ -1391,7 +1392,7 @@ function Lye:workspaceFoldersChanged(params)
 	for _, folder in ipairs(addedFolders) do
 		local uri = folder.uri
 		if type(uri) == "string" then
-			local path = uri:gsub("^file://", ""):gsub("[/\\]+$", "")
+			local path = Uri.rootPath(uri)
 			if path ~= "" then roots[#roots + 1] = path end
 		end
 	end
@@ -1475,14 +1476,12 @@ function Lye:onWorkspaceDiagnostic(params)
 		if entry.line and entry.column and not entry.err then
 			local path = entry.path
 			---@cast path string
-			local absolute = path:sub(1, 1) == "/" or path:sub(1, 1) == "\\"
-			or path:match("^%a:[/\\]") ~= nil
-			if not absolute then
-				local base = self.server:rootFor("file://" .. path)
+			if not Uri.isAbsolute(path) then
+				local base = self.server:rootFor(Uri.fromPath(path))
 				or (self.server.rootPaths or {})[1] or self.server.rootPath
 				if base then path = base .. "/" .. path:gsub("^%./", "") end
 			end
-			local uri = "file://" .. path
+			local uri = Uri.fromPath(path)
 			local item = {
 				range = {
 					start = { line = entry.line - 1, character = entry.column - 1 },
@@ -1926,7 +1925,7 @@ end
 local function lineOfLocation(location, uri, text)
 	local source = text
 	if location.uri ~= uri then
-		local path = location.uri:gsub("^file://", "")
+		local path = Uri.toPath(location.uri)
 		source = fs.read(path)
 	end
 	if type(source) ~= "string" then return nil end
@@ -2469,7 +2468,7 @@ function Lye:rangeIn(target)
 	local lineIndex = document and document.lineIndex
 	if not text then text, lineIndex = definitionsIndex.sourceOf(self:definitionIndex(), target.uri) end
 	if not text then
-		text = fs.read(target.uri:gsub("^file://", ""))
+		text = fs.read(Uri.toPath(target.uri))
 		if text then lineIndex = position.buildLineIndex(text) end
 	end
 	if not text or not lineIndex then
@@ -2533,7 +2532,7 @@ function Lye:targetAt(uri, text, names, offset)
 		local argument = names.parser.nodes[required.args[1]]
 		if argument and argument.kind == "string" and offset >= argument.start and offset <= argument.stop then
 			local path = type(argument.value) == "string" and self:moduleFile(argument.value)
-			if path then return { uri = "file://" .. path, start = 1, stop = 1 } end
+			if path then return { uri = Uri.fromPath(path), start = 1, stop = 1 } end
 		end
 	end
 
@@ -4163,7 +4162,7 @@ function Lye:onWillRenameFiles(params)
 	for _, file in ipairs(files) do
 		local oldUri, newUri = file.oldUri, file.newUri
 		if type(oldUri) == "string" and type(newUri) == "string" then
-			local oldPath, newPath = oldUri:gsub("^file://", ""), newUri:gsub("^file://", "")
+			local oldPath, newPath = Uri.toPath(oldUri), Uri.toPath(newUri)
 			local oldRoot, newRoot = self.server:rootFor(oldUri), self.server:rootFor(newUri)
 			local oldName = oldRoot and self.declarations:moduleNameFor(oldRoot, oldPath)
 			local newName = newRoot and self.declarations:moduleNameFor(newRoot, newPath)
@@ -4864,7 +4863,7 @@ end
 ---@param self lye.Server
 ---@param uri string
 function Lye:editorSettings(uri)
-	local path = uri:gsub("^file://", "")
+	local path = Uri.toPath(uri)
 	local directory = path:match("^(.*)/[^/]*$")
 	self.settings = self.settings or {}
 	local cached = self.settings[directory]
@@ -5115,7 +5114,7 @@ function Lye:onDocumentLink(params)
 				if path then
 					out[#out + 1] = {
 						range = self:toRange(document.text, document.lineIndex, argument.start + 1, argument.stop - 1),
-						target = "file://" .. path,
+						target = Uri.fromPath(path),
 						tooltip = path,
 					}
 				end
@@ -5411,7 +5410,7 @@ function Lye:workspaceSymbols()
 					-- about, and one request over 126 files took the process from 17 MiB to 44.
 					local result = Parser.new(source):parse()
 					local index = nameIndex(source)
-					local uri = "file://" .. file
+					local uri = Uri.fromPath(file)
 					---@type lye.parser.Declaration[]
 					local declarations = result.declarations
 					for _, declaration in ipairs(declarations) do

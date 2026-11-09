@@ -9,12 +9,23 @@
 ]]
 
 local test = require("lde-test")
+local ffi = require("ffi")
 local json = require("lye-json")
 local fs = require("fs")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+-- `cmd` separates commands with `&`, and `%ERRORLEVEL%` expands before the child has run. An
+-- `if errorlevel` chain is read when it runs, so it prints the code the process returned; a POSIX
+-- shell prints `$?` after `;`. The parser below matches either.
+local EXIT_STATUS = ffi.os == "Windows"
+	and ' & if errorlevel 3 (echo EXIT:3) else if errorlevel 2 (echo EXIT:2)'
+		.. ' else if errorlevel 1 (echo EXIT:1) else (echo EXIT:0)'
+	or '; echo "EXIT:$?"'
+
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
-local FIXTURE = TESTS_DIR .. "/fixtures/server.lua"
+-- Relative to the package, because `lde run` on Windows resolves the script against the working
+-- directory rather than accepting an absolute path.
+local FIXTURE = "tests/fixtures/server.lua"
 
 local URI = "file:///tmp/lye-incremental.lua"
 
@@ -69,11 +80,14 @@ end
 
 ---@return table[]
 local function parseFrames(output)
+	-- A pipe read in text mode turns CRLF into LF, and the header parser looks for the two
+	-- newlines a frame ends with. Normalise so one parser serves both platforms.
+	output = output:gsub("\r\n", "\n")
 	local frames, at = {}, 1
 	while true do
-		local _, stop = output:find("\r\n\r\n", at, true)
+		local _, stop = output:find("\n\n", at, true)
 		if not stop then break end
-		local length = tonumber(output:sub(at, stop - 4):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
+		local length = tonumber(output:sub(at, stop - 2):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
 		if not length then break end
 		frames[#frames + 1] = json.decode(output:sub(stop + 1, stop + length))
 		at = stop + 1 + length
@@ -107,9 +121,10 @@ local function run(messages, options)
 	if options.timing then env[#env + 1] = "LYE_TIMING=1" end
 
 	local lock = LOCK and (LOCK .. " ") or ""
+	local environment = "env " .. table.concat(env, " ") .. " "
 	local pipe = assert(io.popen(string.format(
-		"cd %q && cat %q | %s %slde run %q 2> %q; echo \"EXIT:$?\"",
-		PACKAGE_DIR, input, table.concat(env, " "), lock, FIXTURE, stderrPath
+		"cd %q && %s%slde run %q < %q 2> %q%s",
+		PACKAGE_DIR, lock, environment, FIXTURE, input, stderrPath, EXIT_STATUS
 	)))
 	local output = pipe:read("*a")
 	pipe:close()

@@ -16,6 +16,10 @@ local rapidhash = require("rapidhash")
 local serial = require("lye-doc.serial")
 local ffi = require("ffi")
 
+-- A glob is matched against a path spelled with the platform's separator, so `**/*.lua` matches
+-- nothing on Windows. The separator in `package.config` is the one the filesystem uses.
+local sep = string.sub(package.config, 1, 1)
+
 local cache = {}
 
 -- A name no other session's write shares, so two of them can write the same file at once without
@@ -61,7 +65,7 @@ local function codeVersion()
 		local at = source and source:sub(1, 1) == "@" and source:sub(2) or nil
 		local dir = at and at:match("^(.*)/[^/]+$")
 		if dir and fs.isdir(dir) then
-			for path in fs.scan(dir, "**/*.lua", { absolute = true, followSymlinks = false, ignore = function() return false end }) do
+			for path in fs.scan(dir, "**" .. sep .. "*.lua", { absolute = true, followSymlinks = false, ignore = function() return false end }) do
 				---@cast path string
 				addFile(path)
 			end

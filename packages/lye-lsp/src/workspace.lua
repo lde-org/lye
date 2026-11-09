@@ -12,6 +12,7 @@ file and not the workspace.
 local fs = require("fs")
 local lexer = require("lye-lexer")
 local doc = require("lye-doc")
+local Uri = require("lye-framework.uri")
 local methodIndex = require("lye-lsp.method_index")
 
 local KIND = lexer.KIND
@@ -64,18 +65,6 @@ local KIND = lexer.KIND
 ---@field methodsStamp integer
 local Workspace = {}
 Workspace.__index = Workspace
-
----@param uri string
----@return string
-local function pathOf(uri)
-	return (uri:gsub("^file://", ""))
-end
-
----@param path string
----@return string
-local function uriOf(path)
-	return path:sub(1, 7) == "file://" and path or ("file://" .. path)
-end
 
 ---@param text string
 ---@return string
@@ -346,7 +335,7 @@ end
 ---@param uri string
 ---@return lye.WorkspaceFile?
 function Workspace:file(uri)
-	local path = pathOf(uri)
+	local path = Uri.toPath(uri)
 	local document = self.lye.server.documents and self.lye.server.documents:get(uri)
 	local source, key
 	if document then
@@ -381,8 +370,11 @@ function Workspace:files()
 	local seen = {}
 	---@param uri string
 	local function add(uri)
-		if seen[uri] then return end
-		seen[uri] = true
+		-- The editor keys an open buffer by the URI it sent; the workspace index keys the same file
+		-- by the canonical URI. One path is one file, or a reference search sees it twice.
+		local key = Uri.pathKey(uri)
+		if seen[key] then return end
+		seen[key] = true
 		local info = self:file(uri)
 		---@cast info lye.WorkspaceFile
 		if info then out[#out + 1] = info end
@@ -397,7 +389,7 @@ function Workspace:files()
 		if index then
 			for path in pairs(index:files()) do
 				---@cast path string
-				add(uriOf(path))
+				add(Uri.fromPath(path))
 			end
 		end
 	end
@@ -484,8 +476,6 @@ function Workspace:clear()
 	self.methods_ = nil
 end
 
-Workspace.pathOf = pathOf
-Workspace.uriOf = uriOf
 Workspace.unquote = unquote
 
 return Workspace

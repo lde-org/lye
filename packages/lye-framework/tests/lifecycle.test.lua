@@ -8,11 +8,22 @@
 ]]
 
 local test = require("lde-test")
+local ffi = require("ffi")
 local json = require("lye-json")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+-- `cmd` separates commands with `&`, and `%ERRORLEVEL%` expands before the child has run. An
+-- `if errorlevel` chain is read when it runs, so it prints the code the process returned; a POSIX
+-- shell prints `$?` after `;`. The parser below matches either.
+local EXIT_STATUS = ffi.os == "Windows"
+	and ' & if errorlevel 3 (echo EXIT:3) else if errorlevel 2 (echo EXIT:2)'
+		.. ' else if errorlevel 1 (echo EXIT:1) else (echo EXIT:0)'
+	or '; echo "EXIT:$?"'
+
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
-local FIXTURE = TESTS_DIR .. "/fixtures/server.lua"
+-- Relative to the package, because `lde run` on Windows resolves the script against the working
+-- directory rather than accepting an absolute path.
+local FIXTURE = "tests/fixtures/server.lua"
 local INPUT = PACKAGE_DIR .. "/target/framework-test-input.bin"
 
 local INITIALIZE = {
@@ -47,19 +58,22 @@ local function run(messages, isRaw)
 	-- `io.popen` close reports the shell's status, not the child's, so the child prints
 	-- its own exit code as the final line.
 	local pipe = assert(io.popen(string.format(
-		"cat %q | lde run %q 2>/dev/null; echo \"EXIT:$?\"", INPUT, FIXTURE
+		"cd %q && lde run %q < %q 2>/dev/null%s", PACKAGE_DIR, FIXTURE, INPUT, EXIT_STATUS
 	)))
 	local output = pipe:read("*a")
 	pipe:close()
+	-- A pipe read in text mode turns CRLF into LF, and the header parser looks for the two
+	-- newlines a frame ends with. Normalise so one parser serves both platforms.
+	output = output:gsub("\r\n", "\n")
 
 	local code = tonumber(output:match("EXIT:(%d+)%s*$")) or 0
 	output = output:gsub("EXIT:%d+%s*$", "")
 
 	local responses, i = {}, 1
 	while true do
-		local _, stop = output:find("\r\n\r\n", i, true)
+		local _, stop = output:find("\n\n", i, true)
 		if not stop then break end
-		local length = tonumber(output:sub(i, stop - 4):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
+		local length = tonumber(output:sub(i, stop - 2):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
 		if not length then break end
 		responses[#responses + 1] = json.decode(output:sub(stop + 1, stop + length))
 		i = stop + 1 + length

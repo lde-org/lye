@@ -6,6 +6,7 @@
 
 local rpc = require("lye-rpc")
 local json = require("lye-json")
+local Uri = require("lye-framework.uri")
 local DocumentStore = require("lye-framework.document")
 local position = require("lye-framework.position")
 
@@ -199,10 +200,10 @@ end
 ---@param params table
 local function rememberRoot(self, params)
 	local roots, seen = {}, {}
-	---@param uri string?
-	local function add(uri)
-		if type(uri) ~= "string" then return end
-		local path = uri:gsub("^file://", ""):gsub("[/\\]+$", "")
+	---@param folder string?
+	local function add(folder)
+		if type(folder) ~= "string" then return end
+		local path = Uri.rootPath(folder)
 		if path == "" or seen[path] then return end
 		seen[path] = true
 		roots[#roots + 1] = path
@@ -226,7 +227,7 @@ end
 function Server:rootFor(uri)
 	local roots = self.rootPaths or (self.rootPath and { self.rootPath } or {})
 	if not uri then return roots[1] end
-	local path = uri:gsub("^file://", "")
+	local path = Uri.toPath(uri)
 	local best
 	for _, root in ipairs(roots) do
 		if path == root or path:sub(1, #root + 1) == root .. "/" then

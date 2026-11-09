@@ -9,14 +9,25 @@
 ]]
 
 local test = require("lde-test")
+local ffi = require("ffi")
 local json = require("lye-json")
 local fs = require("fs")
+
+-- `cmd` separates commands with `&`, and `%ERRORLEVEL%` expands before the child has run. An
+-- `if errorlevel` chain is read when it runs, so it prints the code the process returned; a POSIX
+-- shell prints `$?` after `;`. The parser below matches either.
+local EXIT_STATUS = ffi.os == "Windows"
+	and ' & if errorlevel 3 (echo EXIT:3) else if errorlevel 2 (echo EXIT:2)'
+		.. ' else if errorlevel 1 (echo EXIT:1) else (echo EXIT:0)'
+	or '; echo "EXIT:$?"'
 local timing = require("lye-lsp.timing")
 local Lye = require("lye-lsp.language")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
-local FIXTURE = TESTS_DIR .. "/fixtures/server.lua"
+-- Relative to the package, because `lde run` on Windows resolves the script against the working
+-- directory rather than accepting an absolute path.
+local FIXTURE = "tests/fixtures/server.lua"
 local INPUT = PACKAGE_DIR .. "/target/memory-test-input.bin"
 local STDERR = PACKAGE_DIR .. "/target/memory-test-stderr.txt"
 local CACHE = PACKAGE_DIR .. "/target/memory-test-cache"
@@ -120,9 +131,9 @@ test.it("writes one stable memory mark per checkpoint across a session", functio
 	handle:close()
 
 	local pipe = assert(io.popen(string.format(
-		"cd %q && cat %q | env LYE_CACHE_DIR=%q LYE_CACHE=off LYE_TIMING=1"
-			.. " lde run %q 2> %q; echo \"EXIT:$?\"",
-		PACKAGE_DIR, INPUT, CACHE, FIXTURE, STDERR
+		"cd %q && env LYE_CACHE_DIR=%q LYE_CACHE=off LYE_TIMING=1"
+			.. " lde run %q < %q 2> %q%s",
+		PACKAGE_DIR, CACHE, FIXTURE, INPUT, STDERR, EXIT_STATUS
 	)))
 	local output = pipe:read("*a")
 	pipe:close()

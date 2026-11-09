@@ -242,6 +242,12 @@ function plugin.spec(hooks, name, report)
 	return protect(hooks, name, nil, report)
 end
 
+--- Whether a path starts at the root: POSIX writes `/opt/x.lua`, Windows writes `C:/x.lua`.
+---@param path string
+local function isAbsolute(path)
+	return path:sub(1, 1) == "/" or path:match("^[A-Za-z]:[/\\]") ~= nil
+end
+
 --- Whether an entry names a file rather than a plugin: a path is written as one — `./tools/x.lua`,
 --- `/opt/x.lua` — and anything else is a name, resolved the way a `require` is.
 ---@param entry string
@@ -302,7 +308,7 @@ function plugin.load(entries, root, resolve, report)
 		end
 		if isPath(entry) then
 			local path = entry
-			if path:sub(1, 1) ~= "/" then path = (root or ".") .. "/" .. path:gsub("^%./", "") end
+			if not isAbsolute(path) then path = (root or ".") .. "/" .. path:gsub("^%./", "") end
 			add(entry:match("([^/]+)%.lua$") or path, path)
 			return
 		end

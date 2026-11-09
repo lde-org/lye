@@ -16,6 +16,7 @@ local Index = require("lye-lsp.index")
 local doc = require("lye-doc")
 local plugin = require("lye-plugin")
 local Parser = require("lye-parser")
+local Uri = require("lye-framework.uri")
 local analyzerNames = require("lye-analyzer.names")
 
 --- How many package entries stay loaded. A monorepo can name more packages than a session needs
@@ -175,7 +176,7 @@ end
 function Declarations:pluginDeclarations(path, source, annotations)
 	local lye = self.lye
 	if not lye or type(lye.plugins) ~= "function" then return nil end
-	local uri = "file://" .. path
+	local uri = Uri.fromPath(path)
 	local ok, specs = pcall(lye.plugins, lye, uri)
 	if not ok or type(specs) ~= "table" or #specs == 0 then return nil end
 	local hasTypes = false
@@ -306,7 +307,10 @@ function Declarations:ensureWorkspace(requested)
 		lye.known = lye.known or {}
 		return self.workspaceIndex
 	end
-	root = root:gsub("[/\\]+$", "")
+	-- The index keys every path it holds by its root. `Uri.rootPath` gives one spelling for a root
+	-- on every platform: forward slashes and a lower-case Windows drive, the same spelling the
+	-- change notifications arrive in.
+	root = Uri.rootPath(root)
 	local index = self.workspaceIndexes[root]
 	if index and lye.known and self.knownByRoot[root] then
 		if root == lye.server.rootPath then self.workspaceIndex = index end
@@ -386,6 +390,8 @@ end
 function Declarations:package(root)
 	local lye = self.lye
 	if not root then return {} end
+	-- One package is one entry whatever spelling its root arrived in.
+	root = Uri.rootPath(root)
 	lye.packageNames = lye.packageNames or {}
 	lye.packageDigests = lye.packageDigests or {}
 	local held = lye.packageNames[root]
@@ -543,7 +549,8 @@ function Declarations:view(uri)
 	local key = uri or ""
 	local cached = self.views[key]
 	if cached and cached.generation == self.generation then return cached.view end
-	local workspaceRoot = rootFor(self.lye.server, uri)
+	local workspaceRoot = uri and Uri.rootPath(rootFor(self.lye.server, uri) or "")
+	if workspaceRoot == "" then workspaceRoot = nil end
 	self:ensureWorkspace(workspaceRoot)
 	local top = (workspaceRoot and self.knownByRoot[workspaceRoot]) or {}
 	local root = uri and self.lye:packageRoot(uri) --[[@as string? ]]
@@ -555,6 +562,45 @@ function Declarations:view(uri)
 	return top
 end
 
+--- Every method the document can see, by class name: the workspace's and the one its own package
+--- links into `target/`. The analyzer seeds a namespace from this map, so a class a module declares
+--- from its own annotations is built with the methods another file declares — which is how a method
+--- in a package dependency resolves without that dependency being an open document.
+---@param self lye.Declarations
+---@param uri string?
+---@return table<string, table<string, lye.doc.Type>>
+function Declarations:methods(uri)
+	local out = {} ---@type table<string, table<string, lye.doc.Type>>
+	---@param from table<string, table<string, lye.doc.Type>>
+	local function merge(from)
+		for className, fields in pairs(from) do
+			local held = out[className]
+			if not held then
+				held = {}
+				out[className] = held
+			end
+			---@cast held table<string, lye.doc.Type>
+			for name, fn in pairs(fields) do
+				if held[name] == nil then held[name] = fn end
+			end
+		end
+	end
+	local workspaceRoot = uri and Uri.rootPath(rootFor(self.lye.server, uri) or "")
+	if workspaceRoot == "" then workspaceRoot = nil end
+	local workspace = (workspaceRoot and self.workspaceIndexes[workspaceRoot]) or self.workspaceIndex
+	if workspace then merge(workspace:methods()) end
+	local root = uri and self.lye:packageRoot(uri)
+	if root then
+		local index = self.packageIndexes[root]
+		if not index then
+			self:package(root)
+			index = self.packageIndexes[root]
+		end
+		if index then merge(index:methods()) end
+	end
+	return out
+end
+
 --- The declarations that do not come from an open buffer: the workspace, the document's package
 --- and the definitions. A module's answer depends on the open buffers only for the names they
 --- actually shadow, and this is the layer to compare against to find those.
@@ -562,7 +608,8 @@ end
 ---@return table<string, boolean|lye.doc.Type>
 ---@param self lye.Declarations
 function Declarations:base(uri)
-	local workspaceRoot = rootFor(self.lye.server, uri)
+	local workspaceRoot = uri and Uri.rootPath(rootFor(self.lye.server, uri) or "")
+	if workspaceRoot == "" then workspaceRoot = nil end
 	self:ensureWorkspace(workspaceRoot)
 	local top = (workspaceRoot and self.knownByRoot[workspaceRoot]) or {}
 	local root = uri and self.lye:packageRoot(uri) --[[@as string? ]]
@@ -604,7 +651,7 @@ end
 ---@param roots string[]
 function Declarations:setRoots(roots)
 	local keep = {}
-	for _, root in ipairs(roots) do keep[root:gsub("[/\\]+$", "")] = true end
+	for _, root in ipairs(roots) do keep[Uri.rootPath(root)] = true end
 	for root in pairs(self.workspaceIndexes) do
 		if not keep[root] then
 			self.workspaceIndexes[root] = nil
@@ -631,8 +678,7 @@ end
 local function pathOfChange(change)
 	local uri = change.uri or change.path
 	if type(uri) ~= "string" then return nil end
-	if uri:sub(1, 7) == "file://" then return uri:sub(8) end
-	return uri
+	return Uri.toPath(uri)
 end
 
 --- Files changed on disk. A source file belongs to the workspace entry; a file under a loaded
@@ -823,7 +869,7 @@ function Declarations:fieldLocation(className, fieldName, uri)
 	---@param index lye.lsp.Index
 	local function inIndex(index)
 		for path, file in pairs(index:files()) do
-			local held = inAnnotations(file.annotations --[[@as lye.doc.Annotation[] ]], "file://" .. path)
+			local held = inAnnotations(file.annotations --[[@as lye.doc.Annotation[] ]], Uri.fromPath(path))
 			if held then return held end
 		end
 	end

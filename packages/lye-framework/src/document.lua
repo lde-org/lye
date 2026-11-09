@@ -1,5 +1,6 @@
 
 
+local Uri = require("lye-framework.uri")
 local position = require("lye-framework.position")
 
 ---@class lye.framework.Position
@@ -66,11 +67,12 @@ end
 
 ---@class lye.framework.DocumentStore
 ---@field byUri table<string, lye.framework.Document>
+---@field byPath table<string, lye.framework.Document> keyed by `Uri.pathKey`, not by the URI string
 local DocumentStore = {}
 DocumentStore.__index = DocumentStore
 
 function DocumentStore.new()
-	return setmetatable({ byUri = {} }, DocumentStore)
+	return setmetatable({ byUri = {}, byPath = {} }, DocumentStore)
 end
 
 ---@param self lye.framework.DocumentStore
@@ -80,6 +82,7 @@ end
 function DocumentStore:open(uri, text, version)
 	local document = Document.new(uri, text, version)
 	self.byUri[uri] = document
+	self.byPath[Uri.pathKey(uri)] = document
 	return document
 end
 
@@ -90,9 +93,33 @@ function DocumentStore:get(uri)
 	return self.byUri[uri]
 end
 
+--- The open document for a path. The URI a client keys a document by and the path a module
+--- resolves to need not be spelled the same way: VS Code writes a drive colon as `%3A`, and a
+--- path may come from the filesystem in another case. Matching on the path keeps an unsaved
+--- buffer the text a `require` of it reads.
+---@param self lye.framework.DocumentStore
+---@param path string
+---@return lye.framework.Document?
+function DocumentStore:forPath(path)
+	return self.byPath[Uri.pathKey(path)]
+end
+
+--- The URI to publish or point at for a path: the one the client opened it with, when it is open,
+--- and otherwise the form `Uri.fromPath` builds.
+---@param self lye.framework.DocumentStore
+---@param path string a path or a URI
+---@return string
+function DocumentStore:uriFor(path)
+	local document = self:forPath(path)
+	if document then return document.uri end
+	return Uri.fromPath(path)
+end
+
 ---@param self lye.framework.DocumentStore
 ---@param uri string
 function DocumentStore:close(uri)
+	local document = self.byUri[uri]
+	if document then self.byPath[Uri.pathKey(document.uri)] = nil end
 	self.byUri[uri] = nil
 end
 

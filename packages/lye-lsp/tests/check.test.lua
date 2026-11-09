@@ -10,7 +10,7 @@ local test = require("lde-test")
 local check = require("lye-lsp.check")
 local env = require("env")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local INPUT = PACKAGE_DIR .. "/target/check-input.lua"
 local MAIN = PACKAGE_DIR .. "/src/main.lua"

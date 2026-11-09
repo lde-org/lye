@@ -9,6 +9,7 @@ local analyzer = require("lye-analyzer")
 local cache = require("lye-lsp.cache")
 local plugin = require("lye-plugin")
 local rapidhash = require("rapidhash")
+local Uri = require("lye-framework.uri")
 local serial = require("lye-doc.serial")
 local timing = require("lye-lsp.timing")
 
@@ -196,7 +197,7 @@ local function requiresStored(self, entry)
 				-- An editor buffer is the text the module was read against; an unsaved edit is a
 				-- different answer even though the file on disk has not moved.
 				local document = self.lye.server.documents
-					and self.lye.server.documents:get("file://" .. required.path)
+					and self.lye.server.documents:forPath(required.path)
 				if document then
 					textHash = rapidhash.hex(document.text)
 				else
@@ -383,7 +384,7 @@ function Modules:requiresOf(from, names)
 			-- A cycle or a failed resolution kept no entry. An editor buffer is the text that was
 			-- actually read; the file on disk is the fallback.
 			local document = self.lye.server.documents
-				and self.lye.server.documents:get("file://" .. path)
+				and self.lye.server.documents:forPath(path)
 			if document then
 				textHash = rapidhash.hex(document.text)
 			else
@@ -442,7 +443,7 @@ function Modules:resolve(name, from)
 	if not path then return nil end
 	if self.requiring[path] then return nil end
 
-	local uri = "file://" .. path
+	local uri = lye.server.documents:uriFor(path)
 	local document = lye.server.documents:get(uri)
 	local written
 	if document then
@@ -548,8 +549,14 @@ function Modules:resolve(name, from)
 	local function moduleAt(inner) return self:type(inner, uri) end
 	---@param message string
 	local function reportPlugin(message) lye.server:log(message, framework.LOG.warning) end
-	local names = analyzer.analyze(written, lye.prelude, lye.declarations:view(uri), moduleAt,
-		nil, nil, true, lye:isDefinition(uri), lye:plugins(uri), reportPlugin, { uri = uri })
+	local declared = lye.declarations:view(uri)
+	-- A class this module declares is built without the methods other files declare unless they are
+	-- seeded here: the module is not an open document, so its own annotations are the whole of its
+	-- namespace and its package's `target/` is where its dependency methods live.
+	local methods = lye.declarations:methods(uri)
+	local names = analyzer.analyze(written, lye.prelude, declared, moduleAt,
+		nil, nil, true, lye:isDefinition(uri), lye:plugins(uri), reportPlugin,
+		{ uri = uri, methods = methods })
 	self.requiring[path] = nil
 	local kept = names.module
 	if names.isDefinition then kept = bindPrelude(kept, lye.prelude) end
@@ -596,10 +603,10 @@ end
 ---@param uri string
 ---@param self lye.Modules
 function Modules:fileChanged(uri)
-	local changed = uri:gsub("^file://", "")
+	local changed = Uri.pathKey(uri)
 	for path, entry in pairs(self.entries) do
 		for _, required in pairs(entry.requires or {}) do
-			if required.path == changed then
+			if required.path and Uri.pathKey(required.path) == changed then
 				self.bytes -= entry.bytes
 				self.entries[path] = nil
 				self.blocked[path] = true
@@ -635,11 +642,11 @@ end
 ---@param declarations table<string, boolean|lye.doc.Type>? what the document declared before it changed
 ---@param self lye.Modules
 function Modules:documentChanged(uri, declarations)
-	local changed = uri and uri:gsub("^file://", "") or nil
+	local changed = uri and Uri.pathKey(uri) or nil
 	for path, entry in pairs(self.entries) do
 		local drop
 		for _, required in pairs(entry.requires or {}) do
-			if changed and required.path == changed then
+			if changed and required.path and Uri.pathKey(required.path) == changed then
 				drop = true
 				break
 			end

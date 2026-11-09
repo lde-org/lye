@@ -13,10 +13,12 @@ local cache = require("lye-lsp.cache")
 local Index = require("lye-lsp.index")
 local Lye = require("lye-lsp.language")
 local Declarations = require("lye-lsp.declarations")
+local Uri = require("lye-framework.uri")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
-local ROOT = PACKAGE_DIR .. "/target/declarations-fixture"
+-- The root every path in the fixture is built from; canonical, as the server keys a root.
+local ROOT = Uri.rootPath(PACKAGE_DIR .. "/target/declarations-fixture")
 local CACHE = PACKAGE_DIR .. "/target/declarations-cache"
 
 ---@param path string

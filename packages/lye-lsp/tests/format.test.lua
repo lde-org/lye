@@ -7,7 +7,7 @@ local formatter = require("lye-lsp.format")
 local Parser = require("lye-parser")
 local fs = require("fs")
 
-local sourcePath = assert(debug.getinfo(1, "S").source):sub(2)
+local sourcePath = assert(debug.getinfo(1, "S").source):sub(2):gsub("\\", "/")
 local TESTS_DIR = assert(sourcePath:match("^(.*)/[^/]+$"))
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local MAIN = PACKAGE_DIR .. "/src/main.lua"

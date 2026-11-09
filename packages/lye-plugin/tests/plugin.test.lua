@@ -8,7 +8,7 @@ local source = require("lye-plugin.source")
 local plugin = require("lye-plugin")
 local types = require("lye-doc.type")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local WORK = PACKAGE_DIR .. "/target/plugin-fixture"
 

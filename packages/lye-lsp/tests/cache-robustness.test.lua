@@ -14,11 +14,13 @@
 
 local test = require("lde-test")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local ROOT = PACKAGE_DIR .. "/target/robustness-fixture"
 local CACHE = PACKAGE_DIR .. "/target/robustness-cache"
-local MAIN = PACKAGE_DIR .. "/src/main.lua"
+-- Relative to the package, because `lde run` on Windows resolves the script against the working
+-- directory rather than accepting an absolute path.
+local MAIN = "src/main.lua"
 local MARKER = CACHE .. "/executed"
 
 ---@param path string
@@ -66,7 +68,7 @@ end
 ---@return integer status
 local function check()
 	local command = string.format(
-		"cd %q && LYE_CACHE_DIR=%q lde run %q -- check %q 2>&1; printf '\\nstatus=%%s\\n' \"$?\"",
+		"cd %q && env LYE_CACHE_DIR=%q lde run %q -- check %q 2>&1; printf '\\nstatus=%%s\\n' \"$?\"",
 		PACKAGE_DIR, CACHE, MAIN, ROOT .. "/src")
 	local pipe = assert(io.popen(command))
 	local output = pipe:read("*a")
