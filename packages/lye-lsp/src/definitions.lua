@@ -9,6 +9,7 @@ local Parser = require("lye-parser")
 local doc = require("lye-doc")
 local fs = require("fs")
 local cache = require("lye-lsp.cache")
+local Uri = require("lye-framework.uri")
 local position = require("lye-framework.position")
 
 local definitions = {}
@@ -51,7 +52,7 @@ function definitions.prepare(sources)
 		-- Beside the entries and written the same way: a session that already has this text writes
 		-- nothing, and one that has to write cannot be read half way through.
 		cache.writeWhole(path, text)
-		local uri = "file://" .. path
+		local uri = Uri.fromPath(path)
 		index.text[uri] = text
 
 		-- A class, an alias and the fields of each, in the order they are written.

@@ -19,6 +19,7 @@
 local fs = require("fs")
 local ffi = require("ffi")
 local rapidhash = require("rapidhash")
+local Uri = require("lye-framework.uri")
 local doc = require("lye-doc")
 local methodIndex = require("lye-lsp.method_index")
 local classes = require("lye-doc.class")
@@ -113,6 +114,8 @@ local sep = string.sub(package.config, 1, 1)
 ---@field read fun(path: string): string?
 ---@field stat fun(path: string): fs.Stat?
 ---@field entry_ lye.lsp.IndexEntry? the entry last adopted
+---@field methods_ table<string, table<string, lye.doc.Type>>? the methods last aggregated
+---@field methodsEntry_ lye.lsp.IndexEntry? the entry `methods_` was built from
 ---@field typeLocations_ table<string, lye.lsp.IndexType>? where each type the entry declares is written
 ---@field stats_ { index: number, built: integer, loaded: integer, files: integer, reads: integer, workers: integer, fellBack: integer }
 local Index = {}
@@ -198,7 +201,7 @@ local function collectTypes(into, path, source, annotations)
 		if isType and annotation.name and not into[annotation.name] then
 			into[annotation.name] = {
 				location = {
-					uri = "file://" .. path,
+					uri = Uri.fromPath(path),
 					start = annotation.nameStart or annotation.start,
 					stop = annotation.nameStop or annotation.stop,
 				},
@@ -518,13 +521,15 @@ function Index:scan(root, kind, max)
 	---@param name string
 	local function workspaceIgnore(name) return isHidden(name) or name == "target" end
 	local ignore = kind == "package" and isHidden or workspaceIgnore
-	for path in fs.scan(dir, "**/*.lua", {
+	for path in fs.scan(dir, "**" .. sep .. "*.lua", {
 		absolute = true,
 		followSymlinks = kind == "package",
 		ignore = ignore,
 	}) do
 		---@cast path string
-		paths[#paths + 1] = path
+		-- A glob uses the platform's separator, and so does what it yields. The rest of the index
+		-- builds file keys and package prefixes with `/`, so the walk hands back that spelling.
+		paths[#paths + 1] = path:gsub("\\", "/")
 	end
 	table.sort(paths)
 	if max and #paths > max then
@@ -1000,6 +1005,38 @@ end
 ---@return table<string, boolean|lye.doc.Type>
 function Index:known()
 	return self.entry_ and self.entry_.known or {}
+end
+
+--- Every method every file of the root declares, by class name. `known` already carries these as
+--- fields of their classes; the analyzer also wants them as the map it seeds a namespace with,
+--- because a class read from a module's own annotations would otherwise be built without the
+--- methods the file beside it declares.
+---@param self lye.lsp.Index
+---@return table<string, table<string, lye.doc.Type>>
+function Index:methods()
+	local entry = self.entry_
+	if not entry then return {} end
+	if self.methodsEntry_ == entry then return self.methods_ end
+	---@cast self.methods_ table<string, table<string, lye.doc.Type>>
+	local out = {} ---@type table<string, table<string, lye.doc.Type>>
+	for _, recordPath in ipairs(pathsOf(entry)) do
+		local record = entry.files[recordPath]
+		for _, method in ipairs(record.methods or {}) do
+			local owner = method.class or method.owner
+			local fields = out[owner]
+			if not fields then
+				fields = {}
+				out[owner] = fields
+			end
+			---@cast fields table<string, lye.doc.Type>
+			if not fields[method.name] then
+				fields[method.name] = methodIndex.signatureOf(method, {})
+			end
+		end
+	end
+	self.methodsEntry_ = entry
+	self.methods_ = out
+	return out
 end
 
 --- Where each class or alias of the root is written.

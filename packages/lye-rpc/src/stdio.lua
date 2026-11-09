@@ -11,6 +11,8 @@ ffi.cdef [[
 	long read(int fd, void *buf, size_t count);
 	long write(int fd, const void *buf, size_t count);
 	int _setmode(int fd, int mode);
+	int _read(int fd, void *buf, unsigned int count);
+	int _write(int fd, const void *buf, unsigned int count);
 	void exit(int status);
 	struct pollfd { int fd; short events; short revents; };
 	int poll(struct pollfd *fds, unsigned long nfds, int timeout);
@@ -19,6 +21,18 @@ ffi.cdef [[
 ]]
 
 local C = ffi.C
+
+-- Windows' C runtime has the POSIX names only as aliases, and a compiled binary links a runtime
+-- without them: `read` does not resolve there, and the server failed on its first message. The
+-- underscored functions are the runtime's own, the same one `_setmode` below comes from.
+local readFd, writeFd
+if ffi.os == "Windows" then
+	readFd = function(fd, buf, count) return C._read(fd, buf, count) end
+	writeFd = function(fd, buf, count) return C._write(fd, buf, count) end
+else
+	readFd = function(fd, buf, count) return C.read(fd, buf, count) end
+	writeFd = function(fd, buf, count) return C.write(fd, buf, count) end
+end
 
 -- Waiting for input with a bound is what lets the server coalesce a burst of keystrokes. A blocking
 -- read cannot: the listener would sit in `read` while the debounce ran. Both `poll` and the sleep
@@ -71,7 +85,7 @@ end
 ---@param chunk lye.rpc.Chunk
 function stdio.read(chunk)
 	if chunk.n == chunk.capacity then grow(chunk) end
-	local got = tonumber(C.read(0, chunk.buf + chunk.n, chunk.capacity - chunk.n)) or 0
+	local got = tonumber(readFd(0, chunk.buf + chunk.n, chunk.capacity - chunk.n)) or 0
 	if got <= 0 then return stdio.EOF end
 	chunk.n += got
 	return got
@@ -101,7 +115,7 @@ end
 function stdio.write(s)
 	local len, sent = #s, 0
 	while sent < len do
-		local wrote = tonumber(C.write(1, ffi.cast("const char *", s) + sent, len - sent))
+		local wrote = tonumber(writeFd(1, ffi.cast("const char *", s) + sent, len - sent))
 		assert(wrote > 0, "lye-rpc: write to stdout failed")
 		sent += wrote
 	end

@@ -6,9 +6,11 @@ the whole path from the wire to the parser and back.
 ]]
 
 local test = require("lde-test")
+local fs = require("fs")
 local json = require("lye-json")
+local Uri = require("lye-framework.uri")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local CACHE = PACKAGE_DIR .. "/target/features-cache"
 
@@ -19,7 +21,9 @@ local CACHE = PACKAGE_DIR .. "/target/features-cache"
 -- run — or another session — left behind.
 os.execute("rm -rf " .. string.format("%q", CACHE))
 local INPUT = PACKAGE_DIR .. "/target/features-input.bin"
-local FIXTURE = TESTS_DIR .. "/fixtures/server.lua"
+-- Relative to the package, because `lde run` on Windows resolves the script against the working
+-- directory rather than accepting an absolute path.
+local FIXTURE = "tests/fixtures/server.lua"
 
 local SOURCE = table.concat({
 	"local x = 1\n",
@@ -118,18 +122,22 @@ local function run(requests, source, root, uri, folders)
 	handle:write(frame({ jsonrpc = "2.0", method = "exit" }))
 	handle:close()
 
-	local pipe = assert(io.popen(string.format("LYE_CACHE_DIR=%q cat %q | lde run %q 2>/dev/null",
-	CACHE, INPUT, FIXTURE)))
+	local pipe = assert(io.popen(string.format(
+		"cd %q && env LYE_CACHE_DIR=%q lde run %q < %q 2>/dev/null",
+		PACKAGE_DIR, CACHE, FIXTURE, INPUT)))
 	local output = pipe:read("*a")
 	pipe:close()
+	-- A pipe read in text mode turns CRLF into LF, and the header parser looks for the two
+	-- newlines a frame ends with. Normalise so one parser serves both platforms.
+	output = output:gsub("\r\n", "\n")
 
 	---@type table<string, lye.test.RunResult>
 	local byId = {}
 	local i = 1
 	while true do
-		local _, stop = output:find("\r\n\r\n", i, true)
+		local _, stop = output:find("\n\n", i, true)
 		if not stop then break end
-		local length = tonumber(output:sub(i, stop - 4):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
+		local length = tonumber(output:sub(i, stop - 2):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
 		if not length then break end
 		local message = json.decode(output:sub(stop + 1, stop + length))
 		---@cast message lye.test.WireMessage
@@ -1491,10 +1499,10 @@ test.it("finds references and renames a method another file declares", function(
 	test.equal(#references, 2, "the declaration and the call")
 	local byUri = {}
 	for _, reference in ipairs(references) do byUri[reference.uri] = true end
-	test.truthy(byUri["file://" .. root .. "/a.lua"], "the declaration's file")
+	test.truthy(byUri[Uri.fromPath(root .. "/a.lua")], "the declaration's file")
 	test.truthy(byUri[uri], "the caller's file")
 	local changes = (results["3"] and results["3"].changes) or {}
-	test.truthy(changes["file://" .. root .. "/a.lua"], "the method is renamed where it is declared")
+	test.truthy(changes[Uri.fromPath(root .. "/a.lua")], "the method is renamed where it is declared")
 	test.truthy(changes[uri], "and where it is called")
 	for _, edits in pairs(changes) do
 		for _, edit in ipairs(edits) do test.equal(edit.newText, "shift") end
@@ -1553,7 +1561,7 @@ test.it("links a require, edits a module rename, and answers the small protocol 
 	local links = results["2"] or {}
 	---@cast links { target: string? }[]
 	test.equal(#links, 1, "the require string is linked")
-	test.truthy((links[1] or {}).target == "file://" .. root .. "/dep.lua", "to the file it names")
+	test.truthy((links[1] or {}).target == Uri.fromPath(root .. "/dep.lua"), "to the file it names")
 	local editing = results["3"] or {}
 	---@cast editing { ranges: table[], wordPattern: string? }
 	local references = results["9"] or {}
@@ -1752,6 +1760,46 @@ test.it("answers a hover on a table key with the field the expected type declare
 	local id = results["4"] and results["4"].contents and results["4"].contents.value or ""
 	test.truthy(id:find("probe.B.id: number", 1, true), id)
 	test.truthy(id:find("#L11", 1, true), "the same member's other field: " .. id)
+end)
+
+test.it("reads a method a package's target module declares", function()
+	-- `target/` is where lde links what a package can require. A class there is read by the
+	-- workspace as a type, but its methods are declared in a file that is not an open document:
+	-- the analyzer is seeded with the package index's methods, or a call on the module's value
+	-- reports every method missing while the class and its fields resolve.
+	local root = PACKAGE_DIR .. "/target/package-methods"
+	fs.mkdirAll(root .. "/src")
+	fs.mkdirAll(root .. "/target/dep")
+	fs.write(root .. "/lde.json", '{ "name": "package-methods", "version": "0.1.0" }\n')
+	fs.write(root .. "/target/dep/init.lua", table.concat({
+		"---@class Dep\n",
+		"---@field value number\n",
+		"local Dep = {}\n",
+		"---@return Dep\n",
+		"local function make() return setmetatable({ value = 1 }, Dep) end\n",
+		"return { make = make }\n",
+	}, ""))
+	fs.write(root .. "/target/dep/methods.lua", table.concat({
+		"---@class Dep\n",
+		"local Dep = {}\n",
+		"---@return number\n",
+		"function Dep:read() return self.value end\n",
+		"return Dep\n",
+	}, ""))
+
+	local source = table.concat({
+		'local dep = require("dep")\n',
+		"local item = dep.make()\n",
+		"return item:read()\n",
+	}, "")
+	local uri = Uri.fromPath(root .. "/src/use.lua")
+	local results = run({
+		{ jsonrpc = "2.0", id = 2, method = "textDocument/diagnostic", params = {
+			textDocument = { uri = uri },
+		} },
+	}, source, root, uri)
+	local items = results["2"] and results["2"].items or {}
+	test.equal(#items, 0, "the method resolves and the call has no diagnostic")
 end)
 
 return true

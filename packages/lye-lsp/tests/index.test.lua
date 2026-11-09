@@ -13,7 +13,7 @@ local Index = require("lye-lsp.index")
 local parallel = require("lye-lsp.parallel")
 local types = require("lye-doc.type")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local ROOT = PACKAGE_DIR .. "/target/index-fixture"
 local CACHE = PACKAGE_DIR .. "/target/index-cache"

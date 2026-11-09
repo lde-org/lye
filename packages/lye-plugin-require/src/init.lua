@@ -16,6 +16,10 @@
 local fs = require("fs")
 local json = require("lye-json")
 
+-- `fs` matches a glob against a path spelled with the platform's separator and leaves the
+-- separator in the pattern as written, so `**/*.lua` matches nothing on Windows.
+local sep = string.sub(package.config, 1, 1)
+
 ---@type lye.plugin.Hooks
 local requirePlugin = {}
 
@@ -35,6 +39,13 @@ end
 ---@param root string
 local function trimmed(root)
 	return (root:gsub("[/\\]+$", ""):gsub("/%./", "/"):gsub("//+", "/"))
+end
+
+--- Whether a search path starts at the root: POSIX writes `/opt/?.lua`, Windows writes
+--- `C:/x/?.lua`.
+---@param pattern string
+local function isAbsolute(pattern)
+	return pattern:sub(1, 1) == "/" or pattern:match("^[A-Za-z]:[/\\]") ~= nil
 end
 
 --- The module name a path relative to a search root writes, with `/init` folded into its parent.
@@ -64,10 +75,11 @@ end
 local function scan(root, mode, detail, out, seen)
 	if not root or not fs.isdir(root) then return end
 	root = trimmed(root)
-	for path in fs.scan(root, "**/*.lua", {
+	for path in fs.scan(root, "**" .. sep .. "*.lua", {
 		absolute = true, followSymlinks = true, ignore = ignored,
 	}) do
-		local relative = path:sub(#root + 2)
+		-- The walk uses the platform's separator; a module name is built with `/`.
+		local relative = path:sub(#root + 2):gsub("\\", "/")
 		if relative ~= "" then
 			local name, keep
 			if mode == "init" then
@@ -120,7 +132,7 @@ local function scanRequirePaths(dir, out, seen)
 
 	for _, pattern in ipairs(paths) do
 		if type(pattern) == "string" and pattern ~= "" and pattern:sub(-4) == ".lua" then
-			local absolute = pattern:sub(1, 1) == "/" and pattern or (trimmed(dir) .. "/" .. pattern)
+			local absolute = isAbsolute(pattern) and pattern or (trimmed(dir) .. "/" .. pattern)
 			local base = absolute:match("^(.*)/[^/]*$") or "."
 			if base == "" then base = "/" end
 			local initPattern = absolute:match("%?/init%.lua$") ~= nil

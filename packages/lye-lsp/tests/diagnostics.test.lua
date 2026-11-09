@@ -7,12 +7,24 @@
 ]]
 
 local test = require("lde-test")
+local ffi = require("ffi")
 local json = require("lye-json")
 local fs = require("fs")
+local Uri = require("lye-framework.uri")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+-- `cmd` separates commands with `&`, and `%ERRORLEVEL%` expands before the child has run. An
+-- `if errorlevel` chain is read when it runs, so it prints the code the process returned; a POSIX
+-- shell prints `$?` after `;`. The parser below matches either.
+local EXIT_STATUS = ffi.os == "Windows"
+	and ' & if errorlevel 3 (echo EXIT:3) else if errorlevel 2 (echo EXIT:2)'
+		.. ' else if errorlevel 1 (echo EXIT:1) else (echo EXIT:0)'
+	or '; echo "EXIT:$?"'
+
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
-local FIXTURE = TESTS_DIR .. "/fixtures/server.lua"
+-- Relative to the package, because `lde run` on Windows resolves the script against the working
+-- directory rather than accepting an absolute path.
+local FIXTURE = "tests/fixtures/server.lua"
 
 --- This process's own id. `math.random` alone is not enough: two copies started in the same second
 --- seed it identically, so both would write the same files.
@@ -107,23 +119,26 @@ local function run(messages, root, cache, capabilities)
 	-- own exit code as the final line. Two sessions at once may make `lde` relink the
 	-- package's shared `target/`, which is not concurrent-safe; a lock file keeps one
 	-- process's links whole while the other waits its turn.
-	local env = cache == false and "" or ("LYE_CACHE_DIR=" .. string.format("%q", cache or CACHE))
+	local env = cache == false and "" or ("env LYE_CACHE_DIR=" .. string.format("%q", cache or CACHE) .. " ")
 	local lock = LOCK and (LOCK .. " ") or ""
 	local pipe = assert(io.popen(string.format(
-		"cd %q && %s cat %q | %slde run %q 2>/dev/null; echo \"EXIT:$?\"",
-		PACKAGE_DIR, env, INPUT, lock, FIXTURE
+		"cd %q && %s%s lde run %q < %q 2>/dev/null%s",
+		PACKAGE_DIR, env, lock, FIXTURE, INPUT, EXIT_STATUS
 	)))
 	local output = pipe:read("*a")
 	pipe:close()
+	-- A pipe read in text mode turns CRLF into LF, and the header parser looks for the two
+	-- newlines a frame ends with. Normalise so one parser serves both platforms.
+	output = output:gsub("\r\n", "\n")
 
 	local code = tonumber(output:match("EXIT:(%d+)%s*$")) or 0
 	output = output:gsub("EXIT:%d+%s*$", "")
 
 	local frames, i = {}, 1
 	while true do
-		local _, stop = output:find("\r\n\r\n", i, true)
+		local _, stop = output:find("\n\n", i, true)
 		if not stop then break end
-		local length = tonumber(output:sub(i, stop - 4):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
+		local length = tonumber(output:sub(i, stop - 2):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
 		if not length then break end
 		frames[#frames + 1] = json.decode(output:sub(stop + 1, stop + length))
 		i = stop + 1 + length
@@ -549,7 +564,7 @@ test.it("answers workspace and document pull diagnostics", function()
 	local broken = "local x = \"s\"\nlocal y = x + 1\nreturn y\n"
 	writeFile(project .. "/broken.lua", broken)
 	writeFile(project .. "/clean.lua", "return 1\n")
-	local brokenUri = "file://" .. project .. "/broken.lua"
+	local brokenUri = Uri.fromPath(project .. "/broken.lua")
 
 	local frames = run(endingWithShutdown({
 		{

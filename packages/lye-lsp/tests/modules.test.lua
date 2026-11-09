@@ -12,9 +12,11 @@ local analyzer = require("lye-analyzer")
 local cache = require("lye-lsp.cache")
 local plugin = require("lye-plugin")
 local rapidhash = require("rapidhash")
+local DocumentStore = require("lye-framework.document")
+local Uri = require("lye-framework.uri")
 local Modules = require("lye-lsp.modules")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local ROOT = PACKAGE_DIR .. "/target/modules-fixture"
 local CACHE = PACKAGE_DIR .. "/target/modules-cache"
@@ -54,11 +56,12 @@ local function prepare(files)
 	function declarations:package() return {} end
 	local view = {}
 	function declarations:view() return view end
+	function declarations:methods() return {} end
 	function declarations:documentChanged() end
 
 	local server = {
 		rootPath = ROOT,
-		documents = { byUri = {}, get = function() return nil end },
+		documents = DocumentStore.new(),
 		log = function() end,
 	}
 	local lye = {
@@ -97,7 +100,7 @@ end
 ---@param path string
 ---@param text string
 local function keyOf(lye, path, text)
-	local uri = "file://" .. path
+	local uri = Uri.fromPath(path)
 	local owner = lye:packageRoot(uri)
 	return cache.key("module", rapidhash.hex(text), lye.annotationsDigest or "",
 		(lye.packageDigests or {})[owner] or "", plugin.digest(lye:plugins(uri)))
@@ -283,7 +286,7 @@ test.it("a document change keeps a module that depends on neither it nor its dec
 	local lye = prepare({ pony = PONY })
 	local modules = Modules.new(lye)
 	modules:type("pony")
-	modules:documentChanged("file://" .. ROOT .. "/unrelated.lua", { Unrelated = true })
+	modules:documentChanged(Uri.fromPath(ROOT .. "/unrelated.lua"), { Unrelated = true })
 	test.truthy(modules.entries[lye.paths.pony], "an unrelated declaration leaves it alone")
 	modules:type("pony")
 	test.equal(modules:stats().hits, 1, "the next lookup is a hit")
@@ -294,7 +297,7 @@ test.it("a document change drops the module that requires the changed path", fun
 	local modules = Modules.new(lye)
 	modules:type("dependent")
 	test.truthy(modules.entries[lye.paths.dependent])
-	modules:documentChanged("file://" .. lye.paths.pony, { Pony = true })
+	modules:documentChanged(Uri.fromPath(lye.paths.pony), { Pony = true })
 	test.falsy(modules.entries[lye.paths.dependent], "the dependent is gone")
 	local misses = modules:stats().misses
 	modules:type("dependent")
@@ -329,7 +332,7 @@ test.it("a document change drops the module that resolved one of its declaration
 	test.truthy(held, "the consumer is analysed")
 	test.truthy(modules.entries[consumer].declarationNames.Shared,
 		"the name it resolved elsewhere is recorded")
-	modules:documentChanged("file://" .. ROOT .. "/shared.lua", { Shared = true })
+	modules:documentChanged(Uri.fromPath(ROOT .. "/shared.lua"), { Shared = true })
 	test.falsy(modules.entries[consumer], "the consumer is gone")
 end)
 

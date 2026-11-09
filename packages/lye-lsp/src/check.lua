@@ -7,6 +7,7 @@ local analyzer = require("lye-analyzer")
 local position = require("lye-framework.position")
 local fs = require("fs")
 local rapidhash = require("rapidhash")
+local Uri = require("lye-framework.uri")
 local env = require("env")
 local parallel = require("lye-lsp.parallel")
 local cache = require("lye-lsp.cache")
@@ -19,6 +20,11 @@ local Parser = require("lye-parser")
 local analyzerNames = require("lye-analyzer.names")
 local config = require("lye-lsp.config")
 local directives = require("lye-analyzer.directives")
+
+-- A glob is matched against a path spelled with the platform's separator; `fs` translates `*` but
+-- leaves the separator in the pattern as written. A `**/*.lua` on Windows therefore matches no
+-- file: every walked path has a `\` where the pattern has a `/`.
+local sep = string.sub(package.config, 1, 1)
 
 local check = {}
 
@@ -152,7 +158,7 @@ end
 --- it, so a run started in a directory has to say where that directory is before walking it.
 ---@param path string
 local function absolute(path)
-	if path:sub(1, 1) == "/" or path:match("^%a:[/\\]") then return path end
+	if Uri.isAbsolute(path) then return path end
 	local cwd = env.cwd() --[[@as string ]]
 	local cleaned = path:gsub("/+$", "")
 	if cleaned == "" or cleaned == "." then return cwd end
@@ -313,7 +319,7 @@ local function linkedDeclarations(root, cache, paths)
 		if paths then
 			for _, file in ipairs(paths) do read(file) end
 		else
-			for file in fs.scan(target, "**/*.lua", { absolute = true, followSymlinks = true, ignore = ignored }) do
+			for file in fs.scan(target, "**" .. sep .. "*.lua", { absolute = true, followSymlinks = true, ignore = ignored }) do
 				---@cast file string
 				read(file)
 			end
@@ -403,9 +409,9 @@ function Store:farm(owner)
 	local files = {} ---@type string[]
 	local target = absolute(owner) .. "/target"
 	if fs.isdir(target) then
-		for file in fs.scan(target, "**/*.lua", { absolute = true, followSymlinks = true, ignore = ignored }) do
+		for file in fs.scan(target, "**" .. sep .. "*.lua", { absolute = true, followSymlinks = true, ignore = ignored }) do
 			---@cast file string
-			files[#files + 1] = file
+			files[#files + 1] = file:gsub("\\", "/")
 		end
 		table.sort(files)
 	end
@@ -497,7 +503,7 @@ local function requirePathsOf(dir)
 	for _, pattern in ipairs(patterns) do
 		---@cast pattern string
 		if type(pattern) == "string" and pattern ~= "" then
-			out[#out + 1] = pattern:sub(1, 1) == "/" and pattern or (dir .. "/" .. pattern)
+			out[#out + 1] = Uri.isAbsolute(pattern) and pattern or (dir .. "/" .. pattern)
 		end
 	end
 	return out
@@ -589,7 +595,7 @@ local function pluginsFor(path)
 		if not ok or type(config) ~= "table" or type(config.plugins) ~= "table" then return end
 		for _, entry in ipairs(config.plugins) do
 			if type(entry) == "string" and entry ~= "" then
-				local named = entry:sub(1, 1) ~= "!" and entry:sub(1, 1) ~= "/"
+				local named = entry:sub(1, 1) ~= "!" and not Uri.isAbsolute(entry)
 				and (entry:sub(1, 1) == "." or entry:sub(-4) == ".lua")
 				entries[#entries + 1] = named and (absolute(dir .. "/" .. entry:gsub("^%./", ""))) or entry
 			end
@@ -639,7 +645,7 @@ function pluginDeclarations(path, written, annotations)
 	---@param node lye.parser.Node
 	local function callNameOf(node) return analyzerNames.callName(tree, node) end
 	local context = {
-		uri = "file://" .. absolute(path),
+		uri = Uri.fromPath(absolute(path)),
 		source = written,
 		text = written,
 		parsed = tree,
@@ -1041,12 +1047,13 @@ function check.discover(root)
 	---@param glob string
 	local function scan(glob)
 		for path in fs.scan(base, glob, { ignore = ignored, absolute = false, followSymlinks = false }) do
-			found[#found + 1] = prefix .. path
+			-- The walk yields the platform's separator; a name lye builds from it uses `/`.
+			found[#found + 1] = prefix .. path:gsub("\\", "/")
 		end
 	end
-	scan("**/*.lua")
+	scan("**" .. sep .. "*.lua")
 	for _, extension in ipairs(check.extensions(root)) do
-		scan("**/*." .. extension)
+		scan("**" .. sep .. "*." .. extension)
 	end
 	table.sort(found)
 	return found
@@ -1060,8 +1067,8 @@ end
 function check.extensions(root)
 	local found, seen = {}, {}
 	local base = absolute(root)
-	for path in fs.scan(base, "**/lye.json", { ignore = ignored, absolute = false, followSymlinks = false }) do
-		local file = base .. "/" .. path
+	for path in fs.scan(base, "**" .. sep .. "lye.json", { ignore = ignored, absolute = false, followSymlinks = false }) do
+		local file = base .. "/" .. path:gsub("\\", "/")
 		local written = readSource(file)
 		if type(written) == "string" then
 			local ok, config = pcall(json.decode, written)

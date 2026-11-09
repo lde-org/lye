@@ -11,7 +11,7 @@ local lye = require("lye-lsp")
 local check = require("lye-lsp.check")
 local report = require("lye-lsp.report")
 
-local sourcePath = assert(debug.getinfo(1, "S").source):sub(2)
+local sourcePath = assert(debug.getinfo(1, "S").source):sub(2):gsub("\\", "/")
 local TESTS_DIR = assert(sourcePath:match("^(.*)/[^/]+$"))
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local INPUT = PACKAGE_DIR .. "/target/library-input.lua"

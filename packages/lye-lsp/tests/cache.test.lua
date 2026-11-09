@@ -9,11 +9,13 @@
 local test = require("lde-test")
 local fs = require("fs")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
 local ROOT = PACKAGE_DIR .. "/target/cache-fixture"
 local CACHE = PACKAGE_DIR .. "/target/cache-entries"
-local MAIN = PACKAGE_DIR .. "/src/main.lua"
+-- Relative to the package, because `lde run` on Windows resolves the script against the working
+-- directory rather than accepting an absolute path.
+local MAIN = "src/main.lua"
 
 ---@param path string
 ---@param content string
@@ -46,9 +48,9 @@ local function check(paths, cache, extra)
 	for _, relative in ipairs(paths) do named[#named + 1] = string.format("%q", ROOT .. "/" .. relative) end
 	local env = ""
 	if cache == false then
-		env = "LYE_CACHE=off "
+		env = "env LYE_CACHE=off "
 	elseif cache then
-		env = "LYE_CACHE_DIR=" .. string.format("%q", cache == true and CACHE or cache) .. " "
+		env = "env LYE_CACHE_DIR=" .. string.format("%q", cache == true and CACHE or cache) .. " "
 	end
 	local command = string.format("cd %q && %s lde run %q -- check %s%s 2>&1",
 		PACKAGE_DIR, env, MAIN, table.concat(named, " "), extra and (" " .. extra) or "")
@@ -76,6 +78,7 @@ end
 -- process still holds in memory: the probe prints the check's counters, and `seconds` is the CPU
 -- the check itself took.
 local PROBE = PACKAGE_DIR .. "/target/cache-probe.lua"
+local PROBE_SCRIPT = "target/cache-probe.lua"
 
 local function writeProbe()
 	local handle = assert(io.open(PROBE, "wb"))
@@ -102,8 +105,8 @@ local function probe(paths, cacheDir)
 	writeProbe()
 	local named = {}
 	for _, path in ipairs(paths) do named[#named + 1] = string.format("%q", path) end
-	local command = string.format("cd %q && LYE_CACHE_DIR=%q LYE_WORKERS=1 lde run %q -- %s 2>&1",
-		PACKAGE_DIR, cacheDir, PROBE, table.concat(named, " "))
+	local command = string.format("cd %q && env LYE_CACHE_DIR=%q LYE_WORKERS=1 lde run %q -- %s 2>&1",
+		PACKAGE_DIR, cacheDir, PROBE_SCRIPT, table.concat(named, " "))
 	local pipe = assert(io.popen(command))
 	local output = pipe:read("*a")
 	pipe:close()
@@ -125,6 +128,7 @@ end
 -- Rewrite half of the interface entries as an older version would have left them, and the rest as
 -- rubbish: both are answers a run must refuse.
 local MUTATE = PACKAGE_DIR .. "/target/cache-mutate.lua"
+local MUTATE_SCRIPT = "target/cache-mutate.lua"
 
 ---@param cacheDir string
 local function mutate(cacheDir)
@@ -151,7 +155,7 @@ local function mutate(cacheDir)
 	}))
 	handle:close()
 	local pipe = assert(io.popen(string.format("cd %q && lde run %q -- %q 2>&1",
-		PACKAGE_DIR, MUTATE, cacheDir)))
+		PACKAGE_DIR, MUTATE_SCRIPT, cacheDir)))
 	local output = pipe:read("*a")
 	pipe:close()
 	test.truthy(output:match("MUTATED [1-9]") and output:match("stale=[1-9]")

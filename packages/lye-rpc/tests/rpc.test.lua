@@ -15,10 +15,13 @@
 
 local test = require("lde-test")
 
-local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):match("^(.*)/[^/]+$")
+local TESTS_DIR = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
 local PACKAGE_DIR = assert(TESTS_DIR:match("^(.*)/tests$"))
-local CHILD = TESTS_DIR .. "/fixtures/echo.lua"
+-- Relative to the package, because `lde run` on Windows resolves the script against the working
+-- directory rather than accepting an absolute path.
+local CHILD = "tests/fixtures/echo.lua"
 local INPUT = PACKAGE_DIR .. "/target/rpc-test-input.bin"
+local INPUT_SCRIPT = "target/rpc-test-input.bin"
 
 ---@param body string
 local function frame(body)
@@ -37,14 +40,16 @@ local function readPipe(command)
 	local pipe = assert(io.popen(command))
 	local output = pipe:read("*a")
 	pipe:close()
-	return output
+	-- A pipe read in text mode turns CRLF into LF, and the header parser looks for the two
+	-- newlines a frame ends with. Normalise so one parser serves both platforms.
+	return (output:gsub("\r\n", "\n"))
 end
 
 --- Write `input` and run the child over it.
 ---@param input string
 local function runChild(input)
 	writeInput(input)
-	return readPipe(string.format("cat %q | lde run %q 2>/dev/null", INPUT, CHILD))
+	return readPipe(string.format("cd %q && lde run %q < %q 2>/dev/null", PACKAGE_DIR, CHILD, INPUT))
 end
 
 --- Split a byte stream into the JSON body of each frame.
@@ -53,9 +58,9 @@ end
 local function bodies(output)
 	local out, n, i = {}, 0, 1
 	while true do
-		local _, stop = output:find("\r\n\r\n", i, true)
+		local _, stop = output:find("\n\n", i, true)
 		if not stop then break end
-		local length = tonumber(output:sub(i, stop - 4):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
+		local length = tonumber(output:sub(i, stop - 2):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
 		if not length then break end
 		n += 1
 		out[n] = output:sub(stop + 1, stop + length)
@@ -79,7 +84,7 @@ end
 
 test.it("frames a response for a single request", function()
 	local output = runChild(frame('{"jsonrpc":"2.0","id":1,"method":"initialize"}'))
-	test.truthy(output:match("^Content%-Length: %d+\r\n\r\n"))
+	test.truthy(output:match("^Content%-Length: %d+\n\n"))
 	test.truthy(hasFrame(output, '"method":"initialize"', 1))
 end)
 
@@ -144,7 +149,9 @@ test.it("reassembles a frame that arrives in small pieces", function()
 	-- dd reads and writes 5 bytes at a time, so the child sees partial frames and a
 	-- header split across reads.
 	writeInput(frame('{"jsonrpc":"2.0","id":1,"method":"initialize"}'))
-	local output = readPipe(string.format("dd if=%q bs=5 2>/dev/null | lde run %q 2>/dev/null", INPUT, CHILD))
+	local output = readPipe(string.format(
+		"cd %q && dd if=%s bs=5 2>/dev/null | lde run %q",
+		PACKAGE_DIR, INPUT_SCRIPT, CHILD))
 	test.truthy(hasFrame(output, '"method":"initialize"', 1))
 end)
 
