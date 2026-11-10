@@ -18,6 +18,10 @@ ffi.cdef [[
 	int poll(struct pollfd *fds, unsigned long nfds, int timeout);
 	int usleep(unsigned int microseconds);
 	void Sleep(unsigned int milliseconds);
+	intptr_t _get_osfhandle(int fd);
+	int lye_rpc_PeekNamedPipe(void *pipe, void *buffer, unsigned long size, unsigned long *read,
+		unsigned long *available, unsigned long *left) __asm__("PeekNamedPipe");
+	uint64_t lye_rpc_GetTickCount64(void) __asm__("GetTickCount64");
 ]]
 
 local C = ffi.C
@@ -35,15 +39,31 @@ else
 end
 
 -- Waiting for input with a bound is what lets the server coalesce a burst of keystrokes. A blocking
--- read cannot: the listener would sit in `read` while the debounce ran. Both `poll` and the sleep
--- used where it is absent are declared above so the checker can see what the branches call; a
--- symbol a platform does not have resolves only when the call is made, and that call is guarded.
+-- read cannot: the listener would sit in `read` while the debounce ran. The wait has to end the
+-- moment a message arrives, or every request an editor sends during it waits the whole bound: on
+-- Windows that was a `Sleep`, and the 400 ms pause before a collection held each inlay hint, code
+-- action and highlight behind it, seconds in all after a keystroke. `poll` is what the other
+-- systems have; Windows has no `poll` for a pipe, so there the pipe is asked how much it holds.
+-- Every function above is declared for the checker to see; a symbol a platform does not have
+-- resolves only when the call is made, and that call is guarded.
 local HAS_POLL = ffi.os ~= "Windows"
 
+-- The handle the runtime's fd 0 reads, which is the pipe an editor writes to.
+local stdinHandle
 if ffi.os == "Windows" then
 	local O_BINARY = 0x8000
 	C._setmode(0, O_BINARY)
 	C._setmode(1, O_BINARY)
+	stdinHandle = ffi.cast("void *", C._get_osfhandle(0))
+end
+
+--- How many bytes the Windows stdin pipe holds, or nothing when it cannot say: the editor has
+--- closed it, or stdin is not a pipe at all (a file, a console).
+---@return integer?
+local function pipeHolds()
+	local available = ffi.new("unsigned long[1]")
+	if C.lye_rpc_PeekNamedPipe(stdinHandle, nil, 0, nil, available, nil) == 0 then return nil end
+	return tonumber(available[0])
 end
 
 local stdio = {}
@@ -127,9 +147,7 @@ function stdio.exit(code)
 end
 
 --- Wait until input is readable or `milliseconds` pass. True means a read will make progress (or
---- report end of stream); false means the deadline passed with nothing waiting. A system without
---- `poll` sleeps the interval and reports the deadline, so the caller retries its work rather than
---- blocking input forever.
+--- report end of stream); false means the deadline passed with nothing waiting.
 ---@param milliseconds integer
 ---@return boolean readable
 function stdio.wait(milliseconds)
@@ -141,10 +159,19 @@ function stdio.wait(milliseconds)
 		return ready > 0
 	end
 	if ffi.os == "Windows" then
-		C.Sleep(milliseconds)
-	else
-		C.usleep(milliseconds * 1000)
+		-- A pipe cannot be waited on, so it is asked in steps of the shortest sleep there is. Only
+		-- a debounce waits here, and it is bounded: an idle server is in `read`, which blocks.
+		local deadline = C.lye_rpc_GetTickCount64() + milliseconds
+		repeat
+			local holds = pipeHolds()
+			-- Nothing to ask is something to read: the end of the stream, or a file or console that
+			-- `read` answers by itself.
+			if holds == nil or holds > 0 then return true end
+			C.Sleep(1)
+		until C.lye_rpc_GetTickCount64() >= deadline
+		return false
 	end
+	C.usleep(milliseconds * 1000)
 	return false
 end
 
@@ -152,6 +179,12 @@ end
 --- uses it to leave a pause for later when the editor is already sending the next key.
 ---@return boolean readable
 function stdio.readable()
+	if ffi.os == "Windows" then
+		-- A pipe the editor has closed says nothing, like a hung-up one does to `poll` below: the
+		-- session is ending, not an editor about to send a key, and the work can run.
+		local holds = pipeHolds()
+		return holds ~= nil and holds > 0
+	end
 	if not HAS_POLL then return false end
 	local fds = ffi.new("struct pollfd[1]")
 	fds[0].fd, fds[0].events = 0, 1 -- POLLIN
