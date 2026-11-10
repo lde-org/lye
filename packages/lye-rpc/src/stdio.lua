@@ -22,6 +22,12 @@ ffi.cdef [[
 	int lye_rpc_PeekNamedPipe(void *pipe, void *buffer, unsigned long size, unsigned long *read,
 		unsigned long *available, unsigned long *left) __asm__("PeekNamedPipe");
 	uint64_t lye_rpc_GetTickCount64(void) __asm__("GetTickCount64");
+	void *lye_rpc_CreateWaitableTimerExW(void *attributes, const uint16_t *name, unsigned long flags,
+		unsigned long access) __asm__("CreateWaitableTimerExW");
+	int lye_rpc_SetWaitableTimer(void *timer, const int64_t *due, long period, void *routine, void *arg,
+		int resume) __asm__("SetWaitableTimer");
+	unsigned long lye_rpc_WaitForSingleObject(void *handle, unsigned long milliseconds)
+		__asm__("WaitForSingleObject");
 ]]
 
 local C = ffi.C
@@ -64,6 +70,30 @@ local function pipeHolds()
 	local available = ffi.new("unsigned long[1]")
 	if C.lye_rpc_PeekNamedPipe(stdinHandle, nil, 0, nil, available, nil) == 0 then return nil end
 	return tonumber(available[0])
+end
+
+-- A `Sleep(1)` sleeps until the system's next timer tick, which is 15.6 ms unless some program has
+-- raised the rate, and a message that arrives inside a wait waited that long for its answer. A
+-- high-resolution waitable timer (Windows 10 1803 and later) keeps the millisecond it is asked
+-- for without changing the rate for the rest of the system. Made on the first wait; where the
+-- system has no such timer, the step is the `Sleep` it always was.
+local CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x2
+local TIMER_ALL_ACCESS = 0x1F0003
+local INFINITE = 0xFFFFFFFF
+local stepTimer ---@type ffi.cdata*|false|nil
+-- One millisecond from now, in the timer's 100 ns units; negative is relative.
+local STEP_DUE = ffi.new("int64_t[1]", -10000)
+
+local function step()
+	if stepTimer == nil then
+		local made = C.lye_rpc_CreateWaitableTimerExW(nil, nil, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+		stepTimer = made ~= nil and made or false
+	end
+	if stepTimer and C.lye_rpc_SetWaitableTimer(stepTimer, STEP_DUE, 0, nil, nil, 0) ~= 0 then
+		C.lye_rpc_WaitForSingleObject(stepTimer, INFINITE)
+		return
+	end
+	C.Sleep(1)
 end
 
 local stdio = {}
@@ -159,15 +189,15 @@ function stdio.wait(milliseconds)
 		return ready > 0
 	end
 	if ffi.os == "Windows" then
-		-- A pipe cannot be waited on, so it is asked in steps of the shortest sleep there is. Only
-		-- a debounce waits here, and it is bounded: an idle server is in `read`, which blocks.
+		-- A pipe cannot be waited on, so it is asked once a millisecond. Only a debounce waits here,
+		-- and it is bounded: an idle server is in `read`, which blocks.
 		local deadline = C.lye_rpc_GetTickCount64() + milliseconds
 		repeat
 			local holds = pipeHolds()
 			-- Nothing to ask is something to read: the end of the stream, or a file or console that
 			-- `read` answers by itself.
 			if holds == nil or holds > 0 then return true end
-			C.Sleep(1)
+			step()
 		until C.lye_rpc_GetTickCount64() >= deadline
 		return false
 	end
