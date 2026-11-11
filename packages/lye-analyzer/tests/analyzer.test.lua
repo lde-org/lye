@@ -2484,6 +2484,20 @@ test.it("reads a function assigned to a field the same way", function()
 	test.equal(typeOf(source, "y"), "string", "the assignment form is the same function")
 end)
 
+test.it("reads the parameters written above a field whose key is not a name", function()
+	-- A handler table keyed by message kind, which a name like `covers:find` cannot spell bare.
+	local source = table.concat({
+		"local handlers = {\n",
+		"\t---@param message string\n",
+		'\t["covers:find"] = function(message)\n',
+		"\t\treturn #message\n",
+		"\tend,\n",
+		"}\n",
+		"return handlers\n",
+	}, "")
+	test.equal(typeOf(source, "message"), "string", "the block above the bracket is the field's")
+end)
+
 test.it("checks a method call against the field, receiver included", function()
 	local source = FIELD_SOURCE .. "function x:call(y)\n\treturn #y\nend\n\nx:call(1)\n"
 	local result = analyzer.analyze(source)
