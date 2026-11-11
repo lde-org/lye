@@ -194,6 +194,10 @@ local function parseTable(self)
 		---@type lye.parser.TableField
 		local field
 		if self:check("[") then
+			-- The `[` is where the field starts, so it is what an annotation block above the field
+			-- sits on: `["covers:find"] = function(self, message)` is a handler whose name is not a
+			-- Lua name, and its `@param` lines were read by nobody.
+			local bracketIdx = self.index
 			self:advance()
 			local keyIdx = self:parseExpression()
 			keyIdxs = keyIdxs or {}
@@ -210,6 +214,8 @@ local function parseTable(self)
 				fieldValues, fieldKinds = fieldValues or {}, fieldKinds or {}
 				fieldValues[keyNode.value] = valueIdx
 				fieldKinds[keyNode.value] = self.lastKind or "unknown"
+				fieldAnchors = fieldAnchors or {}
+				fieldAnchors[keyNode.value] = bracketIdx
 			end
 		elseif self:isName(self:peek()) and self:text(self:peekAt(2)) == "=" then
 			local keyIdx = self.index
