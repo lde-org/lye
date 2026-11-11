@@ -265,6 +265,26 @@ test.it("finds the package of a file named relatively", function()
 	test.equal(isOk, true, "the package's own link answers for a relatively named file")
 end)
 
+test.it("names the classes of a package a project's search paths point into", function()
+	-- A plugin runs inside the program it extends without depending on it: its `lye.json` points
+	-- `requirePaths` into the program's `target/`, and the program's classes are its types too.
+	local root = PACKAGE_DIR .. "/target/pointed-fixture"
+	-- The control's text differs: a check answers the same text the same way, whatever package
+	-- it is in, so a copy would only repeat the first answer.
+	local use = "---@param api HostApi\nlocal function f(api)\n\treturn api.count + %d\nend\n\nreturn f\n"
+	writeTree(root, {
+		["host/lde.json"] = '{ "name": "host", "version": "0.1.0" }\n',
+		["host/target/host/api.lua"] = "---@class HostApi\n---@field count integer\nreturn {}\n",
+		["plugin/lde.json"] = '{ "name": "plugin", "version": "0.1.0" }\n',
+		["plugin/lye.json"] = '{ "requirePaths": ["../host/target/?.lua"] }\n',
+		["plugin/src/use.lua"] = use:format(1),
+		["alone/lde.json"] = '{ "name": "alone", "version": "0.1.0" }\n',
+		["alone/src/use.lua"] = use:format(2),
+	})
+	test.equal(check.file(root .. "/plugin/src/use.lua"), true, "the host's class is named")
+	test.equal(check.file(root .. "/alone/src/use.lua"), false, "a package pointing nowhere does not see it")
+end)
+
 test.it("reads a fixed array against a method that takes one of unknown length", function()
 	-- `ffi.array<T>` is a length this file does not know, not a different class: a fixed
 	-- `ffi.array<T, 16>` fits it. The method signature comes from the package's linked module.

@@ -106,4 +106,22 @@ function config.policy(settings)
 	return directives.policy(settings.diagnostics)
 end
 
+--- The packages a set of `requirePaths` patterns reach into: a pattern under some package's
+--- `target/` (`../app/target/?.lua`) names that package. Its classes are what a project needs to
+--- be read against when it runs inside that package without depending on it -- a plugin loaded
+--- into the program it extends, which the program's `target/` already links everything for.
+---@param patterns string[] already resolved, as `requirePaths` gives them
+---@return string[] roots # In the order the patterns name them, each once
+function config.targetPackages(patterns)
+	local roots, seen = {}, {}
+	for _, pattern in ipairs(patterns) do
+		local root = pattern:match("^(.-)[/\\]target[/\\]%?") --[[@as string?]]
+		if root ~= nil and root ~= "" and not seen[root] then
+			seen[root] = true
+			roots[#roots + 1] = root
+		end
+	end
+	return roots
+end
+
 return config

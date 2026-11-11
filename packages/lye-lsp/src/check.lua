@@ -273,6 +273,28 @@ local function annotationDoc(record)
 	}
 end
 
+--- The `requirePaths` a directory's `lye.json` names, each resolved the way `package.path`
+--- resolves one: an absolute pattern is left alone, a relative one is read from the directory
+--- that declared it. The same rule `Lye:requirePaths` follows.
+---@param dir string
+---@return string[]
+local function requirePathsOf(dir)
+	local out = {}
+	local written = readSource(dir .. "/lye.json")
+	if type(written) ~= "string" then return out end
+	local ok, config = pcall(json.decode, written)
+	if not ok or type(config) ~= "table" then return out end
+	local patterns = config.requirePaths
+	if type(patterns) ~= "table" then return out end
+	for _, pattern in ipairs(patterns) do
+		---@cast pattern string
+		if type(pattern) == "string" and pattern ~= "" then
+			out[#out + 1] = Uri.isAbsolute(pattern) and pattern or (dir .. "/" .. pattern)
+		end
+	end
+	return out
+end
+
 --- The names the modules linked into a package's `target/` declare. A dependency's class is as
 --- real to a file as its own package's, and a check that only knew the files it was handed reported
 --- every `clap.Args` and `process.Child` as a type nothing declares — which is what the editor,
@@ -330,6 +352,30 @@ local function linkedDeclarations(root, cache, paths)
 		for _, list in ipairs(methodLists) do methodIndex.add(found, list) end
 	end
 	cache[root] = found
+	return found
+end
+
+-- The `target/` names of packages a project only points at, read once per run whatever package
+-- points there: they are the same files however many packages of the batch name them.
+local pointedDeclarations = {} ---@type table<string, table<string, boolean|lye.doc.Type>>
+
+--- What a file of a package can name: what its own `target/` links, then what the `target/` of
+--- each package its `lye.json` points `requirePaths` into links -- a plugin that runs inside a
+--- program names the program's classes without depending on it. The package's own names win.
+---@param root string the package root
+---@param cache table<string, table<string, boolean|lye.doc.Type>>
+---@param paths string[]? the files under the package's own `target/`, when a run has listed them
+local function reachableDeclarations(root, cache, paths)
+	local own = linkedDeclarations(root, cache, paths)
+	local pointed = config.targetPackages(requirePathsOf(absolute(root)))
+	if #pointed == 0 then return own end
+	local found = {}
+	for name, value in pairs(own) do found[name] = value end
+	for _, other in ipairs(pointed) do
+		for name, value in pairs(linkedDeclarations(other, pointedDeclarations)) do
+			if found[name] == nil then found[name] = value end
+		end
+	end
 	return found
 end
 
@@ -471,7 +517,7 @@ local function scopeFor(owner, scopes, elsewhere, store)
 	-- What is linked into `target/` is what a file can require. The batch is read on top: a
 	-- package that links its own source there may have an older copy, and the files being checked
 	-- are the ones this run is about.
-	for name, value in pairs(linkedDeclarations(owner, scopes, store and store.farmFiles[owner])) do
+	for name, value in pairs(reachableDeclarations(owner, scopes, store and store.farmFiles[owner])) do
 		scope[name] = value
 	end
 	for name, value in pairs(elsewhere or {}) do scope[name] = value end
@@ -483,31 +529,6 @@ end
 --- belongs to no package. Loading a plugin compiles the language it reads, so one package's
 --- plugins are loaded once for the whole run.
 local pluginsByPackage = {} ---@type table<string, lye.plugin.Spec[]>
-
---- The file a module name resolves to inside a package's `target/`, without reading it: lde
---- links every module a package can reach under that directory, so one rule answers a dependency
---- and a sibling alike.
---- The `requirePaths` a directory's `lye.json` names, each resolved the way `package.path`
---- resolves one: an absolute pattern is left alone, a relative one is read from the directory
---- that declared it. The same rule `Lye:requirePaths` follows.
----@param dir string
----@return string[]
-local function requirePathsOf(dir)
-	local out = {}
-	local written = readSource(dir .. "/lye.json")
-	if type(written) ~= "string" then return out end
-	local ok, config = pcall(json.decode, written)
-	if not ok or type(config) ~= "table" then return out end
-	local patterns = config.requirePaths
-	if type(patterns) ~= "table" then return out end
-	for _, pattern in ipairs(patterns) do
-		---@cast pattern string
-		if type(pattern) == "string" and pattern ~= "" then
-			out[#out + 1] = Uri.isAbsolute(pattern) and pattern or (dir .. "/" .. pattern)
-		end
-	end
-	return out
-end
 
 --- The name an lde package writes in its `lde.json`, when the package is one.
 ---@param owner string?
@@ -544,6 +565,9 @@ local function binaryModulePath(owner, name)
 	return false
 end
 
+--- The file a module name resolves to inside a package's `target/`, without reading it: lde
+--- links every module a package can reach under that directory, so one rule answers a dependency
+--- and a sibling alike.
 local function modulePath(owner, name)
 	local base = absolute(owner)
 	local tail = (name:gsub("%.", "/"))
@@ -1255,7 +1279,7 @@ function check.files(paths, reporter)
 		local root = packageOf(path)
 		if root and not linkedSeen[root] then
 			linkedSeen[root] = true
-			for name, held in pairs(linkedDeclarations(root, prelinked)) do
+			for name, held in pairs(reachableDeclarations(root, prelinked)) do
 				if elsewhere[name] == nil then elsewhere[name] = held end
 			end
 		end
