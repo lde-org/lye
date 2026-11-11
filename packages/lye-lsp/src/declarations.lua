@@ -18,6 +18,7 @@ local plugin = require("lye-plugin")
 local Parser = require("lye-parser")
 local Uri = require("lye-framework.uri")
 local analyzerNames = require("lye-analyzer.names")
+local config = require("lye-lsp.config")
 
 --- How many package entries stay loaded. A monorepo can name more packages than a session needs
 --- at once, and each entry holds every type its links declare; the least recently used is dropped
@@ -535,10 +536,20 @@ function Declarations:moduleFile(name, from)
 	if builtin then return builtin.path --[[@as string? ]] end
 end
 
+--- The packages whose `target/` a document's `lye.json` points `requirePaths` into: their classes
+--- are as nameable as its own package's, without the document's package depending on them.
+---@param self lye.Declarations
+---@param uri string?
+---@return string[]
+local function pointedPackages(self, uri)
+	if not uri then return {} end
+	return config.targetPackages(self.lye:requirePaths(uri))
+end
+
 --- What a document is analysed against, as a cached view: what each open document declared, then
---- the document's own package, then the workspace. The layers are metatables, not copies — the
---- analyzer only indexes `elsewhere[text]`, and a view lives until the generation it was built for
---- changes.
+--- the document's own package, then the packages its `lye.json` points into, then the workspace.
+--- The layers are metatables, not copies — the analyzer only indexes `elsewhere[text]`, and a view
+--- lives until the generation it was built for changes.
 ---
 --- Only an open document's view is kept: an editor asks about the same buffer again and again,
 --- while a closed file's view is a cache entry nothing will ask for. A module URI reached through
@@ -553,6 +564,8 @@ function Declarations:view(uri)
 	if workspaceRoot == "" then workspaceRoot = nil end
 	self:ensureWorkspace(workspaceRoot)
 	local top = (workspaceRoot and self.knownByRoot[workspaceRoot]) or {}
+	-- Beneath the document's own package, so its own names win over the program it points at.
+	for _, pointed in ipairs(pointedPackages(self, uri)) do top = layer(self:package(pointed), top) end
 	local root = uri and self.lye:packageRoot(uri) --[[@as string? ]]
 	if root then top = layer(self:package(root), top) end
 	for _, declarations in pairs(self.open) do top = layer(declarations, top) end
@@ -590,11 +603,14 @@ function Declarations:methods(uri)
 	local workspace = (workspaceRoot and self.workspaceIndexes[workspaceRoot]) or self.workspaceIndex
 	if workspace then merge(workspace:methods()) end
 	local root = uri and self.lye:packageRoot(uri)
-	if root then
-		local index = self.packageIndexes[root]
+	local packages = {}
+	if root then packages[1] = root end
+	for _, pointed in ipairs(pointedPackages(self, uri)) do packages[#packages + 1] = pointed end
+	for _, packageRoot in ipairs(packages) do
+		local index = self.packageIndexes[packageRoot]
 		if not index then
-			self:package(root)
-			index = self.packageIndexes[root]
+			self:package(packageRoot)
+			index = self.packageIndexes[packageRoot]
 		end
 		if index then merge(index:methods()) end
 	end
@@ -612,6 +628,7 @@ function Declarations:base(uri)
 	if workspaceRoot == "" then workspaceRoot = nil end
 	self:ensureWorkspace(workspaceRoot)
 	local top = (workspaceRoot and self.knownByRoot[workspaceRoot]) or {}
+	for _, pointed in ipairs(pointedPackages(self, uri)) do top = layer(self:package(pointed), top) end
 	local root = uri and self.lye:packageRoot(uri) --[[@as string? ]]
 	if root then top = layer(self:package(root), top) end
 	return top

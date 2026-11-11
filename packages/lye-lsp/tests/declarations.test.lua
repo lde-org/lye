@@ -74,6 +74,7 @@ local function session(open)
 	end
 	local lye = Lye.new({
 		rootPath = ROOT,
+		rootFor = function() return ROOT end,
 		log = function() end,
 		documents = {
 			get = function(_, uri)
@@ -288,6 +289,27 @@ test.it("a view reads the open document, then the package, then the workspace", 
 	test.truthy(rawequal(after, declarations:view(uri)), "a stable generation answers the same view")
 	declarations:documentChanged(uri)
 	test.falsy(rawequal(after, declarations:view(uri)), "a new generation answers a new view")
+end)
+
+test.it("a view reads a package the document's search paths point into, beneath its own", function()
+	-- A plugin runs inside the program it extends without depending on it: its `lye.json` points
+	-- `requirePaths` into the program's `target/`, and the program's classes are its types too.
+	fixture({
+		["host/lde.json"] = "{}",
+		["host/target/host/api.lua"] = "---@class HostApi\n---@class Shared\n",
+		["plugin/lde.json"] = "{}",
+		["plugin/lye.json"] = '{ "requirePaths": ["../host/target/?.lua"] }',
+		["plugin/target/own.lua"] = "---@class Shared\n---@field mine boolean\n",
+		["alone/lde.json"] = "{}",
+	}, { "host/target/host", "plugin/src", "plugin/target", "alone/src" })
+	local declarations, lye = session()
+	declarations:workspace()
+
+	local view = declarations:view("file://" .. ROOT .. "/plugin/src/use.lua")
+	test.truthy(view.HostApi, "the host's class is named")
+	test.equal(view.Shared, assert(lye.packageNames)[ROOT .. "/plugin"].Shared, "the plugin's own wins")
+	test.falsy(declarations:view("file://" .. ROOT .. "/alone/src/use.lua").HostApi,
+	"a package pointing nowhere does not see it")
 end)
 
 test.it("module names come from the index manifest in the old layout", function()
